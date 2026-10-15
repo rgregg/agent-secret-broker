@@ -120,9 +120,16 @@ class Broker:
             raise ValueError("allowed_hosts must be up to 10 plain hostnames")
         fp = meta.get("tls_fingerprint")
         if fp is not None:
-            fp = re.sub(r"^sha256:", "", str(fp).strip(), flags=re.I).replace(":", "").lower()
-            if not re.fullmatch(r"[0-9a-f]{64}", fp):
-                raise ValueError("tls_fingerprint must be sha256:<64 hex digits>")
+            raw_fps = fp if isinstance(fp, list) else [fp]
+            if not 1 <= len(raw_fps) <= 20:
+                raise ValueError("tls_fingerprint must be one value or a list of up to 20")
+            fps = []
+            for one in raw_fps:
+                one = re.sub(r"^sha256:", "", str(one).strip(), flags=re.I).replace(":", "").lower()
+                if not re.fullmatch(r"[0-9a-f]{64}", one):
+                    raise ValueError("tls_fingerprint must be sha256:<64 hex digits>")
+                fps.append(one)
+            fp = tuple(sorted(set(fps)))
         verify = meta.get("tls_verify", True)
         if not isinstance(verify, bool):
             raise ValueError("tls_verify must be true or false")
@@ -724,14 +731,14 @@ def _private_host(host):
 
 class _PinnedHTTPSConnection(http.client.HTTPSConnection):
     """TLS with the CA/hostname check replaced by an exact certificate match."""
-    pin = None
+    pins = ()
 
     def connect(self):
         super().connect()
         der = self.sock.getpeercert(binary_form=True)
-        if not der or hashlib.sha256(der).hexdigest() != self.pin:
+        if not der or hashlib.sha256(der).hexdigest() not in self.pins:
             self.close()
-            raise ssl.SSLError("server certificate does not match the pinned fingerprint")
+            raise ssl.SSLError("server certificate does not match any pinned fingerprint")
 
 
 def _opener_for(tls):
@@ -740,9 +747,11 @@ def _opener_for(tls):
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
-    pin = tls.get("fingerprint")
-    if pin:
-        conn = type("_Pinned", (_PinnedHTTPSConnection,), {"pin": pin})
+    pins = tls.get("fingerprint")
+    if pins:
+        if isinstance(pins, str):
+            pins = (pins,)
+        conn = type("_Pinned", (_PinnedHTTPSConnection,), {"pins": tuple(pins)})
         handler = type("_PinnedHandler", (urllib.request.HTTPSHandler,), {
             "https_open": lambda self, req: self.do_open(
                 lambda host, **kw: conn(host, context=ctx, **{k: v for k, v in kw.items() if k != "context"}),

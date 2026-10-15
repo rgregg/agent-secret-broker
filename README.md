@@ -72,9 +72,10 @@ carries one custom text field named `broker`, holding a JSON object:
   with approval in env mode.
 - **Self-signed devices (TLS).** Normal certificate verification applies unless
   the metadata says otherwise:
-  `"tls_fingerprint": "sha256:<hex>"` accepts that exact certificate and nothing
-  else (CA and hostname are not consulted; `secret-run fingerprint HOST[:PORT]`
-  prints it), or `"tls_verify": false` turns verification off, which is only
+  `"tls_fingerprint": "sha256:<hex>"` (or a list of them, for a secret that
+  spans several devices) accepts exactly those certificates and nothing else (CA
+  and hostname are not consulted; `secret-run fingerprint HOST[:PORT]` prints
+  one), or `"tls_verify": false` turns verification off, which is only
   accepted when every allowed host is a private address or `.lan`/`.local`
   name. Prefer the pin: it still fails loudly against an impersonator. A
   request using several secrets with different TLS settings gets the strict

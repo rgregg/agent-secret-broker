@@ -1505,6 +1505,18 @@ class TlsPinned(TlsModes):
         self.assertNotIn(SECRET, json.dumps(r))
 
 
+class TlsPinnedList(TlsModes):
+    pin = "list"
+
+    def tweak(self, cfg):
+        super().tweak(cfg)
+        cfg["secrets"]["svc"]["tls_fingerprint"] = ["sha256:" + "1" * 64, "sha256:" + self.fp]
+
+    def test_any_listed_fingerprint_matches(self):
+        r = self.go()
+        self.assertEqual((r["status"], r["http"]["status"]), ("approved", 200))
+
+
 class TlsPinnedWrong(TlsModes):
     pin = "bad"
 
@@ -1535,14 +1547,23 @@ class TlsPolicyRules(unittest.TestCase):
         self.assertEqual(self.entry(tls_verify=False, allowed_hosts=["10.0.0.5", "pikvm.lan"])["_tls"],
                          {"fingerprint": None, "verify": False})
 
+    def test_several_fingerprints_are_all_accepted_and_normalised(self):
+        a, b = "ab" * 32, "cd" * 32
+        t = self.entry(tls_fingerprint=["sha256:" + b, a, a])["_tls"]
+        self.assertEqual(t["fingerprint"], (a, b))                 # sorted, de-duplicated
+        with self.assertRaises(ValueError):
+            self.entry(tls_fingerprint=[a, "nope"])
+        with self.assertRaises(ValueError):
+            self.entry(tls_fingerprint=[])
+
     def test_fingerprint_forms_and_validation(self):
         h = "ab" * 32
         for form in (h, "sha256:" + h, "SHA256:" + ":".join(h[i:i + 2] for i in range(0, 64, 2)).upper()):
-            self.assertEqual(self.entry(tls_fingerprint=form)["_tls"]["fingerprint"], h)
+            self.assertEqual(self.entry(tls_fingerprint=form)["_tls"]["fingerprint"], (h,))
         with self.assertRaises(ValueError):
             self.entry(tls_fingerprint="sha256:1234")
         # a pin makes tls_verify=false unnecessary even for public names
-        self.assertEqual(self.entry(tls_fingerprint=h, tls_verify=False)["_tls"]["fingerprint"], h)
+        self.assertEqual(self.entry(tls_fingerprint=h, tls_verify=False)["_tls"]["fingerprint"], (h,))
 
 
 class MultiValue(Harness):
