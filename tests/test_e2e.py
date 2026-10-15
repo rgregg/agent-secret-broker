@@ -1209,6 +1209,19 @@ class BwBackendWrites(unittest.TestCase):
         self.assertEqual(it["Login"]["login"]["password"], "p2")
         self.assertEqual({f["name"]: f["value"] for f in it["Login"]["fields"]}["previous_value"], "p-val")
 
+    def test_create_recovers_from_an_invalidated_session(self):
+        real, calls = self.b._resolve_target, []
+
+        def flaky():
+            calls.append(1)
+            if len(calls) == 1:
+                raise BackendError("Expecting value: line 1 column 1 (char 0)")
+            return real()
+        self.b._resolve_target = flaky
+        self.b.put("Recovered", "notes", "v", create=True)
+        self.assertEqual(self.items()["Recovered"]["notes"], "v")
+        self.assertEqual(len(calls), 2)
+
     def test_duplicate_create_refused(self):
         self.b.put("A", "notes", "1", create=True)
         with self.assertRaises(BackendError):
