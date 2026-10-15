@@ -377,33 +377,66 @@ class BwServeBackend(BwBackend):
                 p.kill()
                 p.wait(5)
 
-    def _start_server(self):
+    def _owns_port(self):
+        """True only if every listener on our port is a socket of our child process."""
+        want = set()
+        for name in ("/proc/net/tcp", "/proc/net/tcp6"):
+            try:
+                rows = open(name).read().splitlines()[1:]
+            except OSError:
+                continue
+            for row in rows:
+                f = row.split()
+                if len(f) > 9 and f[3] == "0A" and int(f[1].rsplit(":", 1)[1], 16) == self._port:
+                    want.add(f[9])
+        if not want:
+            return False
+        mine = set()
+        try:
+            for fd in os.listdir(f"/proc/{self._proc.pid}/fd"):
+                try:
+                    link = os.readlink(f"/proc/{self._proc.pid}/fd/{fd}")
+                except OSError:
+                    continue
+                if link.startswith("socket:["):
+                    mine.add(link[8:-1])
+        except OSError:
+            return False
+        return want <= mine
+
+    def _start_server(self, session):
+        """Start `bw serve` already unlocked. The master password and session key
+        never cross the HTTP port: the session goes in the child's environment,
+        and nothing is sent until we have confirmed that our child owns the port
+        (another local process could otherwise squat on it)."""
         self._stop_server()
         self._port = self._free_port()
         self._proc = subprocess.Popen(
             [self._bw, "serve", "--hostname", "127.0.0.1", "--port", str(self._port)],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            env=dict(os.environ))
+            env=dict(os.environ, BW_SESSION=session))
         deadline = time.monotonic() + self._startup_timeout
         while time.monotonic() < deadline:
             if self._proc.poll() is not None:
                 raise BackendError("bw serve exited during startup")
-            try:
-                self._http("GET", "/status", timeout=2)
-                return
-            except BackendError:
-                time.sleep(0.2)
+            if self._owns_port():
+                try:
+                    self._http("GET", "/status", timeout=2)
+                except BackendError:
+                    time.sleep(0.2)
+                    continue
+                if self._proc.poll() is None and self._owns_port():
+                    return
+            time.sleep(0.2)
         self._stop_server()
-        raise BackendError("bw serve did not become ready")
+        raise BackendError("bw serve did not become ready on a port it owns")
 
     # -- session ------------------------------------------------------------
     def _unlock(self):
         self._stop_server()                       # CLI login must not race a running server
-        if self._status() == "unauthenticated":
-            self._run("config", "server", self._server_url)
-            self._run("login", "--apikey")
-        self._start_server()
-        self._http("POST", "/unlock", {"password": self._pw})
+        super()._unlock()                         # login if needed, then unlock -> session key
+        key, self._session = self._session, None
+        self._start_server(key)
         self._session = "serve"                   # truthy marker: the server holds the key
 
     def _sync(self):

@@ -41,6 +41,15 @@ login rate limit. Idle logout still locks the vault, stops the process and logs
 out. In this mode items are matched by exact name (case-insensitive) or id; the
 CLI's substring search can make a name ambiguous or collide with a longer one.
 
+`bw serve` has no authentication of its own, so the controls are around it:
+it listens only on 127.0.0.1 inside the container (nothing else runs there and
+the port is not published), it is unlocked only while in use plus the idle
+window, the master password and session key never cross the HTTP port (the
+session goes in the child's environment), and the broker refuses to talk to it
+unless the listener on that port belongs to the process it started. Anyone who
+can already run code in the container could read the same state from the
+persistent `/bw` volume.
+
 ## Policy, risk, discovery
 
 `list` and `which` never touch the vault or send a notification; each call is

@@ -1172,7 +1172,7 @@ elif cmd == "serve":
     log = os.environ.get("FAKE_BW_SERVE_LOG")
     if log:
         open(log, "a").write("start\n")
-    st = {"unlocked": False}
+    st = {"unlocked": bool(os.environ.get("BW_SESSION"))}
     class H(BaseHTTPRequestHandler):
         def log_message(self, *x): pass
         def reply(self, ok, data=None, msg=None, code=200):
@@ -1434,6 +1434,25 @@ class BwServeWrites(BwBackendWrites):
         self.assertEqual(self.b.get("OPENAI BACKUP", "notes"), "b")   # case-insensitive fallback
         with self.assertRaises(BackendError):
             self.b.put("openai", "notes", "x", create=True)           # exact name exists
+
+    def test_secrets_never_travel_over_the_http_port(self):
+        seen = []
+        orig = self.b._http
+
+        def spy(method, path, body=None, timeout=60):
+            seen.append((method, path, json.dumps(body)))
+            return orig(method, path, body, timeout)
+        self.b._http = spy
+        self.b.put("A", "notes", "a", create=True)
+        self.assertNotIn("/unlock", [p for _, p, _ in seen])
+        self.assertNotIn('"m"', " ".join(b for _, _, b in seen))        # master password is "m"
+
+    def test_refuses_a_port_it_does_not_own(self):
+        self.b._owns_port = lambda: False
+        self.b._startup_timeout = 1.5
+        with self.assertRaises(BackendError):
+            self.b.put("A", "notes", "a", create=True)
+        self.assertIsNone(self.b._proc)
 
     def test_close_stops_the_server(self):
         self.b.put("A", "notes", "a", create=True)
