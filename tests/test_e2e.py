@@ -1262,6 +1262,48 @@ class BwBackendWrites(unittest.TestCase):
         self.b.delete("A")                                              # idempotent
 
 
+class AutoCreate(Harness):
+    """Creating a credential needs no tap by default; updating still does."""
+    decision = None
+    NEW = "auto-created-credential-VALUE-987"
+
+    def store(self, op="create", name="autoapi", **kw):
+        body = {"mode": "store", "names": [name], "op": op, "value": self.NEW}
+        if op == "create":
+            body["allowed_hosts"] = ["127.0.0.1"]
+        body.update(kw)
+        return self.api("POST", "/v1/requests", body)
+
+    def test_create_is_stored_without_a_prompt_and_audited(self):
+        code, body = self.store()
+        self.assertEqual(code, 202)
+        _, b = self.api("GET", f"/v1/requests/{json.loads(body)['id']}?wait=5")
+        r = json.loads(b)
+        self.assertEqual((r["status"], r["stored"]["name"]), ("approved", "autoapi"))
+        self.assertEqual(self.notifier.sent, [])
+        self.assertEqual(self.broker.backend._data["autoapi"]["notes"], self.NEW)
+        with open(self.config_path) as f:
+            sec = json.load(f)["secrets"]["autoapi"]
+        self.assertEqual(sec.get("approval", "prompt"), "prompt")        # use still prompts
+        self.assertEqual(sec["created"]["by"], "policy:auto-create")
+        a = self.events("approved")[0]
+        self.assertEqual(a["via"], "policy")
+        with open(self.audit) as f:
+            self.assertNotIn(self.NEW, f.read())
+
+    def test_update_still_needs_a_human(self):
+        self.store()
+        self.store("update", "svc", value="rotated-value-1234")
+        self.assertEqual(len(self.notifier.sent), 1)
+        self.assertEqual(self.broker.backend._data["Svc"]["token"], SECRET)
+
+    def test_opt_out_restores_the_prompt(self):
+        self.broker.cfg["store"] = {"create": "prompt"}
+        self.store()
+        self.assertEqual(len(self.notifier.sent), 1)
+        self.assertNotIn("autoapi", self.broker.backend._data)
+
+
 class MultiValue(Harness):
     """Several values in one vault field, selected with a `key` on the var."""
     DOTENV = "# creds\nCLIENT_ID=abc\nCLIENT_SECRET: \"s3cr3t\"\nREGION=us-east-1\n"
@@ -1336,6 +1378,9 @@ class StructuredParsing(unittest.TestCase):
 
 class StoreFlow(Harness):
     NEW = "brand-new-credential-VALUE-123"
+
+    def tweak(self, cfg):
+        cfg["store"] = {"create": "prompt"}     # these tests cover the human-approval path
 
     def store(self, op="create", name="newapi", value=None, **kw):
         body = {"mode": "store", "names": [name], "op": op,

@@ -119,9 +119,14 @@ class Broker:
             return []
         return list(sc.get("auto_modes", ["http"]))
 
-    def _auto_allowed(self, mode, names):
+    def _auto_allowed(self, mode, names, spec=None):
         if mode == "store":
-            return False                    # writing credentials always needs a human
+            # Creating a credential is low risk (it cannot read or change anything
+            # that exists, and the new secret still prompts on every use), so it
+            # needs no tap unless `"store": {"create": "prompt"}`. An update
+            # overwrites a live credential and always needs a human.
+            return (bool(spec) and spec.get("op") == "create"
+                    and self.cfg.get("store", {}).get("create", "auto") != "prompt")
         return all(mode in self._auto_modes(self.cfg["secrets"][n]) for n in names)
 
     # -- standing policy changes (approver-initiated, persisted) ------------
@@ -261,12 +266,14 @@ class Broker:
         a = risk_mod.assess(mode, names, spec, self.summarizer)
         req.summary, req.risk = a["summary"], {k: a[k] for k in ("level", "model", "reasons")}
         self.audit("assessed", req, model=a["model"], reasons=a["reasons"])
-        auto = self._auto_allowed(mode, names)
+        auto = self._auto_allowed(mode, names, spec)
         esc = self._escalate_at()
         if auto and esc and risk_mod.rank(a["level"]) >= risk_mod.rank(esc):
             self.audit("escalated", req, reason=f"risk {a['level']} >= {esc}; policy allow overridden")
             auto = False
         if auto:
+            if mode == "store":
+                req.approver = "policy:auto-create"
             try:
                 result = self._release(req)
             except (BackendError, OSError, ValueError) as e:

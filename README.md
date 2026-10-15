@@ -110,8 +110,11 @@ An agent can add or rotate credentials, always with a fresh approval:
   echoing values. `update NAME --var APP_SECRET` rewrites only that key and
   leaves the other lines (and comments) as they were; the whole previous text
   goes to `previous_value`.
-- **Never auto-approved**, regardless of a secret's `approval` policy, and never
-  eligible for "always allow". Risk is `medium` for create and `high` for update.
+- **Create needs no tap** (it is always rated low: it cannot read or change
+  anything that exists, and the new secret still prompts on every use). It is
+  recorded as `policy:auto-create`; set `"store": {"create": "prompt"}` to ask
+  instead. **Update always needs a human**, regardless of a secret's `approval`
+  policy, and is never eligible for "always allow".
 - **No half-finished state:** if the config cannot be written after a create, the
   new vault item is removed again.
 - Needs a vault account that can edit the target collection, and (when the
