@@ -34,7 +34,7 @@ happens on a page that only your authenticated SSO session can reach.
 
 `list` and `which` never touch the vault or send a notification; each call is
 recorded as a `discovery` event. They return names, placeholder variable names,
-allowed hosts, never values. Approval policy and sensitivity are deliberately
+allowed hosts, never values. Approval policy is deliberately
 not exposed: whether a credential prompts must not influence which one an agent
 chooses.
 
