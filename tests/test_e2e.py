@@ -1441,6 +1441,110 @@ class AutoCreate(Harness):
         self.assertNotIn("autoapi", self.broker.backend._data)
 
 
+def _self_signed(tmp):
+    """(certfile, keyfile, sha256 hex) for a throwaway self-signed certificate."""
+    import hashlib
+    import shutil
+    import ssl
+    import subprocess
+    if shutil.which("openssl") is None:
+        raise unittest.SkipTest("openssl not available")
+    cert, key = os.path.join(tmp, "c.pem"), os.path.join(tmp, "k.pem")
+    subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", key,
+                    "-out", cert, "-subj", "/CN=device.lan", "-days", "2"],
+                   check=True, capture_output=True)
+    der = ssl.PEM_cert_to_DER_cert(open(cert).read())
+    return cert, key, hashlib.sha256(der).hexdigest()
+
+
+class TlsModes(Harness):
+    """Self-signed devices: pinned fingerprint, or verification off (private only)."""
+    decision = "approve"
+    pin = None
+
+    def tweak(self, cfg):
+        self.tls_dir = tempfile.mkdtemp()
+        self.cert, self.key, self.fp = _self_signed(self.tls_dir)
+        sc = cfg["secrets"]["svc"]
+        if self.pin == "good":
+            sc["tls_fingerprint"] = "sha256:" + self.fp
+        elif self.pin == "bad":
+            sc["tls_fingerprint"] = "sha256:" + "0" * 64
+        elif self.pin == "noverify":
+            sc["tls_verify"] = False
+
+    def setUp(self):
+        super().setUp()
+        import ssl
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(self.cert, self.key)
+        self.tls_up = ThreadingHTTPServer(("127.0.0.1", 0), Echo)
+        self.tls_up.socket = ctx.wrap_socket(self.tls_up.socket, server_side=True)
+        threading.Thread(target=self.tls_up.serve_forever, daemon=True).start()
+        self.addCleanup(self.tls_up.shutdown)
+
+    def go(self):
+        url = f"https://127.0.0.1:{self.tls_up.server_address[1]}/x"
+        _, body = self.api("POST", "/v1/requests", {
+            "mode": "http", "names": ["svc"], "method": "GET", "url": url,
+            "headers": {"Authorization": "Bearer {{SVC_TOKEN}}"}})
+        _, b = self.api("GET", f"/v1/requests/{json.loads(body)['id']}?wait=8")
+        return json.loads(b)
+
+class TlsDefault(TlsModes):
+    def test_default_rejects_a_self_signed_certificate(self):
+        self.assertEqual(self.go()["status"], "failed")
+
+
+class TlsPinned(TlsModes):
+    pin = "good"
+
+    def test_matching_fingerprint_is_accepted(self):
+        r = self.go()
+        self.assertEqual((r["status"], r["http"]["status"]), ("approved", 200))
+        self.assertNotIn(SECRET, json.dumps(r))
+
+
+class TlsPinnedWrong(TlsModes):
+    pin = "bad"
+
+    def test_wrong_fingerprint_is_refused(self):
+        r = self.go()
+        self.assertEqual(r["status"], "failed")
+        self.assertIn("pinned fingerprint", " ".join(e.get("error", "") for e in self.events("failed")))
+
+
+class TlsNoVerifyPrivate(TlsModes):
+    pin = "noverify"
+
+    def test_unverified_tls_is_allowed_for_a_private_host(self):
+        r = self.go()
+        self.assertEqual((r["status"], r["http"]["status"]), ("approved", 200))
+
+
+class TlsPolicyRules(unittest.TestCase):
+    def entry(self, **kw):
+        meta = {"vars": {"T": {}}, "allowed_hosts": ["api.example.com"], **kw}
+        return Broker._entry("Item", meta)[1]
+
+    def test_unverified_tls_refused_for_public_hosts(self):
+        with self.assertRaises(ValueError):
+            self.entry(tls_verify=False)
+        with self.assertRaises(ValueError):
+            self.entry(tls_verify=False, allowed_hosts=["10.0.0.5", "api.example.com"])
+        self.assertEqual(self.entry(tls_verify=False, allowed_hosts=["10.0.0.5", "pikvm.lan"])["_tls"],
+                         {"fingerprint": None, "verify": False})
+
+    def test_fingerprint_forms_and_validation(self):
+        h = "ab" * 32
+        for form in (h, "sha256:" + h, "SHA256:" + ":".join(h[i:i + 2] for i in range(0, 64, 2)).upper()):
+            self.assertEqual(self.entry(tls_fingerprint=form)["_tls"]["fingerprint"], h)
+        with self.assertRaises(ValueError):
+            self.entry(tls_fingerprint="sha256:1234")
+        # a pin makes tls_verify=false unnecessary even for public names
+        self.assertEqual(self.entry(tls_fingerprint=h, tls_verify=False)["_tls"]["fingerprint"], h)
+
+
 class MultiValue(Harness):
     """Several values in one vault field, selected with a `key` on the var."""
     DOTENV = "# creds\nCLIENT_ID=abc\nCLIENT_SECRET: \"s3cr3t\"\nREGION=us-east-1\n"

@@ -70,6 +70,15 @@ carries one custom text field named `broker`, holding a JSON object:
 - `allowed_hosts` may be omitted for credentials that are not HTTP tokens (a
   Wi-Fi password): such a secret can never be used in `http` mode, only fetched
   with approval in env mode.
+- **Self-signed devices (TLS).** Normal certificate verification applies unless
+  the metadata says otherwise:
+  `"tls_fingerprint": "sha256:<hex>"` accepts that exact certificate and nothing
+  else (CA and hostname are not consulted; `secret-run fingerprint HOST[:PORT]`
+  prints it), or `"tls_verify": false` turns verification off, which is only
+  accepted when every allowed host is a private address or `.lan`/`.local`
+  name. Prefer the pin: it still fails loudly against an impersonator. A
+  request using several secrets with different TLS settings gets the strict
+  default.
 - Items without that field are invisible to the broker. One item carries one
   secret. If two items claim the same secret name, *both* are dropped and the
   conflict is audited, so a look-alike item cannot shadow a real one.

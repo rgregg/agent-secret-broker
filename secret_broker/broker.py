@@ -14,11 +14,15 @@ Everything, including auto-approved use and rejected attempts, is audited.
 """
 import base64
 import binascii
+import hashlib
 import html
+import http.client
+import ipaddress
 import json
 import os
 import re
 import secrets
+import ssl
 import threading
 import time
 import urllib.error
@@ -114,6 +118,19 @@ class Broker:
         if (not isinstance(hosts, list) or len(hosts) > 10
                 or not all(isinstance(h, str) and _HOST_RE.match(h) for h in hosts)):
             raise ValueError("allowed_hosts must be up to 10 plain hostnames")
+        fp = meta.get("tls_fingerprint")
+        if fp is not None:
+            fp = re.sub(r"^sha256:", "", str(fp).strip(), flags=re.I).replace(":", "").lower()
+            if not re.fullmatch(r"[0-9a-f]{64}", fp):
+                raise ValueError("tls_fingerprint must be sha256:<64 hex digits>")
+        verify = meta.get("tls_verify", True)
+        if not isinstance(verify, bool):
+            raise ValueError("tls_verify must be true or false")
+        if not verify and fp is None:
+            public = [h for h in hosts if not _private_host(h)]
+            if public or not hosts:
+                raise ValueError("tls_verify=false is only allowed for private hosts "
+                                 f"(not {', '.join(public) or 'a secret without hosts'}); pin a fingerprint instead")
         raw_vars = meta.get("vars")
         if not isinstance(raw_vars, dict) or not raw_vars:
             raise ValueError("vars must be a non-empty object")
@@ -131,7 +148,8 @@ class Broker:
             if ref.get("key"):
                 vars_[var]["key"] = str(ref["key"])
         return name, {**meta, "vars": vars_, "allowed_hosts": [h.lower() for h in hosts],
-                      "approval": approval, "_item": item, "_meta": meta}
+                      "approval": approval, "_item": item, "_meta": meta,
+                      "_tls": {"fingerprint": fp, "verify": verify}}
 
     def refresh_catalog(self):
         """Rebuild the secret catalog from the vault's items. Raises if the vault
@@ -175,6 +193,18 @@ class Broker:
             self.log("catalog_error", error=str(e)[:200])
         finally:
             self._refreshing.release()
+
+    def _tls_policy(self, names):
+        """TLS handling for a request: a pinned fingerprint, or verification off
+        (private hosts only), or normal verification. If the secrets disagree the
+        strict default applies."""
+        pol = {(self.cfg["secrets"][n].get("_tls", {}).get("fingerprint"),
+                self.cfg["secrets"][n].get("_tls", {}).get("verify", True))
+               for n in names if n in self.cfg["secrets"]}
+        if len(pol) == 1:
+            fp, verify = next(iter(pol))
+            return {"fingerprint": fp, "verify": verify}
+        return {"fingerprint": None, "verify": True}
 
     # -- audit ------------------------------------------------------------
     def log(self, event, **fields):
@@ -609,7 +639,7 @@ class Broker:
             return {"env": env}
         t0 = time.time()
         try:
-            out = _do_http(req.spec, env)
+            out = _do_http(req.spec, env, self._tls_policy(req.names))
         except OSError as e:
             self.audit("http_failed", req, error=str(e)[:200])
             raise
@@ -681,7 +711,48 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 _opener = urllib.request.build_opener(_NoRedirect)
 
 
-def _do_http(spec, env):
+def _private_host(host):
+    """True for addresses/names that only exist on a private network."""
+    try:
+        ip = ipaddress.ip_address(host)
+        return ip.is_private or ip.is_loopback or ip.is_link_local
+    except ValueError:
+        pass
+    h = host.lower()
+    return "." not in h or h.endswith((".lan", ".local", ".internal", ".home.arpa", ".localdomain"))
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """TLS with the CA/hostname check replaced by an exact certificate match."""
+    pin = None
+
+    def connect(self):
+        super().connect()
+        der = self.sock.getpeercert(binary_form=True)
+        if not der or hashlib.sha256(der).hexdigest() != self.pin:
+            self.close()
+            raise ssl.SSLError("server certificate does not match the pinned fingerprint")
+
+
+def _opener_for(tls):
+    if not tls or (tls.get("verify", True) and not tls.get("fingerprint")):
+        return _opener
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    pin = tls.get("fingerprint")
+    if pin:
+        conn = type("_Pinned", (_PinnedHTTPSConnection,), {"pin": pin})
+        handler = type("_PinnedHandler", (urllib.request.HTTPSHandler,), {
+            "https_open": lambda self, req: self.do_open(
+                lambda host, **kw: conn(host, context=ctx, **{k: v for k, v in kw.items() if k != "context"}),
+                req)})()
+    else:
+        handler = urllib.request.HTTPSHandler(context=ctx)
+    return urllib.request.build_opener(_NoRedirect, handler)
+
+
+def _do_http(spec, env, tls=None):
     if spec.get("body_b64") is not None:
         data = base64.b64decode(spec["body_b64"])
     elif spec.get("body"):
@@ -693,7 +764,7 @@ def _do_http(spec, env):
         headers={k: _fill(v, env) for k, v in spec["headers"].items()},
     )
     try:
-        with _opener.open(req, timeout=30) as r:
+        with _opener_for(tls).open(req, timeout=30) as r:
             status, headers, body = r.status, dict(r.headers), r.read(MAX_RESPONSE_BYTES)
     except urllib.error.HTTPError as e:
         status, headers, body = e.code, dict(e.headers), e.read(MAX_RESPONSE_BYTES)
