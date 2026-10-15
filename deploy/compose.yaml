@@ -1,0 +1,35 @@
+# Example deployment: broker + an SSO proxy outpost in front of the approval page.
+# Secrets (mode 600, owned by uid 65534) live in ./secrets, never in this file.
+#   ./data/config.json   broker config (see config.example.json)
+#   ./secrets/*          client_key, notify tokens, vault credentials
+services:
+  broker:
+    image: ghcr.io/rgregg/agent-secret-broker:latest
+    container_name: secret-broker
+    restart: unless-stopped
+    ports:
+      - "8800:8800"            # client API (CLI): needs X-Client-Key. Do NOT publish 8801.
+    env_file: ./secrets/broker.env      # BW_CLIENTID / BW_CLIENTSECRET (bw backend)
+    environment:
+      HOME: /tmp               # bw writes its state under $HOME
+    volumes:
+      - ./data:/data
+      - ./secrets:/run/secrets:ro
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+  # Any reverse proxy that authenticates you and forwards the user's identity in
+  # the header named by `identity_header` works. This example uses an authentik
+  # proxy outpost (mode "proxy", internal host http://broker:8801).
+  outpost:
+    image: ghcr.io/goauthentik/proxy:2026.8.3   # keep == your authentik server version
+    container_name: secret-broker-outpost
+    restart: unless-stopped
+    ports:
+      - "9000:9000"            # point your TLS reverse proxy at this
+    environment:
+      AUTHENTIK_HOST: https://authentik.example.com
+      AUTHENTIK_INSECURE: "false"
+    env_file: ./secrets/outpost.env     # AUTHENTIK_TOKEN

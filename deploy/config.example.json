@@ -1,0 +1,26 @@
+{
+  "backend": {"type": "bw", "server_url": "https://vault.example.com",
+              "master_password_file": "/run/secrets/bw_master_password"},
+  "notify": [
+    {"type": "ticker", "ha_url": "http://homeassistant.example:8123",
+     "ha_token_file": "/run/secrets/ha_token", "category": "general"},
+    {"type": "telegram", "bot_token_file": "/run/secrets/telegram_bot_token", "chat_id": "123456789"}
+  ],
+  "client_key_file": "/run/secrets/client_key",
+  "approve_base_url": "https://secrets.example.com",
+  "allowed_user": "alice",
+  "identity_header": "X-authentik-username",
+  "ttl_seconds": 300,
+  "risk": {"escalate_auto_at": "high"},
+  "audit_log": "/data/audit.jsonl",
+  "summary": {"model": "openai/gpt-5-mini", "api_key_file": "/run/secrets/openrouter_key",
+              "timeout": 4, "max_content_chars": 300, "send_content": true},
+  "secrets": {
+    "example-api": {
+      "vars": {"EXAMPLE_API_KEY": {"item": "Example API", "field": "key"}},
+      "allowed_hosts": ["api.example.com"],
+      "approval": "prompt",
+      "sensitivity": "high"
+    }
+  }
+}
