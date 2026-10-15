@@ -40,6 +40,13 @@ def describe(mode, names, spec, max_content_chars=300, send_content=True):
                 lines.append("body: <binary>")
         elif spec.get("body") or spec.get("body_b64"):
             lines.append("body: <present, not shown>")
+    elif mode == "store":
+        # never include the value: only its size
+        lines.append(f"operation: {spec.get('op')} a stored credential")
+        lines.append(f"vault item: {spec.get('item')} field: {spec.get('field')}")
+        if spec.get("allowed_hosts"):
+            lines.append("usable for hosts: " + ", ".join(spec["allowed_hosts"]))
+        lines.append(f"value: <{len(spec.get('value') or '')} chars, not shown>")
     else:
         cmd = " ".join(spec.get("argv") or [])
         lines.append("command: " + (cmd[:max_content_chars] if send_content else "<not shown>"))

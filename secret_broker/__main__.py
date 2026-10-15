@@ -23,7 +23,8 @@ def main():
 
     b = cfg["backend"]
     backend = (BwBackend(b["server_url"], b["master_password_file"],
-                         idle_timeout=b.get("idle_timeout", 300))
+                         idle_timeout=b.get("idle_timeout", 300),
+                         organization=b.get("organization"), collection=b.get("collection"))
                if b["type"] == "bw" else FileBackend(b["path"]))
     notifier = notify.build(cfg, _read)
     summarizer = None

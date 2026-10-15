@@ -40,9 +40,12 @@ def baseline(mode, names, spec, secrets_cfg):
         reasons.append(why)
 
     for n in names:
-        sens = secrets_cfg[n].get("sensitivity", "medium")
+        sc = secrets_cfg.get(n)
+        if sc is None:                      # a secret that does not exist yet (store/create)
+            continue
+        sens = sc.get("sensitivity", "medium")
         if rank(sens) > rank("low"):
-            raise_to(sens, f"{n} is marked {sens}-sensitivity" if "sensitivity" in secrets_cfg[n]
+            raise_to(sens, f"{n} is marked {sens}-sensitivity" if "sensitivity" in sc
                      else f"{n} has no sensitivity set (assumed medium)")
 
     if mode == "http":
@@ -59,6 +62,11 @@ def baseline(mode, names, spec, secrets_cfg):
             raise_to("medium", "admin/credential/write path")
         if spec.get("body_b64") is not None:
             raise_to("medium", "binary body cannot be inspected")
+    elif mode == "store":
+        if spec.get("op") == "create":
+            raise_to("medium", "stores a new credential whose value the broker cannot verify")
+        else:
+            raise_to("high", "overwrites an existing credential")
     else:
         raise_to("medium", "secret value is released to the requesting host")
         argv = spec.get("argv") or []

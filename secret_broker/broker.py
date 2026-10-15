@@ -17,6 +17,7 @@ import binascii
 import html
 import json
 import os
+import re
 import secrets
 import threading
 import time
@@ -34,6 +35,12 @@ MAX_PENDING = 3
 DENY_COOLDOWN = 60
 MAX_RESPONSE_BYTES = 1_000_000
 MAX_REQUEST_BYTES = 8_000_000
+MAX_STORE_VALUE = 65_536
+_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,40}$")
+_HOST_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
+_VAR_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,60}$")
+_FIELD_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_ .-]{0,59}$")
+_ITEM_RE = re.compile(r"^[^\x00-\x1f]{1,100}$")
 APPROVAL_VALUES = ("prompt", "allow")
 
 
@@ -54,6 +61,7 @@ class Request:
         self.summary = None       # advisory, unverified
         self.risk = None          # {"level","baseline","model","reasons"}
         self.always = None        # outcome of an "always allow" click, if any
+        self.approver = None
         self.done = threading.Event()
 
 
@@ -97,6 +105,10 @@ class Broker:
             rec["risk"] = req.risk["level"]
         if req.mode == "http":
             rec["method"], rec["url"] = req.spec["method"], req.spec["url"]
+        elif req.mode == "store":
+            sp = req.spec
+            rec.update(op=sp.get("op"), item=sp.get("item"), field=sp.get("field"),
+                       hosts=sp.get("allowed_hosts"), value_bytes=sp.get("value_bytes"))
         else:
             rec["argv"] = (req.spec.get("argv") or [])[:50]
         self._audit.log(event, **rec)
@@ -109,6 +121,8 @@ class Broker:
         return list(sc.get("auto_modes", ["http"]))
 
     def _auto_allowed(self, mode, names):
+        if mode == "store":
+            return False                    # writing credentials always needs a human
         return all(mode in self._auto_modes(self.cfg["secrets"][n]) for n in names)
 
     # -- standing policy changes (approver-initiated, persisted) ------------
@@ -119,6 +133,8 @@ class Broker:
         actually take effect, and it is never established from a request that is
         itself high risk or that releases the value to the requesting host.
         """
+        if req.mode == "store":
+            return False, "storing a credential always needs a fresh approval"
         if req.mode != "http":
             return False, "env-mode requests release the value to the requesting host"
         if len(req.names) != 1:
@@ -139,14 +155,19 @@ class Broker:
         return True, ""
 
     def _persist_approval(self, name, value, user):
-        """Atomically record the change in the config file, preserving its mode."""
+        def mutate(disk):
+            entry = disk["secrets"][name]
+            entry["approval"] = value
+            entry["approval_changed"] = {
+                "by": user, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+        self._write_config(mutate)
+
+    def _write_config(self, mutate):
+        """Read-modify-write the config file atomically, preserving its mode."""
         path = self._config_path
         with open(path) as f:
             disk = json.load(f)
-        entry = disk["secrets"][name]
-        entry["approval"] = value
-        entry["approval_changed"] = {
-            "by": user, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+        mutate(disk)
         mode = os.stat(path).st_mode & 0o777
         tmp = f"{path}.tmp.{os.getpid()}"
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
@@ -202,13 +223,16 @@ class Broker:
     def create(self, mode, names, spec, source, peer=None):
         try:
             secrets_cfg = self.cfg["secrets"]
-            if not names or any(n not in secrets_cfg for n in names):
-                raise ValueError("unknown secret name")
-            if mode == "http":
-                self._validate_http(names, spec)
+            if mode == "store":
+                self._validate_store(names, spec)
+            else:
+                if not names or any(n not in secrets_cfg for n in names):
+                    raise ValueError("unknown secret name")
+                if mode == "http":
+                    self._validate_http(names, spec)
         except (ValueError, PermissionError) as e:
             self.log("rejected", reason=str(e), names=names, mode=mode, source=source, peer=peer,
-                     url=spec.get("url") if isinstance(spec, dict) else None)
+                     url=spec.get("url") if isinstance(spec, dict) and mode == "http" else None)
             raise
         with self._lock:
             self._expire_locked()
@@ -252,6 +276,60 @@ class Broker:
             self._finish(req, "failed", error=f"could not notify: {e}")
         return req
 
+    def _validate_store(self, names, spec):
+        """Validate (and fill defaults for) a request to create/update a credential."""
+        if len(names) != 1 or not _NAME_RE.match(names[0]):
+            raise ValueError("secret name must be 1-41 chars of a-z 0-9 _ - ")
+        name, op = names[0], spec.get("op")
+        value = spec.get("value")
+        if not isinstance(value, str) or not value or "\x00" in value:
+            raise ValueError("value must be a non-empty string")
+        if len(value.encode()) > MAX_STORE_VALUE:
+            raise ValueError(f"value is larger than {MAX_STORE_VALUE} bytes")
+        spec["value_bytes"] = len(value.encode())
+        secrets_cfg = self.cfg["secrets"]
+        if op == "create":
+            if name in secrets_cfg:
+                raise ValueError(f"{name} already exists; use update")
+            if not self._config_path:
+                raise PermissionError("the broker has no config file to record a new secret in")
+            hosts = spec.get("allowed_hosts")
+            if (not isinstance(hosts, list) or not 1 <= len(hosts) <= 10
+                    or not all(isinstance(h, str) and _HOST_RE.match(h) for h in hosts)):
+                raise ValueError("allowed_hosts must be 1-10 plain hostnames")
+            spec["allowed_hosts"] = sorted(set(h.lower() for h in hosts))
+            spec["field"] = spec.get("field") or "notes"
+            spec["item"] = spec.get("item") or name
+            spec["var"] = spec.get("var") or re.sub(r"[^A-Za-z0-9]", "_", name).upper() + "_TOKEN"
+            if not _FIELD_RE.match(spec["field"]) or spec["field"] in ("previous_value", "previous_replaced_at"):
+                raise ValueError("bad field name")
+            if not _ITEM_RE.match(spec["item"]):
+                raise ValueError("bad item name")
+            if not _VAR_RE.match(spec["var"]):
+                raise ValueError("variable must look like MY_TOKEN")
+            for other, sc in secrets_cfg.items():
+                for ref in sc["vars"].values():
+                    if ref["item"] == spec["item"]:
+                        raise ValueError(f"vault item {spec['item']!r} is already used by {other}")
+        elif op == "update":
+            if name not in secrets_cfg:
+                raise ValueError("unknown secret name")
+            for k in ("allowed_hosts", "item"):
+                if spec.get(k):
+                    raise ValueError(f"{k} cannot be changed by an update")
+            vars_ = secrets_cfg[name]["vars"]
+            var = spec.get("var")
+            if var is None:
+                if len(vars_) != 1:
+                    raise ValueError("this secret has several variables; say which with var")
+                var = next(iter(vars_))
+            if var not in vars_:
+                raise ValueError(f"{name} has no variable {var}")
+            ref = vars_[var]
+            spec["var"], spec["item"], spec["field"] = var, ref["item"], ref["field"]
+        else:
+            raise ValueError("op must be create or update")
+
     def _validate_http(self, names, spec):
         u = urllib.parse.urlsplit(spec["url"])
         if u.scheme not in ("http", "https") or not u.hostname:
@@ -279,6 +357,10 @@ class Broker:
         url = f"{self.cfg['approve_base_url'].rstrip('/')}/a/{req.nonce}"
         if req.mode == "http":
             what = f"{req.spec['method']} {req.spec['url']}"
+        elif req.mode == "store":
+            sp = req.spec
+            what = (f"{sp['op']} credential: item {sp['item']!r} field {sp['field']} "
+                    f"({sp['value_bytes']} bytes, value not shown)")
         else:
             what = "run: " + " ".join(req.spec.get("argv") or [])[:200]
         head = f"{req.summary} (unverified)\n" if req.summary else ""
@@ -307,6 +389,8 @@ class Broker:
         for r in self._by_id.values():
             if r.status == "pending" and now > r.expires:
                 r.status = "expired"
+                if r.mode == "store":
+                    r.spec["value"] = None
                 self.audit("expired", r)
                 self._resolved(r, "expired")
                 r.done.set()
@@ -319,6 +403,8 @@ class Broker:
             if req.status not in ("pending", "deciding"):
                 return False
             req.status, req.error, req.result = status, error, result
+            if req.mode == "store":
+                req.spec["value"] = None        # never keep a credential longer than needed
         if status == "denied":
             now = time.time()
             for n in req.names:
@@ -342,6 +428,7 @@ class Broker:
             self.log("approval_stale", user=user, peer=peer, client_ip=client_ip, approve=approve)
             return None
         who = {"via": "user", "approver": user, "approver_peer": peer, "approver_ip": client_ip}
+        req.approver = user
         # The decision itself is recorded and announced immediately.
         self.audit("decided", req, decision="approve" if approve else "deny",
                    always_requested=bool(always and approve), **who)
@@ -389,7 +476,38 @@ class Broker:
                 self.log("backend_ready", duration_ms=int((time.time() - t0) * 1000))
         threading.Thread(target=run, daemon=True).start()
 
+    def _store(self, req):
+        """Write the credential to the vault; for a create, also map it in the config."""
+        sp = req.spec
+        name, by = req.names[0], req.approver or "unknown"
+        if not hasattr(self.backend, "put"):
+            raise BackendError("this backend cannot store credentials")
+        t0 = time.time()
+        if sp["op"] == "create":
+            self.backend.put(sp["item"], sp["field"], sp["value"], create=True)
+            entry = {"vars": {sp["var"]: {"item": sp["item"], "field": sp["field"]}},
+                     "allowed_hosts": sp["allowed_hosts"], "approval": "prompt", "sensitivity": "medium"}
+            try:
+                with self._cfg_lock:
+                    stamp = {"by": by, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+                    self._write_config(lambda disk: disk["secrets"].__setitem__(
+                        name, {**entry, "created": stamp}))
+                    self.cfg["secrets"][name] = {**entry, "created": stamp}
+            except Exception as e:  # noqa: BLE001
+                # no half-finished state: remove the item we just created
+                try:
+                    self.backend.delete(sp["item"])
+                except Exception:  # noqa: BLE001
+                    self.audit("store_rollback_failed", req, item=sp["item"])
+                raise BackendError(f"config not updated, vault change rolled back: {e}") from None
+        else:
+            self.backend.put(sp["item"], sp["field"], sp["value"], create=False, keep_previous=True)
+        self.audit("stored", req, duration_ms=int((time.time() - t0) * 1000))
+        return {"stored": {"name": name, "op": sp["op"], "item": sp["item"], "field": sp["field"]}}
+
     def _release(self, req):
+        if req.mode == "store":
+            return self._store(req)
         env = {}
         for n in req.names:
             for var, ref in self.cfg["secrets"][n]["vars"].items():
@@ -546,6 +664,10 @@ def client_handler(broker, client_key):
                             "body_b64": body.get("body_b64")}
                 elif mode == "env":
                     spec = {"argv": [str(a) for a in body.get("argv") or []]}
+                elif mode == "store":
+                    spec = {"op": body.get("op"), "value": body.get("value"),
+                            "field": body.get("field"), "item": body.get("item"),
+                            "var": body.get("var"), "allowed_hosts": body.get("allowed_hosts")}
                 else:
                     raise ValueError("bad mode")
                 req = broker.create(mode, names, spec, str(body.get("source", self.client_address[0]))[:80],
@@ -643,6 +765,15 @@ def approval_handler(broker):
             if req.mode == "http":
                 what = f"{html.escape(req.spec['method'])} {html.escape(req.spec['url'])}"
                 note = "The broker will make this call itself; the secret never leaves it."
+            elif req.mode == "store":
+                sp = req.spec
+                hosts = (f"<br>Usable only for: {html.escape(', '.join(sp['allowed_hosts']))}"
+                         if sp.get("allowed_hosts") else "<br>Hosts and mapping stay unchanged")
+                what = (f"<b>{html.escape(sp['op'].upper())}</b> credential in the vault<br>"
+                        f"Item: {html.escape(sp['item'])}, field: {html.escape(sp['field'])}{hosts}<br>"
+                        f"New value: {sp['value_bytes']} bytes (never displayed)")
+                note = ("An update replaces the current value; the old one is kept in the item's "
+                        "previous_value field. This will not run without your approval.")
             else:
                 what = "run <code>" + html.escape(" ".join(req.spec.get("argv") or [])) + "</code>"
                 note = ("Advisory only: the secret is released to the requesting host and the "

@@ -77,6 +77,30 @@ Messages cross whatever service carries them and include secret names, the
 method and URL, and the approval link (single use, expires with the request,
 and useless without your SSO session).
 
+## Storing and updating credentials
+
+An agent can add or rotate credentials, always with a fresh approval:
+
+    printf '%s' "$NEW_TOKEN" | secret-run store myapi --hosts api.example.com [--field notes] [--item "Vault item"]
+    printf '%s' "$NEW_TOKEN" | secret-run update myapi
+
+- **The value is only read from stdin** (or a hidden prompt on a terminal), never
+  an argument, and it is never written to the audit log, notifications, the
+  approval page (which shows only its size) or the config.
+- **`store` creates** a vault item in the configured organization/collection and
+  adds a secret entry to the config with the hosts you pass (`approval: prompt`,
+  `sensitivity: medium`). The approver sees the item, field and hosts.
+- **`update` replaces** the value of an existing secret's field. Hosts and
+  mapping cannot change, and the replaced value is kept in the item's
+  `previous_value` field for rollback.
+- **Never auto-approved**, regardless of a secret's `approval` policy, and never
+  eligible for "always allow". Risk is `medium` for create and `high` for update.
+- **No half-finished state:** if the config cannot be written after a create, the
+  new vault item is removed again.
+- Needs a vault account that can edit the target collection, and (when the
+  vault has several) `backend.organization` / `backend.collection` to say where
+  new items go. Use TLS in front of the client API: the value crosses it.
+
 ## Always allow
 
 On the approval page, **Approve and always allow `NAME`** approves this request
@@ -124,7 +148,7 @@ values, header values or bodies.
 Events: `startup` (policies in force), `requested`, `assessed`, `notified`,
 `secret_read`, `approved`/`denied`/`expired`/`failed` (with `via` user or
 policy, approver, reported client IP, latency), `http_executed`, `delivered`,
-`escalated`, `policy_changed`, `policy_change_refused`, `policy_change_failed`, and
+`escalated`, `stored`, `policy_changed`, `policy_change_refused`, `policy_change_failed`, and
 security events `auth_failed`, `rejected`, `approval_viewed`,
 `approval_forbidden`, `approval_stale`, `bad_request`, `discovery`.
 

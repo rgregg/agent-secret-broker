@@ -1115,6 +1115,254 @@ class AlwaysAllow(Harness):
         self.assertEqual(r[0], 403)
 
 
+FAKE_BW = r"""#!/usr/bin/env python3
+import base64, json, os, sys
+S = os.environ["FAKE_BW_STATE"]
+def load():
+    return json.load(open(S)) if os.path.exists(S) else {"items": [], "in": False, "n": 0}
+def save(d):
+    json.dump(d, open(S, "w"))
+a = sys.argv[1:]
+d = load()
+cmd = a[0] if a else ""
+if cmd == "status":
+    print(json.dumps({"status": "locked" if d["in"] else "unauthenticated"}))
+elif cmd == "login":
+    d["in"] = True; save(d)
+elif cmd in ("config", "sync", "lock", "logout"):
+    pass
+elif cmd == "unlock":
+    print("SESSION")
+elif cmd == "encode":
+    print(base64.b64encode(sys.stdin.read().encode()).decode())
+elif cmd == "list" and a[1] == "organizations":
+    print(json.dumps(d.get("orgs", [{"id": "org1", "name": "Org"}])))
+elif cmd == "list" and a[1] == "collections":
+    print(json.dumps(d.get("colls", [{"id": "col1", "name": "Shared"}])))
+elif cmd == "get":
+    hits = [i for i in d["items"] if i["name"] == a[2] or i["id"] == a[2]]
+    if not hits:
+        print("Not found.", file=sys.stderr); sys.exit(1)
+    if len(hits) > 1:
+        print("More than one result was found.", file=sys.stderr); sys.exit(1)
+    print(json.dumps(hits[0]))
+elif cmd in ("create", "edit"):
+    obj = json.loads(base64.b64decode(sys.stdin.read().strip()))
+    if cmd == "create":
+        d["n"] += 1; obj["id"] = f"id{d['n']}"; d["items"].append(obj)
+    else:
+        d["items"] = [obj if i["id"] == a[2] else i for i in d["items"]]
+    save(d)
+elif cmd == "delete":
+    d["items"] = [i for i in d["items"] if i["id"] != a[2]]; save(d)
+"""
+
+
+class BwBackendWrites(unittest.TestCase):
+    def setUp(self):
+        d = tempfile.mkdtemp()
+        self.state = os.path.join(d, "state.json")
+        self.bw = os.path.join(d, "bw")
+        with open(self.bw, "w") as f:
+            f.write(FAKE_BW)
+        os.chmod(self.bw, 0o755)
+        os.environ["FAKE_BW_STATE"] = self.state
+        self.addCleanup(os.environ.pop, "FAKE_BW_STATE", None)
+        pw = os.path.join(d, "pw")
+        open(pw, "w").write("m")
+        self.b = BwBackend("https://v.example", pw, bw=self.bw, idle_timeout=0)
+
+    def items(self):
+        return {i["name"]: i for i in json.load(open(self.state))["items"]}
+
+    def test_create_each_field_kind_in_org_collection(self):
+        self.b.put("A", "notes", "n-val", create=True)
+        self.b.put("B", "password", "p-val", create=True)
+        self.b.put("C", "api_key", "c-val", create=True)
+        it = self.items()
+        self.assertEqual((it["A"]["type"], it["A"]["notes"]), (2, "n-val"))
+        self.assertEqual(it["B"]["login"]["password"], "p-val")
+        self.assertEqual(it["C"]["fields"][0], {"name": "api_key", "value": "c-val", "type": 1})
+        for k in "ABC":
+            self.assertEqual((it[k]["organizationId"], it[k]["collectionIds"]), ("org1", ["col1"]))
+        self.assertEqual(self.b.get("C", "api_key"), "c-val")           # readable straight away
+
+    def test_duplicate_create_refused(self):
+        self.b.put("A", "notes", "1", create=True)
+        with self.assertRaises(BackendError):
+            self.b.put("A", "notes", "2", create=True)
+        self.assertEqual(self.items()["A"]["notes"], "1")
+
+    def test_update_replaces_and_keeps_previous(self):
+        self.b.put("A", "notes", "old", create=True)
+        self.b.put("A", "notes", "new", create=False, keep_previous=True)
+        a = self.items()["A"]
+        self.assertEqual(a["notes"], "new")
+        fields = {f["name"]: f["value"] for f in a["fields"]}
+        self.assertEqual(fields["previous_value"], "old")
+        self.assertIn("previous_replaced_at", fields)
+        self.b.put("A", "notes", "newer", create=False, keep_previous=True)   # no field pile-up
+        a = self.items()["A"]
+        self.assertEqual(len([f for f in a["fields"] if f["name"] == "previous_value"]), 1)
+        self.assertEqual({f["name"]: f["value"] for f in a["fields"]}["previous_value"], "new")
+
+    def test_update_missing_item_and_missing_field(self):
+        with self.assertRaises(BackendError):
+            self.b.put("Nope", "notes", "x", create=False)
+        self.b.put("C", "api_key", "v", create=True)
+        with self.assertRaises(BackendError):
+            self.b.put("C", "other", "x", create=False)
+
+    def test_ambiguous_target_requires_config(self):
+        with open(self.state, "w") as f:
+            json.dump({"items": [], "in": False, "n": 0,
+                       "orgs": [{"id": "o1", "name": "One"}, {"id": "o2", "name": "Two"}]}, f)
+        with self.assertRaises(BackendError):
+            self.b.put("A", "notes", "x", create=True)
+
+    def test_delete_rolls_back(self):
+        self.b.put("A", "notes", "x", create=True)
+        self.b.delete("A")
+        self.assertNotIn("A", self.items())
+        self.b.delete("A")                                              # idempotent
+
+
+class StoreFlow(Harness):
+    NEW = "brand-new-credential-VALUE-123"
+
+    def store(self, op="create", name="newapi", value=None, **kw):
+        body = {"mode": "store", "names": [name], "op": op,
+                "value": self.NEW if value is None else value}
+        if op == "create":
+            body.setdefault("allowed_hosts", ["127.0.0.1"])
+        body.update(kw)
+        return self.api("POST", "/v1/requests", body)
+
+    def result(self, body):
+        _, b = self.api("GET", f"/v1/requests/{json.loads(body)['id']}?wait=5")
+        return json.loads(b)
+
+    def disk(self):
+        with open(self.config_path) as f:
+            return json.load(f)
+
+    def test_create_maps_secret_and_is_immediately_usable(self):
+        code, body = self.store()
+        self.assertEqual(code, 202)
+        r = self.result(body)
+        self.assertEqual(r["stored"], {"name": "newapi", "op": "create", "item": "newapi", "field": "notes"})
+        sec = self.disk()["secrets"]["newapi"]
+        self.assertEqual(sec["allowed_hosts"], ["127.0.0.1"])
+        self.assertEqual(sec["vars"], {"NEWAPI_TOKEN": {"item": "newapi", "field": "notes"}})
+        self.assertEqual((sec["approval"], sec["created"]["by"]), ("prompt", "alice"))
+        self.assertEqual(self.broker.backend._data["newapi"]["notes"], self.NEW)
+        _, lst = self.api("GET", "/v1/secrets")
+        self.assertIn("newapi", [x["name"] for x in json.loads(lst)["secrets"]])
+        # and it works for a real, approved call
+        url = f"http://127.0.0.1:{self.up.server_address[1]}/x"
+        _, b2 = self.api("POST", "/v1/requests", {
+            "mode": "http", "names": ["newapi"], "method": "GET", "url": url,
+            "headers": {"Authorization": "Bearer {{NEWAPI_TOKEN}}"}})
+        out = self.result(b2)["http"]["body"]
+        self.assertIn("Bearer ***", out)
+        self.assertNotIn(self.NEW, out)
+
+    def test_value_never_appears_anywhere_but_the_vault(self):
+        self.decision = None
+        _, body = self.store()
+        req_ = next(iter(self.broker._by_id.values()))
+        page = req(self.abase + f"/a/{req_.nonce}", headers={"X-authentik-username": "alice"})[1]
+        self.assertNotIn(self.NEW, page)
+        self.assertIn("never displayed", page)
+        self.assertNotIn(self.NEW, json.dumps(self.notifier.sent))
+        self.assertNotIn("approve_always", page)
+        self.decision = "approve"
+        urllib.request.urlopen(urllib.request.Request(
+            self.abase + f"/a/{req_.nonce}", data=b"decision=approve",
+            headers={"X-authentication-username": "x", "X-authentik-username": "alice"}, method="POST"),
+            timeout=10).read()
+        req_.done.wait(10)
+        first = self.result(body)
+        self.assertEqual((first["status"], first["stored"]["name"]), ("approved", "newapi"))
+        self.assertEqual(self.result(body)["status"], "released")      # results are handed out once
+        with open(self.audit) as f:
+            self.assertNotIn(self.NEW, f.read())
+        with open(self.config_path) as f:
+            self.assertNotIn(self.NEW, f.read())
+        self.assertIsNone(req_.spec["value"])                           # wiped once settled
+        st = self.events("stored")[0]
+        self.assertEqual((st["op"], st["value_bytes"]), ("create", len(self.NEW)))
+
+    def test_never_auto_approved_even_for_allow_secrets(self):
+        self.decision = None
+        self.broker.cfg["secrets"]["svc"]["approval"] = "allow"
+        self.store("update", "svc", value="rotated-value-1234")
+        self.assertEqual(len(self.notifier.sent), 1)                     # still asked
+        self.assertEqual(self.events("approved"), [])
+
+    def test_update_keeps_mapping_and_previous_value(self):
+        before = json.dumps(self.broker.cfg["secrets"]["svc"], sort_keys=True)
+        r = self.result(self.store("update", "svc", value="rotated-value-1234")[1])
+        self.assertEqual(r["stored"]["op"], "update")
+        rec = self.broker.backend._data["Svc"]
+        self.assertEqual((rec["token"], rec["previous_value"]), ("rotated-value-1234", SECRET))
+        self.assertEqual(json.dumps(self.broker.cfg["secrets"]["svc"], sort_keys=True), before)
+
+    def test_update_cannot_change_hosts_or_item(self):
+        self.assertEqual(self.store("update", "svc", allowed_hosts=["evil.example"])[0], 400)
+        self.assertEqual(self.store("update", "svc", item="Other")[0], 400)
+        self.assertEqual(self.notifier.sent, [])
+
+    def test_validation_rejects_before_any_prompt(self):
+        bad = [
+            dict(name="Bad Name"), dict(name="x" * 60), dict(value=""),
+            dict(value="v" * 70000), dict(name="svc"),                       # create over existing
+            dict(allowed_hosts=[]), dict(allowed_hosts=["*.example.com"]),
+            dict(allowed_hosts=["evil.com/path"]), dict(allowed_hosts=["a b"]),
+            dict(field="previous_value"), dict(var="lower"), dict(item="Svc"),  # item already used
+        ]
+        for kw in bad:
+            kw = dict(kw)
+            name = kw.pop("name", "newapi")
+            value = kw.pop("value", None)
+            code, body = self.store("create", name, value, **kw)
+            self.assertEqual(code in (400, 403), True, (kw, code, body))
+        self.assertEqual(self.store("update", "ghost")[0], 400)
+        self.assertEqual(self.notifier.sent, [])
+        self.assertEqual(self.events("approved"), [])
+
+    def test_risk_create_medium_update_high(self):
+        self.decision = None
+        self.store()
+        self.store("update", "svc", value="rotated-value-1234")
+        levels = [e["risk"] for e in self.events("assessed")]
+        self.assertEqual(levels, ["medium", "high"])
+        self.assertIn("[HIGH]", self.notifier.sent[1]["title"])
+
+    def test_config_failure_rolls_back_the_vault(self):
+        def boom(mutate):
+            raise OSError("disk full")
+        self.broker._write_config = boom
+        _, body = self.store()
+        r = self.result(body)
+        self.assertEqual(r["status"], "failed")
+        self.assertIn("rolled back", r["error"])
+        self.assertNotIn("newapi", self.broker.backend._data)
+        self.assertNotIn("newapi", self.broker.cfg["secrets"])
+        self.assertNotIn("newapi", self.disk()["secrets"])
+
+    def test_denied_writes_nothing(self):
+        self.decision = "deny"
+        _, body = self.store()
+        self.assertEqual(self.result(body)["status"], "denied")
+        self.assertNotIn("newapi", self.broker.backend._data)
+        self.assertNotIn("newapi", self.disk()["secrets"])
+
+    def test_create_refused_without_a_config_file(self):
+        self.broker._config_path = None
+        self.assertEqual(self.store()[0], 403)
+
+
 class Cli(Harness):
     def run_cli(self, *args):
         env = dict(os.environ, SECRET_BROKER_URL=self.base, SECRET_BROKER_KEY=KEY)
@@ -1165,6 +1413,20 @@ class Cli(Harness):
         self.assertEqual(self.run_cli("list").returncode, 1)
         pj = self.run_cli("list", "--json")
         self.assertEqual((pj.returncode, json.loads(pj.stdout)), (0, []))
+
+    def test_store_value_from_stdin_never_argv(self):
+        env = dict(os.environ, SECRET_BROKER_URL=self.base, SECRET_BROKER_KEY=KEY)
+        p = subprocess.run([sys.executable, "-I", CLI, "store", "cliapi", "--hosts", "127.0.0.1"],
+                           env=env, input="cli-supplied-value-XYZ\n", capture_output=True,
+                           text=True, timeout=30)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("stored: cliapi (create)", p.stdout)
+        self.assertEqual(self.broker.backend._data["cliapi"]["notes"], "cli-supplied-value-XYZ")
+        self.assertNotIn("cli-supplied-value-XYZ", p.stdout + p.stderr)
+        # a value flag does not exist
+        q = subprocess.run([sys.executable, "-I", CLI, "update", "svc", "--value", "x"],
+                           env=env, input="y", capture_output=True, text=True, timeout=30)
+        self.assertEqual(q.returncode, 2)
 
     def test_which_exit_codes(self):
         ok = self.run_cli("which", "http://127.0.0.1:8080/api")
