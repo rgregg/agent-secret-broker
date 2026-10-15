@@ -17,6 +17,7 @@ happens on a page that only your authenticated SSO session can reach.
 
 ## Modes
 
+    secret-run list [--json]             what credentials exist? name, vars, hosts, policy
     secret-run which HOST|URL            is a credential available? (no approval, no push)
     secret-run http NAME METHOD URL [-H 'K: V']... [-d BODY | -d @file | -d @-]
     secret-run NAME[,NAME] -- command args...
@@ -30,6 +31,10 @@ happens on a page that only your authenticated SSO session can reach.
   client *said* it would run; approve it only if it looks right.
 
 ## Policy, risk, discovery
+
+`list` and `which` never touch the vault or send a notification; each call is
+recorded as a `discovery` event. They return names, placeholder variable names,
+allowed hosts and policy, never values.
 
 Per secret in the broker config:
 

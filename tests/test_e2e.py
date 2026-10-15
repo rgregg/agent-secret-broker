@@ -1011,6 +1011,24 @@ class Cli(Harness):
         self.assertEqual(got["head"], "fffe0001")
         self.assertEqual(got["len"], 4 + len("{{SVC_TOKEN}}"))   # not substituted
 
+    def test_list_text_and_json(self):
+        p = self.run_cli("list")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(p.stdout.strip(), "svc\tSVC_TOKEN\t127.0.0.1\tprompt")
+        pj = self.run_cli("list", "--json")
+        self.assertEqual(json.loads(pj.stdout), [
+            {"name": "svc", "vars": ["SVC_TOKEN"], "allowed_hosts": ["127.0.0.1"], "approval": "prompt"}])
+        self.assertNotIn(SECRET, p.stdout + pj.stdout)
+        self.assertEqual(self.notifier.sent, [])           # no push, no request
+        self.assertEqual(self.broker._by_id, {})
+        self.assertEqual(self.run_cli("list", "--bogus").returncode, 2)
+
+    def test_list_empty_exit_codes(self):
+        self.broker.cfg["secrets"] = {}
+        self.assertEqual(self.run_cli("list").returncode, 1)
+        pj = self.run_cli("list", "--json")
+        self.assertEqual((pj.returncode, json.loads(pj.stdout)), (0, []))
+
     def test_which_exit_codes(self):
         ok = self.run_cli("which", "http://127.0.0.1:8080/api")
         self.assertEqual(ok.returncode, 0, ok.stderr)
