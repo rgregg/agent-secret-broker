@@ -29,6 +29,10 @@ def plan(secrets):
             problems.append(f"{name}: shares item {carrier!r} with {used[carrier]!r}")
             continue
         used[carrier] = name
+        foreign = [v for v, r in vars_.items() if r["item"] != carrier]
+        if foreign:
+            problems.append(f"{name}: variables {foreign} use other items; a secret can only use its own item")
+            continue
         meta = {k: v for k, v in sc.items() if k not in ("vars", "sensitivity")}
         meta["name"] = name
         meta["vars"] = {}

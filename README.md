@@ -63,10 +63,13 @@ carries one custom text field named `broker`, holding a JSON object:
 - `name` is optional (default: the item name, lower-cased). `vars` maps each
   placeholder variable to a `field` (`notes`, `password`, `username`, a custom
   field name, or `auto`) and optionally a `key` inside a multi-value field
-  (below). `item` is implied to be the carrier item; set it only to pull a
-  variable from another item. `approval` is `prompt` (default) or `allow`.
+  (below). A secret can only use fields of its own item (an entry that names
+  another item, or the reserved `broker`/`previous_value` fields, is rejected),
+  so metadata on one item can never pull another item's value. `approval` is
+  `prompt` (default) or `allow`.
 - Items without that field are invisible to the broker. One item carries one
-  secret; a secret may draw variables from other items.
+  secret. If two items claim the same secret name, *both* are dropped and the
+  conflict is audited, so a look-alike item cannot shadow a real one.
 - The broker reads the catalog from the vault at startup, when a request
   names an unknown secret, and when its cache is a minute old; `list` and
   `which` serve the cache and refresh it in the background. Add or edit an item

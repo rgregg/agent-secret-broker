@@ -42,6 +42,8 @@ class FileBackend:
 
     def get(self, item, field):
         field = "notes" if field in (None, "", "auto") else field
+        if field == META_FIELD:
+            raise BackendError("the broker metadata field is not a secret")
         try:
             return self._data[item][field]
         except KeyError:
@@ -52,6 +54,8 @@ class FileBackend:
             raise BackendError(f"item {item!r} already exists")
         if not create and item not in self._data:
             raise BackendError(f"item {item!r} not found")
+        if field == META_FIELD:
+            raise BackendError("the broker metadata field cannot hold a secret")
         field = "notes" if field in (None, "", "auto") else field
         rec = self._data.setdefault(item, {})
         if keep_previous and field in rec:
@@ -287,6 +291,8 @@ class BwBackend:
     def put(self, item, field, value, create=False, keep_previous=False, meta=None):
         """Create a new item (with its broker metadata), or replace one field of
         an existing item."""
+        if field == META_FIELD:
+            raise BackendError("the broker metadata field cannot hold a secret")
         with self._lock:
             try:
                 self._put_locked(item, field, value, create, keep_previous, meta)
@@ -375,6 +381,8 @@ class BwBackend:
             self._touch()
 
     def get(self, item, field):
+        if field == META_FIELD:
+            raise BackendError("the broker metadata field is not a secret")
         with self._lock:
             try:
                 if self._session is None:

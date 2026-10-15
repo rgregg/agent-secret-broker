@@ -494,10 +494,28 @@ class CatalogFromVault(unittest.TestCase):
             ev = [json.loads(line) for line in f if '"catalog_loaded"' in line][0]
         self.assertEqual(len(ev["invalid"]), 4)
 
-    def test_duplicate_names_keep_the_first_only(self):
+    def test_duplicate_names_drop_every_claimant(self):
+        # first-wins would let a look-alike item shadow a real secret
         b, _ = self.make({"A": {"notes": "x", "broker": self.meta(name="same")},
-                          "B": {"notes": "x", "broker": self.meta(name="same")}})
-        self.assertEqual(list(b.cfg["secrets"]), ["same"])
+                          "B": {"notes": "x", "broker": self.meta(name="same")},
+                          "C": {"notes": "x", "broker": self.meta(name="other")}})
+        self.assertEqual(list(b.cfg["secrets"]), ["other"])
+
+    def test_metadata_cannot_reach_other_items_or_itself(self):
+        b, audit = self.make({
+            "Victim": {"notes": "admin-token", "broker": self.meta(name="victim")},
+            "Thief": {"notes": "x", "broker": json.dumps({
+                "vars": {"T": {"item": "Victim", "field": "notes"}}, "allowed_hosts": ["evil.example"]})},
+            "Self": {"notes": "x", "broker": json.dumps({
+                "vars": {"T": {"field": "broker"}}, "allowed_hosts": ["evil.example"]})}})
+        self.assertEqual(list(b.cfg["secrets"]), ["victim"])
+
+    def test_metadata_field_is_never_read_or_written_as_a_secret(self):
+        b, _ = self.make({"A": {"notes": "x", "broker": self.meta()}})
+        with self.assertRaises(BackendError):
+            b.backend.get("A", "broker")
+        with self.assertRaises(BackendError):
+            b.backend.put("A", "broker", "{}", create=False)
 
     def test_a_vault_that_cannot_be_read_does_not_stop_startup(self):
         class Down:

@@ -120,7 +120,12 @@ class Broker:
             ref = ref if isinstance(ref, dict) else {}
             if not _VAR_RE.match(var):
                 raise ValueError(f"bad variable name {var!r}")
-            vars_[var] = {"item": ref.get("item") or item, "field": ref.get("field") or "auto"}
+            if ref.get("item") not in (None, "", item):
+                raise ValueError(f"{var}: a secret can only use its own item's fields")
+            field = ref.get("field") or "auto"
+            if field in ("broker", "previous_value", "previous_replaced_at"):
+                raise ValueError(f"{var}: field {field!r} is reserved")
+            vars_[var] = {"item": item, "field": field}
             if ref.get("key"):
                 vars_[var]["key"] = str(ref["key"])
         return name, {**meta, "vars": vars_, "allowed_hosts": [h.lower() for h in hosts],
@@ -132,17 +137,22 @@ class Broker:
         if not hasattr(self.backend, "catalog"):
             return
         rows = self.backend.catalog()
-        out, bad = {}, []
+        out, bad, owners = {}, [], {}
         for row in rows:
             try:
                 if row["meta"] is None:
                     raise ValueError("broker metadata is not a JSON object")
                 name, entry = self._entry(row["item"], row["meta"])
-                if name in out:
-                    raise ValueError(f"duplicate secret name {name!r}")
                 out[name] = entry
+                owners.setdefault(name, []).append(row["item"])
             except ValueError as e:
                 bad.append({"item": row["item"], "reason": str(e)[:120]})
+        # A name claimed by two items is ambiguous, and "first wins" would let a
+        # look-alike item shadow a real secret: drop every claimant (fail closed).
+        for name, items in owners.items():
+            if len(items) > 1:
+                out.pop(name, None)
+                bad.extend({"item": i, "reason": f"duplicate secret name {name!r}"} for i in items)
         with self._cfg_lock:
             self.cfg["secrets"] = out
             self._catalog_at = time.time()
