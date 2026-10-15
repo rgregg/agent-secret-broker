@@ -77,6 +77,26 @@ Messages cross whatever service carries them and include secret names, the
 method and URL, and the approval link (single use, expires with the request,
 and useless without your SSO session).
 
+## Always allow
+
+On the approval page, **Approve and always allow `NAME`** approves this request
+and records `"approval": "allow"` for that secret in the config file (atomically,
+mode preserved, with who and when), effective immediately. It is offered only
+when it would mean something:
+
+- HTTP mode only: the broker makes the call, so the value never leaves it. Never
+  offered for env mode.
+- One secret per request.
+- Not for secrets marked at or above `risk.escalate_auto_at` sensitivity (they
+  would still prompt), and not from a request that is itself rated at or above
+  it.
+
+The rules are enforced on the server, so a forged form field is refused and
+audited (`policy_change_refused`). Changes are audited as `policy_changed`
+(`policy_change_failed` if the file could not be written; the in-memory policy
+is then left unchanged). `/policies` on the same SSO-gated listener lists
+standing approvals and can put one back to "prompt"; it can only tighten.
+
 ## Vault session lifetime
 
 The vault is not kept open. With the `bw` backend it is unlocked on demand,
@@ -104,7 +124,8 @@ values, header values or bodies.
 Events: `startup` (policies in force), `requested`, `assessed`, `notified`,
 `secret_read`, `approved`/`denied`/`expired`/`failed` (with `via` user or
 policy, approver, reported client IP, latency), `http_executed`, `delivered`,
-`escalated`, and security events `auth_failed`, `rejected`, `approval_viewed`,
+`escalated`, `policy_changed`, `policy_change_refused`, `policy_change_failed`, and
+security events `auth_failed`, `rejected`, `approval_viewed`,
 `approval_forbidden`, `approval_stale`, `bad_request`, `discovery`.
 
     python -m secret_broker.audit verify audit.jsonl

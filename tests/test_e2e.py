@@ -87,7 +87,12 @@ class Harness(unittest.TestCase):
         self.tweak(cfg)
         self.notifier = FakeNotifier(on_send=self._phone)
         self.audit = os.path.join(d, "audit.jsonl")
-        self.broker = Broker(cfg, FileBackend(os.path.join(d, "vault.json")), self.notifier, self.audit)
+        self.config_path = os.path.join(d, "config.json")
+        with open(self.config_path, "w") as f:
+            json.dump(cfg, f)
+        os.chmod(self.config_path, 0o600)
+        self.broker = Broker(cfg, FileBackend(os.path.join(d, "vault.json")), self.notifier, self.audit,
+                             config_path=self.config_path)
         self.c, self.a = serve(self.broker, ("127.0.0.1", 0), ("127.0.0.1", 0), KEY)
         self.base = f"http://127.0.0.1:{self.c.server_address[1]}"
         self.abase = f"http://127.0.0.1:{self.a.server_address[1]}"
@@ -983,6 +988,131 @@ class Prewarm(Harness):
         self.create_env()
         time.sleep(0.3)
         self.assertEqual(self.stub.count, 0)
+
+
+class AlwaysAllow(Harness):
+    decision = None
+
+    def tweak(self, cfg):
+        cfg["secrets"]["svc"]["sensitivity"] = "low"
+        cfg["risk"] = {"escalate_auto_at": "high"}
+
+    def http_req(self, method="GET", path="/x"):
+        url = f"http://127.0.0.1:{self.up.server_address[1]}{path}"
+        return self.api("POST", "/v1/requests", {
+            "mode": "http", "names": ["svc"], "method": method, "url": url,
+            "headers": {"Authorization": "Bearer {{SVC_TOKEN}}"}})
+
+    def nonce(self):
+        return list(self.broker._by_id.values())[-1].nonce
+
+    def page(self, nonce=None):
+        return req(self.abase + f"/a/{nonce or self.nonce()}", headers={"X-authentik-username": "alice"})[1]
+
+    def post(self, path, **form):
+        data = urllib.parse.urlencode(form).encode()
+        try:
+            r = urllib.request.urlopen(urllib.request.Request(
+                self.abase + path, data=data, headers={"X-authentik-username": "alice"}, method="POST"),
+                timeout=10)
+            return r.status, r.read().decode()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode()
+
+    def disk(self):
+        with open(self.config_path) as f:
+            return json.load(f)
+
+    def finish(self):
+        list(self.broker._by_id.values())[-1].done.wait(10)
+
+    def test_button_persists_policy_and_takes_effect(self):
+        self.http_req()
+        self.assertIn("approve_always", self.page())
+        status, body = self.post(f"/a/{self.nonce()}", decision="approve_always")
+        self.assertEqual(status, 200)
+        self.assertIn("Always allow saved", body)
+        self.finish()
+        d = self.disk()
+        self.assertEqual(d["secrets"]["svc"]["approval"], "allow")
+        self.assertEqual(d["secrets"]["svc"]["approval_changed"]["by"], "alice")
+        self.assertEqual(d["ttl_seconds"], 30)                       # rest of the file untouched
+        self.assertEqual(oct(os.stat(self.config_path).st_mode & 0o777), "0o600")
+        self.assertEqual([f for f in os.listdir(os.path.dirname(self.config_path)) if ".tmp." in f], [])
+        self.assertEqual(self.broker.cfg["secrets"]["svc"]["approval"], "allow")
+        ch = self.events("policy_changed")[0]
+        self.assertEqual((ch["secret"], ch["from"], ch["to"], ch["user"]), ("svc", "prompt", "allow", "alice"))
+        self.assertTrue(self.events("decided")[0]["always_requested"])
+        pushes = len(self.notifier.sent)
+        _, b = self.http_req()                                       # next call: no prompt
+        self.assertEqual(len(self.notifier.sent), pushes)
+        _, r = self.api("GET", f"/v1/requests/{json.loads(b)['id']}?wait=3")
+        self.assertEqual(json.loads(r)["http"]["status"], 200)
+        self.assertEqual(self.events("approved")[-1]["via"], "policy")
+
+    def test_not_offered_and_refused_for_env_mode(self):
+        self.create_env()
+        page = self.page()
+        self.assertNotIn("value=approve_always", page)
+        self.assertIn("Always allow not offered", page)
+        status, body = self.post(f"/a/{self.nonce()}", decision="approve_always")   # forged
+        self.assertEqual(status, 200)
+        self.assertIn("not applied", body)
+        self.finish()
+        self.assertEqual(self.disk()["secrets"]["svc"].get("approval", "prompt"), "prompt")
+        self.assertEqual(len(self.events("policy_change_refused")), 1)
+        self.assertEqual(self.events("approved")[0]["via"], "user")   # this request still approved
+
+    def test_high_sensitivity_secret_not_offered(self):
+        self.broker.cfg["secrets"]["svc"]["sensitivity"] = "high"
+        self.http_req()
+        self.assertNotIn("value=approve_always", self.page())
+        self.assertIn("high sensitivity", self.page())
+        self.post(f"/a/{self.nonce()}", decision="approve_always")
+        self.finish()
+        self.assertEqual(self.disk()["secrets"]["svc"].get("approval", "prompt"), "prompt")
+
+    def test_high_risk_request_cannot_establish_standing_allow(self):
+        self.http_req("DELETE")
+        self.assertNotIn("value=approve_always", self.page())
+        self.post(f"/a/{self.nonce()}", decision="approve_always")
+        self.finish()
+        self.assertEqual(self.disk()["secrets"]["svc"].get("approval", "prompt"), "prompt")
+        self.assertIn("rated high", self.events("policy_change_refused")[0]["reason"])
+
+    def test_write_failure_leaves_policy_unchanged_but_approves(self):
+        self.http_req()
+        orig = self.broker._persist_approval
+
+        def boom(*a, **k):
+            raise OSError("disk full")
+        self.broker._persist_approval = boom
+        status, body = self.post(f"/a/{self.nonce()}", decision="approve_always")
+        self.broker._persist_approval = orig
+        self.assertEqual(status, 200)
+        self.assertIn("could not write", body)
+        self.finish()
+        self.assertEqual(self.broker.cfg["secrets"]["svc"].get("approval", "prompt"), "prompt")
+        self.assertEqual(len(self.events("policy_change_failed")), 1)
+        self.assertEqual(len(self.events("approved")), 1)
+
+    def test_policies_page_can_only_tighten(self):
+        self.assertTrue(self.broker.set_approval("svc", "allow", "alice"))
+        status, body = req(self.abase + "/policies", headers={"X-authentik-username": "alice"})
+        self.assertEqual(status, 200)
+        self.assertIn("Require approval again", body)
+        # granting is refused here
+        self.assertEqual(self.post("/policies", name="svc", approval="allow")[0], 400)
+        self.assertEqual(self.disk()["secrets"]["svc"]["approval"], "allow")
+        status, body = self.post("/policies", name="svc", approval="prompt")
+        self.assertEqual(status, 200)
+        self.assertEqual(self.disk()["secrets"]["svc"]["approval"], "prompt")
+        self.assertEqual(self.broker.cfg["secrets"]["svc"]["approval"], "prompt")
+        self.assertEqual(self.post("/policies", name="nope", approval="prompt")[0], 400)
+
+    def test_policies_page_requires_identity(self):
+        r = req(self.abase + "/policies", headers={"X-authentik-username": "mallory"})
+        self.assertEqual(r[0], 403)
 
 
 class Cli(Harness):

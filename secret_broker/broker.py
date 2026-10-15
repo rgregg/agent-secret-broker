@@ -16,6 +16,7 @@ import base64
 import binascii
 import html
 import json
+import os
 import secrets
 import threading
 import time
@@ -52,12 +53,15 @@ class Request:
         self.result = None
         self.summary = None       # advisory, unverified
         self.risk = None          # {"level","baseline","model","reasons"}
+        self.always = None        # outcome of an "always allow" click, if any
         self.done = threading.Event()
 
 
 class Broker:
-    def __init__(self, config, backend, notifier, audit=None, summarizer=None):
+    def __init__(self, config, backend, notifier, audit=None, summarizer=None, config_path=None):
         self.cfg = config
+        self._config_path = config_path
+        self._cfg_lock = threading.Lock()
         self.summarizer = summarizer
         self.backend = backend
         self.notifier = notifier
@@ -106,6 +110,80 @@ class Broker:
 
     def _auto_allowed(self, mode, names):
         return all(mode in self._auto_modes(self.cfg["secrets"][n]) for n in names)
+
+    # -- standing policy changes (approver-initiated, persisted) ------------
+    def always_allow_eligibility(self, req):
+        """(ok, reason). `reason` is shown to the approver when not ok.
+
+        A standing allow is only meaningful (and only offered) when it would
+        actually take effect, and it is never established from a request that is
+        itself high risk or that releases the value to the requesting host.
+        """
+        if req.mode != "http":
+            return False, "env-mode requests release the value to the requesting host"
+        if len(req.names) != 1:
+            return False, "this request involves several secrets"
+        name = req.names[0]
+        sc = self.cfg["secrets"][name]
+        if sc.get("approval", "prompt") == "allow":
+            return False, "already always-allowed"
+        if not self._config_path:
+            return False, "the broker has no config file to record this in"
+        esc = self.cfg.get("risk", {}).get("escalate_auto_at")
+        if esc:
+            sens = sc.get("sensitivity", "medium")
+            if risk_mod.rank(sens) >= risk_mod.rank(esc):
+                return False, f"{name} is marked {sens} sensitivity, so it would still prompt"
+            if req.risk and risk_mod.rank(req.risk["level"]) >= risk_mod.rank(esc):
+                return False, f"this request is rated {req.risk['level']}; such requests always prompt"
+        return True, ""
+
+    def _persist_approval(self, name, value, user):
+        """Atomically record the change in the config file, preserving its mode."""
+        path = self._config_path
+        with open(path) as f:
+            disk = json.load(f)
+        entry = disk["secrets"][name]
+        entry["approval"] = value
+        entry["approval_changed"] = {
+            "by": user, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+        mode = os.stat(path).st_mode & 0o777
+        tmp = f"{path}.tmp.{os.getpid()}"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(disk, f, indent=2)
+                f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+    def set_approval(self, name, value, user, peer=None, client_ip=None, request_id=None):
+        """Change a secret's standing approval policy: file first, then memory."""
+        if value not in APPROVAL_VALUES or name not in self.cfg["secrets"]:
+            raise ValueError("bad policy change")
+        with self._cfg_lock:
+            sc = self.cfg["secrets"][name]
+            old = sc.get("approval", "prompt")
+            if old == value:
+                return True
+            try:
+                self._persist_approval(name, value, user)
+            except (OSError, ValueError, KeyError) as e:
+                self.log("policy_change_failed", secret=name, to=value, user=user,
+                         request_id=request_id, error=str(e)[:200])
+                return False
+            sc["approval"] = value
+            sc["approval_changed"] = {"by": user}
+        self.log("policy_changed", secret=name, **{"from": old, "to": value}, user=user, peer=peer,
+                 client_ip=client_ip, request_id=request_id)
+        return True
 
     # -- discovery (no approval, no push, no values) ----------------------
     def available(self, host=None):
@@ -252,7 +330,7 @@ class Broker:
         req.done.set()
         return True
 
-    def decide(self, nonce, approve, user, peer=None, client_ip=None):
+    def decide(self, nonce, approve, user, peer=None, client_ip=None, always=False):
         with self._lock:
             self._expire_locked()
             req = self._by_nonce.get(nonce)
@@ -265,10 +343,20 @@ class Broker:
             return None
         who = {"via": "user", "approver": user, "approver_peer": peer, "approver_ip": client_ip}
         # The decision itself is recorded and announced immediately.
-        self.audit("decided", req, decision="approve" if approve else "deny", **who)
+        self.audit("decided", req, decision="approve" if approve else "deny",
+                   always_requested=bool(always and approve), **who)
         if not approve:
             self._finish(req, "denied", **who)
             return req
+        if always:
+            ok, why = self.always_allow_eligibility(req)
+            if not ok:
+                req.always = f"not applied: {why}"
+                self.audit("policy_change_refused", req, reason=why, **who)
+            elif self.set_approval(req.names[0], "allow", user, peer, client_ip, req.id):
+                req.always = "applied"
+            else:
+                req.always = "not applied: could not write the config file"
         self._resolved(req, "approved")
         # Releasing can take seconds (vault unlock, upstream call). It runs off
         # the request thread: the approver's page has already been answered, the
@@ -521,9 +609,29 @@ def approval_handler(broker):
             parts = self.path.split("?")[0].strip("/").split("/")
             return parts[1] if len(parts) == 2 and parts[0] == "a" else None
 
+        def _policies_page(self, note=""):
+            rows = []
+            for name, sc in sorted(cfg["secrets"].items()):
+                state = sc.get("approval", "prompt")
+                by = (sc.get("approval_changed") or {}).get("by")
+                btn = ""
+                if state == "allow":
+                    btn = ("<form method=post style='display:inline'>"
+                           f"<input type=hidden name=name value='{html.escape(name)}'>"
+                           "<button name=approval value=prompt>Require approval again</button></form>")
+                rows.append(f"<tr><td><b>{html.escape(name)}</b></td><td>{html.escape(state)}"
+                            f"{' (set by ' + html.escape(by) + ')' if by and state == 'allow' else ''}</td>"
+                            f"<td>{btn}</td></tr>")
+            _page(self, 200, f"<h1>Standing approvals</h1>{note}<table cellpadding=8>"
+                  "<tr><th align=left>Secret</th><th align=left>Policy</th><th></th></tr>"
+                  + "".join(rows) + "</table>")
+
         def do_GET(self):
             if self._user() is None:
                 return
+            if self.path.split("?")[0].rstrip("/") == "/policies":
+                broker.log("policies_viewed", peer=self.client_address[0], client_ip=self._fwd())
+                return self._policies_page()
             nonce = self._nonce()
             req = broker._by_nonce.get(nonce) if nonce else None
             broker.log("approval_viewed", user=self.headers.get(
@@ -545,6 +653,15 @@ def approval_handler(broker):
                          f"<b style='color:{color}'>{lvl.upper()} RISK</b><br><small>"
                          + html.escape("; ".join(req.risk["reasons"]) if req.risk else "")
                          + "</small></p>")
+            ok, why = broker.always_allow_eligibility(req)
+            if ok:
+                always_html = (
+                    "<p><button name=decision value=approve_always style='font-size:1rem;padding:.7rem 1.2rem'>"
+                    f"Approve and always allow {html.escape(req.names[0])}</button><br><small>"
+                    "Future HTTP calls with this secret will run without asking, except requests "
+                    "rated high risk. Revoke any time at /policies.</small></p>")
+            else:
+                always_html = f"<p><small>Always allow not offered: {html.escape(why)}.</small></p>"
             summary_html = risk_html + (
                 f"<p>AI summary <small>(unverified, from client-supplied text)</small>:<br>"
                 f"<i>{html.escape(req.summary)}</i></p>" if req.summary else "")
@@ -558,6 +675,7 @@ def approval_handler(broker):
 <form method=post onsubmit="setTimeout(function(){{document.querySelectorAll('button').forEach(function(b){{b.disabled=true}});document.getElementById('w').hidden=false}},0)">
 <button name=decision value=approve style='font-size:1.4rem;padding:1rem 2rem'>Approve</button>
 <button name=decision value=deny style='font-size:1.4rem;padding:1rem 2rem'>Deny</button>
+{always_html}
 </form>
 <p id=w hidden>Working...</p>""")
 
@@ -565,18 +683,33 @@ def approval_handler(broker):
             user = self._user()
             if user is None:
                 return
-            nonce = self._nonce()
             form = urllib.parse.parse_qs(
                 self.rfile.read(int(self.headers.get("Content-Length", 0))).decode())
-            approve = form.get("decision", [""])[0] == "approve"
-            req = (broker.decide(nonce, approve, user, self.client_address[0], self._fwd())
+            if self.path.split("?")[0].rstrip("/") == "/policies":
+                name = form.get("name", [""])[0]
+                # this page can only *tighten*: granting happens in the context of a request
+                if form.get("approval", [""])[0] != "prompt" or name not in cfg["secrets"]:
+                    return _page(self, 400, "<h1>Bad request</h1>")
+                done = broker.set_approval(name, "prompt", user, self.client_address[0], self._fwd())
+                return self._policies_page(
+                    f"<p>{'Updated' if done else 'Could not update'}: {html.escape(name)}</p>")
+            nonce = self._nonce()
+            decision = form.get("decision", [""])[0]
+            approve = decision in ("approve", "approve_always")
+            req = (broker.decide(nonce, approve, user, self.client_address[0], self._fwd(),
+                                 always=(decision == "approve_always"))
                    if nonce else None)
             if req is None:
                 return _page(self, 404, "<h1>Request not found or already handled</h1>")
-            if approve:
-                _page(self, 200, "<h1>Approved</h1><p>Releasing now. You can close this page.</p>")
-            else:
-                _page(self, 200, "<h1>Denied</h1>")
+            if not approve:
+                return _page(self, 200, "<h1>Denied</h1>")
+            extra = ""
+            if req.always == "applied":
+                extra = (f"<p>Always allow saved for <b>{html.escape(req.names[0])}</b>. "
+                         "Revoke it at <a href='/policies'>/policies</a>.</p>")
+            elif req.always:
+                extra = f"<p><small>Always allow {html.escape(req.always)}.</small></p>"
+            _page(self, 200, "<h1>Approved</h1><p>Releasing now. You can close this page.</p>" + extra)
 
     return H
 
