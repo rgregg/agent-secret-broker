@@ -196,6 +196,21 @@ An agent can add or rotate credentials, always with a fresh approval:
   vault has several) `backend.organization` / `backend.collection` to say where
   new items go. Use TLS in front of the client API: the value crosses it.
 
+## Request history
+
+`/history` on the approval listener (same SSO gate and identity check as the
+approval page) lists recent requests with how each ended: **approved**,
+**auto-approved** (policy), **denied**, **expired**, **failed**, or **pending**.
+Each row shows the time, secret, what was asked (method and URL without its
+query string, the store operation, or "env"), risk, who decided, and how long
+the decision and delivery took. "(not collected)" marks an approval whose
+result the client never fetched. Filters: outcome, secret, mode; 50 per page.
+
+It is derived from the audit log, which stays the only record: events sharing a
+request id are folded into one row, incrementally, with at most the most recent
+5000 requests kept in memory. No values, header values or bodies are ever
+shown (the log does not contain them).
+
 ## Always allow
 
 On the approval page, **Approve and always allow `NAME`** approves this request

@@ -1566,6 +1566,74 @@ class TlsPolicyRules(unittest.TestCase):
         self.assertEqual(self.entry(tls_fingerprint=h, tls_verify=False)["_tls"]["fingerprint"], (h,))
 
 
+class HistoryPage(Harness):
+    ttl = 1
+
+    def tweak(self, cfg):
+        cfg["risk"] = {"escalate_auto_at": "high"}
+
+    def setUp(self):
+        super().setUp()
+        self.broker.summarizer = _Stub("Reads things", "low")
+
+    def call(self, path="/x?token=QUERYSECRET", decision="approve", wait=5):
+        self.decision = decision
+        url = f"http://127.0.0.1:{self.up.server_address[1]}{path}"
+        _, body = self.api("POST", "/v1/requests", {
+            "mode": "http", "names": ["svc"], "method": "GET", "url": url,
+            "headers": {"Authorization": "Bearer {{SVC_TOKEN}}"}})
+        rid = json.loads(body)["id"]
+        _, b = self.api("GET", f"/v1/requests/{rid}?wait={wait}")
+        return rid, json.loads(b)
+
+    def page(self, query="", user="alice"):
+        return req(self.abase + "/history" + query, headers={"X-authentik-username": user})
+
+    def test_every_outcome_is_listed_and_nothing_sensitive_is(self):
+        self.call(decision="approve")
+        self.call(path="/y", decision=None, wait=3)                          # nobody answers: expires
+        self.broker.cfg["secrets"]["svc"]["approval"] = "allow"
+        self.call(decision=None)                                              # policy releases it
+        self.broker.cfg["secrets"]["svc"]["approval"] = "prompt"
+        self.call(decision="deny")                                            # last: denial starts a cooldown
+        code, body = self.page()
+        self.assertEqual(code, 200)
+        for label in ("approved", "denied", "expired", "auto-approved"):
+            self.assertIn(f"<b>{label}", body)
+        self.assertIn("svc", body)
+        self.assertIn("/x?...", body)                                         # query string hidden
+        for secret in (SECRET, "QUERYSECRET"):
+            self.assertNotIn(secret, body)
+
+    def test_filters_and_forbidden_identity(self):
+        self.call(decision="approve")
+        self.call(decision="deny")
+        _, body = self.page("?outcome=denied")
+        self.assertIn("<b>denied", body)
+        self.assertNotIn("<b>approved", body)
+        _, body = self.page("?outcome=bogus&page=zzz&mode=<script>")           # bad input is ignored
+        self.assertNotIn("<script>", body)
+        self.assertEqual(self.page(user="mallory")[0], 403)
+        self.assertEqual(len(self.events("history_viewed")), 2)       # the refused view is not "viewed"
+
+    def test_store_requests_show_the_operation_not_the_value(self):
+        self.decision = "approve"
+        self.api("POST", "/v1/requests", {"mode": "store", "names": ["hist-new"], "op": "create",
+                                          "value": "the-new-credential-VALUE", "allowed_hosts": ["127.0.0.1"]})
+        _, body = self.page()
+        self.assertIn("create credential", body)
+        self.assertNotIn("the-new-credential-VALUE", body)
+
+    def test_rows_survive_a_new_history_object_and_follow_the_log(self):
+        from secret_broker.history import History
+        self.call(decision="approve")
+        h = History(self.audit)
+        first = h.rows()
+        self.assertEqual([r["outcome"] for r in first], ["approved"])
+        self.call(decision="deny")                                            # log grows after the index was built
+        self.assertEqual([r["outcome"] for r in h.rows()], ["denied", "approved"])
+
+
 class MultiValue(Harness):
     """Several values in one vault field, selected with a `key` on the var."""
     DOTENV = "# creds\nCLIENT_ID=abc\nCLIENT_SECRET: \"s3cr3t\"\nREGION=us-east-1\n"

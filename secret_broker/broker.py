@@ -35,6 +35,7 @@ from .backends import BackendError
 from .notify import NotifyError
 from . import risk as risk_mod
 from . import structured
+from .history import History, OUTCOMES
 
 MAX_PENDING = 3
 DENY_COOLDOWN = 60
@@ -82,6 +83,7 @@ class Broker:
         self.backend = backend
         self.notifier = notifier
         self._audit = audit if isinstance(audit, AuditLog) else AuditLog(audit)
+        self.history = History(self._audit._path)
         self._lock = threading.Lock()
         self._by_id = {}
         self._by_nonce = {}
@@ -916,13 +918,81 @@ def approval_handler(broker):
                 rows.append(f"<tr><td><b>{html.escape(name)}</b></td><td>{html.escape(state)}"
                             f"{' (set by ' + html.escape(by) + ')' if by and state == 'allow' else ''}</td>"
                             f"<td>{btn}</td></tr>")
-            _page(self, 200, f"<h1>Standing approvals</h1>{note}<table cellpadding=8>"
+            _page(self, 200, f"<h1>Standing approvals</h1><p><a href='/history'>Request history</a></p>{note}"
+                  "<table cellpadding=8>"
                   "<tr><th align=left>Secret</th><th align=left>Policy</th><th></th></tr>"
                   + "".join(rows) + "</table>")
+
+        def _history_page(self):
+            q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+
+            def arg(k):
+                return (q.get(k) or [""])[0][:60]
+            outcome = arg("outcome") if arg("outcome") in OUTCOMES + ("unknown",) else ""
+            secret, mode = arg("secret"), arg("mode") if arg("mode") in ("http", "env", "store") else ""
+            try:
+                page = max(1, int(arg("page") or 1))
+            except ValueError:
+                page = 1
+            pending = {r.id for r in broker._by_id.values() if r.status == "pending"}
+            rows = broker.history.rows(pending, outcome or None, secret or None, mode or None)
+            per = 50
+            total, rows = len(rows), rows[(page - 1) * per: page * per]
+
+            def opt(vals, cur, label):
+                o = "".join(f"<option value='{html.escape(v)}'{' selected' if v == cur else ''}>"
+                            f"{html.escape(v)}</option>" for v in vals)
+                return f"<option value=''>{label}</option>{o}"
+            form = ("<form method=get style='margin:1em 0'>"
+                    f"<select name=outcome>{opt(OUTCOMES + ('unknown',), outcome, 'any outcome')}</select> "
+                    f"<select name=secret>{opt(broker.history.secrets_seen(), secret, 'any secret')}</select> "
+                    f"<select name=mode>{opt(('http', 'env', 'store'), mode, 'any mode')}</select> "
+                    "<button>Filter</button></form>")
+            body = []
+            for r in rows:
+                if r["mode"] == "http":
+                    what = f"{r['method'] or ''} {r['url'] or ''}"
+                elif r["mode"] == "store":
+                    what = (f"{r['op'] or 'store'} credential: item {r['item']!r} field {r['field']}"
+                            + (f" key {r['key']}" if r.get("key") else ""))
+                else:
+                    what = "env: value released to the requesting host"
+                if r["outcome"] in ("approved", "auto-approved") and not r["delivered"]:
+                    label = r["outcome"] + " (not collected)"
+                else:
+                    label = r["outcome"]
+                who = ("policy" if r["via"] == "policy" else
+                       (r["approver"] or "")) if r["outcome"] not in ("pending", "expired", "unknown") else ""
+                lat = f"{r['latency_ms'] / 1000:.1f}s" if r["latency_ms"] else ""
+                note = html.escape(r["error"] or r["summary"] or "")[:200]
+                body.append(
+                    "<tr>"
+                    f"<td>{html.escape(r['time'])}</td>"
+                    f"<td><b>{html.escape(label)}</b>{' (escalated to a prompt)' if r['escalated'] else ''}</td>"
+                    f"<td>{html.escape(', '.join(r['names']))}</td>"
+                    f"<td>{html.escape(what)}<br><small>{note}</small></td>"
+                    f"<td>{html.escape(r['risk'] or '')}</td>"
+                    f"<td>{html.escape(who)}</td><td>{lat}</td></tr>")
+            nav = ""
+            if total > per:
+                base = urllib.parse.urlencode({k: v for k, v in
+                                               (("outcome", outcome), ("secret", secret), ("mode", mode)) if v})
+                prev = f"<a href='?{base}&page={page - 1}'>newer</a>" if page > 1 else ""
+                nxt = f"<a href='?{base}&page={page + 1}'>older</a>" if page * per < total else ""
+                nav = f"<p>{prev} {nxt} &middot; {total} requests</p>"
+            _page(self, 200, "<h1>Request history</h1><p><a href='/policies'>Standing approvals</a></p>"
+                  + form + "<table cellpadding=6 style='border-collapse:collapse'><tr>"
+                  "<th align=left>Time (UTC)</th><th align=left>Outcome</th><th align=left>Secret</th>"
+                  "<th align=left>Request</th><th align=left>Risk</th><th align=left>Decided by</th>"
+                  "<th align=left>Took</th></tr>" + "".join(body) + f"</table>{nav}"
+                  + ("" if body else "<p>No requests match.</p>"))
 
         def do_GET(self):
             if self._user() is None:
                 return
+            if self.path.split("?")[0].rstrip("/") == "/history":
+                broker.log("history_viewed", peer=self.client_address[0], client_ip=self._fwd())
+                return self._history_page()
             if self.path.split("?")[0].rstrip("/") == "/policies":
                 broker.log("policies_viewed", peer=self.client_address[0], client_ip=self._fwd())
                 return self._policies_page()
