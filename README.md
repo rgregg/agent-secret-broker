@@ -70,6 +70,20 @@ Messages cross whatever service carries them and include secret names, the
 method and URL, and the approval link (single use, expires with the request,
 and useless without your SSO session).
 
+## Vault session lifetime
+
+The vault is not kept open. With the `bw` backend it is unlocked on demand,
+kept for `idle_timeout` seconds (default 300) after its last use, then logged
+out (`backend_closed` in the audit log). With `prewarm` (default true) it is
+unlocked when a request is *created*, so the slow login/unlock overlaps with the
+human picking up their phone; a run of approvals within the window is fast.
+Nothing is released before approval either way.
+
+Approving or denying takes effect immediately: the decision is audited
+(`decided`) and the approver's page answers at once. Releasing the secret
+happens in the background; if that fails, the failure goes to the audit log and
+the requesting client, never to the approver.
+
 ## Audit
 
 JSONL, hash-chained, mode 0600, on the broker host. Never contains secret

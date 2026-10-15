@@ -22,7 +22,8 @@ def main():
     cfg = json.load(open(args.config))
 
     b = cfg["backend"]
-    backend = (BwBackend(b["server_url"], b["master_password_file"])
+    backend = (BwBackend(b["server_url"], b["master_password_file"],
+                         idle_timeout=b.get("idle_timeout", 300))
                if b["type"] == "bw" else FileBackend(b["path"]))
     notifier = notify.build(cfg, _read)
     summarizer = None

@@ -118,7 +118,10 @@ class Harness(unittest.TestCase):
         try:
             urllib.request.urlopen(r, timeout=10).read()
         except urllib.error.HTTPError:
-            pass
+            return                      # rejected: nothing will be released
+        req_ = self.broker._by_nonce.get(path.rsplit("/", 1)[1])
+        if req_ is not None:
+            req_.done.wait(10)          # accepted: release runs asynchronously
 
     def api(self, method, path, body=None, key=KEY):
         return req(self.base + path, method, body, {"X-Client-Key": key, "Content-Type": "application/json"})
@@ -446,6 +449,7 @@ class AuditTrail(Harness):
         data = urllib.parse.urlencode({"decision": "approve"}).encode()
         urllib.request.urlopen(urllib.request.Request(
             self.abase + f"/a/{nonce}", data=data, headers=hdr, method="POST"), timeout=10).read()
+        next(iter(self.broker._by_id.values())).done.wait(10)
         self.assertEqual(self.events("approved")[0]["approver_ip"], "203.0.113.9")
         self.assertNotIn(nonce, open(self.audit).read())
 
@@ -796,10 +800,182 @@ class DoubleSubmit(Harness):
         [t.start() for t in ts]
         [t.join() for t in ts]
         self.assertEqual(sorted(codes), [200, 404])
+        next(iter(self.broker._by_id.values())).done.wait(10)
         self.assertEqual(SlowBackend.reads, 1)
         self.assertEqual(len(self.events("approved")), 1)
         self.assertEqual(self.events("failed"), [])
         self.assertEqual(len(self.events("approval_stale")), 1)
+
+
+class AsyncApproval(Harness):
+    decision = None
+
+    def setUp(self):
+        super().setUp()
+        SlowBackend.reads = 0
+        self.broker.backend = SlowBackend(os.path.join(os.path.dirname(self.audit), "vault.json"))
+
+    def test_page_answers_before_release_finishes(self):
+        _, body = self.create_env()
+        nonce = next(iter(self.broker._by_id.values())).nonce
+        data = urllib.parse.urlencode({"decision": "approve"}).encode()
+        t0 = time.time()
+        r = urllib.request.urlopen(urllib.request.Request(
+            self.abase + f"/a/{nonce}", data=data, headers={"X-authentik-username": "alice"},
+            method="POST"), timeout=10)
+        page, took = r.read().decode(), time.time() - t0
+        self.assertIn("Approved", page)
+        self.assertLess(took, 0.4)                       # backend sleeps 0.6s per read
+        # the decision is on record immediately; the release outcome is not yet
+        self.assertEqual(self.events("decided")[0]["decision"], "approve")
+        self.assertEqual(self.events("approved"), [])
+        self.assertEqual([s for _, s in getattr(self.notifier, "resolutions", [])], ["approved"])
+        _, b = self.api("GET", f"/v1/requests/{json.loads(body)['id']}?wait=5")
+        self.assertEqual(json.loads(b)["env"], {"SVC_TOKEN": SECRET})
+        self.assertEqual(len(self.events("approved")), 1)
+
+    def test_deny_is_immediate_and_recorded(self):
+        _, body = self.create_env()
+        nonce = next(iter(self.broker._by_id.values())).nonce
+        data = urllib.parse.urlencode({"decision": "deny"}).encode()
+        t0 = time.time()
+        page = urllib.request.urlopen(urllib.request.Request(
+            self.abase + f"/a/{nonce}", data=data, headers={"X-authentik-username": "alice"},
+            method="POST"), timeout=10).read().decode()
+        self.assertIn("Denied", page)
+        self.assertLess(time.time() - t0, 0.4)
+        self.assertEqual(self.events("decided")[0]["decision"], "deny")
+        self.assertEqual(len(self.events("denied")), 1)
+        self.assertEqual(SlowBackend.reads, 0)           # nothing was ever read
+
+    def test_release_failure_is_audited_not_shown_to_approver(self):
+        self.broker.backend = FileBackend.__new__(FileBackend)
+        self.broker.backend._data = {}                   # every lookup raises BackendError
+        _, body = self.create_env()
+        nonce = next(iter(self.broker._by_id.values())).nonce
+        data = urllib.parse.urlencode({"decision": "approve"}).encode()
+        urllib.request.urlopen(urllib.request.Request(
+            self.abase + f"/a/{nonce}", data=data, headers={"X-authentik-username": "alice"},
+            method="POST"), timeout=10).read()
+        _, b = self.api("GET", f"/v1/requests/{json.loads(body)['id']}?wait=5")
+        self.assertEqual(json.loads(b)["status"], "failed")
+        self.assertIn("release failed", self.events("failed")[0]["error"])
+
+
+class BwBackendWarm(unittest.TestCase):
+    def setUp(self):
+        d = tempfile.mkdtemp()
+        self.log = os.path.join(d, "calls")
+        self.bw = os.path.join(d, "bw")
+        with open(self.bw, "w") as f:
+            f.write(f"""#!/bin/sh
+echo "$1" >> {self.log}
+case "$1" in
+  status) echo '{{"status":"unauthenticated"}}';;
+  unlock) echo SESSION;;
+  get) echo '{{"name":"T","notes":"v"}}';;
+esac
+""")
+        os.chmod(self.bw, 0o755)
+        self.pw = os.path.join(d, "pw")
+        open(self.pw, "w").write("m")
+
+    def calls(self):
+        with open(self.log) as f:
+            return f.read().split()
+
+    def test_warm_then_get_does_not_unlock_or_resync(self):
+        b = BwBackend("https://v.example", self.pw, bw=self.bw)
+        b.warm()
+        before = self.calls()
+        self.assertEqual(b.get("T", "notes"), "v")
+        self.assertEqual(b.get("T", "notes"), "v")
+        after = self.calls()[len(before):]
+        self.assertEqual(after, ["get", "get"])          # no status/login/unlock/sync
+
+    def test_resync_after_interval(self):
+        b = BwBackend("https://v.example", self.pw, bw=self.bw, sync_interval=0)
+        b.get("T", "notes")
+        b.get("T", "notes")
+        self.assertEqual(self.calls().count("sync"), 2)
+
+
+class BwIdleLogout(BwBackendWarm):
+    """Session is kept for idle_timeout after last use, then logged out."""
+
+    def backend(self, idle):
+        b = BwBackend("https://v.example", self.pw, bw=self.bw, idle_timeout=idle)
+        self.addCleanup(b.close)
+        self.events = []
+        b.on_event = lambda name, **kw: self.events.append(name)
+        return b
+
+    def test_logs_out_after_idle_then_recovers(self):
+        b = self.backend(0.4)
+        self.assertEqual(b.get("T", "notes"), "v")
+        self.assertNotIn("logout", self.calls())
+        time.sleep(1.0)
+        self.assertEqual(self.calls().count("logout"), 1)
+        self.assertEqual(self.events, ["backend_closed"])
+        self.assertEqual(b.get("T", "notes"), "v")        # transparently logs in again
+        self.assertEqual(self.calls().count("login"), 2)
+
+    def test_use_extends_the_window(self):
+        b = self.backend(0.8)
+        b.get("T", "notes")
+        time.sleep(0.5)
+        b.get("T", "notes")                               # re-arms the timer
+        time.sleep(0.5)                                   # 1.0s since first use, 0.5s since last
+        self.assertNotIn("logout", self.calls())
+        time.sleep(0.8)
+        self.assertEqual(self.calls().count("logout"), 1)
+
+    def test_idle_timeout_zero_disables_logout(self):
+        b = self.backend(0)
+        b.get("T", "notes")
+        time.sleep(0.4)
+        self.assertNotIn("logout", self.calls())
+
+    # inherited warm/resync tests don't depend on idle behaviour
+    test_warm_then_get_does_not_unlock_or_resync = None
+    test_resync_after_interval = None
+
+
+class PrewarmStub:
+    def __init__(self):
+        self.warmed = threading.Event()
+        self.count = 0
+
+    def warm(self):
+        self.count += 1
+        self.warmed.set()
+
+    def get(self, item, field):
+        return "v"
+
+
+class Prewarm(Harness):
+    decision = None
+
+    def setUp(self):
+        super().setUp()
+        self.stub = PrewarmStub()
+        self.broker.backend = self.stub
+
+    def test_request_creation_warms_backend(self):
+        self.create_env()
+        self.assertTrue(self.stub.warmed.wait(3))
+        for _ in range(50):
+            if self.events("backend_ready"):
+                break
+            time.sleep(0.05)
+        self.assertEqual(len(self.events("backend_ready")), 1)
+
+    def test_prewarm_can_be_disabled(self):
+        self.broker.cfg["backend"] = {"prewarm": False}
+        self.create_env()
+        time.sleep(0.3)
+        self.assertEqual(self.stub.count, 0)
 
 
 class Cli(Harness):

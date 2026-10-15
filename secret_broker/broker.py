@@ -66,6 +66,8 @@ class Broker:
         self._by_id = {}
         self._by_nonce = {}
         self._denied_at = {}
+        if hasattr(backend, "on_event"):
+            backend.on_event = self.log
         for name, sc in config["secrets"].items():
             if sc.get("approval", "prompt") not in APPROVAL_VALUES:
                 raise ValueError(f"secret {name!r}: approval must be one of {APPROVAL_VALUES}")
@@ -146,6 +148,9 @@ class Broker:
             self.log("rejected", reason=err, names=names, mode=mode, source=source, peer=peer)
             raise PermissionError(err)
         self.audit("requested", req)
+        if self.cfg.get("backend", {}).get("prewarm", True):
+            # unlock while the human is reaching for their phone
+            self.warm_backend()
         a = risk_mod.assess(mode, names, spec, self.cfg["secrets"], self.summarizer)
         req.summary, req.risk = a["summary"], {k: a[k] for k in ("level", "baseline", "model", "reasons")}
         self.audit("assessed", req, baseline=a["baseline"], model=a["model"], reasons=a["reasons"])
@@ -241,8 +246,8 @@ class Broker:
                 self._denied_at[n] = now
         extra["latency_ms"] = int((time.time() - req.created) * 1000)
         self.audit(status, req, error=error, **extra)
-        if extra.get("via") != "policy":
-            self._resolved(req, status)
+        if extra.get("via") != "policy" and status != "approved":
+            self._resolved(req, status)     # approvals were announced at decision time
         req.done.set()
         return True
 
@@ -258,16 +263,42 @@ class Broker:
             self.log("approval_stale", user=user, peer=peer, client_ip=client_ip, approve=approve)
             return None
         who = {"via": "user", "approver": user, "approver_peer": peer, "approver_ip": client_ip}
+        # The decision itself is recorded and announced immediately.
+        self.audit("decided", req, decision="approve" if approve else "deny", **who)
         if not approve:
             self._finish(req, "denied", **who)
             return req
+        self._resolved(req, "approved")
+        # Releasing can take seconds (vault unlock, upstream call). It runs off
+        # the request thread: the approver's page has already been answered, the
+        # result reaches the client through its poll, and any failure is audited
+        # and surfaced to the client, never to the approver.
+        threading.Thread(target=self._release_and_finish, args=(req, who), daemon=True).start()
+        return req
+
+    def _release_and_finish(self, req, who):
         try:
             result = self._release(req)
         except (BackendError, OSError, ValueError) as e:
             self._finish(req, "failed", error=f"release failed: {e}", **who)
-            return req
+            return
         self._finish(req, "approved", result=result, **who)
-        return req
+
+    def warm_backend(self):
+        """Pre-unlock the backend in the background; never raises."""
+        fn = getattr(self.backend, "warm", None)
+        if fn is None:
+            return
+
+        def run():
+            t0 = time.time()
+            try:
+                fn()
+            except Exception as e:  # noqa: BLE001
+                self.log("backend_error", error=str(e)[:200])
+            else:
+                self.log("backend_ready", duration_ms=int((time.time() - t0) * 1000))
+        threading.Thread(target=run, daemon=True).start()
 
     def _release(self, req):
         env = {}
@@ -523,10 +554,11 @@ def approval_handler(broker):
 <p>From: {html.escape(req.source)}<br>{what}</p>
 <p><small>{note}</small></p>
 <p><small>Expires in {int(req.expires - time.time())}s</small></p>
-<form method=post>
+<form method=post onsubmit="setTimeout(function(){{document.querySelectorAll('button').forEach(function(b){{b.disabled=true}});document.getElementById('w').hidden=false}},0)">
 <button name=decision value=approve style='font-size:1.4rem;padding:1rem 2rem'>Approve</button>
 <button name=decision value=deny style='font-size:1.4rem;padding:1rem 2rem'>Deny</button>
-</form>""")
+</form>
+<p id=w hidden>Working...</p>""")
 
         def do_POST(self):
             user = self._user()
@@ -540,8 +572,10 @@ def approval_handler(broker):
                    if nonce else None)
             if req is None:
                 return _page(self, 404, "<h1>Request not found or already handled</h1>")
-            label = {"approved": "Approved", "denied": "Denied"}.get(req.status, req.status)
-            _page(self, 200, f"<h1>{html.escape(label)}</h1>")
+            if approve:
+                _page(self, 200, "<h1>Approved</h1><p>Releasing now. You can close this page.</p>")
+            else:
+                _page(self, 200, "<h1>Denied</h1>")
 
     return H
 

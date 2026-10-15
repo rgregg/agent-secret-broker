@@ -1,6 +1,7 @@
 {
   "backend": {"type": "bw", "server_url": "https://vault.example.com",
-              "master_password_file": "/run/secrets/bw_master_password"},
+              "master_password_file": "/run/secrets/bw_master_password",
+              "idle_timeout": 300, "prewarm": true},
   "notify": [
     {"type": "ticker", "ha_url": "http://homeassistant.example:8123",
      "ha_token_file": "/run/secrets/ha_token", "category": "general"},

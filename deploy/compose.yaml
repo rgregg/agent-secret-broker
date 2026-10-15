@@ -19,6 +19,9 @@ services:
     tmpfs: [/tmp]
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
+    deploy:
+      resources:
+        limits: {cpus: "1.0", memory: 256M}
 
   # Any reverse proxy that authenticates you and forwards the user's identity in
   # the header named by `identity_header` works. This example uses an authentik
