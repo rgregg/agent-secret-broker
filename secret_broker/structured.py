@@ -21,6 +21,16 @@ def _unquote(v):
     return v
 
 
+def _encode(v):
+    """Write a value so that parse() reads back exactly v."""
+    if v == "" or v == v.strip() and not (len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'"):
+        return v
+    for q in ('"', "'"):
+        if q not in v:
+            return q + v + q
+    raise StructuredError("value has surrounding space or quotes and both quote kinds")
+
+
 def is_json(text):
     return text.lstrip().startswith("{")
 
@@ -66,12 +76,12 @@ def set_key(text, key, value):
         obj[key] = value
         return json.dumps(obj, indent=2)
     lines, hit = text.splitlines(), False
+    enc = _encode(value)
     for i, line in enumerate(lines):
         m = _LINE.match(line)
-        if m and m.group(1) == key and not line.lstrip().startswith("#"):
-            prefix = line[:line.index(key) + len(key)]
-            sep = re.match(r"\s*[=:]\s?", line[len(prefix):]).group(0)
-            lines[i], hit = prefix + sep + value, True
+        if m and m.group(1) == key:
+            # splice at the value's own span; never search the line for the key
+            lines[i], hit = line[:m.start(2)] + enc + line[m.end(2):], True
     if not hit:
         raise StructuredError(f"key {key!r} not found in the field")
     return "\n".join(lines) + ("\n" if text.endswith("\n") else "")

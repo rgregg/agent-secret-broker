@@ -1299,6 +1299,18 @@ class StructuredParsing(unittest.TestCase):
         with self.assertRaises(st.StructuredError):
             st.set_key("A=1", "B", "x")
 
+    def test_set_key_round_trips_and_targets_the_right_span(self):
+        from secret_broker import structured as st
+        t = "export port=1\nPORT=2\nB=3 # keep\n"
+        self.assertEqual(st.parse(st.set_key(t, "port", "9")), {"port": "9", "PORT": "2", "B": "3 # keep"})
+        self.assertEqual(st.set_key(t, "port", "9").splitlines()[0], "export port=9")
+        for v in (" lead", "trail ", '"quoted"', "'q'", "a b", "x#y", "=eq", ""):
+            self.assertEqual(st.get(st.set_key("K=old", "K", v), "K"), v, v)
+        with self.assertRaises(st.StructuredError):
+            st.set_key("K=old", "K", "x\nINJECT=1")
+        with self.assertRaises(st.StructuredError):
+            st.set_key("K=old", "K", " \"'")
+
 
 class StoreFlow(Harness):
     NEW = "brand-new-credential-VALUE-123"
