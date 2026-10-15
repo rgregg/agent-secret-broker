@@ -348,6 +348,10 @@ class AutoAllowHttp(Harness):
     def tweak(self, cfg):
         cfg["secrets"]["svc"]["approval"] = "allow"
 
+    def setUp(self):
+        super().setUp()
+        self.broker.summarizer = _Stub("Reads", "low")   # only a low verdict auto-releases
+
     def http_body(self):
         url = f"http://127.0.0.1:{self.up.server_address[1]}/x"
         return {"mode": "http", "names": ["svc"], "method": "GET", "url": url,
@@ -377,11 +381,40 @@ class AutoAllowEnvExplicit(Harness):
     def tweak(self, cfg):
         cfg["secrets"]["svc"].update(approval="allow", auto_modes=["http", "env"])
 
+    def setUp(self):
+        super().setUp()
+        self.broker.summarizer = _Stub("Reads", "low")   # only a low verdict auto-releases
+
     def test_env_auto_when_opted_in(self):
         _, body = self.create_env()
         _, b = self.api("GET", f"/v1/requests/{json.loads(body)['id']}?wait=2")
         self.assertEqual(json.loads(b)["env"], {"SVC_TOKEN": SECRET})
         self.assertEqual(self.notifier.sent, [])
+
+
+class NoVerdictFailsClosed(Harness):
+    decision = None
+
+    def tweak(self, cfg):
+        cfg["secrets"]["svc"]["approval"] = "allow"       # note: no risk.escalate_auto_at set
+
+    def test_allow_secret_still_prompts_without_a_model_verdict(self):
+        url = f"http://127.0.0.1:{self.up.server_address[1]}/x"
+        code, _ = self.api("POST", "/v1/requests", {
+            "mode": "http", "names": ["svc"], "method": "GET", "url": url,
+            "headers": {"Authorization": "Bearer {{SVC_TOKEN}}"}})
+        self.assertEqual(code, 202)
+        self.assertEqual(len(self.notifier.sent), 1)
+        self.assertEqual(self.events("approved"), [])
+        self.assertEqual(len(self.events("escalated")), 1)
+
+    def test_medium_verdict_also_prompts_by_default(self):
+        self.broker.summarizer = _Stub("Changes a thing", "medium")
+        url = f"http://127.0.0.1:{self.up.server_address[1]}/x"
+        self.api("POST", "/v1/requests", {
+            "mode": "http", "names": ["svc"], "method": "GET", "url": url,
+            "headers": {"Authorization": "Bearer {{SVC_TOKEN}}"}})
+        self.assertEqual(len(self.notifier.sent), 1)
 
 
 class MixedPolicy(Harness):

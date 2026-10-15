@@ -144,11 +144,19 @@ class Broker:
             return False, "already always-allowed"
         if not self._config_path:
             return False, "the broker has no config file to record this in"
-        esc = self.cfg.get("risk", {}).get("escalate_auto_at")
+        esc = self._escalate_at()
         if esc:
             if req.risk and risk_mod.rank(req.risk["level"]) >= risk_mod.rank(esc):
                 return False, f"this request is rated {req.risk['level']}; such requests always prompt"
         return True, ""
+
+    def _escalate_at(self):
+        """Level at or above which an `allow` secret is prompted anyway.
+
+        Defaults to medium, so only a request the model rated low (or, with no
+        model verdict, nothing: that counts as high) is released unprompted.
+        """
+        return self.cfg.get("risk", {}).get("escalate_auto_at") or "medium"
 
     def _persist_approval(self, name, value, user):
         def mutate(disk):
@@ -254,7 +262,7 @@ class Broker:
         req.summary, req.risk = a["summary"], {k: a[k] for k in ("level", "model", "reasons")}
         self.audit("assessed", req, model=a["model"], reasons=a["reasons"])
         auto = self._auto_allowed(mode, names)
-        esc = self.cfg.get("risk", {}).get("escalate_auto_at")
+        esc = self._escalate_at()
         if auto and esc and risk_mod.rank(a["level"]) >= risk_mod.rank(esc):
             self.audit("escalated", req, reason=f"risk {a['level']} >= {esc}; policy allow overridden")
             auto = False
