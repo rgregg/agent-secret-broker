@@ -14,6 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from secret_broker import audit as audit_mod  # noqa: E402
 from secret_broker import risk as risk_mod  # noqa: E402
+from secret_broker.backends import BwServeBackend  # noqa: E402
 from secret_broker.backends import BackendError, BwBackend, FileBackend  # noqa: E402
 from secret_broker.broker import Broker, serve  # noqa: E402
 from secret_broker import notify as notify_mod  # noqa: E402
@@ -1164,10 +1165,65 @@ elif cmd in ("create", "edit"):
     save(d)
 elif cmd == "delete":
     d["items"] = [i for i in d["items"] if i["id"] != a[2]]; save(d)
+elif cmd == "serve":
+    import urllib.parse
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    port = int(a[a.index("--port") + 1])
+    log = os.environ.get("FAKE_BW_SERVE_LOG")
+    if log:
+        open(log, "a").write("start\n")
+    st = {"unlocked": False}
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *x): pass
+        def reply(self, ok, data=None, msg=None, code=200):
+            body = json.dumps({"success": ok, "data": data, "message": msg}).encode()
+            self.send_response(code if ok else 400); self.send_header("Content-Length", str(len(body)))
+            self.end_headers(); self.wfile.write(body)
+        def body(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            return json.loads(self.rfile.read(n)) if n else None
+        def route(self, method):
+            u = urllib.parse.urlsplit(self.path); q = urllib.parse.parse_qs(u.query)
+            p = u.path; dd = load()
+            if p == "/status": return self.reply(True, {"status": "unlocked" if st["unlocked"] else "locked"})
+            if p == "/unlock":
+                self.body(); st["unlocked"] = True; return self.reply(True, {"raw": "S"})
+            if not st["unlocked"]: return self.reply(False, msg="Vault is locked.")
+            if p == "/lock": st["unlocked"] = False; return self.reply(True, {})
+            if p == "/sync": return self.reply(True, {})
+            if p == "/list/object/organizations":
+                return self.reply(True, {"data": dd.get("orgs", [{"id": "org1", "name": "Org"}])})
+            if p == "/list/object/collections":
+                return self.reply(True, {"data": dd.get("colls", [{"id": "col1", "name": "Shared"}])})
+            if p == "/list/object/items":
+                t = (q.get("search") or [""])[0].lower()
+                return self.reply(True, {"data": [i for i in dd["items"] if t in i["name"].lower()]})
+            if p.startswith("/object/item"):
+                iid = p[len("/object/item/"):]
+                if method == "POST":
+                    obj = self.body(); dd["n"] += 1; obj["id"] = f"id{dd['n']}"; dd["items"].append(obj)
+                    save(dd); return self.reply(True, obj)
+                hit = [i for i in dd["items"] if i["id"] == iid]
+                if not hit: return self.reply(False, msg="Not found.")
+                if method == "GET": return self.reply(True, hit[0])
+                if method == "PUT":
+                    obj = self.body(); dd["items"] = [obj if i["id"] == iid else i for i in dd["items"]]
+                    save(dd); return self.reply(True, obj)
+                if method == "DELETE":
+                    dd["items"] = [i for i in dd["items"] if i["id"] != iid]; save(dd)
+                    return self.reply(True, {})
+            self.reply(False, msg="unknown route")
+        def do_GET(self): self.route("GET")
+        def do_POST(self): self.route("POST")
+        def do_PUT(self): self.route("PUT")
+        def do_DELETE(self): self.route("DELETE")
+    HTTPServer(("127.0.0.1", port), H).serve_forever()
 """
 
 
 class BwBackendWrites(unittest.TestCase):
+    backend_class = BwBackend
+
     def setUp(self):
         d = tempfile.mkdtemp()
         self.state = os.path.join(d, "state.json")
@@ -1179,7 +1235,8 @@ class BwBackendWrites(unittest.TestCase):
         self.addCleanup(os.environ.pop, "FAKE_BW_STATE", None)
         pw = os.path.join(d, "pw")
         open(pw, "w").write("m")
-        self.b = BwBackend("https://v.example", pw, bw=self.bw, idle_timeout=0)
+        self.b = self.backend_class("https://v.example", pw, bw=self.bw, idle_timeout=0)
+        self.addCleanup(self.b.close)
 
     def items(self):
         return {i["name"]: i for i in json.load(open(self.state))["items"]}
@@ -1351,6 +1408,47 @@ class MultiValue(Harness):
         rec = self.broker.backend._data["Multi"]
         self.assertEqual(rec["notes"], self.DOTENV.replace('"s3cr3t"', "rotated"))
         self.assertEqual(rec["previous_value"], self.DOTENV)
+
+
+class BwServeWrites(BwBackendWrites):
+    """Everything the CLI backend does, through one long-lived `bw serve`."""
+    backend_class = BwServeBackend
+
+    def alive(self):
+        return self.b._proc is not None and self.b._proc.poll() is None
+
+    def test_one_server_for_many_operations(self):
+        log = os.path.join(os.path.dirname(self.state), "serve.log")
+        os.environ["FAKE_BW_SERVE_LOG"] = log
+        self.addCleanup(os.environ.pop, "FAKE_BW_SERVE_LOG", None)
+        for n in "ABC":
+            self.b.put(n, "notes", n.lower(), create=True)
+            self.assertEqual(self.b.get(n, "notes"), n.lower())
+        self.assertEqual(open(log).read().count("start"), 1)
+        self.assertTrue(self.alive())
+
+    def test_exact_name_not_substring(self):
+        self.b.put("OpenAI Backup", "notes", "b", create=True)
+        self.b.put("openai", "notes", "o", create=True)        # not a collision with the longer name
+        self.assertEqual(self.b.get("openai", "notes"), "o")
+        self.assertEqual(self.b.get("OPENAI BACKUP", "notes"), "b")   # case-insensitive fallback
+        with self.assertRaises(BackendError):
+            self.b.put("openai", "notes", "x", create=True)           # exact name exists
+
+    def test_close_stops_the_server(self):
+        self.b.put("A", "notes", "a", create=True)
+        proc = self.b._proc
+        self.assertTrue(self.alive())
+        self.b.close()
+        self.assertIsNotNone(proc.poll())
+        self.assertIsNone(self.b._session)
+
+    def test_restarts_if_the_server_dies(self):
+        self.b.put("A", "notes", "a", create=True)
+        self.b._proc.kill()
+        self.b._proc.wait()
+        self.assertEqual(self.b.get("A", "notes"), "a")           # one retry restarts it
+        self.assertTrue(self.alive())
 
 
 class StructuredParsing(unittest.TestCase):

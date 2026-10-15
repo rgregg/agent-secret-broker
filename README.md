@@ -30,6 +30,17 @@ happens on a page that only your authenticated SSO session can reach.
   into the command's environment. The command shown in the prompt is what the
   client *said* it would run; approve it only if it looks right.
 
+### Vault access: `backend.serve`
+
+By default each vault read or write launches the `bw` CLI. Set
+`"serve": true` in the `backend` block to use one long-lived `bw serve`
+(127.0.0.1, random port, inside the container) instead: a request becomes a few
+local HTTP calls (milliseconds, not seconds) and the access token is refreshed
+only when it really expires, so a burst of requests cannot trip Vaultwarden's
+login rate limit. Idle logout still locks the vault, stops the process and logs
+out. In this mode items are matched by exact name (case-insensitive) or id; the
+CLI's substring search can make a name ambiguous or collide with a longer one.
+
 ## Policy, risk, discovery
 
 `list` and `which` never touch the vault or send a notification; each call is
