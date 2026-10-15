@@ -15,6 +15,7 @@ Everything, including auto-approved use and rejected attempts, is audited.
 import base64
 import binascii
 import hashlib
+import hmac
 import html
 import http.client
 import ipaddress
@@ -84,6 +85,7 @@ class Broker:
         self.notifier = notifier
         self._audit = audit if isinstance(audit, AuditLog) else AuditLog(audit)
         self.history = History(self._audit._path)
+        self._csrf_key = secrets.token_bytes(32)    # per process: tokens die with a restart
         self._lock = threading.Lock()
         self._by_id = {}
         self._by_nonce = {}
@@ -537,7 +539,19 @@ class Broker:
         req.done.set()
         return True
 
-    def decide(self, nonce, approve, user, peer=None, client_ip=None, always=False):
+    def csrf_token(self, user):
+        """Token a page must echo back with a decision. Bound to the identity, so
+        one user's page cannot be replayed by another session."""
+        return hmac.new(self._csrf_key, ("csrf:" + user).encode(), hashlib.sha256).hexdigest()
+
+    def pending(self):
+        """Open requests, oldest first."""
+        with self._lock:
+            self._expire_locked()
+            rows = [r for r in self._by_id.values() if r.status == "pending"]
+        return sorted(rows, key=lambda r: r.created)
+
+    def decide(self, nonce, approve, user, peer=None, client_ip=None, always=False, channel="link"):
         with self._lock:
             self._expire_locked()
             req = self._by_nonce.get(nonce)
@@ -548,7 +562,8 @@ class Broker:
         if req is None:
             self.log("approval_stale", user=user, peer=peer, client_ip=client_ip, approve=approve)
             return None
-        who = {"via": "user", "approver": user, "approver_peer": peer, "approver_ip": client_ip}
+        who = {"via": "user", "approver": user, "approver_peer": peer, "approver_ip": client_ip,
+               "channel": channel}
         req.approver = user
         # The decision itself is recorded and announced immediately.
         self.audit("decided", req, decision="approve" if approve else "deny",
@@ -836,6 +851,11 @@ border:1px solid var(--line);background:var(--bg);color:var(--fg)}
 .tbl td[data-label=Time],.tbl td[data-label=Outcome],.tbl td[data-label=Risk],.tbl td[data-label=Took]
 {white-space:nowrap;overflow-wrap:normal}
 .pager{display:flex;gap:1.25rem;align-items:center;flex-wrap:wrap}
+.req{background:var(--card);border:1px solid var(--line);border-radius:.8rem;padding:.25rem 1rem 1rem;margin:0 0 1rem}
+.req h2{font-size:1.15rem;margin:.75rem 0 .25rem}
+.flash{background:var(--card);border:1px solid var(--line);border-left:.4rem solid var(--accent);border-radius:.4rem;padding:.5rem .8rem;margin:.75rem 0}
+.offline{border-left-color:var(--bad)}
+@media (min-width:60rem){.cards{display:grid;grid-template-columns:repeat(2,1fr);gap:1rem}.req{margin:0}}
 @media (max-width:42rem){
  main{padding:.75rem}
  .tbl thead{display:none}
@@ -848,23 +868,99 @@ border:1px solid var(--line);background:var(--bg);color:var(--fg)}
 }
 """
 
-_NAV = "<nav><a href='/history'>History</a><a href='/policies'>Standing approvals</a></nav>"
+_WORKING_JS = (
+    "document.getElementById('f').addEventListener('submit',function(){"
+    "setTimeout(function(){document.querySelectorAll('button').forEach(function(b){b.disabled=true});"
+    "document.getElementById('w').hidden=false},0)});")
+
+_DASH_JS = r'''
+(function(){
+  var cards=document.getElementById('cards'), flash=document.getElementById('flash'),
+      off=document.getElementById('offline'), last=cards.getAttribute('data-version');
+  function secs(){document.querySelectorAll('time[data-exp]').forEach(function(t){
+    var s=Math.max(0,Math.floor(t.getAttribute('data-exp')-Date.now()/1000));
+    t.textContent='expires in '+s+'s';});}
+  function title(){var n=cards.querySelectorAll('article').length;
+    document.title=(n?'('+n+') ':'')+'Secret broker';}
+  function parse(h){return new DOMParser().parseFromString(h,'text/html');}
+  function poll(){
+    return fetch('/?fragment=1',{credentials:'same-origin',cache:'no-store'})
+      .then(function(r){if(!r.ok)throw 0;return r.text();})
+      .then(function(h){var c=parse(h).getElementById('cards');
+        if(c&&c.getAttribute('data-version')!==last){
+          last=c.getAttribute('data-version');cards.innerHTML=c.innerHTML;bind();}
+        off.hidden=true;secs();title();})
+      .catch(function(){off.hidden=false;});}
+  function bind(){document.querySelectorAll('form.decide').forEach(function(f){
+    if(f.getAttribute('data-bound'))return;f.setAttribute('data-bound','1');
+    f.addEventListener('submit',function(e){
+      if(!window.fetch||!e.submitter)return;e.preventDefault();
+      var body=new URLSearchParams(new FormData(f));
+      body.append(e.submitter.name,e.submitter.value);
+      f.querySelectorAll('button').forEach(function(b){b.disabled=true;});
+      fetch(f.action,{method:'POST',body:body,credentials:'same-origin'})
+        .then(function(r){return r.text();})
+        .then(function(h){var n=parse(h).getElementById('flash');
+          if(n){flash.textContent=n.textContent;flash.hidden=!n.textContent;}
+          last=null;return poll();})
+        .catch(function(){off.hidden=false;});});});}
+  bind();secs();title();setInterval(secs,1000);setInterval(poll,3000);
+  document.addEventListener('visibilitychange',function(){if(!document.hidden)poll();});
+})();
+'''
+
+_NAV = ("<nav><a href='/'>Pending</a><a href='/history'>History</a>"
+        "<a href='/policies'>Standing approvals</a></nav>")
 
 
-def _page(h, code, body, wide=False, nav=True):
+def _page(h, code, body, wide=False, nav=True, script=None):
+    nonce = secrets.token_urlsafe(16)
+    scr = f"<script nonce='{nonce}'>{script}</script>" if script else ""
+    csp = ("default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; connect-src 'self'; "
+           f"base-uri 'none'; frame-ancestors 'none'; script-src 'nonce-{nonce}'")
     raw = ("<!doctype html><html lang=en><meta charset=utf-8>"
            "<meta name=viewport content='width=device-width,initial-scale=1'>"
            "<meta name=color-scheme content='light dark'><title>Secret broker</title>"
            f"<style>{_CSS}</style><body>{_NAV if nav else ''}"
-           f"<main class='{'wide' if wide else 'narrow'}'>{body}</main></body></html>").encode()
+           f"<main class='{'wide' if wide else 'narrow'}'>{body}</main>{scr}</body></html>").encode()
     h.send_response(code)
     h.send_header("Content-Type", "text/html; charset=utf-8")
     h.send_header("Content-Length", str(len(raw)))
     h.send_header("Cache-Control", "no-store")
     h.send_header("X-Frame-Options", "DENY")
-    h.send_header("Content-Security-Policy", "frame-ancestors 'none'")
+    h.send_header("Content-Security-Policy", csp)
     h.end_headers()
     h.wfile.write(raw)
+
+
+def _describe(req):
+    """(what_html, note_html) for a request, escaped."""
+    if req.mode == "http":
+        return (f"{html.escape(req.spec['method'])} {html.escape(req.spec['url'])}",
+                "The broker will make this call itself; the secret never leaves it.")
+    if req.mode == "store":
+        sp = req.spec
+        hosts = (f"<br>Usable only for: {html.escape(', '.join(sp['allowed_hosts']))}"
+                 if sp.get("allowed_hosts") else "<br>Hosts and mapping stay unchanged")
+        key = f", key: {html.escape(sp['key'])}" if sp.get("key") else ""
+        return (f"<b>{html.escape(sp['op'].upper())}</b> credential in the vault<br>"
+                f"Item: {html.escape(sp['item'])}, field: {html.escape(sp['field'])}{key}{hosts}<br>"
+                f"New value: {sp['value_bytes']} bytes (never displayed)",
+                "An update replaces the current value; the old one is kept in the item's "
+                "previous_value field. This will not run without your approval.")
+    return ("run <code>" + html.escape(" ".join(req.spec.get("argv") or [])) + "</code>",
+            "Advisory only: the secret is released to the requesting host and the "
+            "command shown is what it <em>said</em> it would run.")
+
+
+def _risk_html(req):
+    lvl = req.risk["level"] if req.risk else "medium"
+    out = (f"<div class='risk {lvl}'><b>{lvl.upper()} RISK</b><small>"
+           + html.escape("; ".join(req.risk["reasons"]) if req.risk else "") + "</small></div>")
+    if req.summary:
+        out += (f"<p>AI summary <small>(unverified, from client-supplied text)</small>:<br>"
+                f"<i>{html.escape(req.summary)}</i></p>")
+    return out
 
 
 def client_handler(broker, client_key):
@@ -959,11 +1055,78 @@ def approval_handler(broker):
                 return None
             return user
 
+        def _same_origin(self):
+            """Browsers always send these on a POST; a cross-site form cannot forge
+            them. Non-browser clients that send neither are still held to the
+            per-user token."""
+            if self.headers.get("Sec-Fetch-Site") not in (None, "same-origin", "none"):
+                return False
+            origin = self.headers.get("Origin")
+            if origin and origin != "null":
+                want = urllib.parse.urlsplit(cfg.get("approve_base_url", "")).netloc
+                return bool(want) and urllib.parse.urlsplit(origin).netloc == want
+            return origin is None
+
+        def _csrf_ok(self, user, token):
+            return (self._same_origin()
+                    and hmac.compare_digest(token or "", broker.csrf_token(user)))
+
+        def _dashboard(self, user, fragment=False, note=""):
+            notes = {"approved": "Approved. Releasing now.", "denied": "Denied.",
+                     "always": "Approved, and always allowed from now on.",
+                     "stale": "That request was already handled or has expired.",
+                     "bad": "That request could not be processed."}
+            reqs = broker.pending()
+            token = broker.csrf_token(user)
+            cards = []
+            for r in reqs:
+                what, rnote = _describe(r)
+                ok, why = broker.always_allow_eligibility(r)
+                always = (
+                    "<button class=btn name=decision value=approve_always>"
+                    f"Approve and always allow {html.escape(r.names[0])}</button>"
+                    "<p><small>Future HTTP calls with this secret run without asking, except "
+                    "requests rated at or above the risk threshold. Revoke any time under "
+                    "Standing approvals.</small></p>" if ok else
+                    f"<p><small>Always allow not offered: {html.escape(why)}.</small></p>")
+                cards.append(
+                    f"<article class=req data-id='{html.escape(r.id)}'>"
+                    f"<h2>{html.escape(', '.join(r.names))}</h2>{_risk_html(r)}"
+                    f"<div class=box>From: {html.escape(r.source)}<br>{what}</div>"
+                    f"<p><small>{rnote}</small></p>"
+                    f"<p><small><time data-exp='{int(r.expires)}'>expires in "
+                    f"{max(0, int(r.expires - time.time()))}s</time></small></p>"
+                    "<form method=post action='/decide' class=decide>"
+                    f"<input type=hidden name=id value='{html.escape(r.id)}'>"
+                    f"<input type=hidden name=csrf value='{token}'>"
+                    "<div class=actions><button class='btn approve' name=decision value=approve>"
+                    "Approve</button><button class='btn deny' name=decision value=deny>Deny</button>"
+                    f"</div>{always}</form></article>")
+            version = hashlib.sha256("|".join(r.id for r in reqs).encode()).hexdigest()[:16]
+            inner = ("".join(cards) if cards else
+                     "<p class=muted>No requests are waiting for approval.</p>")
+            block = f"<div id=cards class=cards data-version='{version}'>{inner}</div>"
+            if fragment:
+                return _page(self, 200, block, nav=False)
+            msg = notes.get(note, "")
+            _page(self, 200,
+                  "<h1>Pending requests</h1>"
+                  f"<div id=flash class=flash{'' if msg else ' hidden'}>{html.escape(msg)}</div>"
+                  "<div id=offline class='flash offline' hidden>Cannot reach the broker (signed out?). "
+                  "Reload this page.</div>" + block, wide=True, script=_DASH_JS)
+
+        def _redirect(self, where):
+            self.send_response(303)
+            self.send_header("Location", where)
+            self.send_header("Content-Length", "0")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+
         def _nonce(self):
             parts = self.path.split("?")[0].strip("/").split("/")
             return parts[1] if len(parts) == 2 and parts[0] == "a" else None
 
-        def _policies_page(self, note=""):
+        def _policies_page(self, user, note=""):
             rows = []
             for name, sc in sorted(cfg["secrets"].items()):
                 state = sc.get("approval", "prompt")
@@ -971,6 +1134,7 @@ def approval_handler(broker):
                 btn = ""
                 if state == "allow":
                     btn = ("<form method=post>"
+                           f"<input type=hidden name=csrf value='{broker.csrf_token(user)}'>"
                            f"<input type=hidden name=name value='{html.escape(name)}'>"
                            "<button name=approval value=prompt>Require approval again</button></form>")
                 rows.append(f"<tr><td data-label=Secret><b>{html.escape(name)}</b></td>"
@@ -1047,14 +1211,22 @@ def approval_handler(broker):
                   + ("" if body else "<p class=muted>No requests match.</p>"), wide=True)
 
         def do_GET(self):
-            if self._user() is None:
+            user = self._user()
+            if user is None:
                 return
+            u = urllib.parse.urlsplit(self.path)
+            if u.path == "/":
+                q = urllib.parse.parse_qs(u.query)
+                frag = q.get("fragment", [""])[0] == "1"
+                if not frag:
+                    broker.log("dashboard_viewed", peer=self.client_address[0], client_ip=self._fwd())
+                return self._dashboard(user, fragment=frag, note=(q.get("note") or [""])[0][:12])
             if self.path.split("?")[0].rstrip("/") == "/history":
                 broker.log("history_viewed", peer=self.client_address[0], client_ip=self._fwd())
                 return self._history_page()
             if self.path.split("?")[0].rstrip("/") == "/policies":
                 broker.log("policies_viewed", peer=self.client_address[0], client_ip=self._fwd())
-                return self._policies_page()
+                return self._policies_page(user)
             nonce = self._nonce()
             req = broker._by_nonce.get(nonce) if nonce else None
             broker.log("approval_viewed", user=self.headers.get(
@@ -1063,27 +1235,8 @@ def approval_handler(broker):
                 found=bool(req and req.status == "pending" and time.time() <= req.expires))
             if req is None or req.status != "pending" or time.time() > req.expires:
                 return _page(self, 404, "<h1>Request not found or already handled</h1>")
-            if req.mode == "http":
-                what = f"{html.escape(req.spec['method'])} {html.escape(req.spec['url'])}"
-                note = "The broker will make this call itself; the secret never leaves it."
-            elif req.mode == "store":
-                sp = req.spec
-                hosts = (f"<br>Usable only for: {html.escape(', '.join(sp['allowed_hosts']))}"
-                         if sp.get("allowed_hosts") else "<br>Hosts and mapping stay unchanged")
-                what = (f"<b>{html.escape(sp['op'].upper())}</b> credential in the vault<br>"
-                        f"Item: {html.escape(sp['item'])}, field: {html.escape(sp['field'])}{hosts}<br>"
-                        f"New value: {sp['value_bytes']} bytes (never displayed)")
-                note = ("An update replaces the current value; the old one is kept in the item's "
-                        "previous_value field. This will not run without your approval.")
-            else:
-                what = "run <code>" + html.escape(" ".join(req.spec.get("argv") or [])) + "</code>"
-                note = ("Advisory only: the secret is released to the requesting host and the "
-                        "command shown is what it <em>said</em> it would run.")
-            lvl = req.risk["level"] if req.risk else "medium"
-            color = {"low": "#1a7f37", "medium": "#9a6700", "high": "#cf222e"}[lvl]
-            risk_html = (f"<div class='risk {lvl}'><b>{lvl.upper()} RISK</b><small>"
-                         + html.escape("; ".join(req.risk["reasons"]) if req.risk else "")
-                         + "</small></div>")
+            what, note = _describe(req)
+            summary_html = _risk_html(req)
             ok, why = broker.always_allow_eligibility(req)
             if ok:
                 always_html = (
@@ -1093,9 +1246,6 @@ def approval_handler(broker):
                     "rated high risk. Revoke any time at /policies.</small></p>")
             else:
                 always_html = f"<p><small>Always allow not offered: {html.escape(why)}.</small></p>"
-            summary_html = risk_html + (
-                f"<p>AI summary <small>(unverified, from client-supplied text)</small>:<br>"
-                f"<i>{html.escape(req.summary)}</i></p>" if req.summary else "")
             _page(self, 200, f"""
 <h1>Secret request</h1>
 <p><b>{html.escape(', '.join(req.names))}</b></p>
@@ -1103,21 +1253,41 @@ def approval_handler(broker):
 <div class=box>From: {html.escape(req.source)}<br>{what}</div>
 <p><small>{note}</small></p>
 <p><small>Expires in {int(req.expires - time.time())}s</small></p>
-<form method=post onsubmit="setTimeout(function(){{document.querySelectorAll('button').forEach(function(b){{b.disabled=true}});document.getElementById('w').hidden=false}},0)">
+<form method=post id=f>
 <div class=actions>
 <button class='btn approve' name=decision value=approve>Approve</button>
 <button class='btn deny' name=decision value=deny>Deny</button>
 </div>
 {always_html}
 </form>
-<p id=w hidden>Working...</p>""")
+<p id=w hidden>Working...</p>""", script=_WORKING_JS)
 
         def do_POST(self):
             user = self._user()
             if user is None:
                 return
             form = urllib.parse.parse_qs(
-                self.rfile.read(int(self.headers.get("Content-Length", 0))).decode())
+                self.rfile.read(min(int(self.headers.get("Content-Length", 0)), 8192)).decode())
+            path = self.path.split("?")[0].rstrip("/")
+            if path in ("/decide", "/policies") and not self._csrf_ok(user, form.get("csrf", [""])[0]):
+                broker.log("csrf_refused", path=path, peer=self.client_address[0],
+                           client_ip=self._fwd(), origin=(self.headers.get("Origin") or "")[:80],
+                           fetch_site=self.headers.get("Sec-Fetch-Site"))
+                return _page(self, 403, "<h1>Forbidden</h1><p>Reload the page and try again.</p>")
+            if path == "/decide":
+                rid = form.get("id", [""])[0]
+                decision = form.get("decision", [""])[0]
+                r = broker._by_id.get(rid)
+                if decision not in ("approve", "deny", "approve_always") or r is None:
+                    return self._redirect("/?note=stale")
+                done = broker.decide(r.nonce, decision != "deny", user, self.client_address[0],
+                                     self._fwd(), always=(decision == "approve_always"),
+                                     channel="dashboard")
+                if done is None:
+                    return self._redirect("/?note=stale")
+                tag = ("denied" if decision == "deny" else
+                       "always" if done.always == "applied" else "approved")
+                return self._redirect(f"/?note={tag}")
             if self.path.split("?")[0].rstrip("/") == "/policies":
                 name = form.get("name", [""])[0]
                 # this page can only *tighten*: granting happens in the context of a request
@@ -1125,7 +1295,7 @@ def approval_handler(broker):
                     return _page(self, 400, "<h1>Bad request</h1>")
                 done = broker.set_approval(name, "prompt", user, self.client_address[0], self._fwd())
                 return self._policies_page(
-                    f"<p>{'Updated' if done else 'Could not update'}: {html.escape(name)}</p>")
+                    user, f"<p>{'Updated' if done else 'Could not update'}: {html.escape(name)}</p>")
             nonce = self._nonce()
             decision = form.get("decision", [""])[0]
             approve = decision in ("approve", "approve_always")

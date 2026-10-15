@@ -1193,13 +1193,16 @@ class AlwaysAllow(Harness):
         self.assertEqual(status, 200)
         self.assertIn("Require approval again", body)
         # granting is refused here
-        self.assertEqual(self.post("/policies", name="svc", approval="allow")[0], 400)
+        tok = self.broker.csrf_token("alice")
+        self.assertEqual(self.post("/policies", name="svc", approval="allow", csrf=tok)[0], 400)
         self.assertEqual(self.disk()["secrets"]["svc"]["approval"], "allow")
-        status, body = self.post("/policies", name="svc", approval="prompt")
+        self.assertEqual(self.post("/policies", name="svc", approval="prompt")[0], 403)   # no csrf token
+        self.assertEqual(self.disk()["secrets"]["svc"]["approval"], "allow")
+        status, body = self.post("/policies", name="svc", approval="prompt", csrf=tok)
         self.assertEqual(status, 200)
         self.assertEqual(self.disk()["secrets"]["svc"]["approval"], "prompt")
         self.assertEqual(self.broker.cfg["secrets"]["svc"]["approval"], "prompt")
-        self.assertEqual(self.post("/policies", name="nope", approval="prompt")[0], 400)
+        self.assertEqual(self.post("/policies", name="nope", approval="prompt", csrf=tok)[0], 400)
 
     def test_policies_page_requires_identity(self):
         r = req(self.abase + "/policies", headers={"X-authentik-username": "mallory"})
@@ -1653,6 +1656,129 @@ class HistoryPage(Harness):
         self.assertEqual([r["outcome"] for r in first], ["approved"])
         self.call(decision="deny")                                            # log grows after the index was built
         self.assertEqual([r["outcome"] for r in h.rows()], ["denied", "approved"])
+
+
+class Dashboard(Harness):
+    """Approve/deny from the web UI: same decision path, plus CSRF protection."""
+    decision = None
+    ttl = 60
+
+    def tweak(self, cfg):
+        cfg["risk"] = {"escalate_auto_at": "high"}
+
+    def setUp(self):
+        super().setUp()
+        self.broker.summarizer = _Stub("Reads things", "low")
+
+    def ask(self, path="/x", method="GET", name="svc"):
+        url = f"http://127.0.0.1:{self.up.server_address[1]}{path}"
+        _, body = self.api("POST", "/v1/requests", {
+            "mode": "http", "names": [name], "method": method, "url": url,
+            "headers": {"Authorization": "Bearer {{SVC_TOKEN}}"}})
+        return json.loads(body)["id"]
+
+    def get(self, path="/", user="alice"):
+        return req(self.abase + path, headers={"X-authentik-username": user})
+
+    def decide(self, rid, decision, csrf="ok", user="alice", extra=None):
+        form = {"id": rid, "decision": decision}
+        if csrf is not None:
+            form["csrf"] = self.broker.csrf_token(user) if csrf == "ok" else csrf
+        hdr = {"X-authentik-username": user, **(extra or {})}
+
+        class NoFollow(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, *a, **k):
+                return None
+        op = urllib.request.build_opener(NoFollow)
+        try:
+            r = op.open(urllib.request.Request(
+                self.abase + "/decide", data=urllib.parse.urlencode(form).encode(),
+                headers=hdr, method="POST"), timeout=10)
+            return r.status, r.headers.get("Location"), r.read().decode()
+        except urllib.error.HTTPError as e:
+            return e.code, e.headers.get("Location"), e.read().decode()
+
+    def result(self, rid):
+        _, b = self.api("GET", f"/v1/requests/{rid}?wait=5")
+        return json.loads(b)
+
+    def test_lists_pending_without_exposing_the_nonce(self):
+        rid = self.ask("/<img src=x onerror=alert(1)>")
+        code, body = self.get()
+        self.assertEqual(code, 200)
+        self.assertIn("svc", body)
+        self.assertIn("name=csrf", body)
+        self.assertIn(f"data-id='{rid}'", body)
+        self.assertNotIn(self.broker._by_id[rid].nonce, body)         # ids, never the capability URL
+        self.assertNotIn("<img src=x", body)                          # escaped
+        self.assertIn("script-src 'nonce-", urllib.request.urlopen(urllib.request.Request(
+            self.abase + "/", headers={"X-authentik-username": "alice"})).headers["Content-Security-Policy"])
+
+    def test_approve_from_the_dashboard_releases_to_the_client(self):
+        rid = self.ask()
+        code, loc, _ = self.decide(rid, "approve")
+        self.assertEqual((code, loc), (303, "/?note=approved"))
+        r = self.result(rid)
+        self.assertEqual((r["status"], r["http"]["status"]), ("approved", 200))
+        d = self.events("decided")[0]
+        self.assertEqual((d["channel"], d["approver"], d["decision"]), ("dashboard", "alice", "approve"))
+        self.assertNotIn("name=csrf", self.get()[1].split("id=cards")[1].split("</div>")[0])  # nothing pending now
+
+    def test_deny_from_the_dashboard(self):
+        rid = self.ask()
+        self.assertEqual(self.decide(rid, "deny")[1], "/?note=denied")
+        self.assertEqual(self.result(rid)["status"], "denied")
+
+    def test_csrf_and_origin_protections(self):
+        rid = self.ask()
+        for kw in (dict(csrf=None), dict(csrf="wrong"),
+                   dict(extra={"Origin": "https://evil.example"}),
+                   dict(extra={"Sec-Fetch-Site": "cross-site"}),
+                   dict(extra={"Origin": "null"})):
+            code, _, _ = self.decide(rid, "approve", **kw)
+            self.assertEqual(code, 403, kw)
+        self.assertEqual(self.broker._by_id[rid].status, "pending")     # nothing was decided
+        self.assertEqual(self.events("decided"), [])
+        self.assertEqual(len(self.events("csrf_refused")), 5)
+        # a token minted for another identity does not work
+        tok = self.broker.csrf_token("mallory")
+        self.assertEqual(self.decide(rid, "approve", csrf=tok)[0], 403)
+        # the legitimate browser path (same-origin) is accepted
+        ok = self.decide(rid, "approve", extra={"Origin": "https://secrets.example",
+                                                "Sec-Fetch-Site": "same-origin"})
+        self.assertEqual(ok[0], 303)
+
+    def test_wrong_user_is_forbidden(self):
+        rid = self.ask()
+        self.assertEqual(self.get(user="mallory")[0], 403)
+        self.assertEqual(self.decide(rid, "approve", user="mallory", csrf=self.broker.csrf_token("alice"))[0], 403)
+        self.assertEqual(self.broker._by_id[rid].status, "pending")
+
+    def test_double_decision_is_one_decision(self):
+        rid = self.ask()
+        self.assertEqual(self.decide(rid, "approve")[1], "/?note=approved")
+        self.assertEqual(self.decide(rid, "deny")[1], "/?note=stale")
+        self.assertEqual(self.decide("no-such-id", "approve")[1], "/?note=stale")
+        self.assertEqual(self.decide(rid, "maybe")[1], "/?note=stale")
+        self.assertEqual(len(self.events("decided")), 1)
+
+    def test_always_allow_from_the_dashboard_follows_the_same_rules(self):
+        rid = self.ask()
+        self.assertIn("approve_always", self.get()[1])
+        self.assertEqual(self.decide(rid, "approve_always")[1], "/?note=always")
+        self.assertEqual(self.broker.cfg["secrets"]["svc"]["approval"], "allow")
+        self.assertEqual(self.disk()["secrets"]["svc"]["approval"], "allow")
+
+    def test_fragment_version_changes_when_the_queue_changes(self):
+        def version():
+            return self.get("/?fragment=1")[1].split("data-version='")[1].split("'")[0]
+        empty = version()
+        rid = self.ask()
+        one = version()
+        self.assertNotEqual(empty, one)
+        self.decide(rid, "deny")
+        self.assertEqual(version(), empty)
+        self.assertNotIn("<nav>", self.get("/?fragment=1")[1])        # fragment only, no page shell
 
 
 class MultiValue(Harness):

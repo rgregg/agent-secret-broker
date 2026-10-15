@@ -196,6 +196,30 @@ An agent can add or rotate credentials, always with a fresh approval:
   vault has several) `backend.organization` / `backend.collection` to say where
   new items go. Use TLS in front of the client API: the value crosses it.
 
+## Approving from the web UI
+
+`/` on the approval listener is a live list of pending requests, each with
+**Approve**, **Deny** and (where the usual rules allow it) **Approve and always
+allow**. It is for when the phone is out of reach: open the site, sign in
+through your SSO, decide. New requests appear within a few seconds, the tab
+title shows how many are waiting, and with scripting disabled the same forms
+still work as ordinary page loads.
+
+It uses the same decision path as the push link (atomic claim, identity check,
+always-allow eligibility, audit), recorded with `channel: dashboard`. Because
+one signed-in session can now decide many requests, decisions are additionally
+protected against cross-site requests:
+
+- every decision carries a per-user token the page was rendered with, and a
+  request without it is refused and audited (`csrf_refused`);
+- `Origin` must match `approve_base_url` and `Sec-Fetch-Site` must be
+  same-origin, so set `approve_base_url` to the exact public URL of this site;
+- the page never contains a request's approval nonce (it decides by request id);
+- a per-response Content-Security-Policy allows only the page's own script
+  (`script-src` nonce), `connect-src 'self'`, and no framing.
+
+The standing-approvals form uses the same token.
+
 ## Request history
 
 `/history` on the approval listener (same SSO gate and identity check as the
