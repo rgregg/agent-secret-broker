@@ -67,9 +67,12 @@ class Request:
 
 
 class Broker:
-    def __init__(self, config, backend, notifier, audit=None, summarizer=None, config_path=None):
+    def __init__(self, config, backend, notifier, audit=None, summarizer=None):
         self.cfg = config
-        self._config_path = config_path
+        self.cfg["secrets"] = {}        # the catalog lives in the vault; see refresh_catalog()
+        self._catalog_at = 0.0
+        self._catalog_sig = None
+        self._refreshing = threading.Lock()
         self._cfg_lock = threading.Lock()
         self.summarizer = summarizer
         self.backend = backend
@@ -81,15 +84,85 @@ class Broker:
         self._denied_at = {}
         if hasattr(backend, "on_event"):
             backend.on_event = self.log
-        for name, sc in config["secrets"].items():
-            if sc.get("approval", "prompt") not in APPROVAL_VALUES:
-                raise ValueError(f"secret {name!r}: approval must be one of {APPROVAL_VALUES}")
         esc = config.get("risk", {}).get("escalate_auto_at")
         if esc is not None and esc not in risk_mod.LEVELS:
             raise ValueError(f"risk.escalate_auto_at must be one of {risk_mod.LEVELS}")
+        try:
+            self.refresh_catalog()
+        except Exception as e:  # noqa: BLE001 -- start anyway; requests retry the load
+            self.log("catalog_error", error=str(e)[:200])
         self.log("startup", policies={
             n: {"approval": sc.get("approval", "prompt"), "auto_modes": self._auto_modes(sc)}
-            for n, sc in sorted(config["secrets"].items())})
+            for n, sc in sorted(self.cfg["secrets"].items())})
+
+    # -- catalog (the vault is the source of truth) ---------------------------
+    CATALOG_TTL = 60            # a request refreshes if the catalog is older than this
+    CATALOG_BG_TTL = 300        # discovery serves the cache and refreshes in the background
+
+    @staticmethod
+    def _entry(item, meta):
+        """Validated in-memory secret entry from an item's broker metadata."""
+        name = meta.get("name") or re.sub(r"[^a-z0-9_-]+", "-", item.lower()).strip("-")[:41]
+        if not _NAME_RE.match(name or ""):
+            raise ValueError(f"cannot derive a secret name from {item!r}")
+        approval = meta.get("approval", "prompt")
+        if approval not in APPROVAL_VALUES:
+            raise ValueError(f"approval must be one of {APPROVAL_VALUES}")
+        hosts = meta.get("allowed_hosts")
+        if (not isinstance(hosts, list) or not 1 <= len(hosts) <= 10
+                or not all(isinstance(h, str) and _HOST_RE.match(h) for h in hosts)):
+            raise ValueError("allowed_hosts must be 1-10 plain hostnames")
+        raw_vars = meta.get("vars")
+        if not isinstance(raw_vars, dict) or not raw_vars:
+            raise ValueError("vars must be a non-empty object")
+        vars_ = {}
+        for var, ref in raw_vars.items():
+            ref = ref if isinstance(ref, dict) else {}
+            if not _VAR_RE.match(var):
+                raise ValueError(f"bad variable name {var!r}")
+            vars_[var] = {"item": ref.get("item") or item, "field": ref.get("field") or "auto"}
+            if ref.get("key"):
+                vars_[var]["key"] = str(ref["key"])
+        return name, {**meta, "vars": vars_, "allowed_hosts": [h.lower() for h in hosts],
+                      "approval": approval, "_item": item, "_meta": meta}
+
+    def refresh_catalog(self):
+        """Rebuild the secret catalog from the vault's items. Raises if the vault
+        cannot be read, leaving the previous catalog in place."""
+        if not hasattr(self.backend, "catalog"):
+            return
+        rows = self.backend.catalog()
+        out, bad = {}, []
+        for row in rows:
+            try:
+                if row["meta"] is None:
+                    raise ValueError("broker metadata is not a JSON object")
+                name, entry = self._entry(row["item"], row["meta"])
+                if name in out:
+                    raise ValueError(f"duplicate secret name {name!r}")
+                out[name] = entry
+            except ValueError as e:
+                bad.append({"item": row["item"], "reason": str(e)[:120]})
+        with self._cfg_lock:
+            self.cfg["secrets"] = out
+            self._catalog_at = time.time()
+        sig = json.dumps([sorted(out), bad], sort_keys=True)
+        if sig != self._catalog_sig:
+            self._catalog_sig = sig
+            self.log("catalog_loaded", count=len(out), names=sorted(out), invalid=bad)
+
+    def _refresh_if(self, stale_after, wait=True):
+        if time.time() - self._catalog_at <= stale_after:
+            return
+        if not self._refreshing.acquire(blocking=wait):
+            return
+        try:
+            if time.time() - self._catalog_at > stale_after:
+                self.refresh_catalog()
+        except Exception as e:  # noqa: BLE001 -- keep serving the last good catalog
+            self.log("catalog_error", error=str(e)[:200])
+        finally:
+            self._refreshing.release()
 
     # -- audit ------------------------------------------------------------
     def log(self, event, **fields):
@@ -147,8 +220,8 @@ class Broker:
         sc = self.cfg["secrets"][name]
         if sc.get("approval", "prompt") == "allow":
             return False, "already always-allowed"
-        if not self._config_path:
-            return False, "the broker has no config file to record this in"
+        if not hasattr(self.backend, "set_meta"):
+            return False, "the vault backend cannot record this"
         esc = self._escalate_at()
         if esc:
             if req.risk and risk_mod.rank(req.risk["level"]) >= risk_mod.rank(esc):
@@ -164,35 +237,12 @@ class Broker:
         return self.cfg.get("risk", {}).get("escalate_auto_at") or "medium"
 
     def _persist_approval(self, name, value, user):
-        def mutate(disk):
-            entry = disk["secrets"][name]
-            entry["approval"] = value
-            entry["approval_changed"] = {
-                "by": user, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
-        self._write_config(mutate)
-
-    def _write_config(self, mutate):
-        """Read-modify-write the config file atomically, preserving its mode."""
-        path = self._config_path
-        with open(path) as f:
-            disk = json.load(f)
-        mutate(disk)
-        mode = os.stat(path).st_mode & 0o777
-        tmp = f"{path}.tmp.{os.getpid()}"
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
-        try:
-            with os.fdopen(fd, "w") as f:
-                json.dump(disk, f, indent=2)
-                f.write("\n")
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp, path)
-        except BaseException:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
+        """Write the new policy into the item's broker metadata in the vault."""
+        sc = self.cfg["secrets"][name]
+        meta = {**sc["_meta"], "approval": value,
+                "approval_changed": {"by": user, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}}
+        self.backend.set_meta(sc["_item"], meta)
+        sc["_meta"] = meta
 
     def set_approval(self, name, value, user, peer=None, client_ip=None, request_id=None):
         """Change a secret's standing approval policy: file first, then memory."""
@@ -205,7 +255,7 @@ class Broker:
                 return True
             try:
                 self._persist_approval(name, value, user)
-            except (OSError, ValueError, KeyError) as e:
+            except (OSError, ValueError, KeyError, BackendError) as e:
                 self.log("policy_change_failed", secret=name, to=value, user=user,
                          request_id=request_id, error=str(e)[:200])
                 return False
@@ -218,7 +268,11 @@ class Broker:
     # -- discovery (no approval, no push, no values) ----------------------
     def available(self, host=None):
         """Secrets usable for `host` in http mode. Names and placeholder
-        variable names only; this never touches the backend or the notifier."""
+        variable names only; this never sends a notification or reads a value.
+        Serves the cached catalog and refreshes it in the background."""
+        if time.time() - self._catalog_at > self.CATALOG_BG_TTL:
+            threading.Thread(target=self._refresh_if, args=(self.CATALOG_BG_TTL, False),
+                             daemon=True).start()
         out = []
         for name, sc in sorted(self.cfg["secrets"].items()):
             hosts = sc.get("allowed_hosts") or []
@@ -231,6 +285,8 @@ class Broker:
     # -- request lifecycle ------------------------------------------------
     def create(self, mode, names, spec, source, peer=None):
         try:
+            self._refresh_if(0 if (mode != "store" and any(n not in self.cfg["secrets"] for n in names))
+                             else self.CATALOG_TTL)
             secrets_cfg = self.cfg["secrets"]
             if mode == "store":
                 self._validate_store(names, spec)
@@ -302,8 +358,8 @@ class Broker:
         if op == "create":
             if name in secrets_cfg:
                 raise ValueError(f"{name} already exists; use update")
-            if not self._config_path:
-                raise PermissionError("the broker has no config file to record a new secret in")
+            if not hasattr(self.backend, "catalog"):
+                raise PermissionError("this vault backend has no secret catalog")
             hosts = spec.get("allowed_hosts")
             if (not isinstance(hosts, list) or not 1 <= len(hosts) <= 10
                     or not all(isinstance(h, str) and _HOST_RE.match(h) for h in hosts)):
@@ -312,7 +368,8 @@ class Broker:
             spec["field"] = spec.get("field") or "notes"
             spec["item"] = spec.get("item") or name
             spec["var"] = spec.get("var") or re.sub(r"[^A-Za-z0-9]", "_", name).upper() + "_TOKEN"
-            if not _FIELD_RE.match(spec["field"]) or spec["field"] in ("previous_value", "previous_replaced_at"):
+            if not _FIELD_RE.match(spec["field"]) or spec["field"] in (
+                    "previous_value", "previous_replaced_at", "broker"):
                 raise ValueError("bad field name")
             if not _ITEM_RE.match(spec["item"]):
                 raise ValueError("bad item name")
@@ -490,29 +547,23 @@ class Broker:
         threading.Thread(target=run, daemon=True).start()
 
     def _store(self, req):
-        """Write the credential to the vault; for a create, also map it in the config."""
+        """Write the credential to the vault; a create also writes its catalog entry."""
         sp = req.spec
         name, by = req.names[0], req.approver or "unknown"
         if not hasattr(self.backend, "put"):
             raise BackendError("this backend cannot store credentials")
         t0 = time.time()
         if sp["op"] == "create":
-            self.backend.put(sp["item"], sp["field"], sp["value"], create=True)
-            entry = {"vars": {sp["var"]: {"item": sp["item"], "field": sp["field"]}},
-                     "allowed_hosts": sp["allowed_hosts"], "approval": "prompt"}
-            try:
-                with self._cfg_lock:
-                    stamp = {"by": by, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
-                    self._write_config(lambda disk: disk["secrets"].__setitem__(
-                        name, {**entry, "created": stamp}))
-                    self.cfg["secrets"][name] = {**entry, "created": stamp}
-            except Exception as e:  # noqa: BLE001
-                # no half-finished state: remove the item we just created
-                try:
-                    self.backend.delete(sp["item"])
-                except Exception:  # noqa: BLE001
-                    self.audit("store_rollback_failed", req, item=sp["item"])
-                raise BackendError(f"config not updated, vault change rolled back: {e}") from None
+            # One atomic vault write: the item, its value and its broker metadata
+            # (the catalog entry) are created together, so there is nothing to
+            # roll back and no second place to keep in sync.
+            stamp = {"by": by, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+            meta = {"name": name, "vars": {sp["var"]: {"field": sp["field"]}},
+                    "allowed_hosts": sp["allowed_hosts"], "approval": "prompt", "created": stamp}
+            self.backend.put(sp["item"], sp["field"], sp["value"], create=True, meta=meta)
+            _, entry = self._entry(sp["item"], meta)
+            with self._cfg_lock:
+                self.cfg["secrets"][name] = entry
         else:
             value = sp["value"]
             if sp.get("key"):                       # one key of a multi-value field
@@ -530,6 +581,8 @@ class Broker:
             return self._store(req)
         env, raw = {}, {}
         for n in req.names:
+            if n not in self.cfg["secrets"]:
+                raise BackendError(f"{n} is no longer in the vault catalog")
             for var, ref in self.cfg["secrets"][n]["vars"].items():
                 src = (ref["item"], ref.get("field") or "auto")
                 if src not in raw:                  # one vault read per item/field

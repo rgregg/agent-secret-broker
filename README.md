@@ -50,6 +50,45 @@ unless the listener on that port belongs to the process it started. Anyone who
 can already run code in the container could read the same state from the
 persistent `/bw` volume.
 
+## The vault is the catalog
+
+There is no list of secrets in a config file. A secret is a vault item that
+carries one custom text field named `broker`, holding a JSON object:
+
+    {"name": "grafana",
+     "allowed_hosts": ["grafana.example.com"],
+     "vars": {"GRAFANA_TOKEN": {"field": "notes"}},
+     "approval": "prompt"}
+
+- `name` is optional (default: the item name, lower-cased). `vars` maps each
+  placeholder variable to a `field` (`notes`, `password`, `username`, a custom
+  field name, or `auto`) and optionally a `key` inside a multi-value field
+  (below). `item` is implied to be the carrier item; set it only to pull a
+  variable from another item. `approval` is `prompt` (default) or `allow`.
+- Items without that field are invisible to the broker. One item carries one
+  secret; a secret may draw variables from other items.
+- The broker reads the catalog from the vault at startup, when a request
+  names an unknown secret, and when its cache is a minute old; `list` and
+  `which` serve the cache and refresh it in the background. Add or edit an item
+  in any Bitwarden client and the broker picks it up without a restart.
+  Entries that fail validation are skipped and listed in the `catalog_loaded`
+  audit event (fail closed).
+- `store` creates the item, its value and this metadata in one write, so there
+  is nothing to keep in sync and nothing to roll back. "Always allow" and
+  revoking it edit `approval` on the item, with who and when.
+- The settings that remain (vault URL, notify transports, risk threshold,
+  ports) are wiring, not a catalog. They come from the `BROKER_CONFIG`
+  environment variable (a JSON object, see `deploy/config.example.json`) and/or
+  `--config FILE`.
+- **Trust note:** because policy lives in vault items, anyone who can edit the
+  collection can widen a secret's `allowed_hosts` or set `approval: allow`
+  without passing the approval gate. Keep write access to that collection to
+  people you trust as much as the broker. (The broker's own account is
+  writable by design, so `store`/`update` can work.)
+- Moving from an older config file: `python -m secret_broker.import_catalog
+  --config /data/config.json [--apply]` writes each secret's metadata onto its
+  item (dry run by default).
+
 ## Policy, risk, discovery
 
 `list` and `which` never touch the vault or send a notification; each call is
@@ -118,7 +157,7 @@ An agent can add or rotate credentials, always with a fresh approval:
   `previous_value` field for rollback.
 - **Item types:** `--field password` creates a Login item and `--field notes`
   (the default) a Secure Note; any other name is a hidden custom field. In
-  `config.json` a var may omit `field` (or say `"auto"`): reads and updates then
+  the item's metadata a var may omit `field` (or say `"auto"`): reads and updates then
   use a Login's password or a Secure Note's text, whichever the item is.
 - **Several values in one item:** put `KEY=value` lines (or a JSON object) in
   the note, then map each value to its own variable with a `key`:
@@ -144,8 +183,8 @@ An agent can add or rotate credentials, always with a fresh approval:
 ## Always allow
 
 On the approval page, **Approve and always allow `NAME`** approves this request
-and records `"approval": "allow"` for that secret in the config file (atomically,
-mode preserved, with who and when), effective immediately. It is offered only
+and records `"approval": "allow"` in that secret's vault item metadata (with who
+and when), effective immediately. It is offered only
 when it would mean something:
 
 - HTTP mode only: the broker makes the call, so the value never leaves it. Never

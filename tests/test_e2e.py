@@ -86,14 +86,22 @@ class Harness(unittest.TestCase):
                                 "allowed_hosts": ["127.0.0.1"]}},
         }
         self.tweak(cfg)
+        # The vault is the catalog: each configured secret becomes broker
+        # metadata on the vault item that holds its value.
+        vault_path = os.path.join(d, "vault.json")
+        with open(vault_path) as f:
+            vault = json.load(f)
+        for item, rec in cfg.pop("_vault", {}).items():
+            vault.setdefault(item, {}).update(rec)
+        for name, sc in cfg.pop("secrets").items():
+            carrier = next(iter(sc["vars"].values()))["item"]
+            assert "broker" not in vault.get(carrier, {}), "one secret per vault item"
+            vault.setdefault(carrier, {})["broker"] = json.dumps({"name": name, **sc})
+        with open(vault_path, "w") as f:
+            json.dump(vault, f)
         self.notifier = FakeNotifier(on_send=self._phone)
         self.audit = os.path.join(d, "audit.jsonl")
-        self.config_path = os.path.join(d, "config.json")
-        with open(self.config_path, "w") as f:
-            json.dump(cfg, f)
-        os.chmod(self.config_path, 0o600)
-        self.broker = Broker(cfg, FileBackend(os.path.join(d, "vault.json")), self.notifier, self.audit,
-                             config_path=self.config_path)
+        self.broker = Broker(cfg, FileBackend(vault_path), self.notifier, self.audit)
         self.c, self.a = serve(self.broker, ("127.0.0.1", 0), ("127.0.0.1", 0), KEY)
         self.base = f"http://127.0.0.1:{self.c.server_address[1]}"
         self.abase = f"http://127.0.0.1:{self.a.server_address[1]}"
@@ -112,6 +120,15 @@ class Harness(unittest.TestCase):
 
     def events(self, name):
         return [r for r in self.records() if r["event"] == name]
+
+    def disk(self):
+        """The catalog as persisted in the vault (broker metadata of each item)."""
+        out = {}
+        for item, rec in self.broker.backend._data.items():
+            if "broker" in rec:
+                m = json.loads(rec["broker"])
+                out[m.get("name") or item.lower()] = m
+        return {"secrets": out}
 
     def _phone(self, url):
         """Simulates tapping the push, then the button, via the approval page."""
@@ -421,7 +438,8 @@ class NoVerdictFailsClosed(Harness):
 class MixedPolicy(Harness):
     def tweak(self, cfg):
         cfg["secrets"]["svc"]["approval"] = "allow"
-        cfg["secrets"]["locked"] = {"vars": {"LOCKED": {"item": "Svc", "field": "token"}},
+        cfg["_vault"] = {"Locked": {"token": SECRET}}
+        cfg["secrets"]["locked"] = {"vars": {"LOCKED": {"item": "Locked", "field": "token"}},
                                     "allowed_hosts": ["127.0.0.1"]}
 
     def test_any_prompt_secret_forces_prompt(self):
@@ -445,11 +463,55 @@ class MixedPolicy(Harness):
             self.assertNotIn("sensitivity", body)
 
 
-class BadPolicy(unittest.TestCase):
-    def test_unknown_approval_value_refuses_to_start(self):
-        cfg = {"secrets": {"x": {"vars": {}, "approval": "sometimes"}}}
-        with self.assertRaises(ValueError):
-            Broker(cfg, None, FakeNotifier())
+class CatalogFromVault(unittest.TestCase):
+    """The catalog is read from the vault; bad entries are skipped, not trusted."""
+
+    def make(self, vault):
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, "vault.json")
+        with open(path, "w") as f:
+            json.dump(vault, f)
+        audit = os.path.join(d, "audit.jsonl")
+        return Broker({"approve_base_url": "https://s.example"}, FileBackend(path), FakeNotifier(), audit), audit
+
+    def meta(self, **kw):
+        return json.dumps({"vars": {"T_TOKEN": {"field": "notes"}}, "allowed_hosts": ["api.example.com"], **kw})
+
+    def test_only_items_with_metadata_are_secrets(self):
+        b, _ = self.make({"Plain": {"notes": "x"}, "My API": {"notes": "y", "broker": self.meta()}})
+        self.assertEqual(sorted(b.cfg["secrets"]), ["my-api"])      # name derived from the item
+        self.assertEqual(b.cfg["secrets"]["my-api"]["vars"]["T_TOKEN"]["item"], "My API")
+
+    def test_invalid_metadata_is_skipped_and_audited_fail_closed(self):
+        b, audit = self.make({
+            "Bad approval": {"notes": "x", "broker": self.meta(approval="sometimes")},
+            "No hosts": {"notes": "x", "broker": json.dumps({"vars": {"T": {}}})},
+            "Wild": {"notes": "x", "broker": self.meta(allowed_hosts=["*.example.com"])},
+            "Garbage": {"notes": "x", "broker": "not json"},
+            "Good": {"notes": "x", "broker": self.meta()}})
+        self.assertEqual(sorted(b.cfg["secrets"]), ["good"])
+        with open(audit) as f:
+            ev = [json.loads(line) for line in f if '"catalog_loaded"' in line][0]
+        self.assertEqual(len(ev["invalid"]), 4)
+
+    def test_duplicate_names_keep_the_first_only(self):
+        b, _ = self.make({"A": {"notes": "x", "broker": self.meta(name="same")},
+                          "B": {"notes": "x", "broker": self.meta(name="same")}})
+        self.assertEqual(list(b.cfg["secrets"]), ["same"])
+
+    def test_a_vault_that_cannot_be_read_does_not_stop_startup(self):
+        class Down:
+            def catalog(self):
+                raise BackendError("vault down")
+        b = Broker({"approve_base_url": "https://s.example"}, Down(), FakeNotifier(), None)
+        self.assertEqual(b.cfg["secrets"], {})
+
+    def test_new_item_appears_without_restart(self):
+        b, _ = self.make({"Old": {"notes": "x", "broker": self.meta()}})
+        b.backend._data["Fresh"] = {"notes": "z", "broker": self.meta()}
+        b._catalog_at = 0
+        b._refresh_if(0)
+        self.assertEqual(sorted(b.cfg["secrets"]), ["fresh", "old"])
 
 
 class AuditTrail(Harness):
@@ -1037,10 +1099,6 @@ class AlwaysAllow(Harness):
         except urllib.error.HTTPError as e:
             return e.code, e.read().decode()
 
-    def disk(self):
-        with open(self.config_path) as f:
-            return json.load(f)
-
     def finish(self):
         list(self.broker._by_id.values())[-1].done.wait(10)
 
@@ -1052,11 +1110,9 @@ class AlwaysAllow(Harness):
         self.assertIn("Always allow saved", body)
         self.finish()
         d = self.disk()
-        self.assertEqual(d["secrets"]["svc"]["approval"], "allow")
+        self.assertEqual(d["secrets"]["svc"]["approval"], "allow")        # written to the vault item
         self.assertEqual(d["secrets"]["svc"]["approval_changed"]["by"], "alice")
-        self.assertEqual(d["ttl_seconds"], 30)                       # rest of the file untouched
-        self.assertEqual(oct(os.stat(self.config_path).st_mode & 0o777), "0o600")
-        self.assertEqual([f for f in os.listdir(os.path.dirname(self.config_path)) if ".tmp." in f], [])
+        self.assertEqual(d["secrets"]["svc"]["allowed_hosts"], ["127.0.0.1"])   # rest untouched
         self.assertEqual(self.broker.cfg["secrets"]["svc"]["approval"], "allow")
         ch = self.events("policy_changed")[0]
         self.assertEqual((ch["secret"], ch["from"], ch["to"], ch["user"]), ("svc", "prompt", "allow", "alice"))
@@ -1339,8 +1395,7 @@ class AutoCreate(Harness):
         self.assertEqual((r["status"], r["stored"]["name"]), ("approved", "autoapi"))
         self.assertEqual(self.notifier.sent, [])
         self.assertEqual(self.broker.backend._data["autoapi"]["notes"], self.NEW)
-        with open(self.config_path) as f:
-            sec = json.load(f)["secrets"]["autoapi"]
+        sec = self.disk()["secrets"]["autoapi"]
         self.assertEqual(sec.get("approval", "prompt"), "prompt")        # use still prompts
         self.assertEqual(sec["created"]["by"], "policy:auto-create")
         a = self.events("approved")[0]
@@ -1371,13 +1426,10 @@ class MultiValue(Harness):
                      "M_SECRET": {"item": "Multi", "key": "CLIENT_SECRET"},
                      "M_REGION": {"item": "Multi", "field": "notes", "key": "REGION"}},
             "allowed_hosts": ["127.0.0.1"]}
-        cfg["secrets"]["multibad"] = {
-            "vars": {"M_NOPE": {"item": "Multi", "field": "notes", "key": "NOPE"}},
-            "allowed_hosts": ["127.0.0.1"]}
 
     def setUp(self):
         super().setUp()
-        self.broker.backend._data["Multi"] = {"notes": self.DOTENV}
+        self.broker.backend._data["Multi"]["notes"] = self.DOTENV
 
     def test_keys_split_one_field_into_vars(self):
         code, body = self.create_env(("multi",))
@@ -1511,10 +1563,6 @@ class StoreFlow(Harness):
         _, b = self.api("GET", f"/v1/requests/{json.loads(body)['id']}?wait=5")
         return json.loads(b)
 
-    def disk(self):
-        with open(self.config_path) as f:
-            return json.load(f)
-
     def test_create_maps_secret_and_is_immediately_usable(self):
         code, body = self.store()
         self.assertEqual(code, 202)
@@ -1522,7 +1570,7 @@ class StoreFlow(Harness):
         self.assertEqual(r["stored"], {"name": "newapi", "op": "create", "item": "newapi", "field": "notes"})
         sec = self.disk()["secrets"]["newapi"]
         self.assertEqual(sec["allowed_hosts"], ["127.0.0.1"])
-        self.assertEqual(sec["vars"], {"NEWAPI_TOKEN": {"item": "newapi", "field": "notes"}})
+        self.assertEqual(sec["vars"], {"NEWAPI_TOKEN": {"field": "notes"}})   # item = the carrier
         self.assertEqual((sec["approval"], sec["created"]["by"]), ("prompt", "alice"))
         self.assertEqual(self.broker.backend._data["newapi"]["notes"], self.NEW)
         _, lst = self.api("GET", "/v1/secrets")
@@ -1556,8 +1604,7 @@ class StoreFlow(Harness):
         self.assertEqual(self.result(body)["status"], "released")      # results are handed out once
         with open(self.audit) as f:
             self.assertNotIn(self.NEW, f.read())
-        with open(self.config_path) as f:
-            self.assertNotIn(self.NEW, f.read())
+        self.assertNotIn(self.NEW, json.dumps(self.disk()))               # metadata never holds a value
         self.assertIsNone(req_.spec["value"])                           # wiped once settled
         st = self.events("stored")[0]
         self.assertEqual((st["op"], st["value_bytes"]), ("create", len(self.NEW)))
@@ -1611,15 +1658,13 @@ class StoreFlow(Harness):
         self.assertIn("[LOW]", self.notifier.sent[0]["title"])
         self.assertIn("[HIGH]", self.notifier.sent[1]["title"])
 
-    def test_config_failure_rolls_back_the_vault(self):
-        def boom(mutate):
-            raise OSError("disk full")
-        self.broker._write_config = boom
+    def test_vault_failure_leaves_no_catalog_entry(self):
+        def boom(*a, **k):
+            raise BackendError("vault down")
+        self.broker.backend.put = boom
         _, body = self.store()
         r = self.result(body)
         self.assertEqual(r["status"], "failed")
-        self.assertIn("rolled back", r["error"])
-        self.assertNotIn("newapi", self.broker.backend._data)
         self.assertNotIn("newapi", self.broker.cfg["secrets"])
         self.assertNotIn("newapi", self.disk()["secrets"])
 
@@ -1630,8 +1675,11 @@ class StoreFlow(Harness):
         self.assertNotIn("newapi", self.broker.backend._data)
         self.assertNotIn("newapi", self.disk()["secrets"])
 
-    def test_create_refused_without_a_config_file(self):
-        self.broker._config_path = None
+    def test_create_refused_when_the_backend_has_no_catalog(self):
+        class NoCatalog:
+            def put(self, *a, **k): pass
+            def get(self, *a, **k): return ""
+        self.broker.backend = NoCatalog()
         self.assertEqual(self.store()[0], 403)
 
 

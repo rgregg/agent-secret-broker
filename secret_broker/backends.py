@@ -14,6 +14,25 @@ class BackendError(Exception):
     pass
 
 
+# Every secret the broker may hand out is a vault item carrying one custom text
+# field with this name. Its value is a JSON object: allowed_hosts, vars,
+# approval, ... The vault is the catalog; there is no separate config file.
+META_FIELD = "broker"
+
+
+def _catalog_rows(pairs):
+    out = []
+    for item, raw in pairs:
+        if not raw:
+            continue
+        try:
+            meta = json.loads(raw)
+        except ValueError:
+            meta = None
+        out.append({"item": item, "meta": meta if isinstance(meta, dict) else None})
+    return out
+
+
 class FileBackend:
     """JSON file {item: {field: value}}. For tests and bootstrapping only."""
 
@@ -28,7 +47,7 @@ class FileBackend:
         except KeyError:
             raise BackendError(f"{item}/{field} not found")
 
-    def put(self, item, field, value, create=False, keep_previous=False):
+    def put(self, item, field, value, create=False, keep_previous=False, meta=None):
         if create and item in self._data:
             raise BackendError(f"item {item!r} already exists")
         if not create and item not in self._data:
@@ -38,6 +57,17 @@ class FileBackend:
         if keep_previous and field in rec:
             rec["previous_value"] = rec[field]
         rec[field] = value
+        if meta is not None:
+            rec[META_FIELD] = json.dumps(meta)
+
+    def catalog(self):
+        """[{"item", "meta"}] for every item that carries broker metadata."""
+        return _catalog_rows((item, rec.get(META_FIELD)) for item, rec in self._data.items())
+
+    def set_meta(self, item, meta):
+        if item not in self._data:
+            raise BackendError(f"item {item!r} not found")
+        self._data[item][META_FIELD] = json.dumps(meta)
 
     def delete(self, item):
         self._data.pop(item, None)
@@ -193,7 +223,20 @@ class BwBackend:
         return self._target_ids
 
     @staticmethod
-    def _template(item, field, value, org, coll):
+    def _template(item, field, value, org, coll, meta=None):
+        obj = BwBackend._template_base(item, field, value, org, coll)
+        if meta is not None:
+            BwBackend._with_meta(obj, meta)
+        return obj
+
+    @staticmethod
+    def _with_meta(obj, meta):
+        fields = [f for f in (obj.get("fields") or []) if f.get("name") != META_FIELD]
+        fields.append({"name": META_FIELD, "value": json.dumps(meta, separators=(",", ":")), "type": 0})
+        obj["fields"] = fields
+
+    @staticmethod
+    def _template_base(item, field, value, org, coll):
         base = {"organizationId": org, "collectionIds": [coll], "folderId": None,
                 "favorite": False, "name": item, "reprompt": 0}
         if field == "password":
@@ -241,11 +284,12 @@ class BwBackend:
         args = [verb, "item"] + ([item_id] if item_id else []) + ["--session", self._session]
         return self._run(*args, stdin=enc)
 
-    def put(self, item, field, value, create=False, keep_previous=False):
-        """Create a new item, or replace one field of an existing item."""
+    def put(self, item, field, value, create=False, keep_previous=False, meta=None):
+        """Create a new item (with its broker metadata), or replace one field of
+        an existing item."""
         with self._lock:
             try:
-                self._put_locked(item, field, value, create, keep_previous)
+                self._put_locked(item, field, value, create, keep_previous, meta)
             except BackendError as e:
                 msg = str(e).lower()
                 if any(t in msg for t in ("already exists", "not found", "no rights",
@@ -254,15 +298,15 @@ class BwBackend:
                 # the session may have been invalidated behind our back (another
                 # bw process on the same state dir): start clean once and retry
                 self._session, self._synced, self._target_ids = None, 0.0, None
-                self._put_locked(item, field, value, create, keep_previous)
+                self._put_locked(item, field, value, create, keep_previous, meta)
 
-    def _put_locked(self, item, field, value, create, keep_previous):
+    def _put_locked(self, item, field, value, create, keep_previous, meta=None):
         existing = self._find(item)
         if create:
             if existing is not None:
                 raise BackendError(f"item {item!r} already exists")
             org, coll = self._resolve_target()
-            self._submit("create", self._template(item, field, value, org, coll))
+            self._submit("create", self._template(item, field, value, org, coll, meta))
         else:
             if existing is None:
                 raise BackendError(f"item {item!r} not found")
@@ -270,6 +314,45 @@ class BwBackend:
             self._submit("edit", existing, existing["id"])
         self._synced = 0.0
         self._touch()
+
+    # -- catalog ----------------------------------------------------------
+    def _list_items(self):
+        return json.loads(self._run("list", "items", "--session", self._session))
+
+    def catalog(self):
+        """[{"item", "meta"}] for every item in the vault that carries broker
+        metadata. Sees current state (it syncs if the cache is old)."""
+        with self._lock:
+            for attempt in (1, 2):
+                try:
+                    if self._session is None:
+                        self._unlock()
+                    if time.time() - self._synced > self._sync_interval:
+                        self._sync()
+                    items = self._list_items()
+                    break
+                except BackendError:
+                    if attempt == 2:
+                        raise
+                    self._session, self._synced = None, 0.0
+            self._touch()
+        rows = []
+        for it in items:
+            raw = next((f.get("value") for f in it.get("fields") or []
+                        if f.get("name") == META_FIELD), None)
+            rows.append((it["name"], raw))
+        return _catalog_rows(rows)
+
+    def set_meta(self, item, meta):
+        """Replace the broker metadata of an existing item."""
+        with self._lock:
+            existing = self._find(item)
+            if existing is None:
+                raise BackendError(f"item {item!r} not found")
+            self._with_meta(existing, meta)
+            self._submit("edit", existing, existing["id"])
+            self._synced = 0.0
+            self._touch()
 
     def delete(self, item):
         """Permanently delete an item (used to roll back a half-finished create)."""
@@ -469,6 +552,9 @@ class BwServeBackend(BwBackend):
 
     def _list_orgs(self):
         return (self._http("GET", "/list/object/organizations") or {}).get("data") or []
+
+    def _list_items(self):
+        return (self._http("GET", "/list/object/items") or {}).get("data") or []
 
     def _list_collections(self, org):
         path = "/list/object/collections?organizationId=" + urllib.parse.quote(org)
