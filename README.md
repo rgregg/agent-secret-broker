@@ -67,6 +67,9 @@ carries one custom text field named `broker`, holding a JSON object:
   another item, or the reserved `broker`/`previous_value` fields, is rejected),
   so metadata on one item can never pull another item's value. `approval` is
   `prompt` (default) or `allow`.
+- `allowed_hosts` may be omitted for credentials that are not HTTP tokens (a
+  Wi-Fi password): such a secret can never be used in `http` mode, only fetched
+  with approval in env mode.
 - Items without that field are invisible to the broker. One item carries one
   secret. If two items claim the same secret name, *both* are dropped and the
   conflict is audited, so a look-alike item cannot shadow a real one.

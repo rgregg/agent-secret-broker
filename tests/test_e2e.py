@@ -485,7 +485,7 @@ class CatalogFromVault(unittest.TestCase):
     def test_invalid_metadata_is_skipped_and_audited_fail_closed(self):
         b, audit = self.make({
             "Bad approval": {"notes": "x", "broker": self.meta(approval="sometimes")},
-            "No hosts": {"notes": "x", "broker": json.dumps({"vars": {"T": {}}})},
+            "Bad var": {"notes": "x", "broker": json.dumps({"vars": {"lower": {}}, "allowed_hosts": []})},
             "Wild": {"notes": "x", "broker": self.meta(allowed_hosts=["*.example.com"])},
             "Garbage": {"notes": "x", "broker": "not json"},
             "Good": {"notes": "x", "broker": self.meta()}})
@@ -493,6 +493,13 @@ class CatalogFromVault(unittest.TestCase):
         with open(audit) as f:
             ev = [json.loads(line) for line in f if '"catalog_loaded"' in line][0]
         self.assertEqual(len(ev["invalid"]), 4)
+
+    def test_no_hosts_means_env_only_never_http(self):
+        b, _ = self.make({"Wifi": {"notes": "pw", "broker": json.dumps({"vars": {"WIFI_PW": {}}})}})
+        self.assertEqual(b.cfg["secrets"]["wifi"]["allowed_hosts"], [])
+        with self.assertRaises(PermissionError):
+            b.create("http", ["wifi"], {"method": "GET", "url": "https://x.example/", "headers": {},
+                                       "body": None}, "t")
 
     def test_duplicate_names_drop_every_claimant(self):
         # first-wins would let a look-alike item shadow a real secret

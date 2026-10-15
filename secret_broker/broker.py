@@ -108,10 +108,12 @@ class Broker:
         approval = meta.get("approval", "prompt")
         if approval not in APPROVAL_VALUES:
             raise ValueError(f"approval must be one of {APPROVAL_VALUES}")
-        hosts = meta.get("allowed_hosts")
-        if (not isinstance(hosts, list) or not 1 <= len(hosts) <= 10
+        # No hosts = not an HTTP credential (a Wi-Fi password, say): it can never
+        # be used in http mode, only fetched with approval in env mode.
+        hosts = meta.get("allowed_hosts") or []
+        if (not isinstance(hosts, list) or len(hosts) > 10
                 or not all(isinstance(h, str) and _HOST_RE.match(h) for h in hosts)):
-            raise ValueError("allowed_hosts must be 1-10 plain hostnames")
+            raise ValueError("allowed_hosts must be up to 10 plain hostnames")
         raw_vars = meta.get("vars")
         if not isinstance(raw_vars, dict) or not raw_vars:
             raise ValueError("vars must be a non-empty object")
