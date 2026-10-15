@@ -677,6 +677,58 @@ class ResolvedHook(Harness):
         self.assertEqual([s for _, s in self.notifier.resolutions], ["approved"])
 
 
+class BwBackendState(unittest.TestCase):
+    """The real CLI refuses `config server` once logged in; the backend must cope."""
+
+    def setUp(self):
+        d = tempfile.mkdtemp()
+        self.state = os.path.join(d, "state")
+        os.mkdir(self.state)
+        item = {"name": "Thing", "notes": "tok\n"}
+        self.bw = os.path.join(d, "bw")
+        with open(self.bw, "w") as f:
+            f.write(f"""#!/bin/sh
+S={self.state}
+case "$1" in
+  status) if [ -e $S/in ]; then if [ -e $S/unlocked ]; then echo '{{"status":"unlocked"}}'; else echo '{{"status":"locked"}}'; fi
+          else echo '{{"status":"unauthenticated"}}'; fi;;
+  config) if [ -e $S/in ]; then echo "Logout required before server config update." >&2; exit 1; fi;;
+  login) touch $S/in;;
+  lock) rm -f $S/unlocked;;
+  unlock) if [ ! -e $S/in ]; then echo "not logged in" >&2; exit 1; fi; sleep 0.2; touch $S/unlocked; echo SESSION;;
+  sync) ;;
+  get) cat <<'EOF'
+{json.dumps(item)}
+EOF
+;;
+esac
+""")
+        os.chmod(self.bw, 0o755)
+        self.pw = os.path.join(d, "pw")
+        open(self.pw, "w").write("master")
+
+    def backend(self):
+        return BwBackend("https://vault.example", self.pw, bw=self.bw)
+
+    def test_new_process_with_existing_login_state(self):
+        self.assertEqual(self.backend().get("Thing", "notes"), "tok")
+        # second "process" (new object) sees an already logged-in, unlocked CLI
+        self.assertEqual(self.backend().get("Thing", "notes"), "tok")
+
+    def test_concurrent_gets_on_one_backend(self):
+        b, out, errs = self.backend(), [], []
+
+        def go():
+            try:
+                out.append(b.get("Thing", "notes"))
+            except Exception as e:  # noqa: BLE001
+                errs.append(e)
+        ts = [threading.Thread(target=go) for _ in range(6)]
+        [t.start() for t in ts]
+        [t.join() for t in ts]
+        self.assertEqual((errs, out), ([], ["tok"] * 6))
+
+
 class BwBackendParsing(unittest.TestCase):
     """BwBackend against a fake `bw` executable (no network, no real vault)."""
 
@@ -707,6 +759,47 @@ class BwBackendParsing(unittest.TestCase):
         self.assertEqual(self.b.get("Thing", "key"), "custom-val")
         with self.assertRaises(BackendError):
             self.b.get("Thing", "nope")
+
+
+class SlowBackend(FileBackend):
+    reads = 0
+
+    def get(self, item, field):
+        SlowBackend.reads += 1
+        time.sleep(0.6)
+        return super().get(item, field)
+
+
+class DoubleSubmit(Harness):
+    decision = None
+
+    def setUp(self):
+        super().setUp()
+        SlowBackend.reads = 0
+        self.broker.backend = SlowBackend(os.path.join(os.path.dirname(self.audit), "vault.json"))
+
+    def test_concurrent_approvals_release_once(self):
+        self.create_env()
+        nonce = next(iter(self.broker._by_id.values())).nonce
+        hdr = {"X-authentik-username": "alice"}
+        data = urllib.parse.urlencode({"decision": "approve"}).encode()
+        codes = []
+
+        def post():
+            try:
+                r = urllib.request.urlopen(urllib.request.Request(
+                    self.abase + f"/a/{nonce}", data=data, headers=hdr, method="POST"), timeout=10)
+                codes.append(r.status)
+            except urllib.error.HTTPError as e:
+                codes.append(e.code)
+        ts = [threading.Thread(target=post) for _ in range(2)]
+        [t.start() for t in ts]
+        [t.join() for t in ts]
+        self.assertEqual(sorted(codes), [200, 404])
+        self.assertEqual(SlowBackend.reads, 1)
+        self.assertEqual(len(self.events("approved")), 1)
+        self.assertEqual(self.events("failed"), [])
+        self.assertEqual(len(self.events("approval_stale")), 1)
 
 
 class Cli(Harness):

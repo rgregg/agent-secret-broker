@@ -232,7 +232,7 @@ class Broker:
 
     def _finish(self, req, status, error=None, result=None, **extra):
         with self._lock:
-            if req.status != "pending":
+            if req.status not in ("pending", "deciding"):
                 return False
             req.status, req.error, req.result = status, error, result
         if status == "denied":
@@ -248,9 +248,13 @@ class Broker:
 
     def decide(self, nonce, approve, user, peer=None, client_ip=None):
         with self._lock:
-            req = self._by_nonce.get(nonce)
             self._expire_locked()
-        if req is None or req.status != "pending":
+            req = self._by_nonce.get(nonce)
+            if req is not None and req.status == "pending":
+                req.status = "deciding"      # claim it: a second submit must not also act
+            else:
+                req = None
+        if req is None:
             self.log("approval_stale", user=user, peer=peer, client_ip=client_ip, approve=approve)
             return None
         who = {"via": "user", "approver": user, "approver_peer": peer, "approver_ip": client_ip}
