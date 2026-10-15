@@ -14,7 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from secret_broker import audit as audit_mod  # noqa: E402
 from secret_broker import risk as risk_mod  # noqa: E402
-from secret_broker.backends import FileBackend  # noqa: E402
+from secret_broker.backends import BackendError, BwBackend, FileBackend  # noqa: E402
 from secret_broker.broker import Broker, serve  # noqa: E402
 from secret_broker import notify as notify_mod  # noqa: E402
 from secret_broker.notify import FakeNotifier, NotifyError  # noqa: E402
@@ -675,6 +675,38 @@ class ResolvedHook(Harness):
                 break
             time.sleep(0.05)
         self.assertEqual([s for _, s in self.notifier.resolutions], ["approved"])
+
+
+class BwBackendParsing(unittest.TestCase):
+    """BwBackend against a fake `bw` executable (no network, no real vault)."""
+
+    def setUp(self):
+        d = tempfile.mkdtemp()
+        item = {"name": "Thing", "notes": "tok-value\n\n",
+                "login": {"username": "u", "password": "p4ss"},
+                "fields": [{"name": "key", "value": "custom-val", "type": 1}]}
+        self.bw = os.path.join(d, "bw")
+        with open(self.bw, "w") as f:
+            f.write("#!/bin/sh\n"
+                    'case "$1" in\n'
+                    '  status) echo \'{"status":"unauthenticated"}\';;\n'
+                    '  unlock) echo SESSIONKEY;;\n'
+                    "  get) cat <<'EOF'\n" + json.dumps(item) + "\nEOF\n;;\n"
+                    "  *) ;;\n"
+                    "esac\n")
+        os.chmod(self.bw, 0o755)
+        self.pw = os.path.join(d, "pw")
+        with open(self.pw, "w") as f:
+            f.write("master\n")
+        self.b = BwBackend("https://vault.example", self.pw, bw=self.bw)
+
+    def test_fields(self):
+        self.assertEqual(self.b.get("Thing", "notes"), "tok-value")      # trailing newlines stripped
+        self.assertEqual(self.b.get("Thing", "password"), "p4ss")
+        self.assertEqual(self.b.get("Thing", "username"), "u")
+        self.assertEqual(self.b.get("Thing", "key"), "custom-val")
+        with self.assertRaises(BackendError):
+            self.b.get("Thing", "nope")
 
 
 class Cli(Harness):

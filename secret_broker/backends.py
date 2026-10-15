@@ -61,7 +61,8 @@ class BwBackend:
         if field == "username" and obj.get("login"):
             return obj["login"]["username"]
         if field == "notes":
-            return obj.get("notes") or ""
+            # secure notes are free text; a trailing newline would corrupt a header
+            return (obj.get("notes") or "").strip()
         for f in obj.get("fields") or []:
             if f.get("name") == field:
                 return f.get("value") or ""
