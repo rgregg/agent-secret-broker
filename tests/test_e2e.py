@@ -393,10 +393,16 @@ class MixedPolicy(Harness):
         self.assertEqual(len(self.notifier.sent), 1)
         self.assertEqual(self.events("approved")[0]["via"], "user")
 
-    def test_discovery_reports_policy(self):
-        _, body = self.api("GET", "/v1/secrets?host=127.0.0.1")
-        pol = {s["name"]: s["approval"] for s in json.loads(body)["secrets"]}
-        self.assertEqual(pol, {"locked": "prompt", "svc": "allow"})
+    def test_discovery_does_not_reveal_policy(self):
+        # whether a credential prompts must not influence which one is chosen
+        for path in ("/v1/secrets", "/v1/secrets?host=127.0.0.1"):
+            _, body = self.api("GET", path)
+            names = {s["name"] for s in json.loads(body)["secrets"]}
+            self.assertEqual(names, {"locked", "svc"})
+            for s in json.loads(body)["secrets"]:
+                self.assertEqual(set(s), {"name", "vars", "allowed_hosts"})
+            self.assertNotIn("allow", body)
+            self.assertNotIn("sensitivity", body)
 
 
 class BadPolicy(unittest.TestCase):
@@ -1014,10 +1020,10 @@ class Cli(Harness):
     def test_list_text_and_json(self):
         p = self.run_cli("list")
         self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertEqual(p.stdout.strip(), "svc\tSVC_TOKEN\t127.0.0.1\tprompt")
+        self.assertEqual(p.stdout.strip(), "svc\tSVC_TOKEN\t127.0.0.1")
         pj = self.run_cli("list", "--json")
         self.assertEqual(json.loads(pj.stdout), [
-            {"name": "svc", "vars": ["SVC_TOKEN"], "allowed_hosts": ["127.0.0.1"], "approval": "prompt"}])
+            {"name": "svc", "vars": ["SVC_TOKEN"], "allowed_hosts": ["127.0.0.1"]}])
         self.assertNotIn(SECRET, p.stdout + pj.stdout)
         self.assertEqual(self.notifier.sent, [])           # no push, no request
         self.assertEqual(self.broker._by_id, {})

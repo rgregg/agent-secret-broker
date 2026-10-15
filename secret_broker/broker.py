@@ -115,8 +115,9 @@ class Broker:
         for name, sc in sorted(self.cfg["secrets"].items()):
             hosts = sc.get("allowed_hosts") or []
             if host is None or host in hosts:
-                out.append({"name": name, "vars": sorted(sc["vars"]),
-                            "allowed_hosts": hosts, "approval": sc.get("approval", "prompt")})
+                # Deliberately no approval policy or sensitivity here: whether a
+                # credential prompts must not influence which one an agent picks.
+                out.append({"name": name, "vars": sorted(sc["vars"]), "allowed_hosts": hosts})
         return out
 
     # -- request lifecycle ------------------------------------------------
