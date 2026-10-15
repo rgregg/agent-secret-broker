@@ -539,6 +539,19 @@ class Broker:
         req.done.set()
         return True
 
+    def peer_trusted(self, peer):
+        """`approval_trusted_peers`: CIDRs the approval listener will answer.
+        The listener trusts the identity header, so it should only ever hear
+        from the SSO proxy; unset means no restriction (network isolation)."""
+        nets = self.cfg.get("approval_trusted_peers")
+        if not nets:
+            return True
+        try:
+            ip = ipaddress.ip_address(peer)
+            return any(ip in ipaddress.ip_network(n, strict=False) for n in nets)
+        except ValueError:
+            return False
+
     def csrf_token(self, user):
         """Token a page must echo back with a decision. Bound to the identity, so
         one user's page cannot be replayed by another session."""
@@ -1047,6 +1060,11 @@ def approval_handler(broker):
             return (self.headers.get("X-Forwarded-For", "").split(",")[0].strip()[:64]) or None
 
         def _user(self):
+            if not broker.peer_trusted(self.client_address[0]):
+                broker.log("approval_forbidden", reason="peer is not a trusted proxy",
+                           peer=self.client_address[0], client_ip=self._fwd(), method=self.command)
+                _page(self, 403, "<h1>Forbidden</h1>", nav=False)
+                return None
             user = self.headers.get(cfg.get("identity_header", "X-authentik-username"), "")
             if user != cfg["allowed_user"]:
                 broker.log("approval_forbidden", claimed_user=user[:80], peer=self.client_address[0],

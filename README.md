@@ -220,6 +220,14 @@ protected against cross-site requests:
 
 The standing-approvals form uses the same token.
 
+The approval listener trusts the identity header, so it must only ever hear from
+your SSO proxy. Besides not publishing its port, set
+`"approval_trusted_peers": ["172.23.0.0/16"]` (the proxy's network) and it
+refuses every other peer with a 403 before looking at any header. This matters
+more now that the dashboard can decide many requests: a caller that could reach
+the listener and forge the header would otherwise be able to list and approve
+them all.
+
 ## Request history
 
 `/history` on the approval listener (same SSO gate and identity check as the

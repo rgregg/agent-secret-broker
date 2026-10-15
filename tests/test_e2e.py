@@ -1781,6 +1781,27 @@ class Dashboard(Harness):
         self.assertNotIn("<nav>", self.get("/?fragment=1")[1])        # fragment only, no page shell
 
 
+class TrustedPeers(Harness):
+    decision = None
+
+    def test_untrusted_peer_gets_nothing_even_with_the_right_identity(self):
+        self.broker.cfg["approval_trusted_peers"] = ["10.9.9.0/24"]
+        for path in ("/", "/history", "/policies"):
+            self.assertEqual(req(self.abase + path, headers={"X-authentik-username": "alice"})[0], 403)
+        rid = json.loads(self.create_env()[1])["id"]
+        nonce = self.broker._by_id[rid].nonce
+        self.assertEqual(req(self.abase + f"/a/{nonce}", headers={"X-authentik-username": "alice"})[0], 403)
+        self.assertEqual(self.broker._by_id[rid].status, "pending")
+        self.assertEqual(self.events("approval_forbidden")[0]["reason"], "peer is not a trusted proxy")
+
+    def test_trusted_peer_and_default(self):
+        self.assertEqual(req(self.abase + "/", headers={"X-authentik-username": "alice"})[0], 200)  # unset
+        self.broker.cfg["approval_trusted_peers"] = ["127.0.0.0/8"]
+        self.assertEqual(req(self.abase + "/", headers={"X-authentik-username": "alice"})[0], 200)
+        self.broker.cfg["approval_trusted_peers"] = ["not-a-cidr"]
+        self.assertEqual(req(self.abase + "/", headers={"X-authentik-username": "alice"})[0], 403)
+
+
 class MultiValue(Harness):
     """Several values in one vault field, selected with a `key` on the var."""
     DOTENV = "# creds\nCLIENT_ID=abc\nCLIENT_SECRET: \"s3cr3t\"\nREGION=us-east-1\n"
