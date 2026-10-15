@@ -326,7 +326,7 @@ class Broker:
             if var not in vars_:
                 raise ValueError(f"{name} has no variable {var}")
             ref = vars_[var]
-            spec["var"], spec["item"], spec["field"] = var, ref["item"], ref["field"]
+            spec["var"], spec["item"], spec["field"] = var, ref["item"], ref.get("field") or "auto"
         else:
             raise ValueError("op must be create or update")
 
@@ -511,7 +511,7 @@ class Broker:
         env = {}
         for n in req.names:
             for var, ref in self.cfg["secrets"][n]["vars"].items():
-                env[var] = self.backend.get(ref["item"], ref["field"])
+                env[var] = self.backend.get(ref["item"], ref.get("field") or "auto")
             self.audit("secret_read", req, secret=n, vars=sorted(self.cfg["secrets"][n]["vars"]))
         if req.mode == "env":
             return {"env": env}

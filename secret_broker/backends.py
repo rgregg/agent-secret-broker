@@ -186,8 +186,15 @@ class BwBackend:
                 "fields": [{"name": field, "value": value, "type": 1}]}
 
     @staticmethod
+    def _auto_field(obj):
+        """The natural secret field of an item: a login's password, else the note."""
+        return "password" if obj.get("login") is not None else "notes"
+
+    @staticmethod
     def _apply(obj, field, value, keep_previous):
         old = None
+        if field in (None, "", "auto"):
+            field = BwBackend._auto_field(obj)
         if field == "password" and obj.get("login") is not None:
             old = obj["login"].get("password")
             obj["login"]["password"] = value
@@ -265,6 +272,8 @@ class BwBackend:
                 self._unlock()
                 obj = self._fetch(item)
             self._touch()
+        if field in (None, "", "auto"):
+            field = self._auto_field(obj)
         if field == "password" and obj.get("login"):
             return obj["login"]["password"]
         if field == "username" and obj.get("login"):

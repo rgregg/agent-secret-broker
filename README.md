@@ -93,6 +93,10 @@ An agent can add or rotate credentials, always with a fresh approval:
 - **`update` replaces** the value of an existing secret's field. Hosts and
   mapping cannot change, and the replaced value is kept in the item's
   `previous_value` field for rollback.
+- **Item types:** `--field password` creates a Login item and `--field notes`
+  (the default) a Secure Note; any other name is a hidden custom field. In
+  `config.json` a var may omit `field` (or say `"auto"`): reads and updates then
+  use a Login's password or a Secure Note's text, whichever the item is.
 - **Never auto-approved**, regardless of a secret's `approval` policy, and never
   eligible for "always allow". Risk is `medium` for create and `high` for update.
 - **No half-finished state:** if the config cannot be written after a create, the

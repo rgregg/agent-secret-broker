@@ -1187,6 +1187,19 @@ class BwBackendWrites(unittest.TestCase):
             self.assertEqual((it[k]["organizationId"], it[k]["collectionIds"]), ("org1", ["col1"]))
         self.assertEqual(self.b.get("C", "api_key"), "c-val")           # readable straight away
 
+    def test_auto_field_follows_item_type(self):
+        self.b.put("Note", "notes", "n-val", create=True)
+        self.b.put("Login", "password", "p-val", create=True)
+        for f in ("auto", None, ""):
+            self.assertEqual(self.b.get("Note", f), "n-val")
+            self.assertEqual(self.b.get("Login", f), "p-val")
+        self.b.put("Note", "auto", "n2", create=False)
+        self.b.put("Login", "auto", "p2", create=False, keep_previous=True)
+        it = self.items()
+        self.assertEqual(it["Note"]["notes"], "n2")
+        self.assertEqual(it["Login"]["login"]["password"], "p2")
+        self.assertEqual({f["name"]: f["value"] for f in it["Login"]["fields"]}["previous_value"], "p-val")
+
     def test_duplicate_create_refused(self):
         self.b.put("A", "notes", "1", create=True)
         with self.assertRaises(BackendError):
