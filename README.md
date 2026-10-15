@@ -2,7 +2,7 @@
 
 Give a CLI agent (Claude Code, scripts, anything that shells out) access to
 credentials **only after a human approves each use** on their phone, with a full
-audit trail. Self-hosted, standard library only, no MCP.
+audit trail. Self-hosted, no MCP.
 
     agent                         broker                          you
       | secret-run http NAME ...    |                              |
