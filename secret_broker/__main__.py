@@ -55,7 +55,8 @@ def main():
             _read(sc["api_key_file"]), sc["model"], timeout=sc.get("timeout", 4.0),
             max_content_chars=sc.get("max_content_chars", 300),
             send_content=sc.get("send_content", True))
-    broker = Broker(cfg, backend, notifier, audit=cfg.get("audit_log"), summarizer=summarizer)
+    broker = Broker(cfg, backend, notifier, audit=cfg.get("audit_log"), summarizer=summarizer,
+                    background_load=True)
     bind = os.environ.get("BIND", "0.0.0.0")
     serve(broker,
           (bind, int(cfg.get("client_port", 8800))),

@@ -73,7 +73,8 @@ class Request:
 
 
 class Broker:
-    def __init__(self, config, backend, notifier, audit=None, summarizer=None):
+    def __init__(self, config, backend, notifier, audit=None, summarizer=None,
+                 background_load=False):
         self.cfg = config
         self.cfg["secrets"] = {}        # the catalog lives in the vault; see refresh_catalog()
         self._catalog_at = 0.0
@@ -95,13 +96,25 @@ class Broker:
         esc = config.get("risk", {}).get("escalate_auto_at")
         if esc is not None and esc not in risk_mod.LEVELS:
             raise ValueError(f"risk.escalate_auto_at must be one of {risk_mod.LEVELS}")
+        if background_load:
+            # Listen right away; the first requests wait on the same lock.
+            self._refreshing.acquire()
+            threading.Thread(target=self._initial_load, daemon=True).start()
+        else:
+            self._initial_load(locked=False)
+
+    def _initial_load(self, locked=True):
         try:
-            self.refresh_catalog()
-        except Exception as e:  # noqa: BLE001 -- start anyway; requests retry the load
-            self.log("catalog_error", error=str(e)[:200])
-        self.log("startup", policies={
-            n: {"approval": sc.get("approval", "prompt"), "auto_modes": self._auto_modes(sc)}
-            for n, sc in sorted(self.cfg["secrets"].items())})
+            try:
+                self.refresh_catalog()
+            except Exception as e:  # noqa: BLE001 -- start anyway; requests retry the load
+                self.log("catalog_error", error=str(e)[:200])
+            self.log("startup", policies={
+                n: {"approval": sc.get("approval", "prompt"), "auto_modes": self._auto_modes(sc)}
+                for n, sc in sorted(self.cfg["secrets"].items())})
+        finally:
+            if locked:
+                self._refreshing.release()
 
     # -- catalog (the vault is the source of truth) ---------------------------
     CATALOG_TTL = 60            # a request refreshes if the catalog is older than this
@@ -323,7 +336,9 @@ class Broker:
         """Secrets usable for `host` in http mode. Names and placeholder
         variable names only; this never sends a notification or reads a value.
         Serves the cached catalog and refreshes it in the background."""
-        if time.time() - self._catalog_at > self.CATALOG_BG_TTL:
+        if self._catalog_at == 0.0:
+            self._refresh_if(0, wait=True)   # first load still running: wait for it
+        elif time.time() - self._catalog_at > self.CATALOG_BG_TTL:
             threading.Thread(target=self._refresh_if, args=(self.CATALOG_BG_TTL, False),
                              daemon=True).start()
         out = []

@@ -531,6 +531,28 @@ class CatalogFromVault(unittest.TestCase):
         b = Broker({"approve_base_url": "https://s.example"}, Down(), FakeNotifier(), None)
         self.assertEqual(b.cfg["secrets"], {})
 
+    def test_background_load_returns_at_once_and_requests_wait_for_it(self):
+        import threading, time as _t
+        gate = threading.Event()
+
+        class Slow:
+            def catalog(self):
+                gate.wait(5)
+                return [{"item": "A", "meta": {"name": "a", "allowed_hosts": ["h.example"],
+                                               "vars": {"V": {"field": "notes"}}}}]
+        t0 = _t.time()
+        b = Broker({"approve_base_url": "https://s.example"}, Slow(), FakeNotifier(), None,
+                   background_load=True)
+        self.assertLess(_t.time() - t0, 1)          # constructor did not wait for the vault
+        out = []
+        th = threading.Thread(target=lambda: out.append(b.available("h.example")))
+        th.start()
+        _t.sleep(0.2)
+        self.assertTrue(th.is_alive())              # discovery waits instead of answering []
+        gate.set()
+        th.join(5)
+        self.assertEqual([r["name"] for r in out[0]], ["a"])
+
     def test_new_item_appears_without_restart(self):
         b, _ = self.make({"Old": {"notes": "x", "broker": self.meta()}})
         b.backend._data["Fresh"] = {"notes": "z", "broker": self.meta()}
