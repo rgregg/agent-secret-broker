@@ -79,6 +79,11 @@ unlocked when a request is *created*, so the slow login/unlock overlaps with the
 human picking up their phone; a run of approvals within the window is fast.
 Nothing is released before approval either way.
 
+Mount a persistent directory for the CLI's state (`BITWARDENCLI_APPDATA_DIR`,
+see `deploy/compose.yaml`). The CLI keeps its device identifier there across
+logouts; without it, every login from a fresh container is a *new device* and
+your vault server emails you ("new device logged in") each time.
+
 Approving or denying takes effect immediately: the decision is audited
 (`decided`) and the approver's page answers at once. Releasing the secret
 happens in the background; if that fails, the failure goes to the audit log and

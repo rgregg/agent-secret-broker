@@ -11,9 +11,11 @@ services:
       - "8800:8800"            # client API (CLI): needs X-Client-Key. Do NOT publish 8801.
     env_file: ./secrets/broker.env      # BW_CLIENTID / BW_CLIENTSECRET (bw backend)
     environment:
-      HOME: /tmp               # bw writes its state under $HOME
+      HOME: /tmp
+      BITWARDENCLI_APPDATA_DIR: /bw   # persistent: keeps ONE stable device identity
     volumes:
       - ./data:/data
+      - ./bw:/bw               # owned by uid 65534, mode 700
       - ./secrets:/run/secrets:ro
     read_only: true
     tmpfs: [/tmp]
