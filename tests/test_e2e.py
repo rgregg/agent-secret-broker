@@ -401,7 +401,8 @@ class MixedPolicy(Harness):
             self.assertEqual(names, {"locked", "svc"})
             for s in json.loads(body)["secrets"]:
                 self.assertEqual(set(s), {"name", "vars", "allowed_hosts"})
-            self.assertNotIn("allow", body)
+            self.assertNotIn("approval", body)
+            self.assertNotIn('"allow"', body)
             self.assertNotIn("sensitivity", body)
 
 
