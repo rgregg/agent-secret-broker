@@ -11,6 +11,7 @@ overwritten unless --force is given.
 import argparse
 import json
 import sys
+import time
 
 from .__main__ import build_backend, load_settings
 from .backends import BackendError
@@ -50,6 +51,7 @@ def main(argv=None):
     ap.add_argument("--config", required=True)
     ap.add_argument("--apply", action="store_true")
     ap.add_argument("--force", action="store_true", help="overwrite existing metadata")
+    ap.add_argument("--pause", type=float, default=3.0, help="seconds between writes")
     args = ap.parse_args(argv)
     cfg = load_settings(args.config)
     entries, problems = plan(cfg.get("secrets") or {})
@@ -64,10 +66,22 @@ def main(argv=None):
             continue
         print(f"{'write ' if args.apply else 'would '} {meta['name']:<32} -> {item!r}")
         if args.apply:
-            try:
-                backend.set_meta(item, meta)
-            except BackendError as e:
-                print(f"  FAILED: {e}")
+            # gentle on the server: it rate-limits bursts of syncs and logins
+            for attempt in range(1, 5):
+                try:
+                    backend.set_meta(item, meta)
+                    time.sleep(args.pause)
+                    break
+                except BackendError as e:
+                    if "rate limit" in str(e).lower() or "too many" in str(e).lower():
+                        print(f"  rate limited, waiting {30 * attempt}s")
+                        time.sleep(30 * attempt)
+                        continue
+                    print(f"  FAILED: {e}")
+                    bad = True
+                    break
+            else:
+                print("  FAILED: still rate limited")
                 bad = True
     if hasattr(backend, "close"):
         backend.close()
