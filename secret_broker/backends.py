@@ -360,6 +360,41 @@ class BwBackend:
             self._synced = 0.0
             self._touch()
 
+    def create_login(self, item, username, password, uri=None, notes=None, meta=None):
+        """Create a Login item with real username / password / URL fields."""
+        with self._lock:
+            if self._find(item) is not None:
+                raise BackendError(f"item {item!r} already exists")
+            org, coll = self._resolve_target()
+            obj = BwBackend._template_base(item, "password", password, org, coll)
+            obj["login"]["username"] = username
+            obj["login"]["uris"] = [{"match": None, "uri": uri}] if uri else []
+            obj["notes"] = notes or None
+            if meta is not None:
+                BwBackend._with_meta(obj, meta)
+            self._submit("create", obj)
+            self._synced = 0.0
+            self._touch()
+
+    def edit_item(self, item, new_name=None, meta=None, drop_meta=False):
+        """Rename an item and/or replace or remove its broker metadata."""
+        with self._lock:
+            existing = self._find(item)
+            if existing is None:
+                raise BackendError(f"item {item!r} not found")
+            if new_name:
+                if self._find(new_name) is not None:
+                    raise BackendError(f"item {new_name!r} already exists")
+                existing["name"] = new_name
+            if drop_meta:
+                existing["fields"] = [f for f in (existing.get("fields") or [])
+                                      if f.get("name") != META_FIELD]
+            if meta is not None:
+                BwBackend._with_meta(existing, meta)
+            self._submit("edit", existing, existing["id"])
+            self._synced = 0.0
+            self._touch()
+
     def delete(self, item):
         """Permanently delete an item (used to roll back a half-finished create)."""
         with self._lock:
