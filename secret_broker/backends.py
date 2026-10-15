@@ -18,6 +18,7 @@ class FileBackend:
             self._data = json.load(f)
 
     def get(self, item, field):
+        field = "notes" if field in (None, "", "auto") else field
         try:
             return self._data[item][field]
         except KeyError:
@@ -28,6 +29,7 @@ class FileBackend:
             raise BackendError(f"item {item!r} already exists")
         if not create and item not in self._data:
             raise BackendError(f"item {item!r} not found")
+        field = "notes" if field in (None, "", "auto") else field
         rec = self._data.setdefault(item, {})
         if keep_previous and field in rec:
             rec["previous_value"] = rec[field]

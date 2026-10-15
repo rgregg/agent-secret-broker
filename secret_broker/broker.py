@@ -30,6 +30,7 @@ from .audit import AuditLog
 from .backends import BackendError
 from .notify import NotifyError
 from . import risk as risk_mod
+from . import structured
 
 MAX_PENDING = 3
 DENY_COOLDOWN = 60
@@ -107,7 +108,7 @@ class Broker:
             rec["method"], rec["url"] = req.spec["method"], req.spec["url"]
         elif req.mode == "store":
             sp = req.spec
-            rec.update(op=sp.get("op"), item=sp.get("item"), field=sp.get("field"),
+            rec.update(op=sp.get("op"), item=sp.get("item"), field=sp.get("field"), key=sp.get("key"),
                        hosts=sp.get("allowed_hosts"), value_bytes=sp.get("value_bytes"))
         else:
             rec["argv"] = (req.spec.get("argv") or [])[:50]
@@ -327,6 +328,7 @@ class Broker:
                 raise ValueError(f"{name} has no variable {var}")
             ref = vars_[var]
             spec["var"], spec["item"], spec["field"] = var, ref["item"], ref.get("field") or "auto"
+            spec["key"] = ref.get("key")
         else:
             raise ValueError("op must be create or update")
 
@@ -359,7 +361,8 @@ class Broker:
             what = f"{req.spec['method']} {req.spec['url']}"
         elif req.mode == "store":
             sp = req.spec
-            what = (f"{sp['op']} credential: item {sp['item']!r} field {sp['field']} "
+            what = (f"{sp['op']} credential: item {sp['item']!r} field {sp['field']}"
+                    f"{' key ' + sp['key'] if sp.get('key') else ''} "
                     f"({sp['value_bytes']} bytes, value not shown)")
         else:
             what = "run: " + " ".join(req.spec.get("argv") or [])[:200]
@@ -501,17 +504,31 @@ class Broker:
                     self.audit("store_rollback_failed", req, item=sp["item"])
                 raise BackendError(f"config not updated, vault change rolled back: {e}") from None
         else:
-            self.backend.put(sp["item"], sp["field"], sp["value"], create=False, keep_previous=True)
+            value = sp["value"]
+            if sp.get("key"):                       # one key of a multi-value field
+                try:
+                    value = structured.set_key(self.backend.get(sp["item"], sp["field"]),
+                                               sp["key"], value)
+                except structured.StructuredError as e:
+                    raise BackendError(str(e)) from None
+            self.backend.put(sp["item"], sp["field"], value, create=False, keep_previous=True)
         self.audit("stored", req, duration_ms=int((time.time() - t0) * 1000))
         return {"stored": {"name": name, "op": sp["op"], "item": sp["item"], "field": sp["field"]}}
 
     def _release(self, req):
         if req.mode == "store":
             return self._store(req)
-        env = {}
+        env, raw = {}, {}
         for n in req.names:
             for var, ref in self.cfg["secrets"][n]["vars"].items():
-                env[var] = self.backend.get(ref["item"], ref.get("field") or "auto")
+                src = (ref["item"], ref.get("field") or "auto")
+                if src not in raw:                  # one vault read per item/field
+                    raw[src] = self.backend.get(*src)
+                try:
+                    env[var] = (structured.get(raw[src], ref["key"]) if ref.get("key")
+                                else raw[src])
+                except structured.StructuredError as e:
+                    raise BackendError(f"{var}: {e}") from None
             self.audit("secret_read", req, secret=n, vars=sorted(self.cfg["secrets"][n]["vars"]))
         if req.mode == "env":
             return {"env": env}

@@ -1240,6 +1240,66 @@ class BwBackendWrites(unittest.TestCase):
         self.b.delete("A")                                              # idempotent
 
 
+class MultiValue(Harness):
+    """Several values in one vault field, selected with a `key` on the var."""
+    DOTENV = "# creds\nCLIENT_ID=abc\nCLIENT_SECRET: \"s3cr3t\"\nREGION=us-east-1\n"
+
+    def tweak(self, cfg):
+        cfg["secrets"]["multi"] = {
+            "vars": {"M_ID": {"item": "Multi", "field": "notes", "key": "CLIENT_ID"},
+                     "M_SECRET": {"item": "Multi", "key": "CLIENT_SECRET"},
+                     "M_REGION": {"item": "Multi", "field": "notes", "key": "REGION"}},
+            "allowed_hosts": ["127.0.0.1"]}
+        cfg["secrets"]["multibad"] = {
+            "vars": {"M_NOPE": {"item": "Multi", "field": "notes", "key": "NOPE"}},
+            "allowed_hosts": ["127.0.0.1"]}
+
+    def setUp(self):
+        super().setUp()
+        self.broker.backend._data["Multi"] = {"notes": self.DOTENV}
+
+    def test_keys_split_one_field_into_vars(self):
+        code, body = self.create_env(("multi",))
+        self.assertEqual(code, 202)
+        _, b = self.api("GET", f"/v1/requests/{json.loads(body)['id']}?wait=5")
+        self.assertEqual(json.loads(b)["env"], {
+            "M_ID": "abc", "M_SECRET": "s3cr3t", "M_REGION": "us-east-1"})
+
+    def test_json_field_and_missing_key(self):
+        self.broker.backend._data["Multi"]["notes"] = json.dumps(
+            {"CLIENT_ID": "j1", "CLIENT_SECRET": "j2", "REGION": "eu", "NOPE": 5})
+        code, body = self.create_env(("multi",))
+        _, b = self.api("GET", f"/v1/requests/{json.loads(body)['id']}?wait=5")
+        self.assertEqual(json.loads(b)["env"]["M_SECRET"], "j2")
+        self.broker.backend._data["Multi"]["notes"] = "CLIENT_ID=only"
+        code, body = self.create_env(("multi",))
+        _, b = self.api("GET", f"/v1/requests/{json.loads(body)['id']}?wait=5")
+        self.assertEqual(json.loads(b)["status"], "failed")
+        self.assertNotIn("only", self.events("failed")[-1].get("error", ""))
+
+    def test_update_one_key_keeps_the_rest(self):
+        code, body = self.api("POST", "/v1/requests", {
+            "mode": "store", "names": ["multi"], "op": "update", "var": "M_SECRET",
+            "value": "rotated"})
+        self.assertEqual(code, 202)
+        _, b = self.api("GET", f"/v1/requests/{json.loads(body)['id']}?wait=5")
+        self.assertEqual(json.loads(b)["status"], "approved")
+        rec = self.broker.backend._data["Multi"]
+        self.assertEqual(rec["notes"], self.DOTENV.replace('"s3cr3t"', "rotated"))
+        self.assertEqual(rec["previous_value"], self.DOTENV)
+
+
+class StructuredParsing(unittest.TestCase):
+    def test_parse_forms(self):
+        from secret_broker import structured as st
+        self.assertEqual(st.parse("export A=1\nB = two words\n#C=3\nD='q'"),
+                         {"A": "1", "B": "two words", "D": "q"})
+        with self.assertRaises(st.StructuredError):
+            st.parse("just a bare token")
+        with self.assertRaises(st.StructuredError):
+            st.set_key("A=1", "B", "x")
+
+
 class StoreFlow(Harness):
     NEW = "brand-new-credential-VALUE-123"
 

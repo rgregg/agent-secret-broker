@@ -97,6 +97,16 @@ An agent can add or rotate credentials, always with a fresh approval:
   (the default) a Secure Note; any other name is a hidden custom field. In
   `config.json` a var may omit `field` (or say `"auto"`): reads and updates then
   use a Login's password or a Secure Note's text, whichever the item is.
+- **Several values in one item:** put `KEY=value` lines (or a JSON object) in
+  the note, then map each value to its own variable with a `key`:
+
+      "vars": {"APP_ID":     {"item": "Example App", "key": "CLIENT_ID"},
+               "APP_SECRET": {"item": "Example App", "key": "CLIENT_SECRET"}}
+
+  The item is read once per request. A missing key fails the request without
+  echoing values. `update NAME --var APP_SECRET` rewrites only that key and
+  leaves the other lines (and comments) as they were; the whole previous text
+  goes to `previous_value`.
 - **Never auto-approved**, regardless of a secret's `approval` policy, and never
   eligible for "always allow". Risk is `medium` for create and `high` for update.
 - **No half-finished state:** if the config cannot be written after a create, the
