@@ -1616,6 +1616,27 @@ class HistoryPage(Harness):
         self.assertEqual(self.page(user="mallory")[0], 403)
         self.assertEqual(len(self.events("history_viewed")), 2)       # the refused view is not "viewed"
 
+    def test_pages_are_responsive_and_not_frameable(self):
+        self.call(decision="approve")
+        r = urllib.request.urlopen(urllib.request.Request(
+            self.abase + "/history", headers={"X-authentik-username": "alice"}), timeout=10)
+        body = r.read().decode()
+        self.assertEqual(r.headers.get("X-Frame-Options"), "DENY")
+        self.assertIn("frame-ancestors 'none'", r.headers.get("Content-Security-Policy"))
+        for want in ("width=device-width", "color-scheme", "@media (max-width:42rem)",
+                     "data-label=Outcome", "prefers-color-scheme:dark", "<nav>"):
+            self.assertIn(want, body)
+        # the decision page uses the same shell and big tap targets
+        self.decision = None
+        url = f"http://127.0.0.1:{self.up.server_address[1]}/x"
+        _, b = self.api("POST", "/v1/requests", {
+            "mode": "http", "names": ["svc"], "method": "GET", "url": url,
+            "headers": {"Authorization": "Bearer {{SVC_TOKEN}}"}})
+        nonce = self.broker._by_id[json.loads(b)["id"]].nonce
+        _, page = req(self.abase + f"/a/{nonce}", headers={"X-authentik-username": "alice"})
+        for want in ("class='btn approve'", "class='btn deny'", "width=device-width"):
+            self.assertIn(want, page)
+
     def test_store_requests_show_the_operation_not_the_value(self):
         self.decision = "approve"
         self.api("POST", "/v1/requests", {"mode": "store", "names": ["hist-new"], "op": "create",

@@ -797,14 +797,72 @@ def _json(h, code, obj):
     h.wfile.write(raw)
 
 
-def _page(h, code, body):
-    raw = ("<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
-           "<body style='font-family:system-ui;max-width:32rem;margin:2rem auto;padding:0 1rem'>"
-           + body).encode()
+_CSS = """
+:root{color-scheme:light dark;--bg:#fff;--fg:#1f2328;--muted:#59636e;--line:#d1d9e0;--card:#f6f8fa;
+--accent:#0969da;--ok:#1a7f37;--warn:#9a6700;--bad:#cf222e}
+@media (prefers-color-scheme:dark){:root{--bg:#0d1117;--fg:#e6edf3;--muted:#9198a1;--line:#30363d;
+--card:#161b22;--accent:#4493f8;--ok:#3fb950;--warn:#d29922;--bad:#f85149}}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+main{max-width:72rem;margin:0 auto;padding:1rem}
+main.narrow{max-width:38rem}
+nav{display:flex;flex-wrap:wrap;gap:.25rem 1.25rem;padding:.75rem 1rem;border-bottom:1px solid var(--line);
+background:var(--card)}
+nav a{color:var(--accent);text-decoration:none;padding:.35rem 0;font-weight:600}
+h1{font-size:1.5rem;margin:.25rem 0 1rem}
+a{color:var(--accent)}
+small,.muted{color:var(--muted)}
+p,td,li{overflow-wrap:anywhere}
+.actions{display:flex;flex-wrap:wrap;gap:.75rem;margin:1.25rem 0}
+.btn,button{font:inherit;font-weight:600;min-height:3rem;padding:.6rem 1.4rem;border-radius:.6rem;
+border:1px solid var(--line);background:var(--card);color:var(--fg);cursor:pointer}
+.btn.approve{background:var(--ok);border-color:var(--ok);color:#fff}
+.btn.deny{background:var(--bad);border-color:var(--bad);color:#fff}
+.actions .btn{flex:1 1 9rem}
+button:disabled{opacity:.6;cursor:default}
+.risk{border-left:.4rem solid var(--muted);padding:.4rem .8rem;background:var(--card);border-radius:.3rem;margin:1rem 0}
+.risk.low{border-color:var(--ok)}.risk.medium{border-color:var(--warn)}.risk.high{border-color:var(--bad)}
+.risk b{display:block}
+.risk.low b{color:var(--ok)}.risk.medium b{color:var(--warn)}.risk.high b{color:var(--bad)}
+.box{background:var(--card);border:1px solid var(--line);border-radius:.5rem;padding:.6rem .9rem;margin:.75rem 0;
+overflow-wrap:anywhere}
+.filters{display:flex;flex-wrap:wrap;gap:.5rem;margin:1rem 0}
+.filters select{font:inherit;min-height:2.75rem;flex:1 1 9rem;padding:.3rem .5rem;border-radius:.5rem;
+border:1px solid var(--line);background:var(--bg);color:var(--fg)}
+.tbl{width:100%;border-collapse:collapse}
+.tbl th{text-align:left;font-size:.85rem;color:var(--muted);padding:.5rem;border-bottom:2px solid var(--line)}
+.tbl td{padding:.55rem .5rem;border-bottom:1px solid var(--line);vertical-align:top}
+.tbl td[data-label=Time],.tbl td[data-label=Outcome],.tbl td[data-label=Risk],.tbl td[data-label=Took]
+{white-space:nowrap;overflow-wrap:normal}
+.pager{display:flex;gap:1.25rem;align-items:center;flex-wrap:wrap}
+@media (max-width:42rem){
+ main{padding:.75rem}
+ .tbl thead{display:none}
+ .tbl,.tbl tbody,.tbl tr,.tbl td{display:block;width:100%}
+ .tbl tr{background:var(--card);border:1px solid var(--line);border-radius:.6rem;margin:0 0 .75rem;padding:.4rem .7rem}
+ .tbl td{border:0;padding:.2rem 0;display:flex;gap:.75rem}
+ .tbl td::before{content:attr(data-label);flex:0 0 5.5rem;color:var(--muted);font-size:.85rem;padding-top:.1rem}
+ .tbl td>*{min-width:0}
+ .actions .btn{flex-basis:100%}
+}
+"""
+
+_NAV = "<nav><a href='/history'>History</a><a href='/policies'>Standing approvals</a></nav>"
+
+
+def _page(h, code, body, wide=False, nav=True):
+    raw = ("<!doctype html><html lang=en><meta charset=utf-8>"
+           "<meta name=viewport content='width=device-width,initial-scale=1'>"
+           "<meta name=color-scheme content='light dark'><title>Secret broker</title>"
+           f"<style>{_CSS}</style><body>{_NAV if nav else ''}"
+           f"<main class='{'wide' if wide else 'narrow'}'>{body}</main></body></html>").encode()
     h.send_response(code)
     h.send_header("Content-Type", "text/html; charset=utf-8")
     h.send_header("Content-Length", str(len(raw)))
     h.send_header("Cache-Control", "no-store")
+    h.send_header("X-Frame-Options", "DENY")
+    h.send_header("Content-Security-Policy", "frame-ancestors 'none'")
     h.end_headers()
     h.wfile.write(raw)
 
@@ -897,7 +955,7 @@ def approval_handler(broker):
             if user != cfg["allowed_user"]:
                 broker.log("approval_forbidden", claimed_user=user[:80], peer=self.client_address[0],
                            client_ip=self._fwd(), method=self.command)
-                _page(self, 403, "<h1>Forbidden</h1>")
+                _page(self, 403, "<h1>Forbidden</h1>", nav=False)
                 return None
             return user
 
@@ -912,16 +970,16 @@ def approval_handler(broker):
                 by = (sc.get("approval_changed") or {}).get("by")
                 btn = ""
                 if state == "allow":
-                    btn = ("<form method=post style='display:inline'>"
+                    btn = ("<form method=post>"
                            f"<input type=hidden name=name value='{html.escape(name)}'>"
                            "<button name=approval value=prompt>Require approval again</button></form>")
-                rows.append(f"<tr><td><b>{html.escape(name)}</b></td><td>{html.escape(state)}"
+                rows.append(f"<tr><td data-label=Secret><b>{html.escape(name)}</b></td>"
+                            f"<td data-label=Policy>{html.escape(state)}"
                             f"{' (set by ' + html.escape(by) + ')' if by and state == 'allow' else ''}</td>"
-                            f"<td>{btn}</td></tr>")
-            _page(self, 200, f"<h1>Standing approvals</h1><p><a href='/history'>Request history</a></p>{note}"
-                  "<table cellpadding=8>"
-                  "<tr><th align=left>Secret</th><th align=left>Policy</th><th></th></tr>"
-                  + "".join(rows) + "</table>")
+                            f"<td data-label=''>{btn}</td></tr>")
+            _page(self, 200, f"<h1>Standing approvals</h1>{note}<table class=tbl>"
+                  "<thead><tr><th>Secret</th><th>Policy</th><th></th></tr></thead><tbody>"
+                  + "".join(rows) + "</tbody></table>", wide=True)
 
         def _history_page(self):
             q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
@@ -943,7 +1001,7 @@ def approval_handler(broker):
                 o = "".join(f"<option value='{html.escape(v)}'{' selected' if v == cur else ''}>"
                             f"{html.escape(v)}</option>" for v in vals)
                 return f"<option value=''>{label}</option>{o}"
-            form = ("<form method=get style='margin:1em 0'>"
+            form = ("<form method=get class=filters>"
                     f"<select name=outcome>{opt(OUTCOMES + ('unknown',), outcome, 'any outcome')}</select> "
                     f"<select name=secret>{opt(broker.history.secrets_seen(), secret, 'any secret')}</select> "
                     f"<select name=mode>{opt(('http', 'env', 'store'), mode, 'any mode')}</select> "
@@ -967,25 +1025,26 @@ def approval_handler(broker):
                 note = html.escape(r["error"] or r["summary"] or "")[:200]
                 body.append(
                     "<tr>"
-                    f"<td>{html.escape(r['time'])}</td>"
-                    f"<td><b>{html.escape(label)}</b>{' (escalated to a prompt)' if r['escalated'] else ''}</td>"
-                    f"<td>{html.escape(', '.join(r['names']))}</td>"
-                    f"<td>{html.escape(what)}<br><small>{note}</small></td>"
-                    f"<td>{html.escape(r['risk'] or '')}</td>"
-                    f"<td>{html.escape(who)}</td><td>{lat}</td></tr>")
+                    f"<td data-label=Time>{html.escape(r['time'])}</td>"
+                    f"<td data-label=Outcome><span><b>{html.escape(label)}</b>"
+                    f"{' (escalated to a prompt)' if r['escalated'] else ''}</span></td>"
+                    f"<td data-label=Secret>{html.escape(', '.join(r['names']))}</td>"
+                    f"<td data-label=Request><span>{html.escape(what)}<br><small>{note}</small></span></td>"
+                    f"<td data-label=Risk>{html.escape(r['risk'] or '')}</td>"
+                    f"<td data-label='Decided by'>{html.escape(who)}</td>"
+                    f"<td data-label=Took>{lat}</td></tr>")
             nav = ""
             if total > per:
                 base = urllib.parse.urlencode({k: v for k, v in
                                                (("outcome", outcome), ("secret", secret), ("mode", mode)) if v})
                 prev = f"<a href='?{base}&page={page - 1}'>newer</a>" if page > 1 else ""
                 nxt = f"<a href='?{base}&page={page + 1}'>older</a>" if page * per < total else ""
-                nav = f"<p>{prev} {nxt} &middot; {total} requests</p>"
-            _page(self, 200, "<h1>Request history</h1><p><a href='/policies'>Standing approvals</a></p>"
-                  + form + "<table cellpadding=6 style='border-collapse:collapse'><tr>"
-                  "<th align=left>Time (UTC)</th><th align=left>Outcome</th><th align=left>Secret</th>"
-                  "<th align=left>Request</th><th align=left>Risk</th><th align=left>Decided by</th>"
-                  "<th align=left>Took</th></tr>" + "".join(body) + f"</table>{nav}"
-                  + ("" if body else "<p>No requests match.</p>"))
+                nav = f"<p class=pager>{prev} {nxt} <span class=muted>{total} requests</span></p>"
+            _page(self, 200, "<h1>Request history</h1>" + form
+                  + "<table class=tbl><thead><tr><th>Time (UTC)</th><th>Outcome</th><th>Secret</th>"
+                  "<th>Request</th><th>Risk</th><th>Decided by</th><th>Took</th></tr></thead><tbody>"
+                  + "".join(body) + f"</tbody></table>{nav}"
+                  + ("" if body else "<p class=muted>No requests match.</p>"), wide=True)
 
         def do_GET(self):
             if self._user() is None:
@@ -1022,14 +1081,13 @@ def approval_handler(broker):
                         "command shown is what it <em>said</em> it would run.")
             lvl = req.risk["level"] if req.risk else "medium"
             color = {"low": "#1a7f37", "medium": "#9a6700", "high": "#cf222e"}[lvl]
-            risk_html = (f"<p style='border-left:6px solid {color};padding-left:.6rem'>"
-                         f"<b style='color:{color}'>{lvl.upper()} RISK</b><br><small>"
+            risk_html = (f"<div class='risk {lvl}'><b>{lvl.upper()} RISK</b><small>"
                          + html.escape("; ".join(req.risk["reasons"]) if req.risk else "")
-                         + "</small></p>")
+                         + "</small></div>")
             ok, why = broker.always_allow_eligibility(req)
             if ok:
                 always_html = (
-                    "<p><button name=decision value=approve_always style='font-size:1rem;padding:.7rem 1.2rem'>"
+                    "<p><button class=btn name=decision value=approve_always>"
                     f"Approve and always allow {html.escape(req.names[0])}</button><br><small>"
                     "Future HTTP calls with this secret will run without asking, except requests "
                     "rated high risk. Revoke any time at /policies.</small></p>")
@@ -1042,12 +1100,14 @@ def approval_handler(broker):
 <h1>Secret request</h1>
 <p><b>{html.escape(', '.join(req.names))}</b></p>
 {summary_html}
-<p>From: {html.escape(req.source)}<br>{what}</p>
+<div class=box>From: {html.escape(req.source)}<br>{what}</div>
 <p><small>{note}</small></p>
 <p><small>Expires in {int(req.expires - time.time())}s</small></p>
 <form method=post onsubmit="setTimeout(function(){{document.querySelectorAll('button').forEach(function(b){{b.disabled=true}});document.getElementById('w').hidden=false}},0)">
-<button name=decision value=approve style='font-size:1.4rem;padding:1rem 2rem'>Approve</button>
-<button name=decision value=deny style='font-size:1.4rem;padding:1rem 2rem'>Deny</button>
+<div class=actions>
+<button class='btn approve' name=decision value=approve>Approve</button>
+<button class='btn deny' name=decision value=deny>Deny</button>
+</div>
 {always_html}
 </form>
 <p id=w hidden>Working...</p>""")
