@@ -20,8 +20,7 @@
     "example-api": {
       "vars": {"EXAMPLE_API_KEY": {"item": "Example API", "field": "key"}},
       "allowed_hosts": ["api.example.com"],
-      "approval": "prompt",
-      "sensitivity": "high"
+      "approval": "prompt"
     }
   }
 }

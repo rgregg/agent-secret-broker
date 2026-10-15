@@ -488,46 +488,26 @@ class AuditTrail(Harness):
         self.assertEqual(self.events("approval_forbidden")[0]["claimed_user"], "mallory")
 
 
-class RiskBaseline(unittest.TestCase):
-    CFG = {"lo": {"vars": {}, "sensitivity": "low"}, "hi": {"vars": {}, "sensitivity": "high"},
-           "unset": {"vars": {}}}
+class RiskModelOnly(unittest.TestCase):
+    SPEC = {"method": "GET", "url": "https://h.example/x", "headers": {}}
 
-    def b(self, mode, names, **spec):
-        return risk_mod.baseline(mode, names, spec, self.CFG)
+    def test_level_is_the_model_verdict_in_both_directions(self):
+        for v in ("low", "medium", "high"):
+            a = risk_mod.assess("http", ["s"], self.SPEC, _Stub("x", v))
+            self.assertEqual((a["level"], a["model"]), (v, v))
+        a = risk_mod.assess("http", ["s"], dict(self.SPEC, method="DELETE"), _Stub("x", "low"))
+        self.assertEqual(a["level"], "low")               # no rule overrides the model
 
-    def http(self, names, method="GET", url="https://h.example/api/things", **kw):
-        return self.b("http", names, method=method, url=url, headers={}, **kw)
+    def test_no_or_bad_verdict_fails_closed_to_high(self):
+        for analyzer in (None, _Stub("x", "catastrophic"), _Stub("x", None), _Boom()):
+            a = risk_mod.assess("http", ["s"], self.SPEC, analyzer)
+            self.assertEqual((a["level"], a["model"]), ("high", None))
+            self.assertIn("no model verdict", a["reasons"][0])
 
-    def test_levels(self):
-        self.assertEqual(self.http(["lo"])[0], "low")
-        self.assertEqual(self.http(["lo"], "POST")[0], "medium")
-        self.assertEqual(self.http(["lo"], "DELETE")[0], "high")
-        self.assertEqual(self.http(["hi"])[0], "high")
-        self.assertEqual(self.http(["unset"])[0], "medium")          # unlabelled is not low
 
-    def test_destructive_keywords_and_privilege_paths(self):
-        self.assertEqual(self.http(["lo"], "POST", body='{"type":"DeleteStack"}')[0], "high")
-        self.assertEqual(self.http(["lo"], url="https://h.example/api/stack/restart")[0], "high")
-        self.assertEqual(self.http(["lo"], url="https://h.example/admin/x")[0], "medium")
-
-    def test_env_mode(self):
-        self.assertEqual(self.b("env", ["lo"], argv=["curl", "-s", "https://x"])[0], "medium")
-        self.assertEqual(self.b("env", ["lo"], argv=["sh", "-c", "curl $T"])[0], "high")
-        self.assertEqual(self.b("env", ["lo"], argv=["printenv"])[0], "high")
-
-    def test_model_can_only_raise(self):
-        a = risk_mod.assess("http", ["lo"], {"method": "DELETE", "url": "https://h.example/x", "headers": {}},
-                            self.CFG, _Stub("harmless", "low"))
-        self.assertEqual((a["level"], a["model"]), ("high", "low"))
-        a = risk_mod.assess("http", ["lo"], {"method": "GET", "url": "https://h.example/x", "headers": {}},
-                            self.CFG, _Stub("scary", "high"))
-        self.assertEqual(a["level"], "high")
-        self.assertIn("model rated it high", a["reasons"])
-
-    def test_garbage_model_output_is_ignored(self):
-        a = risk_mod.assess("http", ["lo"], {"method": "GET", "url": "https://h.example/x", "headers": {}},
-                            self.CFG, _Stub("x", "catastrophic"))
-        self.assertEqual((a["level"], a["model"]), ("low", None))
+class _Boom:
+    def analyze(self, mode, names, spec):
+        raise RuntimeError("model down")
 
 
 class _Stub:
@@ -543,7 +523,6 @@ class RiskFlow(Harness):
     model_risk = "low"
 
     def tweak(self, cfg):
-        cfg["secrets"]["svc"]["sensitivity"] = "low"
         cfg["risk"] = {"escalate_auto_at": "high"}
 
     def setUp(self):
@@ -557,11 +536,12 @@ class RiskFlow(Harness):
             "headers": {"Authorization": "Bearer {{SVC_TOKEN}}"}, **kw})
 
     def test_risk_in_title_page_and_audit(self):
+        self.broker.summarizer = _Stub("Deletes things", "high")
         self.http("DELETE")
         self.assertIn("[HIGH]", self.notifier.sent[0]["title"])
-        self.assertIn("DELETE request", self.notifier.sent[0]["message"])
+        self.assertIn("model rated it high", self.notifier.sent[0]["message"])
         a = self.events("assessed")[0]
-        self.assertEqual((a["baseline"], a["risk"]), ("high", "high"))
+        self.assertEqual((a["model"], a["risk"]), ("high", "high"))
         nonce = next(iter(self.broker._by_id.values())).nonce
         _, page = req(self.abase + f"/a/{nonce}", headers={"X-authentik-username": "alice"})
         self.assertIn("HIGH RISK", page)
@@ -574,6 +554,7 @@ class RiskFlow(Harness):
 
     def test_high_risk_overrides_allow_and_prompts(self):
         self.broker.cfg["secrets"]["svc"]["approval"] = "allow"
+        self.broker.summarizer = _Stub("Deletes things", "high")
         self.http("DELETE")
         self.assertEqual(len(self.notifier.sent), 1)               # prompted despite allow
         self.assertEqual(self.events("approved"), [])
@@ -994,8 +975,11 @@ class AlwaysAllow(Harness):
     decision = None
 
     def tweak(self, cfg):
-        cfg["secrets"]["svc"]["sensitivity"] = "low"
         cfg["risk"] = {"escalate_auto_at": "high"}
+
+    def setUp(self):
+        super().setUp()
+        self.broker.summarizer = _Stub("List things", "low")
 
     def http_req(self, method="GET", path="/x"):
         url = f"http://127.0.0.1:{self.up.server_address[1]}{path}"
@@ -1063,16 +1047,8 @@ class AlwaysAllow(Harness):
         self.assertEqual(len(self.events("policy_change_refused")), 1)
         self.assertEqual(self.events("approved")[0]["via"], "user")   # this request still approved
 
-    def test_high_sensitivity_secret_not_offered(self):
-        self.broker.cfg["secrets"]["svc"]["sensitivity"] = "high"
-        self.http_req()
-        self.assertNotIn("value=approve_always", self.page())
-        self.assertIn("high sensitivity", self.page())
-        self.post(f"/a/{self.nonce()}", decision="approve_always")
-        self.finish()
-        self.assertEqual(self.disk()["secrets"]["svc"].get("approval", "prompt"), "prompt")
-
     def test_high_risk_request_cannot_establish_standing_allow(self):
+        self.broker.summarizer = _Stub("Deletes things", "high")
         self.http_req("DELETE")
         self.assertNotIn("value=approve_always", self.page())
         self.post(f"/a/{self.nonce()}", decision="approve_always")
@@ -1416,12 +1392,15 @@ class StoreFlow(Harness):
         self.assertEqual(self.notifier.sent, [])
         self.assertEqual(self.events("approved"), [])
 
-    def test_risk_create_medium_update_high(self):
+    def test_store_risk_is_the_model_verdict_or_high(self):
         self.decision = None
+        self.broker.summarizer = _Stub("Creates a credential", "medium")
         self.store()
+        self.broker.summarizer = None                      # no verdict: fail closed
         self.store("update", "svc", value="rotated-value-1234")
         levels = [e["risk"] for e in self.events("assessed")]
         self.assertEqual(levels, ["medium", "high"])
+        self.assertIn("[MEDIUM]", self.notifier.sent[0]["title"])
         self.assertIn("[HIGH]", self.notifier.sent[1]["title"])
 
     def test_config_failure_rolls_back_the_vault(self):

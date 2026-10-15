@@ -42,14 +42,18 @@ Per secret in the broker config:
 
     "approval": "prompt"        # default: every use needs a phone approval
     "approval": "allow"         # no prompt (http mode only unless auto_modes adds env)
-    "sensitivity": "low|medium|high"   # default medium
     "allowed_hosts": ["api.example.com"]
 
-Every request is rated low/medium/high: `max(rule baseline, optional model
-verdict)`. The model can only raise the level (its input is attacker-influenced
-text). Baseline rules use sensitivity, HTTP method, destructive keywords,
-opaque shells and env dumps. With `"risk": {"escalate_auto_at": "high"}`, an
-`allow` secret is prompted anyway at or above that level.
+Every request is rated low/medium/high by the analysis model (the `summary`
+block below) and nothing else: there are no per-secret ratings and no rule
+baseline. If the model is not configured, fails, times out or returns anything
+else, the request counts as **high**, so a missing verdict can only make the
+broker ask more. The rating is shown on the push and approval page and recorded
+in the audit log (`assessed`). Because the model reads attacker-influenced
+text, treat it as a hint for a human who also sees the raw request; where it
+carries weight is `allow` secrets: with `"risk": {"escalate_auto_at": "high"}`
+such a secret is still prompted at or above that level, so set it to `medium`
+if you want only `low` requests released unprompted.
 
 Optional one-line summaries come from a cheap OpenRouter model (`summary`
 block). They are labelled unverified and never replace the raw request.
@@ -88,8 +92,7 @@ An agent can add or rotate credentials, always with a fresh approval:
   an argument, and it is never written to the audit log, notifications, the
   approval page (which shows only its size) or the config.
 - **`store` creates** a vault item in the configured organization/collection and
-  adds a secret entry to the config with the hosts you pass (`approval: prompt`,
-  `sensitivity: medium`). The approver sees the item, field and hosts.
+  adds a secret entry to the config with the hosts you pass (`approval: prompt`). The approver sees the item, field and hosts.
 - **`update` replaces** the value of an existing secret's field. Hosts and
   mapping cannot change, and the replaced value is kept in the item's
   `previous_value` field for rollback.
@@ -125,9 +128,7 @@ when it would mean something:
 - HTTP mode only: the broker makes the call, so the value never leaves it. Never
   offered for env mode.
 - One secret per request.
-- Not for secrets marked at or above `risk.escalate_auto_at` sensitivity (they
-  would still prompt), and not from a request that is itself rated at or above
-  it.
+- Not from a request that is itself rated at or above `risk.escalate_auto_at`.
 
 The rules are enforced on the server, so a forged form field is refused and
 audited (`policy_change_refused`). Changes are audited as `policy_changed`

@@ -60,7 +60,7 @@ class Request:
         self.error = None
         self.result = None
         self.summary = None       # advisory, unverified
-        self.risk = None          # {"level","baseline","model","reasons"}
+        self.risk = None          # {"level","model","reasons"}
         self.always = None        # outcome of an "always allow" click, if any
         self.approver = None
         self.done = threading.Event()
@@ -84,8 +84,6 @@ class Broker:
         for name, sc in config["secrets"].items():
             if sc.get("approval", "prompt") not in APPROVAL_VALUES:
                 raise ValueError(f"secret {name!r}: approval must be one of {APPROVAL_VALUES}")
-            if sc.get("sensitivity", "medium") not in risk_mod.LEVELS:
-                raise ValueError(f"secret {name!r}: sensitivity must be one of {risk_mod.LEVELS}")
         esc = config.get("risk", {}).get("escalate_auto_at")
         if esc is not None and esc not in risk_mod.LEVELS:
             raise ValueError(f"risk.escalate_auto_at must be one of {risk_mod.LEVELS}")
@@ -148,9 +146,6 @@ class Broker:
             return False, "the broker has no config file to record this in"
         esc = self.cfg.get("risk", {}).get("escalate_auto_at")
         if esc:
-            sens = sc.get("sensitivity", "medium")
-            if risk_mod.rank(sens) >= risk_mod.rank(esc):
-                return False, f"{name} is marked {sens} sensitivity, so it would still prompt"
             if req.risk and risk_mod.rank(req.risk["level"]) >= risk_mod.rank(esc):
                 return False, f"this request is rated {req.risk['level']}; such requests always prompt"
         return True, ""
@@ -255,9 +250,9 @@ class Broker:
         if self.cfg.get("backend", {}).get("prewarm", True):
             # unlock while the human is reaching for their phone
             self.warm_backend()
-        a = risk_mod.assess(mode, names, spec, self.cfg["secrets"], self.summarizer)
-        req.summary, req.risk = a["summary"], {k: a[k] for k in ("level", "baseline", "model", "reasons")}
-        self.audit("assessed", req, baseline=a["baseline"], model=a["model"], reasons=a["reasons"])
+        a = risk_mod.assess(mode, names, spec, self.summarizer)
+        req.summary, req.risk = a["summary"], {k: a[k] for k in ("level", "model", "reasons")}
+        self.audit("assessed", req, model=a["model"], reasons=a["reasons"])
         auto = self._auto_allowed(mode, names)
         esc = self.cfg.get("risk", {}).get("escalate_auto_at")
         if auto and esc and risk_mod.rank(a["level"]) >= risk_mod.rank(esc):
@@ -489,7 +484,7 @@ class Broker:
         if sp["op"] == "create":
             self.backend.put(sp["item"], sp["field"], sp["value"], create=True)
             entry = {"vars": {sp["var"]: {"item": sp["item"], "field": sp["field"]}},
-                     "allowed_hosts": sp["allowed_hosts"], "approval": "prompt", "sensitivity": "medium"}
+                     "allowed_hosts": sp["allowed_hosts"], "approval": "prompt"}
             try:
                 with self._cfg_lock:
                     stamp = {"by": by, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
