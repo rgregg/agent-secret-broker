@@ -1427,13 +1427,13 @@ class StoreFlow(Harness):
 
     def test_store_risk_is_the_model_verdict_or_high(self):
         self.decision = None
-        self.broker.summarizer = _Stub("Creates a credential", "medium")
-        self.store()
+        self.broker.summarizer = _Stub("Creates a credential", "high")
+        self.store()                                       # create is low, whatever the model says
         self.broker.summarizer = None                      # no verdict: fail closed
         self.store("update", "svc", value="rotated-value-1234")
         levels = [e["risk"] for e in self.events("assessed")]
-        self.assertEqual(levels, ["medium", "high"])
-        self.assertIn("[MEDIUM]", self.notifier.sent[0]["title"])
+        self.assertEqual(levels, ["low", "high"])
+        self.assertIn("[LOW]", self.notifier.sent[0]["title"])
         self.assertIn("[HIGH]", self.notifier.sent[1]["title"])
 
     def test_config_failure_rolls_back_the_vault(self):
