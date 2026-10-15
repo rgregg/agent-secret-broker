@@ -15,4 +15,4 @@ COPY --from=bw /out/bw /usr/local/bin/bw
 WORKDIR /app
 COPY secret_broker ./secret_broker
 USER nobody
-CMD ["python", "-m", "secret_broker", "--config", "/data/config.json"]
+CMD ["python", "-m", "secret_broker"]

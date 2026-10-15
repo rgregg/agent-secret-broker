@@ -1,6 +1,7 @@
 # Example deployment: broker + an SSO proxy outpost in front of the approval page.
 # Secrets (mode 600, owned by uid 65534) live in ./secrets, never in this file.
-#   ./data/config.json   broker config (see config.example.json)
+#   BROKER_CONFIG       settings JSON (see config.example.json); the list of
+#                       secrets lives in the vault, not in a file
 #   ./secrets/*          client_key, notify tokens, vault credentials
 services:
   broker:
@@ -13,6 +14,7 @@ services:
     environment:
       HOME: /tmp
       BITWARDENCLI_APPDATA_DIR: /bw   # persistent: keeps ONE stable device identity
+      BROKER_CONFIG: '{"backend": {"type": "bw", "server_url": "https://vault.example.com", "master_password_file": "/run/secrets/bw_master_password", "organization": "My Org", "collection": "Secrets", "serve": true}, "client_key_file": "/run/secrets/client_key", "approve_base_url": "https://secrets.example.com", "allowed_user": "alice", "identity_header": "X-authentik-username", "audit_log": "/data/audit.jsonl"}'
     volumes:
       - ./data:/data
       - ./bw:/bw               # owned by uid 65534, mode 700
