@@ -1025,19 +1025,26 @@ _DASH_JS = r'''
   bind();secs();title();setInterval(secs,1000);setInterval(poll,3000);
   document.addEventListener('visibilitychange',function(){if(!document.hidden)poll();});
   if('serviceWorker' in navigator)navigator.serviceWorker.addEventListener('message',function(m){
-    if(m.data&&m.data.type==='poll')poll();});
+    if(m.data&&m.data.type==='poll')poll();
+    if(m.data&&m.data.type==='diag')why('Service worker v'+m.data.v+': '+m.data.what+' at '
+      +new Date().toLocaleTimeString()+'.');});
 })();
 '''
 
 _SERVICE_WORKER = r"""
+var SW_VERSION='3';
+function tell(m){return self.clients.matchAll({type:'window',includeUncontrolled:true}).then(function(cs){
+  cs.forEach(function(c){try{c.postMessage(m);}catch(x){}});return cs;});}
 self.addEventListener('install',function(){self.skipWaiting();});
 self.addEventListener('activate',function(e){e.waitUntil(self.clients.claim());});
 self.addEventListener('push',function(e){
   var d={};try{d=e.data.json();}catch(x){}
+  tell({type:'diag',what:'push received',v:SW_VERSION});
   e.waitUntil(self.registration.showNotification(d.title||'Approval needed',{
     body:d.body||'A secret was requested',tag:d.tag||'secret-request',requireInteraction:true}));});
 self.addEventListener('notificationclick',function(e){
   e.notification.close();
+  tell({type:'diag',what:'notification clicked',v:SW_VERSION});
   // Focus an open dashboard tab (preferring one already on "/"); if focusing is
   // refused or there is no tab, open a new one so a click never does nothing.
   e.waitUntil(self.clients.matchAll({type:'window',includeUncontrolled:true}).then(function(cs){
