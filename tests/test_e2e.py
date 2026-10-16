@@ -525,7 +525,9 @@ class CatalogFromVault(unittest.TestCase):
         self.assertEqual(b.cfg["secrets"], {})
 
     def test_dangerous_variable_names_are_rejected(self):
-        for var in ("LD_PRELOAD", "PATH", "PYTHONPATH", "NODE_OPTIONS", "GIT_SSH_COMMAND", "BASH_ENV"):
+        for var in ("LD_PRELOAD", "PATH", "PYTHONPATH", "NODE_OPTIONS", "GIT_SSH_COMMAND", "BASH_ENV",
+                    "CLASSPATH", "OPENSSL_CONF", "HTTPS_PROXY", "SSL_CERT_FILE", "KUBECONFIG",
+                    "SECRET_BROKER_URL", "ZDOTDIR", "CURL_HOME"):
             with self.assertRaises(ValueError, msg=var):
                 Broker._entry("Item", {"vars": {var: {"field": "notes"}}})
         Broker._entry("Item", {"vars": {"MY_TOKEN": {"field": "notes"}}})   # ordinary names still fine
