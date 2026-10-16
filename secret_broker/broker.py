@@ -921,6 +921,7 @@ _DASH_JS = r'''
   function remember(v){try{localStorage.setItem('notify',v?'1':'0');}catch(e){}}
   function nshow(){
     if(!nbtn)return;
+    var tbtn=document.getElementById('notify-test');
     if(!('Notification' in window)){nbtn.hidden=true;
       nmsg.textContent='This browser cannot show notifications.';return;}
     var p=Notification.permission;
@@ -928,18 +929,34 @@ _DASH_JS = r'''
       nmsg.textContent='Notifications are blocked for this site in the browser settings.';return;}
     var on=p==='granted'&&want();
     nbtn.hidden=false;
+    if(tbtn)tbtn.hidden=!on;
     nbtn.textContent=on?'Turn off notifications on this device':'Notify me on this device';
     nmsg.textContent=on?'You will get a notification when a request arrives, as long as this page '
       +'stays open in a tab or window.':'Notifications only arrive while this page is open.';}
+  function why(t){var e=document.getElementById('notify-why');if(e)e.textContent=t;}
+  function fire(title,body,tag){
+    try{var n=new Notification(title,{body:body,tag:tag,requireInteraction:true});
+      n.onclick=function(){window.focus();n.close();};return true;}
+    catch(e){why('The browser refused to show a notification ('+e.name+'). '
+      +'Some mobile browsers need an installed web app for this.');return false;}}
   function announce(found){
-    if(!('Notification' in window)||Notification.permission!=='granted'||!want())return;
-    Object.keys(found).forEach(function(id){
-      if(seen[id]!==undefined)return;
-      if(!document.hidden&&document.hasFocus())return;   // you are already looking at it
-      var n=new Notification('Approval needed',{body:found[id]||'A secret was requested',
-        tag:id,requireInteraction:true});
-      n.onclick=function(){window.focus();n.close();};});}
+    var fresh=Object.keys(found).filter(function(id){return seen[id]===undefined;});
+    if(!fresh.length)return;
+    if(!('Notification' in window)||Notification.permission!=='granted'||!want()){
+      why('A request arrived but notifications are off on this device.');return;}
+    if(!document.hidden&&document.hasFocus()){
+      why('A request arrived while this page was in front, so no pop-up was shown.');return;}
+    fresh.forEach(function(id){fire('Approval needed',found[id]||'A secret was requested',id);});
+    why('Last request: notification sent to the browser ('+new Date().toLocaleTimeString()+'). '
+      +'If nothing appeared, check the operating system notification settings for this browser.');}
   function track(found){announce(found);seen=found;}
+  var tbtn=document.getElementById('notify-test');
+  if(tbtn)tbtn.addEventListener('click',function(){
+    if(!('Notification' in window)||Notification.permission!=='granted'){
+      why('Notifications are not allowed for this site yet.');return;}
+    if(fire('Test notification','If you can see this, notifications work on this device.','test'))
+      why('Test sent ('+new Date().toLocaleTimeString()+'). If nothing appeared, the browser or '
+        +'operating system is hiding it.');});
   if(nbtn)nbtn.addEventListener('click',function(){
     if(!('Notification' in window))return;
     if(Notification.permission==='granted'&&want()){remember(false);nshow();return;}
@@ -1180,8 +1197,10 @@ def approval_handler(broker):
             msg = notes.get(note, "")
             _page(self, 200,
                   "<h1>Pending requests</h1>"
-                  "<p class=notify><button id=notify class=btn type=button hidden></button> "
-                  "<small id=notify-state class=muted></small></p>"
+                  "<p class=notify><button id=notify class=btn type=button hidden></button>"
+                  "<button id=notify-test class=btn type=button hidden>Send a test notification"
+                  "</button> <small id=notify-state class=muted></small></p>"
+                  "<p class=notify><small id=notify-why class=muted></small></p>"
                   f"<div id=flash class=flash{'' if msg else ' hidden'}>{html.escape(msg)}</div>"
                   "<div id=offline class='flash offline' hidden>Cannot reach the broker (signed out?). "
                   "Reload this page.</div>" + block, wide=True, script=_DASH_JS)
