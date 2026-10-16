@@ -258,7 +258,7 @@ class Listener(t.Dashboard):
         return {"endpoint": endpoint, "p256dh": P256DH, "auth": AUTH}
 
     def test_dashboard_offers_push_and_serves_the_service_worker(self):
-        code, body = self.get()
+        code, body = self.get("/settings")
         self.assertEqual(code, 200)
         self.assertIn("id=push-enable", body)
         self.assertIn("data-key='", body)
@@ -294,10 +294,10 @@ class Listener(t.Dashboard):
         self.post("/push/subscribe", self.sub_form())
         sid = self.store.devices()[0]["id"]
         code, loc, _ = self.post("/push/test", {})
-        self.assertEqual((code, loc), (303, "/?note=push_test_ok"))
+        self.assertEqual((code, loc), (303, "/settings?note=push_test_ok"))
         self.assertEqual(len(self.sender.calls), 1)
         code, loc, _ = self.post("/push/revoke", {"id": sid})
-        self.assertEqual((code, loc), (303, "/?note=push_removed"))
+        self.assertEqual((code, loc), (303, "/settings?note=push_removed"))
         self.assertEqual(self.store.devices(), [])
         self.assertEqual(len(self.events("push_revoked")), 1)
 

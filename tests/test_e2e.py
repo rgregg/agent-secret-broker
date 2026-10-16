@@ -1213,7 +1213,8 @@ class AlwaysAllow(Harness):
         self.assertTrue(self.broker.set_approval("svc", "allow", "alice"))
         status, body = req(self.abase + "/policies", headers={"X-authentik-username": "alice"})
         self.assertEqual(status, 200)
-        self.assertIn("Require approval again", body)
+        self.assertIn("Revoke", body)
+        self.assertNotIn("Nothing is always allowed", body)
         # granting is refused here
         tok = self.broker.csrf_token("alice")
         self.assertEqual(self.post("/policies", name="svc", approval="allow", csrf=tok)[0], 400)
@@ -1645,11 +1646,12 @@ class HistoryPage(Harness):
         self.call(decision="approve")
         r = urllib.request.urlopen(urllib.request.Request(
             self.abase + "/history", headers={"X-authentik-username": "alice"}), timeout=10)
-        body = r.read().decode()
+        body = r.read().decode() + r.headers.get("Content-Security-Policy")
         self.assertEqual(r.headers.get("X-Frame-Options"), "DENY")
         self.assertIn("frame-ancestors 'none'", r.headers.get("Content-Security-Policy"))
         for want in ("width=device-width", "color-scheme", "@media (max-width:42rem)",
-                     "data-label=Outcome", "prefers-color-scheme:dark", "<nav>"):
+                     "data-label=Outcome", "prefers-color-scheme:dark", "<nav class=tabs>", "Agent Secret Broker",
+                     "rel=icon", "img-src data:"):
             self.assertIn(want, body)
         # the decision page uses the same shell and big tap targets
         self.decision = None
@@ -1728,7 +1730,8 @@ class Dashboard(Harness):
         self.ask("/secret-looking-path?token=abc123")
         code, body = self.get()
         self.assertEqual(code, 200)
-        self.assertIn("id=notify", body)
+        self.assertIn("id=notify", self.get("/settings")[1])
+        self.assertNotIn("id=notify", body)      # the controls live on Settings
         # The browser notification body is built from the card heading (secret
         # names) only: never from the request description, URL or source.
         js = body[body.index("function announce"):body.index("function track")]

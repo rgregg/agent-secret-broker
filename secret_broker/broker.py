@@ -843,64 +843,101 @@ def _json(h, code, obj):
 
 
 _CSS = """
-:root{color-scheme:light dark;--bg:#fff;--fg:#1f2328;--muted:#59636e;--line:#d1d9e0;--card:#f6f8fa;
---accent:#0969da;--ok:#1a7f37;--warn:#9a6700;--bad:#cf222e}
-@media (prefers-color-scheme:dark){:root{--bg:#0d1117;--fg:#e6edf3;--muted:#9198a1;--line:#30363d;
---card:#161b22;--accent:#4493f8;--ok:#3fb950;--warn:#d29922;--bad:#f85149}}
+:root{color-scheme:light dark;--bg:#f6f8fa;--card:#fff;--fg:#1f2328;--muted:#656d76;--line:#d0d7de;
+--accent:#2563eb;--ok:#1a7f37;--warn:#9a6700;--bad:#cf222e;--okbg:#dcfce7;--okfg:#166534;
+--wbg:#fef3c7;--wfg:#92400e;--badbg:#ffebe9;--hov:#f3f4f6}
+@media (prefers-color-scheme:dark){:root{--bg:#0d1117;--card:#161b22;--fg:#e6edf3;--muted:#8b949e;
+--line:#30363d;--accent:#4c8dff;--ok:#3fb950;--warn:#d29922;--bad:#f85149;--okbg:#12301c;--okfg:#3fb950;
+--wbg:#3a2a0a;--wfg:#e3b341;--badbg:#3d1418;--hov:#1c2230}}
 *{box-sizing:border-box}
 html{-webkit-text-size-adjust:100%}
-body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
-main{max-width:72rem;margin:0 auto;padding:1rem}
-main.narrow{max-width:38rem}
-nav{display:flex;flex-wrap:wrap;gap:.25rem 1.25rem;padding:.75rem 1rem;border-bottom:1px solid var(--line);
-background:var(--card)}
-nav a{color:var(--accent);text-decoration:none;padding:.35rem 0;font-weight:600}
-h1{font-size:1.5rem;margin:.25rem 0 1rem}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+main{max-width:56rem;margin:0 auto;padding:1.25rem 1rem 3rem}
+main.wide{max-width:72rem}
+main.narrow{max-width:40rem}
+.top{background:var(--card);border-bottom:1px solid var(--line)}
+.bar{display:flex;align-items:center;gap:.65rem;max-width:72rem;margin:0 auto;padding:.7rem 1rem}
+.logo{width:1.7rem;height:1.7rem;border-radius:.45rem;background:var(--accent);color:#fff;display:grid;
+place-items:center;font-weight:700}
+.brand{font-size:1.05rem}.who{margin-left:auto;color:var(--muted);font-size:.85rem}
+.tabs{background:var(--card);border-bottom:1px solid var(--line);display:flex;gap:1.4rem;padding:0 1rem;
+overflow-x:auto}
+.tabs a{display:flex;align-items:center;gap:.4rem;padding:.7rem .15rem .6rem;margin-bottom:-1px;
+border-bottom:2px solid transparent;color:var(--muted);text-decoration:none;font-weight:600;white-space:nowrap;
+line-height:1.25rem}
+.tabs a.on{color:var(--accent);border-bottom-color:var(--accent)}
+.count{background:var(--accent);color:#fff;border-radius:99px;padding:0 .5rem;font-size:.75rem;line-height:1.1rem}
+h1{font-size:1.25rem;margin:.1rem 0 .9rem}
+h2{font-size:1.05rem;margin:0}
+h3{font-size:.75rem;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin:1.4rem 0 .5rem}
 a{color:var(--accent)}
 small,.muted{color:var(--muted)}
 p,td,li{overflow-wrap:anywhere}
-.actions{display:flex;flex-wrap:wrap;gap:.75rem;margin:1.25rem 0}
-.btn,button{font:inherit;font-weight:600;min-height:3rem;padding:.6rem 1.4rem;border-radius:.6rem;
-border:1px solid var(--line);background:var(--card);color:var(--fg);cursor:pointer}
+.pill{display:inline-block;padding:0 .55rem;border-radius:99px;font-size:.75rem;font-weight:600;line-height:1.1rem;
+white-space:nowrap}
+.pill.ok{background:var(--okbg);color:var(--okfg)}.pill.warn{background:var(--wbg);color:var(--wfg)}
+.pill.bad{background:var(--badbg);color:var(--bad)}.pill.plain{background:var(--hov);color:var(--muted)}
+.actions{display:flex;flex-wrap:wrap;align-items:center;gap:.5rem;margin:.9rem 0 .2rem}
+.btn,button{font:inherit;font-weight:600;font-size:.85rem;min-height:2.25rem;padding:.35rem .95rem;
+border-radius:.5rem;border:1px solid var(--line);background:var(--card);color:var(--fg);cursor:pointer}
+.btn:hover,button:hover{background:var(--hov)}
+.btn.approve{background:var(--accent);border-color:var(--accent);color:#fff}
+.btn.approve:hover{filter:brightness(1.08)}
+.btn.deny{color:var(--bad)}
+.btn.sm,td button{min-height:1.8rem;padding:.15rem .65rem;font-size:.8rem}
 [hidden]{display:none!important}
-.pushpanel{margin-top:2rem;border-top:1px solid var(--line);padding-top:1rem}
-.devices{list-style:none;padding:0}.devices li{display:flex;gap:.8rem;align-items:center;
-justify-content:space-between;padding:.5rem 0;border-bottom:1px solid var(--line)}
-form.inline{display:inline}
-.notify{margin:.25rem 0 1rem}.notify .btn{margin-right:.6rem}
-.btn.approve{background:var(--ok);border-color:var(--ok);color:#fff}
-.btn.deny{background:var(--bad);border-color:var(--bad);color:#fff}
-.actions .btn{flex:1 1 9rem}
 button:disabled{opacity:.6;cursor:default}
-.risk{border-left:.4rem solid var(--muted);padding:.4rem .8rem;background:var(--card);border-radius:.3rem;margin:1rem 0}
-.risk.low{border-color:var(--ok)}.risk.medium{border-color:var(--warn)}.risk.high{border-color:var(--bad)}
-.risk b{display:block}
-.risk.low b{color:var(--ok)}.risk.medium b{color:var(--warn)}.risk.high b{color:var(--bad)}
-.box{background:var(--card);border:1px solid var(--line);border-radius:.5rem;padding:.6rem .9rem;margin:.75rem 0;
-overflow-wrap:anywhere}
-.filters{display:flex;flex-wrap:wrap;gap:.5rem;margin:1rem 0}
-.filters select{font:inherit;min-height:2.75rem;flex:1 1 9rem;padding:.3rem .5rem;border-radius:.5rem;
-border:1px solid var(--line);background:var(--bg);color:var(--fg)}
-.tbl{width:100%;border-collapse:collapse}
-.tbl th{text-align:left;font-size:.85rem;color:var(--muted);padding:.5rem;border-bottom:2px solid var(--line)}
-.tbl td{padding:.55rem .5rem;border-bottom:1px solid var(--line);vertical-align:top}
+details.more{margin-left:auto;font-size:.85rem}
+details.more summary{cursor:pointer;color:var(--muted);list-style:none;padding:.35rem .2rem}
+details.more summary::-webkit-details-marker{display:none}
+details.more[open]{flex-basis:100%;margin:.2rem 0 0;border-top:1px solid var(--line);padding-top:.5rem}
+form.inline{display:inline}
+.card,.req{background:var(--card);border:1px solid var(--line);border-radius:.7rem;padding:1rem;margin:0 0 .8rem}
+.card h2{margin-bottom:.4rem}
+.reqhead{display:flex;align-items:center;gap:.6rem;flex-wrap:wrap}
+.reqhead h2{font-size:1.15rem}.reqhead time{margin-left:auto;color:var(--muted);font-size:.8rem}
+.risk{display:inline-flex;align-items:center;gap:.5rem;margin:.1rem 0}
+.risk b{font-size:.75rem;padding:0 .55rem;border-radius:99px;line-height:1.1rem;background:var(--hov);color:var(--muted)}
+.risk.low b{background:var(--okbg);color:var(--okfg)}.risk.medium b{background:var(--wbg);color:var(--wfg)}
+.risk.high b{background:var(--badbg);color:var(--bad)}
+.box{background:var(--bg);border:1px solid var(--line);border-radius:.5rem;padding:.5rem .75rem;margin:.6rem 0;
+font-size:.85rem;overflow-wrap:anywhere}
+.flash{background:var(--card);border:1px solid var(--line);border-left:.3rem solid var(--accent);
+border-radius:.5rem;padding:.5rem .8rem;margin:0 0 .9rem}
+.offline{border-left-color:var(--bad)}
+.empty{color:var(--muted);text-align:center;padding:1.2rem}
+.hist{list-style:none;margin:0;padding:0}
+.hist li{display:flex;align-items:center;gap:.7rem;padding:.6rem 1rem;border-bottom:1px solid var(--line)}
+.hist li:last-child{border-bottom:0}.hist .what{min-width:0;flex:1}
+.hist .what small{display:block;font-family:ui-monospace,Menlo,monospace;font-size:.75rem}
+.hist .when{color:var(--muted);font-size:.8rem;white-space:nowrap}
+.card.flush{padding:0}.card.flush .more-link{display:block;padding:.6rem 1rem;border-top:1px solid var(--line);font-size:.85rem}
+.devices{list-style:none;padding:0;margin:.5rem 0}.devices li{display:flex;gap:.8rem;align-items:center;
+justify-content:space-between;padding:.55rem 0;border-bottom:1px solid var(--line)}
+.devices li:last-child{border-bottom:0}
+.notify{margin:.5rem 0}.notify .btn{margin-right:.5rem}
+.filters{display:flex;flex-wrap:wrap;gap:.5rem;margin:0 0 .9rem}
+.filters select{font:inherit;min-height:2.25rem;flex:1 1 9rem;padding:.2rem .5rem;border-radius:.5rem;
+border:1px solid var(--line);background:var(--card);color:var(--fg)}
+.tbl{width:100%;border-collapse:collapse;background:var(--card);border:1px solid var(--line);border-radius:.7rem;
+overflow:hidden}
+.tbl th{text-align:left;font-size:.75rem;color:var(--muted);padding:.55rem .8rem;border-bottom:1px solid var(--line)}
+.tbl td{padding:.6rem .8rem;border-bottom:1px solid var(--line);vertical-align:top}
+.tbl tr:last-child td{border-bottom:0}
 .tbl td[data-label=Time],.tbl td[data-label=Outcome],.tbl td[data-label=Risk],.tbl td[data-label=Took]
 {white-space:nowrap;overflow-wrap:normal}
 .pager{display:flex;gap:1.25rem;align-items:center;flex-wrap:wrap}
-.req{background:var(--card);border:1px solid var(--line);border-radius:.8rem;padding:.25rem 1rem 1rem;margin:0 0 1rem}
-.req h2{font-size:1.15rem;margin:.75rem 0 .25rem}
-.flash{background:var(--card);border:1px solid var(--line);border-left:.4rem solid var(--accent);border-radius:.4rem;padding:.5rem .8rem;margin:.75rem 0}
-.offline{border-left-color:var(--bad)}
-@media (min-width:60rem){.cards{display:grid;grid-template-columns:repeat(2,1fr);gap:1rem}.req{margin:0}}
 @media (max-width:42rem){
- main{padding:.75rem}
+ main{padding:.9rem .75rem 2.5rem}
+ .who{display:none}
  .tbl thead{display:none}
  .tbl,.tbl tbody,.tbl tr,.tbl td{display:block;width:100%}
- .tbl tr{background:var(--card);border:1px solid var(--line);border-radius:.6rem;margin:0 0 .75rem;padding:.4rem .7rem}
+ .tbl tr{border-bottom:1px solid var(--line);padding:.4rem .7rem}
  .tbl td{border:0;padding:.2rem 0;display:flex;gap:.75rem}
- .tbl td::before{content:attr(data-label);flex:0 0 5.5rem;color:var(--muted);font-size:.85rem;padding-top:.1rem}
+ .tbl td::before{content:attr(data-label);flex:0 0 5.5rem;color:var(--muted);font-size:.8rem;padding-top:.1rem}
  .tbl td>*{min-width:0}
- .actions .btn{flex-basis:100%}
+ .actions .btn{flex:1 1 100%;min-height:2.75rem}
+ details.more{margin:0;flex-basis:100%;text-align:center}
 }
 """
 
@@ -912,12 +949,13 @@ _WORKING_JS = (
 _DASH_JS = r'''
 (function(){
   var cards=document.getElementById('cards'), flash=document.getElementById('flash'),
-      off=document.getElementById('offline'), last=cards.getAttribute('data-version');
+      off=document.getElementById('offline'), recent=document.getElementById('recent'),
+      last=cards?cards.getAttribute('data-version'):null;
   function secs(){document.querySelectorAll('time[data-exp]').forEach(function(t){
     var s=Math.max(0,Math.floor(t.getAttribute('data-exp')-Date.now()/1000));
     t.textContent='expires in '+s+'s';});}
-  function title(){var n=cards.querySelectorAll('article').length;
-    document.title=(n?'('+n+') ':'')+'Secret broker';}
+  function title(){if(!cards)return;var n=cards.querySelectorAll('article').length;
+    document.title=(n?'('+n+') ':'')+'Agent Secret Broker';}
   function parse(h){return new DOMParser().parseFromString(h,'text/html');}
   var nbtn=document.getElementById('notify'), nmsg=document.getElementById('notify-state'),
       seen={};
@@ -973,12 +1011,11 @@ _DASH_JS = r'''
   function u8(b){var s=(b+'='.repeat((4-b.length%4)%4)).replace(/-/g,'+').replace(/_/g,'/'),
     r=atob(s),o=new Uint8Array(r.length);for(var i=0;i<r.length;i++)o[i]=r.charCodeAt(i);return o;}
   function pshow(){
-    if(!pbtn)return;
-    if(!('serviceWorker' in navigator)||!('PushManager' in window)){pbtn.hidden=true;
-      pst.textContent='This browser cannot receive push notifications.';return;}
+    if(!('serviceWorker' in navigator)||!('PushManager' in window)){
+      if(pbtn){pbtn.hidden=true;pst.textContent='This browser cannot receive push notifications.';}return;}
     navigator.serviceWorker.getRegistration('/').then(function(reg){
       return reg?reg.pushManager.getSubscription():null;}).then(function(sub){
-      pushOn=!!sub;pbtn.hidden=false;
+      pushOn=!!sub;if(!pbtn)return;pbtn.hidden=false;
       pbtn.textContent=sub?'Register this device again':'Enable on this device';
       pst.textContent=sub?'This device has a subscription. It receives notifications with the '
         +'browser closed, as long as the browser is allowed to run in the background.':
@@ -1000,11 +1037,13 @@ _DASH_JS = r'''
       location.reload();})
     .catch(function(e){pst.textContent='Could not enable: '+(e&&e.message||e);});});
   function poll(){
+    if(!cards)return Promise.resolve();
     return fetch('/?fragment=1',{credentials:'same-origin',cache:'no-store'})
       .then(function(r){if(!r.ok)throw 0;return r.text();})
-      .then(function(h){var c=parse(h).getElementById('cards');
+      .then(function(h){var d=parse(h),c=d.getElementById('cards'),rc=d.getElementById('recent');
         if(c&&c.getAttribute('data-version')!==last){
           last=c.getAttribute('data-version');cards.innerHTML=c.innerHTML;bind();
+          if(recent&&rc)recent.innerHTML=rc.innerHTML;
           track(ids(c));}
         off.hidden=true;secs();title();})
       .catch(function(){off.hidden=false;});}
@@ -1021,8 +1060,8 @@ _DASH_JS = r'''
           if(n){flash.textContent=n.textContent;flash.hidden=!n.textContent;}
           last=null;return poll();})
         .catch(function(){off.hidden=false;});});});}
-  seen=ids(cards);nshow();pshow();
-  bind();secs();title();setInterval(secs,1000);setInterval(poll,3000);
+  seen=cards?ids(cards):{};nshow();pshow();
+  bind();secs();title();if(cards){setInterval(secs,1000);setInterval(poll,3000);}
   document.addEventListener('visibilitychange',function(){if(!document.hidden)poll();});
   if('serviceWorker' in navigator)navigator.serviceWorker.addEventListener('message',function(m){
     if(m.data&&m.data.type==='poll')poll();
@@ -1077,19 +1116,39 @@ def _agent_label(ua):
     return browser
 
 
-_NAV = ("<nav><a href='/'>Pending</a><a href='/history'>History</a>"
-        "<a href='/policies'>Standing approvals</a></nav>")
+_ICON = ("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E"
+         "%3Crect width='32' height='32' rx='8' fill='%232563eb'/%3E%3Ctext x='16' y='23' "
+         "font-family='system-ui,Arial,sans-serif' font-size='20' font-weight='700' fill='white' "
+         "text-anchor='middle'%3EA%3C/text%3E%3C/svg%3E")
+
+_TABS = (("requests", "/", "Requests"), ("policies", "/policies", "Policies"),
+         ("settings", "/settings", "Settings"))
 
 
-def _page(h, code, body, wide=False, nav=True, script=None):
+def _chrome(tab, badge, user):
+    who = f"<span class=who>{html.escape(user)}</span>" if user else ""
+    head = ("<header class=top><div class=bar><span class=logo>A</span>"
+            "<b class=brand>Agent Secret Broker</b><span class='pill ok'>&#9679; online</span>"
+            f"{who}</div></header>")
+    if tab is None:
+        return head
+    links = "".join(
+        f"<a href='{href}'{' class=on' if key == tab else ''}>{label}"
+        + (f" <span class=count>{badge}</span>" if key == "requests" and badge else "") + "</a>"
+        for key, href, label in _TABS)
+    return head + f"<nav class=tabs>{links}</nav>"
+
+
+def _page(h, code, body, wide=False, nav=True, script=None, tab=None, badge=0, user=""):
     nonce = secrets.token_urlsafe(16)
     scr = f"<script nonce='{nonce}'>{script}</script>" if script else ""
-    csp = ("default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; connect-src 'self'; "
+    csp = ("default-src 'none'; style-src 'unsafe-inline'; img-src data:; form-action 'self'; connect-src 'self'; "
            f"base-uri 'none'; frame-ancestors 'none'; worker-src 'self'; script-src 'nonce-{nonce}'")
     raw = ("<!doctype html><html lang=en><meta charset=utf-8>"
            "<meta name=viewport content='width=device-width,initial-scale=1'>"
-           "<meta name=color-scheme content='light dark'><title>Secret broker</title>"
-           f"<style>{_CSS}</style><body>{_NAV if nav else ''}"
+           "<meta name=color-scheme content='light dark'><title>Agent Secret Broker</title>"
+           f"<link rel=icon href=\"{_ICON}\">"
+           f"<style>{_CSS}</style><body>{_chrome(tab, badge, user) if nav else ''}"
            f"<main class='{'wide' if wide else 'narrow'}'>{body}</main>{scr}</body></html>").encode()
     h.send_response(code)
     h.send_header("Content-Type", "text/html; charset=utf-8")
@@ -1259,42 +1318,82 @@ def approval_handler(broker):
                 what, rnote = _describe(r)
                 ok, why = broker.always_allow_eligibility(r)
                 always = (
+                    "<details class=more><summary>Always allow &#9662;</summary>"
                     "<button class=btn name=decision value=approve_always>"
                     f"Approve and always allow {html.escape(r.names[0])}</button>"
                     "<p><small>Future HTTP calls with this secret run without asking, except "
                     "requests rated at or above the risk threshold. Revoke any time under "
-                    "Standing approvals.</small></p>" if ok else
-                    f"<p><small>Always allow not offered: {html.escape(why)}.</small></p>")
+                    "Policies.</small></p></details>" if ok else "")
+                no_always = ("" if ok else
+                             f"<p><small>Always allow not offered: {html.escape(why)}.</small></p>")
                 cards.append(
                     f"<article class=req data-id='{html.escape(r.id)}'>"
-                    f"<h2>{html.escape(', '.join(r.names))}</h2>{_risk_html(r)}"
+                    f"<div class=reqhead><h2>{html.escape(', '.join(r.names))}</h2>"
+                    f"<time data-exp='{int(r.expires)}'>expires in "
+                    f"{max(0, int(r.expires - time.time()))}s</time></div>{_risk_html(r)}"
                     f"<div class=box>From: {html.escape(r.source)}<br>{what}</div>"
                     f"<p><small>{rnote}</small></p>"
-                    f"<p><small><time data-exp='{int(r.expires)}'>expires in "
-                    f"{max(0, int(r.expires - time.time()))}s</time></small></p>"
                     "<form method=post action='/decide' class=decide>"
                     f"<input type=hidden name=id value='{html.escape(r.id)}'>"
                     f"<input type=hidden name=csrf value='{token}'>"
                     "<div class=actions><button class='btn approve' name=decision value=approve>"
                     "Approve</button><button class='btn deny' name=decision value=deny>Deny</button>"
-                    f"</div>{always}</form></article>")
+                    f"{always}</div>{no_always}</form></article>")
             version = hashlib.sha256("|".join(r.id for r in reqs).encode()).hexdigest()[:16]
             inner = ("".join(cards) if cards else
-                     "<p class=muted>No requests are waiting for approval.</p>")
+                     "<div class='card empty'>Nothing is waiting for approval.</div>")
             block = f"<div id=cards class=cards data-version='{version}'>{inner}</div>"
+            pend_ids = {r.id for r in broker._by_id.values() if r.status == "pending"}
+            recent = self._recent_history(broker.history.rows(pend_ids))
             if fragment:
-                return _page(self, 200, block, nav=False)
+                return _page(self, 200, block + recent, nav=False)
+            msg = notes.get(note, "")
+            _page(self, 200,
+                  f"<div id=flash class=flash{'' if msg else ' hidden'}>{html.escape(msg)}</div>"
+                  "<div id=offline class='flash offline' hidden>Cannot reach the broker (signed out?). "
+                  "Reload this page.</div><h3 style='margin-top:0'>Waiting for you</h3>"
+                  + block + recent, script=_DASH_JS, tab="requests", badge=len(reqs), user=user)
+
+        def _recent_history(self, rows):
+            good = ("approved", "auto-approved")
+            bad = ("denied", "failed")
+            items = []
+            for r in [r for r in rows if r["outcome"] != "pending"][:8]:
+                if r["mode"] == "http":
+                    what = f"{r['method'] or ''} {r['url'] or ''}".strip()
+                elif r["mode"] == "store":
+                    what = f"{r['op'] or 'store'} credential"
+                else:
+                    what = "env"
+                kind = "ok" if r["outcome"] in good else "bad" if r["outcome"] in bad else "plain"
+                items.append(
+                    f"<li><div class=what><b>{html.escape(', '.join(r['names']))}</b>"
+                    f"<small>{html.escape(what[:90])}</small></div>"
+                    f"<span class='pill {kind}'>{html.escape(r['outcome'])}</span>"
+                    f"<span class=when>{html.escape(r['time'][11:16] or r['time'])}</span></li>")
+            body = ("".join(items) if items else "<li class=muted>No requests yet.</li>")
+            return ("<section id=recent><h3>History</h3><div class='card flush'>"
+                    f"<ul class=hist>{body}</ul>"
+                    "<a class=more-link href='/history'>Search and filter all history</a></div></section>")
+
+        def _settings_page(self, user, note=""):
+            token = broker.csrf_token(user)
+            notes = {"push_removed": "Device removed.",
+                     "push_test_ok": "Test push sent. It should arrive even with the browser closed.",
+                     "push_failed": "The test push was not delivered to any device."}
             msg = notes.get(note, "")
             panel = self._push_panel(token) if broker.push is not None else ""
             _page(self, 200,
-                  "<h1>Pending requests</h1>"
-                  "<p class=notify><button id=notify class=btn type=button hidden></button>"
+                  "<h1>Settings</h1>"
+                  f"<div class=flash{'' if msg else ' hidden'}>{html.escape(msg)}</div>"
+                  "<section class=card><h2>This browser</h2>"
+                  "<p><small class=muted>Show a notification when a request arrives while this "
+                  "page is open in a tab or window.</small></p>"
+                  "<p class=notify><button id=notify class=btn type=button hidden></button> "
                   "<button id=notify-test class=btn type=button hidden>Send a test notification"
                   "</button> <small id=notify-state class=muted></small></p>"
-                  "<p class=notify><small id=notify-why class=muted></small></p>"
-                  f"<div id=flash class=flash{'' if msg else ' hidden'}>{html.escape(msg)}</div>"
-                  "<div id=offline class='flash offline' hidden>Cannot reach the broker (signed out?). "
-                  "Reload this page.</div>" + block + panel, wide=True, script=_DASH_JS)
+                  "<p class=notify><small id=notify-why class=muted></small></p></section>"
+                  + panel, script=_DASH_JS, tab="settings", user=user)
 
         def _push_panel(self, token):
             rows = []
@@ -1309,12 +1408,12 @@ def approval_handler(broker):
                     "<form method=post action='/push/revoke' class=inline>"
                     f"<input type=hidden name=id value='{html.escape(d['id'])}'>"
                     f"<input type=hidden name=csrf value='{token}'>"
-                    "<button>Remove</button></form></li>")
+                    "<button class=sm>Remove</button></form></li>")
             test = ("<form method=post action='/push/test' class=inline>"
                     f"<input type=hidden name=csrf value='{token}'>"
-                    "<button>Send a test push</button></form>" if rows else "")
+                    "<button class=sm>Send a test push</button></form>" if rows else "")
             return (
-                "<section class=pushpanel><h2>Notifications with the browser closed</h2>"
+                "<section class=card><h2>Notifications with the browser closed</h2>"
                 "<p><small class=muted>Subscribed devices get a notification even when no tab is "
                 "open. The message carries only the secret names; decisions still happen here, "
                 "after you sign in.</small></p>"
@@ -1358,23 +1457,25 @@ def approval_handler(broker):
         def _policies_page(self, user, note=""):
             rows = []
             for name, sc in sorted(cfg["secrets"].items()):
-                state = sc.get("approval", "prompt")
+                if sc.get("approval", "prompt") != "allow":
+                    continue
                 by = (sc.get("approval_changed") or {}).get("by")
-                btn = ""
-                if state == "allow":
-                    btn = ("<form method=post>"
-                           f"<input type=hidden name=csrf value='{broker.csrf_token(user)}'>"
-                           f"<input type=hidden name=name value='{html.escape(name)}'>"
-                           "<button name=approval value=prompt>Require approval again</button></form>")
-                rows.append(f"<tr><td data-label=Secret><b>{html.escape(name)}</b></td>"
-                            f"<td data-label=Policy>{html.escape(state)}"
-                            f"{' (set by ' + html.escape(by) + ')' if by and state == 'allow' else ''}</td>"
-                            f"<td data-label=''>{btn}</td></tr>")
-            _page(self, 200, f"<h1>Standing approvals</h1>{note}<table class=tbl>"
-                  "<thead><tr><th>Secret</th><th>Policy</th><th></th></tr></thead><tbody>"
-                  + "".join(rows) + "</tbody></table>", wide=True)
+                rows.append(
+                    f"<tr><td data-label=Secret><b>{html.escape(name)}</b></td>"
+                    f"<td data-label='Allowed by'>{html.escape(by or '')}</td>"
+                    "<td><form method=post class=inline>"
+                    f"<input type=hidden name=csrf value='{broker.csrf_token(user)}'>"
+                    f"<input type=hidden name=name value='{html.escape(name)}'>"
+                    "<button name=approval value=prompt>Revoke</button></form></td></tr>")
+            table = ("<table class=tbl><thead><tr><th>Secret</th><th>Allowed by</th><th></th></tr></thead>"
+                     "<tbody>" + "".join(rows) + "</tbody></table>" if rows else
+                     "<div class='card empty'>Nothing is always allowed. Every use asks you first.</div>")
+            _page(self, 200, f"<h1>Policies</h1>{note}<h3 style='margin-top:0'>Always allowed</h3>"
+                  "<p><small class=muted>These secrets are released without asking when the request is "
+                  "rated low risk. Revoke to ask every time again.</small></p>" + table,
+                  tab="policies", badge=len(broker.pending()), user=user)
 
-        def _history_page(self):
+        def _history_page(self, user=""):
             q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
 
             def arg(k):
@@ -1433,11 +1534,12 @@ def approval_handler(broker):
                 prev = f"<a href='?{base}&page={page - 1}'>newer</a>" if page > 1 else ""
                 nxt = f"<a href='?{base}&page={page + 1}'>older</a>" if page * per < total else ""
                 nav = f"<p class=pager>{prev} {nxt} <span class=muted>{total} requests</span></p>"
-            _page(self, 200, "<h1>Request history</h1>" + form
+            _page(self, 200, "<h1>History</h1>" + form
                   + "<table class=tbl><thead><tr><th>Time (UTC)</th><th>Outcome</th><th>Secret</th>"
                   "<th>Request</th><th>Risk</th><th>Decided by</th><th>Took</th></tr></thead><tbody>"
                   + "".join(body) + f"</tbody></table>{nav}"
-                  + ("" if body else "<p class=muted>No requests match.</p>"), wide=True)
+                  + ("" if body else "<p class=muted>No requests match.</p>"), wide=True,
+                  tab="requests", badge=len(broker.pending()), user=user)
 
         def do_GET(self):
             user = self._user()
@@ -1454,7 +1556,10 @@ def approval_handler(broker):
                 return self._dashboard(user, fragment=frag, note=(q.get("note") or [""])[0][:12])
             if self.path.split("?")[0].rstrip("/") == "/history":
                 broker.log("history_viewed", peer=self.client_address[0], client_ip=self._fwd())
-                return self._history_page()
+                return self._history_page(user)
+            if self.path.split("?")[0].rstrip("/") == "/settings":
+                q = urllib.parse.parse_qs(u.query)
+                return self._settings_page(user, (q.get("note") or [""])[0][:12])
             if self.path.split("?")[0].rstrip("/") == "/policies":
                 broker.log("policies_viewed", peer=self.client_address[0], client_ip=self._fwd())
                 return self._policies_page(user)
@@ -1512,14 +1617,14 @@ def approval_handler(broker):
                 gone = broker.push.remove(form.get("id", [""])[0])
                 broker.log("push_revoked", user=user, device=form.get("id", [""])[0][:16],
                            removed=gone, peer=peer, client_ip=fwd)
-                return self._redirect("/?note=push_removed")
+                return self._redirect("/settings?note=push_removed")
             if path == "/push/test":
                 ok, errors = broker.push.send_all({"title": "Test notification",
                                                    "body": "Push notifications work on this device.",
                                                    "tag": "test"})
                 broker.log("push_test", user=user, delivered=ok, errors=errors[:3], peer=peer,
                            client_ip=fwd)
-                return self._redirect("/?note=" + ("push_test_ok" if ok else "push_failed"))
+                return self._redirect("/settings?note=" + ("push_test_ok" if ok else "push_failed"))
             return self._json(404, {"ok": False})
 
         def do_POST(self):
