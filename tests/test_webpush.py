@@ -270,6 +270,10 @@ class Listener(t.Dashboard):
         self.assertIn("javascript", r.headers["Content-Type"])
         self.assertIn("showNotification", js)
         self.assertNotIn("nonce", js.lower())
+        # a click must never do nothing: focus failure or no tab opens a window
+        self.assertIn("notificationclick", js)
+        self.assertGreaterEqual(js.count("openWindow"), 2)
+        self.assertIn(".catch(", js)
 
     def test_subscribe_requires_the_csrf_token(self):
         code, _, _ = self.post("/push/subscribe", self.sub_form(), csrf=None)

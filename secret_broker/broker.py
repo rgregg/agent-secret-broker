@@ -942,7 +942,7 @@ _DASH_JS = r'''
   function why(t){var e=document.getElementById('notify-why');if(e)e.textContent=t;}
   function fire(title,body,tag){
     try{var n=new Notification(title,{body:body,tag:tag,requireInteraction:true});
-      n.onclick=function(){window.focus();n.close();};return true;}
+      n.onclick=function(){try{window.focus();}catch(x){}poll();n.close();};return true;}
     catch(e){why('The browser refused to show a notification ('+e.name+'). '
       +'Some mobile browsers need an installed web app for this.');return false;}}
   function announce(found){
@@ -1024,6 +1024,8 @@ _DASH_JS = r'''
   seen=ids(cards);nshow();pshow();
   bind();secs();title();setInterval(secs,1000);setInterval(poll,3000);
   document.addEventListener('visibilitychange',function(){if(!document.hidden)poll();});
+  if('serviceWorker' in navigator)navigator.serviceWorker.addEventListener('message',function(m){
+    if(m.data&&m.data.type==='poll')poll();});
 })();
 '''
 
@@ -1036,9 +1038,18 @@ self.addEventListener('push',function(e){
     body:d.body||'A secret was requested',tag:d.tag||'secret-request',requireInteraction:true}));});
 self.addEventListener('notificationclick',function(e){
   e.notification.close();
+  // Focus an open dashboard tab (preferring one already on "/"); if focusing is
+  // refused or there is no tab, open a new one so a click never does nothing.
   e.waitUntil(self.clients.matchAll({type:'window',includeUncontrolled:true}).then(function(cs){
-    for(var i=0;i<cs.length;i++){if('focus' in cs[i])return cs[i].focus();}
-    return self.clients.openWindow('/');}));});
+    var pick=null;
+    for(var i=0;i<cs.length;i++){
+      if(!('focus' in cs[i]))continue;
+      if(!pick||new URL(cs[i].url).pathname==='/')pick=cs[i];}
+    if(!pick)return self.clients.openWindow('/');
+    return pick.focus().then(function(c){
+      if(c&&c.postMessage)c.postMessage({type:'poll'});
+      return c;}).catch(function(){return self.clients.openWindow('/');});
+  }).catch(function(){return self.clients.openWindow('/');}));});
 """
 
 def _agent_label(ua):
