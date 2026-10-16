@@ -9,10 +9,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl unzip ca-c
  && echo "${BW_SHA256}  /tmp/bw.zip" | sha256sum -c - \
  && unzip -q /tmp/bw.zip -d /out && chmod 0755 /out/bw
 
-# Stage 2: runtime (stdlib-only Python + the bw binary)
+# Stage 2: runtime (Python + the pinned web-push dependencies + the bw binary)
 FROM python:3.12-slim
 COPY --from=bw /out/bw /usr/local/bin/bw
 WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 COPY secret_broker ./secret_broker
 USER nobody
 CMD ["python", "-m", "secret_broker"]

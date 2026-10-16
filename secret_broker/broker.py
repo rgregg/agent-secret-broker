@@ -33,6 +33,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .audit import AuditLog
 from .backends import BackendError
+from . import notify as notify_mod
 from .notify import NotifyError
 from . import risk as risk_mod
 from . import structured
@@ -74,7 +75,8 @@ class Request:
 
 class Broker:
     def __init__(self, config, backend, notifier, audit=None, summarizer=None,
-                 background_load=False):
+                 background_load=False, push=None):
+        self.push = push                # PushStore when the webpush transport is configured
         self.cfg = config
         self.cfg["secrets"] = {}        # the catalog lives in the vault; see refresh_catalog()
         self._catalog_at = 0.0
@@ -505,7 +507,7 @@ class Broker:
         why = f"\nWhy: {'; '.join(req.risk['reasons'][:3])}" if req.risk and req.risk["reasons"] else ""
         msg = f"{head}{', '.join(req.names)} from {req.source}\n{what}{why}"
         title = f"Secret request [{req.risk['level'].upper()}]" if req.risk else "Secret request"
-        self.notifier.send(title, msg, url, f"secret-{req.id[:8]}")
+        notify_mod.deliver(self.notifier, title, msg, url, f"secret-{req.id[:8]}", list(req.names))
         self.audit("notified", req)
 
     def _resolved(self, req, status):
@@ -861,6 +863,10 @@ p,td,li{overflow-wrap:anywhere}
 .btn,button{font:inherit;font-weight:600;min-height:3rem;padding:.6rem 1.4rem;border-radius:.6rem;
 border:1px solid var(--line);background:var(--card);color:var(--fg);cursor:pointer}
 [hidden]{display:none!important}
+.pushpanel{margin-top:2rem;border-top:1px solid var(--line);padding-top:1rem}
+.devices{list-style:none;padding:0}.devices li{display:flex;gap:.8rem;align-items:center;
+justify-content:space-between;padding:.5rem 0;border-bottom:1px solid var(--line)}
+form.inline{display:inline}
 .notify{margin:.25rem 0 1rem}.notify .btn{margin-right:.6rem}
 .btn.approve{background:var(--ok);border-color:var(--ok);color:#fff}
 .btn.deny{background:var(--bad);border-color:var(--bad);color:#fff}
@@ -941,7 +947,7 @@ _DASH_JS = r'''
       +'Some mobile browsers need an installed web app for this.');return false;}}
   function announce(found){
     var fresh=Object.keys(found).filter(function(id){return seen[id]===undefined;});
-    if(!fresh.length)return;
+    if(!fresh.length||pushOn)return;
     if(!('Notification' in window)||Notification.permission!=='granted'||!want()){
       why('A request arrived but notifications are off on this device.');return;}
     if(!document.hidden&&document.hasFocus()){
@@ -962,6 +968,37 @@ _DASH_JS = r'''
     if(Notification.permission==='granted'&&want()){remember(false);nshow();return;}
     var go=function(p){if(p==='granted')remember(true);nshow();};
     var r=Notification.requestPermission(go);if(r&&r.then)r.then(go);});
+  var pbtn=document.getElementById('push-enable'), pst=document.getElementById('push-state'),
+      pushOn=false;
+  function u8(b){var s=(b+'='.repeat((4-b.length%4)%4)).replace(/-/g,'+').replace(/_/g,'/'),
+    r=atob(s),o=new Uint8Array(r.length);for(var i=0;i<r.length;i++)o[i]=r.charCodeAt(i);return o;}
+  function pshow(){
+    if(!pbtn)return;
+    if(!('serviceWorker' in navigator)||!('PushManager' in window)){pbtn.hidden=true;
+      pst.textContent='This browser cannot receive push notifications.';return;}
+    navigator.serviceWorker.getRegistration('/').then(function(reg){
+      return reg?reg.pushManager.getSubscription():null;}).then(function(sub){
+      pushOn=!!sub;pbtn.hidden=false;
+      pbtn.textContent=sub?'Register this device again':'Enable on this device';
+      pst.textContent=sub?'This device has a subscription. It receives notifications with the '
+        +'browser closed, as long as the browser is allowed to run in the background.':
+        'Not enabled on this device.';});}
+  if(pbtn)pbtn.addEventListener('click',function(){
+    pst.textContent='Working...';
+    Notification.requestPermission().then(function(p){
+      if(p!=='granted')throw new Error('notifications are not allowed for this site');
+      return navigator.serviceWorker.register('/sw.js',{scope:'/'});})
+    .then(function(){return navigator.serviceWorker.ready;})
+    .then(function(reg){return reg.pushManager.getSubscription().then(function(sub){
+      return sub||reg.pushManager.subscribe({userVisibleOnly:true,
+        applicationServerKey:u8(pbtn.getAttribute('data-key'))});});})
+    .then(function(sub){var j=sub.toJSON();
+      return fetch('/push/subscribe',{method:'POST',credentials:'same-origin',
+        body:new URLSearchParams({csrf:pbtn.getAttribute('data-csrf'),endpoint:j.endpoint,
+          p256dh:j.keys.p256dh,auth:j.keys.auth})});})
+    .then(function(r){if(!r.ok)throw new Error('the broker refused the subscription');
+      location.reload();})
+    .catch(function(e){pst.textContent='Could not enable: '+(e&&e.message||e);});});
   function poll(){
     return fetch('/?fragment=1',{credentials:'same-origin',cache:'no-store'})
       .then(function(r){if(!r.ok)throw 0;return r.text();})
@@ -984,11 +1021,41 @@ _DASH_JS = r'''
           if(n){flash.textContent=n.textContent;flash.hidden=!n.textContent;}
           last=null;return poll();})
         .catch(function(){off.hidden=false;});});});}
-  seen=ids(cards);nshow();
+  seen=ids(cards);nshow();pshow();
   bind();secs();title();setInterval(secs,1000);setInterval(poll,3000);
   document.addEventListener('visibilitychange',function(){if(!document.hidden)poll();});
 })();
 '''
+
+_SERVICE_WORKER = r"""
+self.addEventListener('install',function(){self.skipWaiting();});
+self.addEventListener('activate',function(e){e.waitUntil(self.clients.claim());});
+self.addEventListener('push',function(e){
+  var d={};try{d=e.data.json();}catch(x){}
+  e.waitUntil(self.registration.showNotification(d.title||'Approval needed',{
+    body:d.body||'A secret was requested',tag:d.tag||'secret-request',requireInteraction:true}));});
+self.addEventListener('notificationclick',function(e){
+  e.notification.close();
+  e.waitUntil(self.clients.matchAll({type:'window',includeUncontrolled:true}).then(function(cs){
+    for(var i=0;i<cs.length;i++){if('focus' in cs[i])return cs[i].focus();}
+    return self.clients.openWindow('/');}));});
+"""
+
+def _agent_label(ua):
+    ua = ua or ""
+    for token, name in (("Edg/", "Edge"), ("Firefox/", "Firefox"), ("Chrome/", "Chrome"),
+                        ("Safari/", "Safari")):
+        if token in ua:
+            browser = name
+            break
+    else:
+        return "Unknown browser"
+    for token, name in (("Windows", "Windows"), ("Mac OS X", "macOS"), ("Android", "Android"),
+                        ("iPhone", "iPhone"), ("iPad", "iPad"), ("Linux", "Linux")):
+        if token in ua:
+            return f"{browser} on {name}"
+    return browser
+
 
 _NAV = ("<nav><a href='/'>Pending</a><a href='/history'>History</a>"
         "<a href='/policies'>Standing approvals</a></nav>")
@@ -998,7 +1065,7 @@ def _page(h, code, body, wide=False, nav=True, script=None):
     nonce = secrets.token_urlsafe(16)
     scr = f"<script nonce='{nonce}'>{script}</script>" if script else ""
     csp = ("default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; connect-src 'self'; "
-           f"base-uri 'none'; frame-ancestors 'none'; script-src 'nonce-{nonce}'")
+           f"base-uri 'none'; frame-ancestors 'none'; worker-src 'self'; script-src 'nonce-{nonce}'")
     raw = ("<!doctype html><html lang=en><meta charset=utf-8>"
            "<meta name=viewport content='width=device-width,initial-scale=1'>"
            "<meta name=color-scheme content='light dark'><title>Secret broker</title>"
@@ -1161,6 +1228,9 @@ def approval_handler(broker):
             notes = {"approved": "Approved. Releasing now.", "denied": "Denied.",
                      "always": "Approved, and always allowed from now on.",
                      "stale": "That request was already handled or has expired.",
+                     "push_removed": "Device removed.",
+                     "push_test_ok": "Test push sent. It should arrive even with the browser closed.",
+                     "push_failed": "The test push was not delivered to any device.",
                      "bad": "That request could not be processed."}
             reqs = broker.pending()
             token = broker.csrf_token(user)
@@ -1195,6 +1265,7 @@ def approval_handler(broker):
             if fragment:
                 return _page(self, 200, block, nav=False)
             msg = notes.get(note, "")
+            panel = self._push_panel(token) if broker.push is not None else ""
             _page(self, 200,
                   "<h1>Pending requests</h1>"
                   "<p class=notify><button id=notify class=btn type=button hidden></button>"
@@ -1203,7 +1274,55 @@ def approval_handler(broker):
                   "<p class=notify><small id=notify-why class=muted></small></p>"
                   f"<div id=flash class=flash{'' if msg else ' hidden'}>{html.escape(msg)}</div>"
                   "<div id=offline class='flash offline' hidden>Cannot reach the broker (signed out?). "
-                  "Reload this page.</div>" + block, wide=True, script=_DASH_JS)
+                  "Reload this page.</div>" + block + panel, wide=True, script=_DASH_JS)
+
+        def _push_panel(self, token):
+            rows = []
+            for d in broker.push.devices():
+                when = time.strftime("%Y-%m-%d", time.gmtime(d["created"] or 0))
+                status = ("last delivery OK" if d["last_ok"] else
+                          f"last error: {d['last_error']}" if d["last_error"] else "not used yet")
+                rows.append(
+                    f"<li><span>{html.escape(_agent_label(d['agent']))} "
+                    f"<small class=muted>({html.escape(d['user'])}, added {when}, "
+                    f"{html.escape(status)})</small></span>"
+                    "<form method=post action='/push/revoke' class=inline>"
+                    f"<input type=hidden name=id value='{html.escape(d['id'])}'>"
+                    f"<input type=hidden name=csrf value='{token}'>"
+                    "<button>Remove</button></form></li>")
+            test = ("<form method=post action='/push/test' class=inline>"
+                    f"<input type=hidden name=csrf value='{token}'>"
+                    "<button>Send a test push</button></form>" if rows else "")
+            return (
+                "<section class=pushpanel><h2>Notifications with the browser closed</h2>"
+                "<p><small class=muted>Subscribed devices get a notification even when no tab is "
+                "open. The message carries only the secret names; decisions still happen here, "
+                "after you sign in.</small></p>"
+                f"<p><button id=push-enable class=btn type=button hidden data-key='"
+                f"{html.escape(broker.push.public_key())}' data-csrf='{token}'>Enable on this "
+                "device</button> <small id=push-state class=muted></small></p>"
+                f"<ul class=devices>{''.join(rows) or '<li class=muted>No devices yet.</li>'}</ul>"
+                f"{test}</section>")
+
+        def _json(self, code, obj):
+            raw = json.dumps(obj).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def _service_worker(self):
+            raw = _SERVICE_WORKER.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/javascript; charset=utf-8")
+            self.send_header("Content-Length", str(len(raw)))
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Service-Worker-Allowed", "/")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(raw)
 
         def _redirect(self, where):
             self.send_response(303)
@@ -1305,6 +1424,8 @@ def approval_handler(broker):
             if user is None:
                 return
             u = urllib.parse.urlsplit(self.path)
+            if u.path == "/sw.js" and broker.push is not None:
+                return self._service_worker()
             if u.path == "/":
                 q = urllib.parse.parse_qs(u.query)
                 frag = q.get("fragment", [""])[0] == "1"
@@ -1352,6 +1473,35 @@ def approval_handler(broker):
 </form>
 <p id=w hidden>Working...</p>""", script=_WORKING_JS)
 
+        def _push_post(self, path, form, user):
+            peer, fwd = self.client_address[0], self._fwd()
+            if broker.push is None:
+                return self._json(404, {"ok": False})
+            if path == "/push/subscribe":
+                try:
+                    sid = broker.push.add(user, form.get("endpoint", [""])[0],
+                                          form.get("p256dh", [""])[0], form.get("auth", [""])[0],
+                                          self.headers.get("User-Agent", ""))
+                except ValueError as e:
+                    broker.log("push_refused", user=user, reason=str(e)[:80], peer=peer,
+                               client_ip=fwd)
+                    return self._json(400, {"ok": False, "error": str(e)[:80]})
+                broker.log("push_subscribed", user=user, device=sid, peer=peer, client_ip=fwd)
+                return self._json(200, {"ok": True})
+            if path == "/push/revoke":
+                gone = broker.push.remove(form.get("id", [""])[0])
+                broker.log("push_revoked", user=user, device=form.get("id", [""])[0][:16],
+                           removed=gone, peer=peer, client_ip=fwd)
+                return self._redirect("/?note=push_removed")
+            if path == "/push/test":
+                ok, errors = broker.push.send_all({"title": "Test notification",
+                                                   "body": "Push notifications work on this device.",
+                                                   "tag": "test"})
+                broker.log("push_test", user=user, delivered=ok, errors=errors[:3], peer=peer,
+                           client_ip=fwd)
+                return self._redirect("/?note=" + ("push_test_ok" if ok else "push_failed"))
+            return self._json(404, {"ok": False})
+
         def do_POST(self):
             user = self._user()
             if user is None:
@@ -1359,11 +1509,14 @@ def approval_handler(broker):
             form = urllib.parse.parse_qs(
                 self.rfile.read(min(int(self.headers.get("Content-Length", 0)), 8192)).decode())
             path = self.path.split("?")[0].rstrip("/")
-            if path in ("/decide", "/policies") and not self._csrf_ok(user, form.get("csrf", [""])[0]):
+            if path in ("/decide", "/policies", "/push/subscribe", "/push/revoke",
+                        "/push/test") and not self._csrf_ok(user, form.get("csrf", [""])[0]):
                 broker.log("csrf_refused", path=path, peer=self.client_address[0],
                            client_ip=self._fwd(), origin=(self.headers.get("Origin") or "")[:80],
                            fetch_site=self.headers.get("Sec-Fetch-Site"))
                 return _page(self, 403, "<h1>Forbidden</h1><p>Reload the page and try again.</p>")
+            if path.startswith("/push/"):
+                return self._push_post(path, form, user)
             if path == "/decide":
                 rid = form.get("id", [""])[0]
                 decision = form.get("decision", [""])[0]

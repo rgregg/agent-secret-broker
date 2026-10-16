@@ -47,7 +47,11 @@ def main():
     if not cfg:
         ap.error("no settings: set BROKER_CONFIG or pass --config")
     backend = build_backend(cfg)
-    notifier = notify.build(cfg, _read)
+    push = None
+    if any(sp.get("type") == "webpush" for sp in cfg.get("notify") or []):
+        from .webpush import store_from_config
+        push = store_from_config(cfg)
+    notifier = notify.build(cfg, _read, push_store=push)
     summarizer = None
     sc = cfg.get("summary")
     if sc:
@@ -56,7 +60,7 @@ def main():
             max_content_chars=sc.get("max_content_chars", 300),
             send_content=sc.get("send_content", True))
     broker = Broker(cfg, backend, notifier, audit=cfg.get("audit_log"), summarizer=summarizer,
-                    background_load=True)
+                    background_load=True, push=push)
     bind = os.environ.get("BIND", "0.0.0.0")
     serve(broker,
           (bind, int(cfg.get("client_port", 8800))),

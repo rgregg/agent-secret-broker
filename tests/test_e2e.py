@@ -784,7 +784,7 @@ class Transports(unittest.TestCase):
 
     def test_multi_delivers_if_any_succeeds(self):
         class Boom:
-            def send(self, *a):
+            def send(self, *a, **k):
                 raise NotifyError("down")
         ok = FakeNotifier()
         multi = notify_mod.MultiNotifier([Boom(), ok])

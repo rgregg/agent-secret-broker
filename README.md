@@ -246,6 +246,36 @@ needs its own permission in the OS notification settings (macOS: System
 Settings > Notifications > the browser), and Focus or Do Not Disturb modes hide
 notifications too.
 
+### Web Push (notifications with the browser closed)
+
+Add `{"type": "webpush"}` to `notify` and the dashboard gains a **Notifications
+with the browser closed** panel. Click **Enable on this device** once (the
+browser asks permission, registers a small service worker and subscribes through
+its vendor's push service); from then on a new request produces a notification
+even with no tab open, and clicking it opens the dashboard. Remove a device from
+the same panel; **Send a test push** checks the whole path.
+
+- The message carries the title and the secret names only, encrypted for the
+  browser (RFC 8291, authorised with a VAPID key, RFC 8292). It has no URL, no
+  request body, no value and no approval nonce: the decision is still made on
+  the dashboard, after SSO.
+- Subscriptions (`webpush.json`) and the VAPID private key (`vapid.pem`) are
+  kept next to the audit log, mode 0600, outside the vault. Override with
+  `webpush.subscriptions_file` / `webpush.vapid_key_file`; `webpush.subject`
+  (a `mailto:` or https URL) identifies the sender to the push service and
+  defaults to `approve_base_url`.
+- A subscription is a URL the broker will POST to, so only known push services
+  are accepted (Chrome/Edge via FCM, Firefox, Safari, Windows); add others with
+  `webpush.endpoint_hosts`.
+- Delivery is weaker than the Home Assistant transport: a push service accepting
+  a message is not proof that you saw it. Keep another transport configured as a
+  backup; with several, a request is delivered if any one succeeds.
+- This is the one transport with a third-party dependency (`pywebpush`, pinned
+  in `requirements.txt` and installed in the image).
+- Chrome only needs notifications allowed for the site and the browser (macOS:
+  also System Settings > Notifications). The open-tab notification above stands
+  down on a device that is subscribed, so you do not get two.
+
 ## Request history
 
 `/history` on the approval listener (same SSO gate and identity check as the

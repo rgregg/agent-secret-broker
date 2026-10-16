@@ -3,13 +3,18 @@
 A transport only *delivers the link* to the approval page; approval itself
 always happens on that page (behind SSO). Contract:
 
-    send(title, message, url, tag) -> None   raise NotifyError if not delivered
+    send(title, message, url, tag, names=None) -> None
+                                             raise NotifyError if not delivered.
+                                             `names` is the list of secret names,
+                                             for transports that must not carry
+                                             the longer message (web push).
     resolved(tag, status)          -> None   optional, best effort: called when
                                              the request is approved/denied/expired
 
 Configure one or more under `notify` in the broker config; with several, a
 request is delivered if at least one transport succeeds.
 """
+import inspect
 import json
 import threading
 import time
@@ -19,6 +24,21 @@ import urllib.request
 
 class NotifyError(Exception):
     pass
+
+
+def deliver(transport, title, message, url, tag, names=None):
+    """Call transport.send, passing `names` only to transports that accept it
+    (those written against the older four-argument contract do not)."""
+    send = transport.send
+    try:
+        params = inspect.signature(send).parameters
+        takes = "names" in params or any(
+            p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+    except (TypeError, ValueError):
+        takes = False
+    if takes:
+        return send(title, message, url, tag, names=names)
+    return send(title, message, url, tag)
 
 
 class TickerNotifier:
@@ -37,7 +57,7 @@ class TickerNotifier:
         with urllib.request.urlopen(req, timeout=self._timeout) as r:
             return json.load(r)
 
-    def send(self, title, message, url, tag):
+    def send(self, title, message, url, tag, names=None):
         """Send the push and confirm Ticker actually delivered it to a device.
 
         ticker.notify returns 200 even when the category is `never` for every
@@ -90,7 +110,7 @@ class TelegramNotifier:
             raise NotifyError(f"telegram {method} failed: {out.get('description', '')}"[:200])
         return out["result"]
 
-    def send(self, title, message, url, tag):
+    def send(self, title, message, url, tag, names=None):
         text = f"{title}\n\n{message}"
         res = self._call("sendMessage", {
             "chat_id": self._chat, "text": text, "disable_web_page_preview": True,
@@ -111,11 +131,11 @@ class MultiNotifier:
     def __init__(self, notifiers):
         self._n = list(notifiers)
 
-    def send(self, title, message, url, tag):
+    def send(self, title, message, url, tag, names=None):
         errors, ok = [], 0
         for n in self._n:
             try:
-                n.send(title, message, url, tag)
+                deliver(n, title, message, url, tag, names)
                 ok += 1
             except (NotifyError, OSError) as e:
                 errors.append(f"{type(n).__name__}: {e}")
@@ -132,7 +152,7 @@ class MultiNotifier:
                     pass
 
 
-def build(cfg, read_secret):
+def build(cfg, read_secret, push_store=None):
     """Build the notifier from config. `read_secret(path)` returns file text.
 
     New style:  "notify": [{"type": "ticker", ...}, {"type": "telegram", ...}]
@@ -151,6 +171,11 @@ def build(cfg, read_secret):
         elif kind == "telegram":
             out.append(TelegramNotifier(read_secret(sp["bot_token_file"]), sp["chat_id"],
                                         sp.get("api_base", "https://api.telegram.org")))
+        elif kind == "webpush":
+            if push_store is None:
+                raise ValueError("webpush transport needs a push store")
+            from .webpush import WebPushNotifier
+            out.append(WebPushNotifier(push_store))
         else:
             raise ValueError(f"unknown notify transport {kind!r}")
     if not out:
@@ -165,7 +190,7 @@ class FakeNotifier:
         self.sent = []
         self._on_send = on_send
 
-    def send(self, title, message, url, tag):
+    def send(self, title, message, url, tag, names=None):
         self.sent.append({"title": title, "message": message, "url": url, "tag": tag})
         if self._on_send:
             self._on_send(url)
