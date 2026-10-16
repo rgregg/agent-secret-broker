@@ -16,6 +16,8 @@ The agent never holds the vault password or the approval channel. Approval
 happens on a web page that only your authenticated SSO session can reach, from a
 push notification or the dashboard.
 
+![The approval page: a pending request with Approve, Deny and Always allow, and recent history](docs/img/requests.png)
+
 - **The vault is the catalog.** Every login and secure note in the broker's
   Bitwarden/Vaultwarden collection is a credential, with safe defaults you can
   tune. No config file lists your secrets.
