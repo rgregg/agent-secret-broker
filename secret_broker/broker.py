@@ -852,17 +852,18 @@ _CSS = """
 *{box-sizing:border-box}
 html{-webkit-text-size-adjust:100%}
 body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
-main{max-width:56rem;margin:0 auto;padding:1.25rem 1rem 3rem}
-main.wide{max-width:72rem}
-main.narrow{max-width:40rem}
+main{max-width:72rem;margin:0 auto;padding:1.25rem 1rem 3rem}
+main.narrow>*{max-width:46rem}
+.back{display:inline-block;margin:0 0 .6rem;font-size:.85rem;text-decoration:none}
 .top{background:var(--card);border-bottom:1px solid var(--line)}
 .bar{display:flex;align-items:center;gap:.65rem;max-width:72rem;margin:0 auto;padding:.7rem 1rem}
+.tabs{--edge:max(1rem,calc((100% - 72rem)/2 + 1rem))}
 .logo{width:1.7rem;height:1.7rem;border-radius:.45rem;background:var(--accent);color:#fff;display:grid;
 place-items:center;font-weight:700}
 .brand{font-size:1.05rem}.who{margin-left:auto;color:var(--muted);font-size:.85rem}
-.tabs{background:var(--card);border-bottom:1px solid var(--line);display:flex;gap:1.4rem;padding:0 1rem;
+.tabs{background:var(--card);border-bottom:1px solid var(--line);display:flex;gap:1.4rem;padding:0 var(--edge);
 overflow-x:auto}
-.tabs a{display:flex;align-items:center;gap:.4rem;padding:.7rem .15rem .6rem;margin-bottom:-1px;
+.tabs a{display:flex;align-items:center;gap:.4rem;padding:.7rem 0 .6rem;margin-bottom:-1px;
 border-bottom:2px solid transparent;color:var(--muted);text-decoration:none;font-weight:600;white-space:nowrap;
 line-height:1.25rem}
 .tabs a.on{color:var(--accent);border-bottom-color:var(--accent)}
@@ -912,9 +913,13 @@ border-radius:.5rem;padding:.5rem .8rem;margin:0 0 .9rem}
 .hist .what small{display:block;font-family:ui-monospace,Menlo,monospace;font-size:.75rem}
 .hist .when{color:var(--muted);font-size:.8rem;white-space:nowrap}
 .card.flush{padding:0}.card.flush .more-link{display:block;padding:.6rem 1rem;border-top:1px solid var(--line);font-size:.85rem}
-.devices{list-style:none;padding:0;margin:.5rem 0}.devices li{display:flex;gap:.8rem;align-items:center;
-justify-content:space-between;padding:.55rem 0;border-bottom:1px solid var(--line)}
-.devices li:last-child{border-bottom:0}
+.devices{list-style:none;padding:0;margin:0}.devices li{display:flex;gap:.8rem;align-items:center;
+padding:.7rem 1rem;border-top:1px solid var(--line)}
+.srow{display:flex;align-items:center;gap:1rem;padding:.75rem 0;border-top:1px solid var(--line)}
+.card h2+.srow{border-top:0;margin-top:.2rem}
+.t{flex:1;min-width:0}.t b,.t small{display:block}
+.chead{display:flex;align-items:center;gap:.8rem;padding:1rem 1rem .2rem}.chead h2{margin:0;flex:1}
+.cnote{margin:0;padding:0 1rem .6rem}
 .notify{margin:.5rem 0}.notify .btn{margin-right:.5rem}
 .filters{display:flex;flex-wrap:wrap;gap:.5rem;margin:0 0 .9rem}
 .filters select{font:inherit;min-height:2.25rem;flex:1 1 9rem;padding:.2rem .5rem;border-radius:.5rem;
@@ -1382,46 +1387,55 @@ def approval_handler(broker):
                      "push_test_ok": "Test push sent. It should arrive even with the browser closed.",
                      "push_failed": "The test push was not delivered to any device."}
             msg = notes.get(note, "")
-            panel = self._push_panel(token) if broker.push is not None else ""
+            push_row = self._push_enable_row(token) if broker.push is not None else ""
+            devices = self._push_devices(token) if broker.push is not None else ""
             _page(self, 200,
                   "<h1>Settings</h1>"
                   f"<div class=flash{'' if msg else ' hidden'}>{html.escape(msg)}</div>"
                   "<section class=card><h2>This browser</h2>"
-                  "<p><small class=muted>Show a notification when a request arrives while this "
-                  "page is open in a tab or window.</small></p>"
-                  "<p class=notify><button id=notify class=btn type=button hidden></button> "
+                  "<div class=srow><div class=t><b>Notifications while this page is open</b>"
+                  "<small id=notify-state class=muted></small></div>"
+                  "<button id=notify class=btn type=button hidden></button></div>"
+                  + push_row +
+                  "<div class=srow><div class=t><b>Test</b>"
+                  "<small id=notify-why class=muted>Shows a notification on this device.</small></div>"
                   "<button id=notify-test class=btn type=button hidden>Send a test notification"
-                  "</button> <small id=notify-state class=muted></small></p>"
-                  "<p class=notify><small id=notify-why class=muted></small></p></section>"
-                  + panel, script=_DASH_JS, tab="settings", user=user)
+                  "</button></div></section>" + devices, script=_DASH_JS, tab="settings", user=user)
 
-        def _push_panel(self, token):
+        def _push_enable_row(self, token):
+            return (
+                "<div class=srow><div class=t><b>Notifications with the browser closed</b>"
+                "<small id=push-state class=muted></small></div>"
+                f"<button id=push-enable class=btn type=button hidden data-key='"
+                f"{html.escape(broker.push.public_key())}' data-csrf='{token}'>Enable on this "
+                "device</button></div>")
+
+        def _push_devices(self, token):
             rows = []
             for d in broker.push.devices():
                 when = time.strftime("%Y-%m-%d", time.gmtime(d["created"] or 0))
-                status = ("last delivery OK" if d["last_ok"] else
-                          f"last error: {d['last_error']}" if d["last_error"] else "not used yet")
+                ok = d["last_ok"]
+                status = ("<span class='pill ok'>last delivery OK</span>" if ok else
+                          f"<span class='pill bad'>{html.escape(str(d['last_error']))[:60]}</span>"
+                          if d["last_error"] else "<span class='pill plain'>not used yet</span>")
                 rows.append(
-                    f"<li><span>{html.escape(_agent_label(d['agent']))} "
-                    f"<small class=muted>({html.escape(d['user'])}, added {when}, "
-                    f"{html.escape(status)})</small></span>"
+                    f"<li><div class=t><b>{html.escape(_agent_label(d['agent']))}</b>"
+                    f"<small class=muted>{html.escape(d['user'])}, added {when}</small></div>"
+                    f"{status}"
                     "<form method=post action='/push/revoke' class=inline>"
                     f"<input type=hidden name=id value='{html.escape(d['id'])}'>"
                     f"<input type=hidden name=csrf value='{token}'>"
-                    "<button class=sm>Remove</button></form></li>")
+                    "<button class='btn sm deny'>Remove</button></form></li>")
             test = ("<form method=post action='/push/test' class=inline>"
                     f"<input type=hidden name=csrf value='{token}'>"
-                    "<button class=sm>Send a test push</button></form>" if rows else "")
+                    "<button class='btn sm'>Send a test push</button></form>" if rows else "")
             return (
-                "<section class=card><h2>Notifications with the browser closed</h2>"
-                "<p><small class=muted>Subscribed devices get a notification even when no tab is "
-                "open. The message carries only the secret names; decisions still happen here, "
-                "after you sign in.</small></p>"
-                f"<p><button id=push-enable class=btn type=button hidden data-key='"
-                f"{html.escape(broker.push.public_key())}' data-csrf='{token}'>Enable on this "
-                "device</button> <small id=push-state class=muted></small></p>"
+                "<section class='card flush'><div class=chead><h2>Devices receiving push</h2>"
+                f"{test}</div>"
+                "<p class=cnote><small class=muted>The message carries only the secret names; "
+                "decisions still happen here, after you sign in.</small></p>"
                 f"<ul class=devices>{''.join(rows) or '<li class=muted>No devices yet.</li>'}</ul>"
-                f"{test}</section>")
+                "</section>")
 
         def _json(self, code, obj):
             raw = json.dumps(obj).encode()
@@ -1534,7 +1548,7 @@ def approval_handler(broker):
                 prev = f"<a href='?{base}&page={page - 1}'>newer</a>" if page > 1 else ""
                 nxt = f"<a href='?{base}&page={page + 1}'>older</a>" if page * per < total else ""
                 nav = f"<p class=pager>{prev} {nxt} <span class=muted>{total} requests</span></p>"
-            _page(self, 200, "<h1>History</h1>" + form
+            _page(self, 200, "<a class=back href='/'>&larr; Back to Requests</a><h1>History</h1>" + form
                   + "<table class=tbl><thead><tr><th>Time (UTC)</th><th>Outcome</th><th>Secret</th>"
                   "<th>Request</th><th>Risk</th><th>Decided by</th><th>Took</th></tr></thead><tbody>"
                   + "".join(body) + f"</tbody></table>{nav}"

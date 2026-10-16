@@ -5,7 +5,7 @@ credentials **only after a human approves each use** on their phone, with a full
 audit trail. Self-hosted, no MCP.
 
     agent                         broker                          you
-      | secret-run http NAME ...    |                              |
+      | asb http NAME ...    |                              |
       |---------------------------->|  push: "NAME, GET /x [LOW]"  |
       |                             |----------------------------->|
       |                             |      tap -> SSO login -> Approve
@@ -17,12 +17,12 @@ happens on a page that only your authenticated SSO session can reach.
 
 ## Modes
 
-    secret-run list [--json]             what credentials exist? name, vars, hosts
-    secret-run which HOST|URL            is a credential available? (no approval, no push)
-    secret-run http NAME METHOD URL [-H 'K: V']... [-d BODY | -d @file | -d @-]
-    secret-run NAME[,NAME] -- command args...
-    secret-run help COMMAND              usage + example for one command
-    secret-run guide                     manual for agents: workflow, {{VAR}}, approvals, exit codes
+    asb list [--json]             what credentials exist? name, vars, hosts
+    asb which HOST|URL            is a credential available? (no approval, no push)
+    asb http NAME METHOD URL [-H 'K: V']... [-d BODY | -d @file | -d @-]
+    asb NAME[,NAME] -- command args...
+    asb help COMMAND              usage + example for one command
+    asb guide                     manual for agents: workflow, {{VAR}}, approvals, exit codes
 
 - **`http` (enforced).** The broker makes the call itself, only to the secret's
   `allowed_hosts`, never follows redirects, and masks the secret in the response.
@@ -76,7 +76,7 @@ carries one custom text field named `broker`, holding a JSON object:
   the metadata says otherwise:
   `"tls_fingerprint": "sha256:<hex>"` (or a list of them, for a secret that
   spans several devices) accepts exactly those certificates and nothing else (CA
-  and hostname are not consulted; `secret-run fingerprint HOST[:PORT]` prints
+  and hostname are not consulted; `asb fingerprint HOST[:PORT]` prints
   one), or `"tls_verify": false` turns verification off, which is only
   accepted when every allowed host is a private address or `.lan`/`.local`
   name. Prefer the pin: it still fails loudly against an impersonator. A
@@ -162,8 +162,8 @@ and useless without your SSO session).
 
 An agent can add or rotate credentials, always with a fresh approval:
 
-    printf '%s' "$NEW_TOKEN" | secret-run store myapi --hosts api.example.com [--field notes] [--item "Vault item"]
-    printf '%s' "$NEW_TOKEN" | secret-run update myapi
+    printf '%s' "$NEW_TOKEN" | asb store myapi --hosts api.example.com [--field notes] [--item "Vault item"]
+    printf '%s' "$NEW_TOKEN" | asb update myapi
 
 - **The value is only read from stdin** (or a hidden prompt on a terminal), never
   an argument, and it is never written to the audit log, notifications, the

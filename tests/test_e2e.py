@@ -22,7 +22,7 @@ from secret_broker.notify import FakeNotifier, NotifyError  # noqa: E402
 from secret_broker.summarize import OpenRouterSummarizer  # noqa: E402
 
 SECRET = "s3cr3t-token-value"
-CLI = os.path.join(os.path.dirname(__file__), "..", "client", "secret-run")
+CLI = os.path.join(os.path.dirname(__file__), "..", "client", "asb")
 KEY = "client-key"
 
 
@@ -2192,7 +2192,7 @@ class Cli(Harness):
         for cmd in ("list", "which", "http", "store", "update", "fingerprint"):
             p = self.run_cli(cmd, "--help")
             self.assertEqual(p.returncode, 0, (cmd, p.stderr))
-            self.assertIn(f"usage: secret-run", p.stdout)
+            self.assertIn(f"usage: asb", p.stdout)
         self.assertIn("{{GRAFANA_TOKEN}}", self.run_cli("help", "http").stdout)
         self.assertEqual(self.run_cli("help", "nope").returncode, 2)
         # a flag piped to store must not create an item called "--help"
@@ -2212,16 +2212,16 @@ class Cli(Harness):
     def test_guide_explains_the_workflow(self):
         p = self.run_cli("guide")
         self.assertEqual(p.returncode, 0)
-        for needle in ("{{VAR}}", "secret-run which", "approve", "Exit codes", "stdin"):
+        for needle in ("{{VAR}}", "asb which", "approve", "Exit codes", "stdin"):
             self.assertIn(needle, p.stdout)
-        self.assertIn("secret-run guide", self.run_cli().stdout)
+        self.assertIn("asb guide", self.run_cli().stdout)
 
     def test_errors_say_what_to_do_next(self):
         none = self.run_cli("which", "nothing.example")
-        self.assertIn("secret-run list", none.stderr)
+        self.assertIn("asb list", none.stderr)
         bad = self.run_cli("frobnicate")
         self.assertEqual(bad.returncode, 2)
-        self.assertIn("secret-run guide", bad.stderr)
+        self.assertIn("asb guide", bad.stderr)
 
     def test_list_has_a_labelled_header_on_stderr(self):
         p = self.run_cli("list")
