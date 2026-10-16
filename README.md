@@ -240,6 +240,12 @@ leaves the page, no third-party service is involved, and the notification never
 contains a URL, request body or value. On iOS the site must be installed to the
 home screen as a web app before the browser will allow notifications.
 
+If nothing appears, use **Send a test notification** and read the line under the
+buttons. The usual cause is the operating system, not the page: the browser
+needs its own permission in the OS notification settings (macOS: System
+Settings > Notifications > the browser), and Focus or Do Not Disturb modes hide
+notifications too.
+
 ## Request history
 
 `/history` on the approval listener (same SSO gate and identity check as the
