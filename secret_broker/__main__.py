@@ -13,6 +13,7 @@ import threading
 
 from .backends import BwBackend, BwServeBackend, FileBackend
 from .broker import Broker, serve
+from .localstore import BackendConfigError, LocalBackend
 from . import notify
 from .summarize import OpenRouterSummarizer
 
@@ -30,13 +31,29 @@ def load_settings(config_path=None):
     return cfg
 
 
-def build_backend(cfg):
-    b = cfg["backend"]
+def _bw_backend(b):
     bw_class = BwServeBackend if b.get("serve") else BwBackend
-    return (bw_class(b["server_url"], b["master_password_file"],
-                     idle_timeout=b.get("idle_timeout", 300),
-                     organization=b.get("organization"), collection=b.get("collection"))
-            if b["type"] == "bw" else FileBackend(b["path"]))
+    return bw_class(b["server_url"], b["master_password_file"],
+                    idle_timeout=b.get("idle_timeout", 300),
+                    organization=b.get("organization"), collection=b.get("collection"))
+
+
+def _file_backend(b):
+    return FileBackend(b["path"])
+
+
+# backend `type` -> factory(settings dict). A new backend is one entry here.
+BACKENDS = {"bw": _bw_backend, "file": _file_backend, "local": LocalBackend.from_config}
+
+
+def build_backend(cfg):
+    b = cfg.get("backend")
+    if not isinstance(b, dict):
+        raise BackendConfigError("backend: required (an object with a type)")
+    kind = b.get("type")
+    if kind not in BACKENDS:
+        raise BackendConfigError(f"backend.type: must be one of {sorted(BACKENDS)}, got {kind!r}")
+    return BACKENDS[kind](b)
 
 
 def main():
@@ -46,7 +63,10 @@ def main():
     cfg = load_settings(args.config)
     if not cfg:
         ap.error("no settings: set BROKER_CONFIG or pass --config")
-    backend = build_backend(cfg)
+    try:
+        backend = build_backend(cfg)
+    except BackendConfigError as e:
+        raise SystemExit(f"config error: {e}") from None
     push = None
     if any(sp.get("type") == "webpush" for sp in cfg.get("notify") or []):
         from .webpush import store_from_config
