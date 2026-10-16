@@ -1032,7 +1032,7 @@ _DASH_JS = r'''
 '''
 
 _SERVICE_WORKER = r"""
-var SW_VERSION='3';
+var SW_VERSION='4';
 function tell(m){return self.clients.matchAll({type:'window',includeUncontrolled:true}).then(function(cs){
   cs.forEach(function(c){try{c.postMessage(m);}catch(x){}});return cs;});}
 self.addEventListener('install',function(){self.skipWaiting();});
@@ -1041,7 +1041,9 @@ self.addEventListener('push',function(e){
   var d={};try{d=e.data.json();}catch(x){}
   tell({type:'diag',what:'push received',v:SW_VERSION});
   e.waitUntil(self.registration.showNotification(d.title||'Approval needed',{
-    body:d.body||'A secret was requested',tag:d.tag||'secret-request',requireInteraction:true}));});
+    body:d.body||'A secret was requested',tag:d.tag||'secret-request',requireInteraction:true,
+    data:{url:'/'},actions:[{action:'open',title:'Review'}],renotify:true,
+    timestamp:Date.now()}));});
 self.addEventListener('notificationclick',function(e){
   e.notification.close();
   tell({type:'diag',what:'notification clicked',v:SW_VERSION});
