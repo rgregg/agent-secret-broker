@@ -524,6 +524,25 @@ class CatalogFromVault(unittest.TestCase):
                         {"item": "router", "meta": None, "auto": one}])
         self.assertEqual(b.cfg["secrets"], {})
 
+    def test_dangerous_variable_names_are_rejected(self):
+        for var in ("LD_PRELOAD", "PATH", "PYTHONPATH", "NODE_OPTIONS", "GIT_SSH_COMMAND", "BASH_ENV"):
+            with self.assertRaises(ValueError, msg=var):
+                Broker._entry("Item", {"vars": {var: {"field": "notes"}}})
+        Broker._entry("Item", {"vars": {"MY_TOKEN": {"field": "notes"}}})   # ordinary names still fine
+
+    def test_adopted_item_cannot_produce_a_dangerous_name(self):
+        row = {"item": "LD", "meta": None, "auto": {
+            "login": False, "username": False, "password": False, "notes": False,
+            "fields": ["PRELOAD"], "uris": []}}
+        self.assertEqual(self.adopt([row]).cfg["secrets"], {})
+
+    def test_request_for_secrets_sharing_a_variable_is_rejected(self):
+        meta = {"vars": {"SAME_TOKEN": {"field": "notes"}}, "allowed_hosts": ["a.example.com"]}
+        b = self.adopt([], [{"item": "One", "meta": meta}, {"item": "Two", "meta": meta}])
+        with self.assertRaises(ValueError):
+            b.create("env", ["one", "two"], {}, "test")
+        b.create("env", ["one"], {}, "test")                # each alone is fine
+
     def test_disabled_metadata_hides_an_item(self):
         b = self.adopt([], [{"item": "Hidden", "meta": {"disabled": True}}])
         self.assertEqual(b.cfg["secrets"], {})

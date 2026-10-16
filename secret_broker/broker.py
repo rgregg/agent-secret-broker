@@ -47,6 +47,12 @@ MAX_STORE_VALUE = 65_536
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,40}$")
 _HOST_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
 _VAR_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,60}$")
+# Variable names that change how a process loads code or resolves commands: a
+# secret exposed under one of these in env mode would be a code-execution primitive.
+_DANGEROUS_VAR_RE = re.compile(
+    r"^(LD_.*|DYLD_.*|PYTHON.*|NODE_.*|GIT_.*|PERL.*|RUBY.*|JAVA_TOOL_OPTIONS|_JAVA_OPTIONS|"
+    r"PATH|BASH_ENV|ENV|IFS|PS4|PROMPT_COMMAND|SHELL|HOME|CDPATH|GCONV_PATH|HOSTALIASES|"
+    r"LOCPATH|NLSPATH|MALLOC_.*|TMPDIR|SSH_ASKPASS|EDITOR|VISUAL|PAGER)$")
 _FIELD_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_ .-]{0,59}$")
 _ITEM_RE = re.compile(r"^[^\x00-\x1f]{1,100}$")
 APPROVAL_VALUES = ("prompt", "allow")
@@ -165,6 +171,8 @@ class Broker:
             ref = ref if isinstance(ref, dict) else {}
             if not _VAR_RE.match(var):
                 raise ValueError(f"bad variable name {var!r}")
+            if _DANGEROUS_VAR_RE.match(var):
+                raise ValueError(f"variable name {var!r} is reserved (it changes how processes run)")
             if ref.get("item") not in (None, "", item):
                 raise ValueError(f"{var}: a secret can only use its own item's fields")
             field = ref.get("field") or "auto"
@@ -418,6 +426,11 @@ class Broker:
             else:
                 if not names or any(n not in secrets_cfg for n in names):
                     raise ValueError("unknown secret name")
+                seen = {}
+                for n in dict.fromkeys(names):
+                    for var in secrets_cfg[n]["vars"]:
+                        if seen.setdefault(var, n) != n:
+                            raise ValueError(f"{seen[var]} and {n} both define {var}; request them separately")
                 if mode == "http":
                     self._validate_http(names, spec)
         except (ValueError, PermissionError) as e:
