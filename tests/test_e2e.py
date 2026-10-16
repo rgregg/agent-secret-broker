@@ -2185,6 +2185,56 @@ class Cli(Harness):
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertNotIn(SECRET, p.stdout)
 
+    def test_every_command_has_help_and_flags_are_never_names(self):
+        for cmd in ("list", "which", "http", "store", "update", "fingerprint"):
+            p = self.run_cli(cmd, "--help")
+            self.assertEqual(p.returncode, 0, (cmd, p.stderr))
+            self.assertIn(f"usage: secret-run", p.stdout)
+        self.assertIn("{{GRAFANA_TOKEN}}", self.run_cli("help", "http").stdout)
+        self.assertEqual(self.run_cli("help", "nope").returncode, 2)
+        # a flag piped to store must not create an item called "--help"
+        env = dict(os.environ, SECRET_BROKER_URL=self.base, SECRET_BROKER_KEY=KEY)
+        q = subprocess.run([sys.executable, "-I", CLI, "store", "--help"], env=env,
+                           input="v", capture_output=True, text=True, timeout=30)
+        self.assertEqual(q.returncode, 0)
+        self.assertNotIn("--help", self.broker.backend._data)
+        for argv in (["store", "-x", "--hosts", "h"], ["http", "-x", "GET", "http://h/"],
+                     ["which", "-x"], ["-x", "--", "true"]):
+            r = subprocess.run([sys.executable, "-I", CLI, *argv], env=env, input="v",
+                               capture_output=True, text=True, timeout=30)
+            self.assertEqual(r.returncode, 2, argv)
+            self.assertIn("flag", r.stderr)
+        self.assertEqual(self.broker._by_id, {})
+
+    def test_guide_explains_the_workflow(self):
+        p = self.run_cli("guide")
+        self.assertEqual(p.returncode, 0)
+        for needle in ("{{VAR}}", "secret-run which", "approve", "Exit codes", "stdin"):
+            self.assertIn(needle, p.stdout)
+        self.assertIn("secret-run guide", self.run_cli().stdout)
+
+    def test_errors_say_what_to_do_next(self):
+        none = self.run_cli("which", "nothing.example")
+        self.assertIn("secret-run list", none.stderr)
+        bad = self.run_cli("frobnicate")
+        self.assertEqual(bad.returncode, 2)
+        self.assertIn("secret-run guide", bad.stderr)
+
+    def test_list_has_a_labelled_header_on_stderr(self):
+        p = self.run_cli("list")
+        self.assertIn("NAME", p.stderr)
+        self.assertEqual(p.stdout.strip(), "svc\tSVC_TOKEN\t127.0.0.1")
+
+    def test_exit_codes_are_distinct(self):
+        self.decision = "deny"
+        url = f"http://127.0.0.1:{self.up.server_address[1]}/x"
+        self.assertEqual(self.run_cli("http", "svc", "GET", url).returncode, 4)
+        self.assertEqual(self.run_cli("http", "nosuch", "GET", url).returncode, 3)
+        env = dict(os.environ, SECRET_BROKER_URL="http://127.0.0.1:9", SECRET_BROKER_KEY=KEY)
+        r = subprocess.run([sys.executable, "-I", CLI, "list"], env=env, capture_output=True,
+                           text=True, timeout=30)
+        self.assertEqual(r.returncode, 3)
+
 
 if __name__ == "__main__":
     unittest.main()

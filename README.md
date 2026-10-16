@@ -21,6 +21,8 @@ happens on a page that only your authenticated SSO session can reach.
     secret-run which HOST|URL            is a credential available? (no approval, no push)
     secret-run http NAME METHOD URL [-H 'K: V']... [-d BODY | -d @file | -d @-]
     secret-run NAME[,NAME] -- command args...
+    secret-run help COMMAND              usage + example for one command
+    secret-run guide                     manual for agents: workflow, {{VAR}}, approvals, exit codes
 
 - **`http` (enforced).** The broker makes the call itself, only to the secret's
   `allowed_hosts`, never follows redirects, and masks the secret in the response.
