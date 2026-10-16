@@ -272,6 +272,13 @@ the same panel; **Send a test push** checks the whole path.
   backup; with several, a request is delivered if any one succeeds.
 - This is the one transport with a third-party dependency (`pywebpush`, pinned
   in `requirements.txt` and installed in the image).
+- A push can only reach a browser that is running. With the browser fully quit
+  the push service holds the message (until its TTL, 5 minutes) and delivers it
+  when the browser next starts. For "nothing is running", keep a phone transport
+  such as the Home Assistant ticker configured alongside. To receive pushes with
+  no window open, let the browser run in the background (Chrome: Settings >
+  System > "Continue running background apps when Google Chrome is closed") and
+  close the windows instead of quitting.
 - Chrome only needs notifications allowed for the site and the browser (macOS:
   also System Settings > Notifications). The open-tab notification above stands
   down on a device that is subscribed, so you do not get two.
