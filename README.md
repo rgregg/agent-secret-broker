@@ -16,8 +16,9 @@ The agent never holds the vault password or the approval channel. Approval
 happens on a web page that only your authenticated SSO session can reach, from a
 push notification or the dashboard.
 
-- **The vault is the catalog.** A credential is a Bitwarden/Vaultwarden item with a
-  little metadata. No config file lists your secrets.
+- **The vault is the catalog.** Every login and secure note in the broker's
+  Bitwarden/Vaultwarden collection is a credential, with safe defaults you can
+  tune. No config file lists your secrets.
 - **The agent never sees the value** in `http` mode: the broker makes the call and
   substitutes `{{VAR}}` placeholders itself.
 - **Every use is approved or explicitly allow-listed**, rated by a risk model, and

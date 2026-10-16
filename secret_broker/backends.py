@@ -33,6 +33,27 @@ def _catalog_rows(pairs):
     return out
 
 
+_RESERVED_FIELDS = (META_FIELD, "previous_value", "previous_replaced_at")
+
+
+def _auto_info(it):
+    """What an item without broker metadata could offer: shapes only, never values.
+    None when it has nothing usable (or is not a login or secure note)."""
+    if it.get("type") not in (1, 2):
+        return None
+    login = it.get("login") or {}
+    info = {"login": it.get("type") == 1,
+            "username": bool(login.get("username")), "password": bool(login.get("password")),
+            "notes": bool(it.get("notes")),
+            "fields": [f["name"] for f in it.get("fields") or []
+                       if f.get("name") and f.get("value") and f.get("type") in (0, 1)
+                       and f["name"] not in _RESERVED_FIELDS],
+            "uris": [u["uri"] for u in login.get("uris") or [] if u.get("uri")]}
+    usable = (info["username"] or info["password"] or info["fields"]
+              or (info["notes"] and not info["login"]))
+    return info if usable else None
+
+
 class FileBackend:
     """JSON file {item: {field: value}}. For tests and bootstrapping only."""
 
@@ -326,8 +347,11 @@ class BwBackend:
         return json.loads(self._run("list", "items", "--session", self._session))
 
     def catalog(self):
-        """[{"item", "meta"}] for every item in the vault that carries broker
-        metadata. Sees current state (it syncs if the cache is old)."""
+        """[{"item", "meta"}] for every item that carries broker metadata, plus
+        [{"item", "meta": None, "auto": shape}] for the other logins and secure
+        notes in the broker's own collection (they are adopted with defaults;
+        nothing outside that collection ever is). Sees current state (it syncs if
+        the cache is old)."""
         with self._lock:
             for attempt in (1, 2):
                 try:
@@ -341,13 +365,25 @@ class BwBackend:
                     if attempt == 2:
                         raise
                     self._session, self._synced = None, 0.0
+            target = None
+            if self._org_want and self._coll_want:       # cannot scope without both: adopt nothing
+                try:
+                    target = self._resolve_target()
+                except BackendError:
+                    target = None
             self._touch()
         rows = []
         for it in items:
             raw = next((f.get("value") for f in it.get("fields") or []
                         if f.get("name") == META_FIELD), None)
-            rows.append((it["name"], raw))
-        return _catalog_rows(rows)
+            if raw:
+                rows.extend(_catalog_rows([(it["name"], raw)]))
+            elif (target and it.get("organizationId") == target[0]
+                  and target[1] in (it.get("collectionIds") or [])):
+                info = _auto_info(it)
+                if info:
+                    rows.append({"item": it["name"], "meta": None, "auto": info})
+        return rows
 
     def set_meta(self, item, meta):
         """Replace the broker metadata of an existing item."""

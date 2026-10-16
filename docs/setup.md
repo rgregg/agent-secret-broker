@@ -33,7 +33,8 @@ The broker publishes two ports. Treat them very differently:
 3. In that account's settings, create an **API key** (client id and client
    secret). Choose a **master password** for the account.
 
-Anything not in that collection is invisible to the broker.
+Only that collection is visible to the broker: every login and secure note in it
+becomes a credential (see "The vault is the catalog" in [reference.md](reference.md)).
 
 ## 2. Lay out the stack
 
@@ -114,11 +115,12 @@ with "Nothing is waiting for approval". If you get a 403 your proxy is not in
 
 ## 7. Add a first credential and try it
 
-Either from a Bitwarden client (the item must live in the broker's collection):
-
-1. Create a Login or Secure Note with the token in the password (or note).
-2. Add a custom text field named `broker` holding:
-   `{"allowed_hosts": ["grafana.example.com"], "vars": {"GRAFANA_TOKEN": {"field": "auto"}}}`
+Either from a Bitwarden client: put a Login or Secure Note in the broker's
+collection (copying an existing item works). It appears in `asb list` within a
+minute, with variables named after the item (for a login named `Grafana`:
+`GRAFANA_USERNAME`, `GRAFANA_PASSWORD`) and hosts taken from its URLs. To choose
+the names and hosts yourself, add a custom text field `broker`:
+`{"allowed_hosts": ["grafana.example.com"], "vars": {"GRAFANA_TOKEN": {"field": "auto"}}}`
 
 or from the CLI once it is installed (see [cli.md](cli.md)):
 

@@ -43,8 +43,10 @@ persistent `/bw` volume.
 
 ## The vault is the catalog
 
-There is no list of secrets in a config file. A secret is a vault item that
-carries one custom text field named `broker`, holding a JSON object:
+There is no list of secrets in a config file. Every login and secure note in the
+broker's collection is a secret. An item can carry one custom text field named
+`broker`, holding a JSON object, to set its details; without it the broker uses
+defaults (next section). The object looks like this:
 
     {"name": "grafana",
      "allowed_hosts": ["grafana.example.com"],
@@ -71,7 +73,18 @@ carries one custom text field named `broker`, holding a JSON object:
   name. Prefer the pin: it still fails loudly against an impersonator. A
   request using several secrets with different TLS settings gets the strict
   default.
-- Items without that field are invisible to the broker. One item carries one
+- **Items without that field are adopted with defaults**, so you can copy an item
+  from your own vault into the broker's collection and use it at once. The name is
+  the item name (lower-cased); a login gives `<NAME>_USERNAME` and
+  `<NAME>_PASSWORD`; a secure note gives `<NAME>_NOTE`; each custom field gives
+  `<NAME>_<FIELD>`. `allowed_hosts` come from the login's URLs (no URL means env
+  mode only, never `http`), and `approval` is `prompt`. Only the broker's own
+  collection is ever adopted, and only logins and secure notes (cards and
+  identities are ignored). Add the `broker` field to change any default (for
+  example a TLS fingerprint for a self-signed device), or give it
+  `{"disabled": true}` to hide an item from the broker. If an item's metadata
+  names the same secret as an adopted item, the explicit one wins; two adopted
+  items with one name drop each other. One item carries one
   secret. If two items claim the same secret name, *both* are dropped and the
   conflict is audited, so a look-alike item cannot shadow a real one.
 - The broker reads the catalog from the vault at startup, when a request

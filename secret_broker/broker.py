@@ -177,14 +177,47 @@ class Broker:
                       "approval": approval, "_item": item, "_meta": meta,
                       "_tls": {"fingerprint": fp, "verify": verify}}
 
+    @staticmethod
+    def _auto_meta(item, info):
+        """Defaults for an item that has no broker metadata (copied or created in
+        a vault client): hosts from its login URLs, one variable per usable field,
+        approval on every use. None if there is nothing to expose."""
+        base = re.sub(r"[^A-Z0-9]+", "_", item.upper()).strip("_")[:30]
+        if not base or not base[0].isalpha():
+            base = "ITEM_" + base
+        vars_ = {}
+        if info.get("username"):
+            vars_[f"{base}_USERNAME"] = {"field": "username"}
+        if info.get("password"):
+            vars_[f"{base}_PASSWORD"] = {"field": "password"}
+        if info.get("notes") and not info.get("login"):
+            vars_[f"{base}_NOTE"] = {"field": "notes"}
+        for f in info.get("fields") or []:
+            v = f"{base}_" + re.sub(r"[^A-Z0-9]+", "_", f.upper()).strip("_")
+            if _VAR_RE.match(v):
+                vars_[v] = {"field": f}
+        hosts = []
+        for uri in info.get("uris") or []:
+            host = urllib.parse.urlsplit(uri if "//" in uri else "//" + uri).hostname
+            if host and _HOST_RE.match(host) and host.lower() not in hosts:
+                hosts.append(host.lower())
+        if not vars_:
+            return None
+        return {"allowed_hosts": hosts[:10], "vars": vars_, "approval": "prompt"}
+
     def refresh_catalog(self):
         """Rebuild the secret catalog from the vault's items. Raises if the vault
         cannot be read, leaving the previous catalog in place."""
         if not hasattr(self.backend, "catalog"):
             return
         rows = self.backend.catalog()
-        out, bad, owners = {}, [], {}
+        out, bad, owners, autos = {}, [], {}, []
         for row in rows:
+            if row.get("auto") is not None:
+                autos.append(row)
+                continue
+            if isinstance(row["meta"], dict) and row["meta"].get("disabled") is True:
+                continue                               # hidden from the broker on purpose
             try:
                 if row["meta"] is None:
                     raise ValueError("broker metadata is not a JSON object")
@@ -199,13 +232,35 @@ class Broker:
             if len(items) > 1:
                 out.pop(name, None)
                 bad.extend({"item": i, "reason": f"duplicate secret name {name!r}"} for i in items)
+        # Items with no metadata are adopted with defaults, but an explicitly
+        # configured secret always wins a name (so a stray copy cannot shadow it),
+        # and two adopted items with the same name drop each other.
+        adopted, claims = {}, {}
+        for row in autos:
+            meta = self._auto_meta(row["item"], row["auto"])
+            try:
+                name, entry = self._entry(row["item"], meta) if meta else (None, None)
+            except ValueError as e:
+                bad.append({"item": row["item"], "reason": str(e)[:120]})
+                continue
+            if name is None or name in out:
+                continue
+            entry["auto"] = True
+            adopted[name] = entry
+            claims.setdefault(name, []).append(row["item"])
+        for name, items in claims.items():
+            if len(items) > 1:
+                adopted.pop(name, None)
+                bad.extend({"item": i, "reason": f"duplicate secret name {name!r}"} for i in items)
+        out.update(adopted)
         with self._cfg_lock:
             self.cfg["secrets"] = out
             self._catalog_at = time.time()
         sig = json.dumps([sorted(out), bad], sort_keys=True)
         if sig != self._catalog_sig:
             self._catalog_sig = sig
-            self.log("catalog_loaded", count=len(out), names=sorted(out), invalid=bad)
+            self.log("catalog_loaded", count=len(out), names=sorted(out), invalid=bad,
+                     adopted=sorted(adopted))
 
     def _refresh_if(self, stale_after, wait=True):
         if time.time() - self._catalog_at <= stale_after:

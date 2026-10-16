@@ -482,6 +482,71 @@ class CatalogFromVault(unittest.TestCase):
         self.assertEqual(sorted(b.cfg["secrets"]), ["my-api"])      # name derived from the item
         self.assertEqual(b.cfg["secrets"]["my-api"]["vars"]["T_TOKEN"]["item"], "My API")
 
+    def adopt(self, rows, explicit=None):
+        class Rows:
+            def catalog(self_inner):
+                return (explicit or []) + rows
+        b = Broker({"approve_base_url": "https://s.example"}, Rows(), FakeNotifier(), None)
+        return b
+
+    def test_items_without_metadata_are_adopted_with_defaults(self):
+        modem = {"item": "Cable Modem", "meta": None, "auto": {
+            "login": True, "username": True, "password": True, "notes": True, "fields": [],
+            "uris": ["http://192.168.100.1/login", "https://192.168.100.1:8443/"]}}
+        b = self.adopt([modem])
+        sc = b.cfg["secrets"]["cable-modem"]
+        self.assertEqual(sorted(sc["vars"]), ["CABLE_MODEM_PASSWORD", "CABLE_MODEM_USERNAME"])
+        self.assertEqual(sc["vars"]["CABLE_MODEM_PASSWORD"]["field"], "password")
+        self.assertEqual(sc["allowed_hosts"], ["192.168.100.1"])
+        self.assertEqual(sc["approval"], "prompt")          # always asks until told otherwise
+        self.assertTrue(sc["auto"])
+
+    def test_adopted_notes_and_custom_fields_and_no_url(self):
+        note = {"item": "Wifi 2.4", "meta": None, "auto": {
+            "login": False, "username": False, "password": False, "notes": True,
+            "fields": ["API Key"], "uris": []}}
+        sc = self.adopt([note]).cfg["secrets"]["wifi-2-4"]
+        self.assertEqual(sorted(sc["vars"]), ["WIFI_2_4_API_KEY", "WIFI_2_4_NOTE"])
+        self.assertEqual(sc["allowed_hosts"], [])           # no URL: env mode only, never http
+
+    def test_explicit_secret_wins_a_name_over_an_adopted_item(self):
+        explicit = [{"item": "Real", "meta": json.loads(self.meta(name="grafana"))}]
+        stray = {"item": "Grafana", "meta": None, "auto": {
+            "login": True, "username": False, "password": True, "notes": False, "fields": [],
+            "uris": ["https://evil.example/"]}}
+        b = self.adopt([stray], explicit)
+        self.assertEqual(b.cfg["secrets"]["grafana"]["_item"], "Real")
+        self.assertNotIn("auto", b.cfg["secrets"]["grafana"])
+
+    def test_two_adopted_items_with_one_name_drop_each_other(self):
+        one = {"login": True, "username": False, "password": True, "notes": False, "fields": [], "uris": []}
+        b = self.adopt([{"item": "Router", "meta": None, "auto": one},
+                        {"item": "router", "meta": None, "auto": one}])
+        self.assertEqual(b.cfg["secrets"], {})
+
+    def test_disabled_metadata_hides_an_item(self):
+        b = self.adopt([], [{"item": "Hidden", "meta": {"disabled": True}}])
+        self.assertEqual(b.cfg["secrets"], {})
+
+    def test_bw_backend_adopts_only_its_own_collection(self):
+        from secret_broker.backends import BwBackend
+        bw = BwBackend("https://v.example", "/dev/null", organization="Org", collection="Coll")
+        login = {"type": 1, "name": "In coll", "organizationId": "o1", "collectionIds": ["c1"],
+                 "login": {"username": "u", "password": "p", "uris": [{"uri": "https://x.example"}]}}
+        other = {**login, "name": "Other coll", "collectionIds": ["c2"]}
+        mine = {**login, "name": "Personal", "organizationId": None, "collectionIds": []}
+        card = {**login, "name": "A card", "type": 3}
+        tagged = {**login, "name": "Tagged", "fields": [{"name": "broker", "type": 0,
+                  "value": json.dumps({"vars": {"T": {}}})}]}
+        bw._session, bw._synced = "s", time.time()
+        bw._list_items = lambda: [login, other, mine, card, tagged]
+        bw._resolve_target = lambda: ("o1", "c1")
+        rows = bw.catalog()
+        self.assertEqual(sorted(r["item"] for r in rows), ["In coll", "Tagged"])
+        self.assertTrue(next(r for r in rows if r["item"] == "In coll")["auto"]["password"])
+        bw._org_want = None                                   # cannot scope: adopt nothing
+        self.assertEqual([r["item"] for r in bw.catalog()], ["Tagged"])
+
     def test_invalid_metadata_is_skipped_and_audited_fail_closed(self):
         b, audit = self.make({
             "Bad approval": {"notes": "x", "broker": self.meta(approval="sometimes")},

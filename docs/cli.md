@@ -115,7 +115,7 @@ whichever machine asked; the request shows where it came from
 |---|---|
 | `no broker config` | `client.json` is missing or malformed, or the environment variables are not set |
 | `cannot reach broker` (exit 3) | Wrong URL, TLS name mismatch, or the client API is not routed |
-| `unknown secret name` | Not in the broker's collection, or it has no `broker` metadata field; run `asb list` |
+| `unknown secret name` | Not in the broker's collection (or hidden with `{"disabled": true}`); run `asb list` |
 | `no credential available for HOST` (exit 1) | No secret lists that host in `allowed_hosts` |
 | Waits and then exit 5 | No notification arrived or nobody approved; open the approval site, check Settings |
 | Notification arrives but a click does nothing | Allow the browser's notifications in the operating system settings, and see Web Push in [reference.md](reference.md) |
