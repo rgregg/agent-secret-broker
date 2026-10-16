@@ -1724,6 +1724,21 @@ class Dashboard(Harness):
         _, b = self.api("GET", f"/v1/requests/{rid}?wait=5")
         return json.loads(b)
 
+    def test_notification_toggle_is_present_and_text_is_names_only(self):
+        self.ask("/secret-looking-path?token=abc123")
+        code, body = self.get()
+        self.assertEqual(code, 200)
+        self.assertIn("id=notify", body)
+        # The browser notification body is built from the card heading (secret
+        # names) only: never from the request description, URL or source.
+        js = body[body.index("function announce"):body.index("function track")]
+        self.assertIn("querySelector('h2')", body)
+        self.assertNotIn("class=box", js)
+        self.assertNotIn("data-url", js)
+        self.assertNotIn("secret-looking-path", js)
+        # Nothing about the request is placed in an attribute the script reads.
+        self.assertNotIn("data-body", body)
+
     def test_lists_pending_without_exposing_the_nonce(self):
         rid = self.ask("/<img src=x onerror=alert(1)>")
         code, body = self.get()

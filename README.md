@@ -228,6 +228,18 @@ more now that the dashboard can decide many requests: a caller that could reach
 the listener and forge the header would otherwise be able to list and approve
 them all.
 
+### Browser notifications
+
+The dashboard has a **Notify me on this device** button. Click it once, allow
+notifications in the browser, and a notification titled "Approval needed" (body:
+the secret names, nothing else) appears when a request arrives while the page is
+in a background tab or window; clicking it brings the page forward. The choice is
+remembered per browser. This works only while the page is open somewhere: it is
+a fallback and a convenience, not a replacement for a push transport. Nothing
+leaves the page, no third-party service is involved, and the notification never
+contains a URL, request body or value. On iOS the site must be installed to the
+home screen as a web app before the browser will allow notifications.
+
 ## Request history
 
 `/history` on the approval listener (same SSO gate and identity check as the

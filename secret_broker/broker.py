@@ -860,6 +860,8 @@ p,td,li{overflow-wrap:anywhere}
 .actions{display:flex;flex-wrap:wrap;gap:.75rem;margin:1.25rem 0}
 .btn,button{font:inherit;font-weight:600;min-height:3rem;padding:.6rem 1.4rem;border-radius:.6rem;
 border:1px solid var(--line);background:var(--card);color:var(--fg);cursor:pointer}
+[hidden]{display:none!important}
+.notify{margin:.25rem 0 1rem}.notify .btn{margin-right:.6rem}
 .btn.approve{background:var(--ok);border-color:var(--ok);color:#fff}
 .btn.deny{background:var(--bad);border-color:var(--bad);color:#fff}
 .actions .btn{flex:1 1 9rem}
@@ -911,12 +913,45 @@ _DASH_JS = r'''
   function title(){var n=cards.querySelectorAll('article').length;
     document.title=(n?'('+n+') ':'')+'Secret broker';}
   function parse(h){return new DOMParser().parseFromString(h,'text/html');}
+  var nbtn=document.getElementById('notify'), nmsg=document.getElementById('notify-state'),
+      seen={};
+  function ids(root){var o={};root.querySelectorAll('article[data-id]').forEach(function(a){
+    o[a.getAttribute('data-id')]=a.querySelector('h2')?a.querySelector('h2').textContent:'';});return o;}
+  function want(){try{return localStorage.getItem('notify')==='1';}catch(e){return false;}}
+  function remember(v){try{localStorage.setItem('notify',v?'1':'0');}catch(e){}}
+  function nshow(){
+    if(!nbtn)return;
+    if(!('Notification' in window)){nbtn.hidden=true;
+      nmsg.textContent='This browser cannot show notifications.';return;}
+    var p=Notification.permission;
+    if(p==='denied'){nbtn.hidden=true;
+      nmsg.textContent='Notifications are blocked for this site in the browser settings.';return;}
+    var on=p==='granted'&&want();
+    nbtn.hidden=false;
+    nbtn.textContent=on?'Turn off notifications on this device':'Notify me on this device';
+    nmsg.textContent=on?'You will get a notification when a request arrives, as long as this page '
+      +'stays open in a tab or window.':'Notifications only arrive while this page is open.';}
+  function announce(found){
+    if(!('Notification' in window)||Notification.permission!=='granted'||!want())return;
+    Object.keys(found).forEach(function(id){
+      if(seen[id]!==undefined)return;
+      if(!document.hidden&&document.hasFocus())return;   // you are already looking at it
+      var n=new Notification('Approval needed',{body:found[id]||'A secret was requested',
+        tag:id,requireInteraction:true});
+      n.onclick=function(){window.focus();n.close();};});}
+  function track(found){announce(found);seen=found;}
+  if(nbtn)nbtn.addEventListener('click',function(){
+    if(!('Notification' in window))return;
+    if(Notification.permission==='granted'&&want()){remember(false);nshow();return;}
+    var go=function(p){if(p==='granted')remember(true);nshow();};
+    var r=Notification.requestPermission(go);if(r&&r.then)r.then(go);});
   function poll(){
     return fetch('/?fragment=1',{credentials:'same-origin',cache:'no-store'})
       .then(function(r){if(!r.ok)throw 0;return r.text();})
       .then(function(h){var c=parse(h).getElementById('cards');
         if(c&&c.getAttribute('data-version')!==last){
-          last=c.getAttribute('data-version');cards.innerHTML=c.innerHTML;bind();}
+          last=c.getAttribute('data-version');cards.innerHTML=c.innerHTML;bind();
+          track(ids(c));}
         off.hidden=true;secs();title();})
       .catch(function(){off.hidden=false;});}
   function bind(){document.querySelectorAll('form.decide').forEach(function(f){
@@ -932,6 +967,7 @@ _DASH_JS = r'''
           if(n){flash.textContent=n.textContent;flash.hidden=!n.textContent;}
           last=null;return poll();})
         .catch(function(){off.hidden=false;});});});}
+  seen=ids(cards);nshow();
   bind();secs();title();setInterval(secs,1000);setInterval(poll,3000);
   document.addEventListener('visibilitychange',function(){if(!document.hidden)poll();});
 })();
@@ -1144,6 +1180,8 @@ def approval_handler(broker):
             msg = notes.get(note, "")
             _page(self, 200,
                   "<h1>Pending requests</h1>"
+                  "<p class=notify><button id=notify class=btn type=button hidden></button> "
+                  "<small id=notify-state class=muted></small></p>"
                   f"<div id=flash class=flash{'' if msg else ' hidden'}>{html.escape(msg)}</div>"
                   "<div id=offline class='flash offline' hidden>Cannot reach the broker (signed out?). "
                   "Reload this page.</div>" + block, wide=True, script=_DASH_JS)
