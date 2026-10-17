@@ -275,12 +275,39 @@ class Listener(t.Dashboard):
         self.assertIn("notificationclick", js)
         self.assertGreaterEqual(js.count("openWindow"), 1)
         self.assertIn(".catch(", js)
-        self.assertIn("SW_VERSION='5'", js)
-        for needle in ("/push/event", "X-Requested-With", "notificationclose",
+        self.assertIn(f"SW_VERSION='{broker_mod.SW_VERSION}'", js)
+        self.assertEqual(r.headers["X-SW-Version"], broker_mod.SW_VERSION)
+        self.assertIn("no-cache", r.headers["Cache-Control"])
+        self.assertNotIn("__SW_VERSION__", js)
+        for needle in ("addEventListener('message'", "type==='version'", "type==='skip'",
+                       "skipWaiting", "/push/event", "X-Requested-With", "notificationclose",
                        "pushsubscriptionchange", "click_navigate", "click_focus",
                        "click_openwindow", "click_outcome", "sw_install", "sw_activate",
                        "keepalive", "Q.length<20"):
             self.assertIn(needle, js)
+
+    def test_settings_shows_service_worker_status_block(self):
+        code, body = self.get("/settings")
+        self.assertEqual(code, 200)
+        self.assertIn(f"id=sw-box data-expected='{broker_mod.SW_VERSION}'", body)
+        for el in ("sw-status", "sw-expected", "sw-running", "sw-waiting", "sw-controlled",
+                   "sw-reg", "sw-sub", "sw-caches", "sw-update", "sw-clear", "sw-recheck"):
+            self.assertIn(f"id={el}", body)
+        for label in ("Expected (server)", "Running (active worker)", "Waiting / installing",
+                      "This tab is controlled by the worker", "Registration",
+                      "Push subscription", "Update worker now", "Recheck"):
+            self.assertIn(label, body)
+        for js in ("sw_status", "Up to date", "Stale: running v", "No worker registered",
+                   "not responding", "controllerchange", "type:'skip'"):
+            self.assertIn(js, body)
+
+    def test_sw_status_event_is_accepted_and_sanitized(self):
+        self.assertEqual(self.ev({"kind": "sw_status", "v": "5", "state": "stale" * 20,
+                                  "note": "expected v6", "title": "SEKRIT"}), 204)
+        (r,) = self.events("client_event")
+        self.assertEqual((r["kind"], r["v"], r["note"]), ("sw_status", "5", "expected v6"))
+        self.assertEqual(len(r["state"]), 24)
+        self.assertNotIn("title", r)
 
     def ev(self, body, user="alice", hdr=None, raw=None):
         import urllib.request
@@ -344,7 +371,7 @@ class Listener(t.Dashboard):
         import urllib.request
         js = urllib.request.urlopen(urllib.request.Request(
             self.abase + "/sw.js", headers={"X-authentik-username": "alice"})).read().decode()
-        self.assertIn("SW_VERSION='5'", js)
+        self.assertIn(f"SW_VERSION='{broker_mod.SW_VERSION}'", js)
         self.assertIn("/push/event", js)
         self.assertIn("X-Requested-With", js)
         for step in ("notificationclick", "notificationclose", "pushsubscriptionchange",

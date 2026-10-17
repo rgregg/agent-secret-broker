@@ -1178,6 +1178,85 @@ _DASH_JS = r'''
     .then(function(r){if(!r.ok)throw new Error('the broker refused the subscription');
       location.reload();})
     .catch(function(e){pst.textContent='Could not enable: '+(e&&e.message||e);});});
+  // Service worker status block (Settings only): what the browser runs vs what the server serves
+  var swbox=document.getElementById('sw-box');
+  function swt(id,t){var e=document.getElementById(id);if(e)e.textContent=t;}
+  function swv(v){return v?'v'+v:'none';}
+  // Ask a worker for its version; resolves null (no worker), a string, or undefined (no reply in 2 s)
+  function swask(w,id){return new Promise(function(res){
+    if(!w){res(null);return;}
+    var done=false,t=setTimeout(function(){fin(undefined);},2000);
+    function fin(v){if(done)return;done=true;clearTimeout(t);
+      navigator.serviceWorker.removeEventListener('message',on);res(v);}
+    function on(m){var d=m.data;if(d&&d.type==='version'&&d.id===id)fin(String(d.v));}
+    navigator.serviceWorker.addEventListener('message',on);
+    try{w.postMessage({type:'version',id:id});}catch(x){fin(undefined);}});}
+  function swpath(u){try{return new URL(u).pathname;}catch(x){return String(u||'');}}
+  function swstatus(cls,text,note){var s=document.getElementById('sw-status');
+    if(s){s.className='pill '+cls;s.textContent=text;}swt('sw-note',note||'');}
+  function swcheck(){
+    if(!swbox)return Promise.resolve();
+    var exp=swbox.getAttribute('data-expected'),upd=document.getElementById('sw-update');
+    swt('sw-expected',swv(exp));
+    swstatus('plain','Checking','');
+    if(upd)upd.hidden=true;
+    if(!('serviceWorker' in navigator)){swstatus('bad','Unsupported',
+      'This browser has no service workers.');return Promise.resolve();}
+    swt('sw-controlled',navigator.serviceWorker.controller?'yes':'no');
+    var cs=document.getElementById('sw-clear');
+    if(window.caches&&caches.keys)caches.keys().then(function(n){
+      swt('sw-caches',n.length?n.length+': '+n.join(', '):'No caches');if(cs)cs.hidden=!n.length;
+      cs&&(cs.onclick=function(){Promise.all(n.map(function(k){return caches.delete(k);}))
+        .then(swcheck);});},function(){swt('sw-caches','No caches');});
+    else swt('sw-caches','No caches');
+    // the server may have moved on since this page loaded: ask /sw.js itself
+    var live=fetch('/sw.js',{credentials:'same-origin',cache:'no-store'}).then(function(r){
+      return r.headers.get('X-SW-Version')||exp;},function(){return exp;});
+    return live.then(function(e2){exp=e2;swt('sw-expected',swv(exp));
+      return navigator.serviceWorker.getRegistration('/');}).then(function(reg){
+      if(!reg){swt('sw-running','none');swt('sw-waiting','none');swt('sw-reg','none');
+        swt('sw-sub','absent');
+        swstatus('bad','No worker registered','Use "Enable on this device" above to register it.');
+        report('sw_status',{state:'none',note:'expected '+swv(exp)});return;}
+      var wk=reg.waiting||reg.installing;
+      swt('sw-reg',reg.scope?swpath(reg.scope)+', '+(reg.active?reg.active.state:wk?wk.state:'none')
+        +', '+swpath((reg.active||wk||{}).scriptURL):'none');
+      reg.pushManager.getSubscription().then(function(sub){
+        swt('sw-sub',sub?'present':'absent');},function(){swt('sw-sub','absent');});
+      return Promise.all([swask(reg.active,'active'),swask(wk,'waiting')]).then(function(r){
+        var run=r[0],wv=r[1],state;
+        swt('sw-running',run===null?'none':run===undefined?'not responding':swv(run));
+        swt('sw-waiting',wk?(wv===undefined?'not responding':swv(wv))+' ('+wk.state+')':'none');
+        var note=wk?'A newer worker is waiting; the old one keeps control until all tabs '
+          +'close or you update it here.':'';
+        if(run&&run===exp){state='current';swstatus('ok','Up to date',note);}
+        else if(run){state='stale';swstatus('warn','Stale: running v'+run+', server has v'+exp,note);}
+        else if(run===undefined){state='noreply';swstatus('warn','Stale: running worker did not answer, '
+          +'server has v'+exp,'Workers older than v6 cannot answer this check.'+(note?' '+note:''));}
+        else{state='none';swstatus('bad','No active worker',note);}
+        if(upd)upd.hidden=state==='current'&&!wk;
+        report('sw_status',{v:run||undefined,state:state,note:'expected '+swv(exp)});});
+    }).catch(function(e){swstatus('bad','Check failed',String(e&&e.message||e));});}
+  function swupdate(){
+    var upd=document.getElementById('sw-update');if(upd)upd.disabled=true;
+    swstatus('plain','Updating','');
+    var done=false;
+    navigator.serviceWorker.addEventListener('controllerchange',function(){
+      if(done)return;done=true;location.reload();});
+    navigator.serviceWorker.getRegistration('/').then(function(reg){
+      if(!reg)throw new Error('no registration');
+      function skip(){if(reg.waiting)reg.waiting.postMessage({type:'skip'});}
+      reg.addEventListener('updatefound',function(){var w=reg.installing;
+        if(w)w.addEventListener('statechange',function(){if(w.state==='installed')skip();});});
+      return reg.update().then(skip);})
+    .then(function(){setTimeout(function(){if(done)return;if(upd)upd.disabled=false;
+      swcheck();},8000);})
+    .catch(function(e){if(upd)upd.disabled=false;swstatus('bad','Update failed',String(e&&e.message||e));});}
+  if(swbox){
+    var sr=document.getElementById('sw-recheck'),su=document.getElementById('sw-update');
+    if(sr)sr.addEventListener('click',swcheck);
+    if(su)su.addEventListener('click',swupdate);
+    swcheck();}
   function poll(){
     if(!cards)return Promise.resolve();
     return fetch('/?fragment=1',{credentials:'same-origin',cache:'no-store'})
@@ -1208,15 +1287,19 @@ _DASH_JS = r'''
     report('visibility',{visible:!document.hidden,state:document.visibilityState},5000);
     if(!document.hidden)poll();});
   if('serviceWorker' in navigator)navigator.serviceWorker.addEventListener('message',function(m){
-    if(m.data&&m.data.type)report('sw_message',{note:String(m.data.type),v:String(m.data.v||'')},2000);
+    if(m.data&&m.data.type&&m.data.type!=='version')report('sw_message',{note:String(m.data.type),v:String(m.data.v||'')},2000);
     if(m.data&&m.data.type==='poll'){report('poll_requested',{},2000);poll();}
     if(m.data&&m.data.type==='diag')why('Service worker v'+m.data.v+': '+m.data.what+' at '
       +new Date().toLocaleTimeString()+'.');});
 })();
 '''
 
+# Single source of truth for the worker version: rendered into the worker, the
+# X-SW-Version header on /sw.js, and the Settings page ("expected" version).
+SW_VERSION = "6"
+
 _SERVICE_WORKER = r"""
-var SW_VERSION='5';
+var SW_VERSION='__SW_VERSION__';
 var Q=[],T0={};
 function tell(m){return self.clients.matchAll({type:'window',includeUncontrolled:true}).then(function(cs){
   cs.forEach(function(c){try{c.postMessage(m);}catch(x){}});return cs;});}
@@ -1304,7 +1387,16 @@ self.addEventListener('notificationclick',function(e){
     });
   }).catch(function(){});
   e.waitUntil(chain);});
+// Settings page probes: {type:'version'} is answered with the running version
+// (echoing the caller's id); {type:'skip'} lets a waiting worker take over now.
+self.addEventListener('message',function(e){
+  var d=e.data||{};
+  if(d.type==='version'){
+    var m={type:'version',v:SW_VERSION,id:d.id};
+    try{if(e.source)e.source.postMessage(m);else tell(m);}catch(x){}
+  }else if(d.type==='skip'){e.waitUntil(self.skipWaiting());}});
 """
+_SERVICE_WORKER = _SERVICE_WORKER.replace("__SW_VERSION__", SW_VERSION)
 
 def _agent_label(ua):
     ua = ua or ""
@@ -1601,7 +1693,28 @@ def approval_handler(broker):
                   "<div class=srow><div class=t><b>Test</b>"
                   "<small id=notify-why class=muted>Shows a notification on this device.</small></div>"
                   "<button id=notify-test class=btn type=button hidden>Send a test notification"
-                  "</button></div></section>" + devices, script=_DASH_JS, tab="settings", user=user)
+                  "</button></div>" + self._sw_block() + "</section>" + devices,
+                  script=_DASH_JS, tab="settings", user=user)
+
+        def _sw_block(self):
+            # Filled in by _DASH_JS; the expected version comes from the same constant /sw.js serves
+            def row(id_, label):
+                return (f"<div class=srow><div class=t><b>{label}</b>"
+                        f"<small id={id_} class=muted>...</small></div></div>")
+            return (
+                f"<div id=sw-box data-expected='{html.escape(SW_VERSION)}'>"
+                "<div class=srow><div class=t><b>Service worker</b>"
+                "<small id=sw-note class=muted></small></div>"
+                "<span id=sw-status class='pill plain'>Checking</span></div>"
+                + row("sw-expected", "Expected (server)") + row("sw-running", "Running (active worker)")
+                + row("sw-waiting", "Waiting / installing")
+                + row("sw-controlled", "This tab is controlled by the worker")
+                + row("sw-reg", "Registration") + row("sw-sub", "Push subscription")
+                + row("sw-caches", "Caches")
+                + "<div class=srow><div class=t>"
+                "<button id=sw-update class=btn type=button hidden>Update worker now</button> "
+                "<button id=sw-clear class=btn type=button hidden>Clear caches</button> "
+                "<button id=sw-recheck class=btn type=button>Recheck</button></div></div></div>")
 
         def _push_enable_row(self, token):
             return (
@@ -1653,6 +1766,7 @@ def approval_handler(broker):
             self.send_header("Content-Type", "application/javascript; charset=utf-8")
             self.send_header("Content-Length", str(len(raw)))
             self.send_header("Cache-Control", "no-cache")
+            self.send_header("X-SW-Version", SW_VERSION)
             self.send_header("Service-Worker-Allowed", "/")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()

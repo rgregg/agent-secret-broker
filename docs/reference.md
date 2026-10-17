@@ -307,6 +307,11 @@ CORS, which is never granted). Bodies over 2 KB are refused; the answer is 204.
   Unknown fields are dropped. Notification titles/bodies and request details
   are never sent or logged. Beacons that fail (expired session, network) are
   queued in the worker (max 20) and sent with the next event.
+  The Settings page sends `kind: sw_status` once per load and on Recheck:
+  `v` is the running worker version, `state` is `current`, `stale`, `noreply`
+  or `none`, and `note` is `expected vN` (the version `/sw.js` serves, also sent
+  in the `X-SW-Version` response header). Settings > This browser shows the
+  same comparison and an "Update worker now" button.
 - `client_event_dropped`: more than 120 events per user per minute are
   discarded; one line is written when dropping starts (`dropped: 1`) and, if
   more were dropped, a final count (`final: true`) when the next window opens.
