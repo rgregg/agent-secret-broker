@@ -1812,6 +1812,80 @@ class Dashboard(Harness):
         _, b = self.api("GET", f"/v1/requests/{rid}?wait=5")
         return json.loads(b)
 
+    def cev(self, body, user="alice", headers=None, raw=None):
+        h = {"X-authentik-username": user, "Content-Type": "application/json",
+             "X-Requested-With": "asb"}
+        if headers is not None:
+            h = {k: v for k, v in {**h, **headers}.items() if v is not None}
+        data = raw if raw is not None else json.dumps(body).encode()
+        try:
+            r = urllib.request.urlopen(urllib.request.Request(
+                self.abase + "/push/event", data=data, headers=h, method="POST"), timeout=10)
+            return r.status
+        except urllib.error.HTTPError as e:
+            return e.code
+
+    def test_client_event_rejects_bad_requests(self):
+        ok = {"kind": "push"}
+        self.assertEqual(self.cev(ok, headers={"X-Requested-With": None}), 403)
+        self.assertEqual(self.cev(ok, headers={"X-Requested-With": "x"}), 403)
+        self.assertEqual(self.cev(ok, headers={"Content-Type": "text/plain"}), 403)
+        self.assertEqual(self.cev(ok, headers={"Content-Type": "application/x-www-form-urlencoded"}), 403)
+        self.assertEqual(self.cev({"kind": "x", "note": "a" * 3000}), 413)
+        self.assertEqual(self.cev(ok, user="mallory"), 403)
+        self.assertEqual(self.cev(ok, user=""), 403)
+        self.assertEqual(self.cev(None, raw=b"not json"), 400)
+        self.assertEqual(self.cev({"nokind": 1}), 400)
+        self.assertEqual(self.events("client_event"), [])
+
+    def test_client_event_is_sanitized_and_audited(self):
+        self.assertEqual(self.cev({
+            "kind": "notificationclick", "v": "5", "tag": "t" * 100, "action": "open",
+            "clients": 2, "client_paths": ["https://h.example/settings?token=SEKRIT#f", "/", "/a",
+                                           "/b", "/c", "/dropped"],
+            "ok": True, "err": "e" * 500, "ms": 12, "state": "s" * 99, "visible": False,
+            "note": "n" * 200, "queued": 3, "title": "SECRET TITLE", "body": "SECRET BODY",
+            "url": "https://x/?a=b", "evil": {"a": 1}}), 204)
+        (ev,) = self.events("client_event")
+        self.assertEqual(ev["user"], "alice")
+        self.assertIn("peer", ev)
+        self.assertIn("client_ip", ev)
+        self.assertEqual((ev["kind"], ev["v"], ev["action"], ev["clients"], ev["ok"], ev["ms"],
+                          ev["visible"], ev["queued"]),
+                         ("notificationclick", "5", "open", 2, True, 12, False, 3))
+        self.assertEqual(len(ev["tag"]), 40)
+        self.assertEqual(len(ev["err"]), 120)
+        self.assertEqual(len(ev["note"]), 80)
+        self.assertEqual(len(ev["state"]), 24)
+        self.assertEqual(ev["client_paths"], ["/settings", "/", "/a", "/b", "/c"])
+        for k in ("title", "body", "url", "evil"):
+            self.assertNotIn(k, ev)
+        with open(self.audit) as f:
+            blob = f.read()
+        for bad in ("SEKRIT", "SECRET TITLE", "SECRET BODY"):
+            self.assertNotIn(bad, blob)
+
+    def test_client_event_rate_limit_drops_and_audits_once(self):
+        from secret_broker import broker as bmod
+        for _ in range(bmod._CE_LIMIT):
+            self.assertEqual(self.cev({"kind": "visibility"}), 204)
+        for _ in range(5):
+            self.assertEqual(self.cev({"kind": "visibility"}), 204)
+        self.assertEqual(len(self.events("client_event")), bmod._CE_LIMIT)
+        (d,) = self.events("client_event_dropped")
+        self.assertEqual((d["user"], d["dropped"], d["limit_per_min"]), ("alice", 1, bmod._CE_LIMIT))
+
+    def test_dashboard_js_reports_page_steps(self):
+        body = self.get()[1]
+        for needle in ("/push/event", "X-Requested-With", "page_load", "sw_message",
+                       "poll_requested", "visibility"):
+            self.assertIn(needle, body)
+        self.assertIn("connect-src 'self'", self.get_headers()["Content-Security-Policy"])
+
+    def get_headers(self, path="/"):
+        return urllib.request.urlopen(urllib.request.Request(
+            self.abase + path, headers={"X-authentik-username": "alice"})).headers
+
     def test_notification_toggle_is_present_and_text_is_names_only(self):
         self.ask("/secret-looking-path?token=abc123")
         code, body = self.get()

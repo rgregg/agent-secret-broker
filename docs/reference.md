@@ -291,6 +291,26 @@ the same panel; **Send a test push** checks the whole path.
   also System Settings > Notifications). The open-tab notification above stands
   down on a device that is subscribed, so you do not get two.
 
+### Client-side diagnostics (`POST /push/event`)
+
+The service worker and the dashboard page report their own steps (install,
+push received, notification shown, click, focus/navigate/openWindow outcome,
+close, page load, visibility) so a click that "does nothing" can be traced from
+the audit log. The endpoint sits on the approval listener behind the same SSO
+and trusted-proxy checks, and requires `X-Requested-With: asb` plus
+`Content-Type: application/json` (a cross-site page cannot send that without
+CORS, which is never granted). Bodies over 2 KB are refused; the answer is 204.
+
+- `client_event`: `user`, `peer`, `client_ip`, `kind`, plus any of `v`, `tag`,
+  `action`, `clients`, `client_paths` (up to 5 pathnames, query removed), `ok`,
+  `err` (120 chars), `ms`, `state`, `visible`, `note` (80 chars), `queued`.
+  Unknown fields are dropped. Notification titles/bodies and request details
+  are never sent or logged. Beacons that fail (expired session, network) are
+  queued in the worker (max 20) and sent with the next event.
+- `client_event_dropped`: more than 120 events per user per minute are
+  discarded; one line is written when dropping starts (`dropped: 1`) and, if
+  more were dropped, a final count (`final: true`) when the next window opens.
+
 ## Request history
 
 `/history` on the approval listener (linked from the Requests tab; same SSO gate

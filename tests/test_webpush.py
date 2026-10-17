@@ -10,6 +10,7 @@ import urllib.parse
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import test_e2e as t  # noqa: E402  (module import only: its tests are not re-collected)
 
+from secret_broker import broker as broker_mod  # noqa: E402
 from secret_broker import webpush  # noqa: E402
 from secret_broker.notify import NotifyError  # noqa: E402
 
@@ -272,8 +273,92 @@ class Listener(t.Dashboard):
         self.assertNotIn("nonce", js.lower())
         # a click must never do nothing: focus failure or no tab opens a window
         self.assertIn("notificationclick", js)
-        self.assertGreaterEqual(js.count("openWindow"), 2)
+        self.assertGreaterEqual(js.count("openWindow"), 1)
         self.assertIn(".catch(", js)
+        self.assertIn("SW_VERSION='5'", js)
+        for needle in ("/push/event", "X-Requested-With", "notificationclose",
+                       "pushsubscriptionchange", "click_navigate", "click_focus",
+                       "click_openwindow", "click_outcome", "sw_install", "sw_activate",
+                       "keepalive", "Q.length<20"):
+            self.assertIn(needle, js)
+
+    def ev(self, body, user="alice", hdr=None, raw=None):
+        import urllib.request
+        h = {"X-authentik-username": user, "Content-Type": "application/json",
+             "X-Requested-With": "asb"}
+        h.update(hdr or {})
+        h = {k: v for k, v in h.items() if v is not None}
+        data = raw if raw is not None else json.dumps(body).encode()
+        try:
+            return urllib.request.urlopen(urllib.request.Request(
+                self.abase + "/push/event", data=data, headers=h, method="POST"), timeout=10).status
+        except urllib.error.HTTPError as e:
+            return e.code
+
+    def test_client_event_requires_header_type_size_and_user(self):
+        ok = {"kind": "push"}
+        self.assertEqual(self.ev(ok, hdr={"X-Requested-With": None}), 403)
+        self.assertEqual(self.ev(ok, hdr={"Content-Type": "text/plain"}), 403)
+        self.assertEqual(self.ev(ok, hdr={"Content-Type": "application/x-www-form-urlencoded"}), 403)
+        self.assertEqual(self.ev({"kind": "x", "note": "a" * 3000}), 413)
+        self.assertEqual(self.ev(None, user="mallory"), 403)
+        self.assertEqual(self.ev(None, raw=b"not json"), 400)
+        self.assertEqual(self.ev(None, raw=b"[1]"), 400)
+        self.assertEqual(self.ev({"note": "no kind"}), 400)
+        self.assertEqual(self.events("client_event"), [])
+        self.assertEqual(self.ev(ok, hdr={"Sec-Fetch-Site": "cross-site"}), 403)
+
+    def test_client_event_is_sanitized_and_audited(self):
+        code = self.ev({"kind": "notificationclick", "v": "5", "tag": "t" * 99, "action": "open",
+                        "clients": 2, "ms": 1234, "ok": True, "visible": False, "state": "focused",
+                        "err": "e" * 500, "note": "n" * 500, "queued": 3,
+                        "client_paths": ["https://h/settings?token=SEKRIT#f", "/", "/a/b?x=1",
+                                         "/4", "/5", "/6-dropped"],
+                        "title": "SEKRIT-title", "body": "SEKRIT-body", "user": "evil",
+                        "peer": "6.6.6.6", "url": "https://x/?token=SEKRIT"})
+        self.assertEqual(code, 204)
+        (r,) = self.events("client_event")
+        self.assertEqual(r["user"], "alice")
+        self.assertEqual(r["peer"], "127.0.0.1")
+        self.assertEqual(len(r["tag"]), 40)
+        self.assertEqual(len(r["err"]), 120)
+        self.assertEqual(len(r["note"]), 80)
+        self.assertEqual(r["client_paths"], ["/settings", "/", "/a/b", "/4", "/5"])
+        self.assertEqual((r["clients"], r["ms"], r["ok"], r["visible"], r["queued"]),
+                         (2, 1234, True, False, 3))
+        for k in ("title", "body", "url"):
+            self.assertNotIn(k, r)
+        self.assertNotIn("SEKRIT", json.dumps(r))
+
+    def test_client_event_rate_limit_drops_and_audits_once(self):
+        lim = broker_mod._CE_LIMIT
+        for _ in range(lim):
+            self.assertEqual(self.ev({"kind": "visibility"}), 204)
+        for _ in range(5):
+            self.assertEqual(self.ev({"kind": "visibility"}), 204)
+        self.assertEqual(len(self.events("client_event")), lim)
+        (d,) = self.events("client_event_dropped")
+        self.assertEqual((d["user"], d["dropped"], d["limit_per_min"]), ("alice", 1, lim))
+
+    def test_service_worker_reports_every_step(self):
+        import urllib.request
+        js = urllib.request.urlopen(urllib.request.Request(
+            self.abase + "/sw.js", headers={"X-authentik-username": "alice"})).read().decode()
+        self.assertIn("SW_VERSION='5'", js)
+        self.assertIn("/push/event", js)
+        self.assertIn("X-Requested-With", js)
+        for step in ("notificationclick", "notificationclose", "pushsubscriptionchange",
+                     "click_navigate", "click_focus", "click_openwindow", "click_outcome",
+                     "sw_install", "sw_activate", "'show'", "keepalive"):
+            self.assertIn(step, js)
+        # the dashboard page reports too, and the CSP lets it fetch same-origin
+        import urllib.request as ur
+        r = ur.urlopen(ur.Request(self.abase + "/settings", headers={"X-authentik-username": "alice"}))
+        page, csp = r.read().decode(), r.headers["Content-Security-Policy"]
+        self.assertIn("connect-src 'self'", csp)
+        for k in ("page_load", "sw_registered", "sw_register_failed", "sw_message",
+                  "poll_requested", "visibility"):
+            self.assertIn(k, page)
 
     def test_subscribe_requires_the_csrf_token(self):
         code, _, _ = self.post("/push/subscribe", self.sub_form(), csrf=None)

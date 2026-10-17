@@ -1021,8 +1021,73 @@ _WORKING_JS = (
     "setTimeout(function(){document.querySelectorAll('button').forEach(function(b){b.disabled=true});"
     "document.getElementById('w').hidden=false},0)});")
 
+_CE_LOCK = threading.Lock()
+_CE_LIMIT = 120          # client events per user per minute
+
+
+def _ce_str(v, n):
+    if not isinstance(v, str):
+        return None
+    return "".join(ch if ch.isprintable() else " " for ch in v)[:n]
+
+
+def _ce_int(v):
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    try:
+        return max(-1, min(int(v), 10**9))
+    except (ValueError, OverflowError):
+        return None
+
+
+def _ce_path(v):
+    """A URL reduced to its pathname: no scheme, host, query or fragment."""
+    if not isinstance(v, str):
+        return None
+    try:
+        p = urllib.parse.urlsplit(v[:300]).path
+    except ValueError:
+        return None
+    return _ce_str(p, 80) or "/"
+
+
+def sanitize_client_event(obj):
+    """Allowlisted, length-capped copy of a browser-reported event, or None."""
+    if not isinstance(obj, dict):
+        return None
+    out = {}
+    for key, n in (("kind", 40), ("v", 8), ("tag", 40), ("action", 40), ("err", 120),
+                   ("state", 24), ("note", 80)):
+        if key in obj:
+            val = _ce_str(obj[key], n)
+            if val is not None:
+                out[key] = val
+    for key in ("clients", "ms", "queued"):
+        if key in obj:
+            val = _ce_int(obj[key])
+            if val is not None:
+                out[key] = val
+    for key in ("ok", "visible"):
+        if isinstance(obj.get(key), bool):
+            out[key] = obj[key]
+    if isinstance(obj.get("client_paths"), list):
+        out["client_paths"] = [p for p in (_ce_path(x) for x in obj["client_paths"][:5])
+                               if p is not None]
+    if "kind" not in out:
+        return None
+    return out
+
+
 _DASH_JS = r'''
 (function(){
+  var lastRep={};
+  function report(kind,extra,gap){try{
+    var now=Date.now();if(gap&&lastRep[kind]&&now-lastRep[kind]<gap)return;lastRep[kind]=now;
+    var b=extra||{};b.kind=kind;
+    fetch('/push/event',{method:'POST',credentials:'same-origin',keepalive:true,
+      headers:{'Content-Type':'application/json','X-Requested-With':'asb'},
+      body:JSON.stringify(b)}).catch(function(){});}catch(x){}}
+  report('page_load',{note:location.pathname,state:document.visibilityState});
   var cards=document.getElementById('cards'), flash=document.getElementById('flash'),
       off=document.getElementById('offline'), recent=document.getElementById('recent'),
       last=cards?cards.getAttribute('data-version'):null;
@@ -1099,7 +1164,9 @@ _DASH_JS = r'''
     pst.textContent='Working...';
     Notification.requestPermission().then(function(p){
       if(p!=='granted')throw new Error('notifications are not allowed for this site');
-      return navigator.serviceWorker.register('/sw.js',{scope:'/'});})
+      return navigator.serviceWorker.register('/sw.js',{scope:'/'}).then(function(r){
+        report('sw_registered',{ok:true});return r;},function(e){
+        report('sw_register_failed',{ok:false,err:String(e&&e.message||e)});throw e;});})
     .then(function(){return navigator.serviceWorker.ready;})
     .then(function(reg){return reg.pushManager.getSubscription().then(function(sub){
       return sub||reg.pushManager.subscribe({userVisibleOnly:true,
@@ -1137,42 +1204,106 @@ _DASH_JS = r'''
         .catch(function(){off.hidden=false;});});});}
   seen=cards?ids(cards):{};nshow();pshow();
   bind();secs();title();if(cards){setInterval(secs,1000);setInterval(poll,3000);}
-  document.addEventListener('visibilitychange',function(){if(!document.hidden)poll();});
+  document.addEventListener('visibilitychange',function(){
+    report('visibility',{visible:!document.hidden,state:document.visibilityState},5000);
+    if(!document.hidden)poll();});
   if('serviceWorker' in navigator)navigator.serviceWorker.addEventListener('message',function(m){
-    if(m.data&&m.data.type==='poll')poll();
+    if(m.data&&m.data.type)report('sw_message',{note:String(m.data.type),v:String(m.data.v||'')},2000);
+    if(m.data&&m.data.type==='poll'){report('poll_requested',{},2000);poll();}
     if(m.data&&m.data.type==='diag')why('Service worker v'+m.data.v+': '+m.data.what+' at '
       +new Date().toLocaleTimeString()+'.');});
 })();
 '''
 
 _SERVICE_WORKER = r"""
-var SW_VERSION='4';
+var SW_VERSION='5';
+var Q=[],T0={};
 function tell(m){return self.clients.matchAll({type:'window',includeUncontrolled:true}).then(function(cs){
   cs.forEach(function(c){try{c.postMessage(m);}catch(x){}});return cs;});}
-self.addEventListener('install',function(){self.skipWaiting();});
-self.addEventListener('activate',function(e){e.waitUntil(self.clients.claim());});
+// Report a step to the broker audit log. Never throws and never rejects; a
+// failed beacon (expired SSO session, network) is queued and retried next time.
+function rep(kind,x){
+  try{
+    var b=x||{};b.kind=kind;b.v=SW_VERSION;
+    var batch=Q.splice(0,Q.length);
+    if(batch.length)b.queued=batch.length;
+    batch.push(b);
+    return Promise.all(batch.map(function(o){
+      return fetch('/push/event',{method:'POST',credentials:'same-origin',keepalive:true,
+        redirect:'manual',headers:{'Content-Type':'application/json','X-Requested-With':'asb'},
+        body:JSON.stringify(o)}).then(function(r){
+        if(r.status!==204&&r.status!==200)throw new Error('http '+r.status);
+      }).catch(function(){if(Q.length<20)Q.push(o);});
+    })).catch(function(){});
+  }catch(e){return Promise.resolve();}
+}
+function em(e){return String(e&&(e.name||'')+(e&&e.message?': '+e.message:'')||e).slice(0,120);}
+self.addEventListener('install',function(e){
+  e.waitUntil(rep('sw_install').then(function(){return self.skipWaiting();}));});
+self.addEventListener('activate',function(e){
+  e.waitUntil(self.clients.claim().then(function(){return rep('sw_activate');},
+    function(){return rep('sw_activate',{ok:false});}));});
 self.addEventListener('push',function(e){
-  var d={};try{d=e.data.json();}catch(x){}
+  var d={},parsed=true;try{d=e.data.json();}catch(x){parsed=false;}
+  var tag=d.tag||'secret-request',t0=Date.now();T0[tag]=t0;
   tell({type:'diag',what:'push received',v:SW_VERSION});
-  e.waitUntil(self.registration.showNotification(d.title||'Approval needed',{
-    body:d.body||'A secret was requested',tag:d.tag||'secret-request',requireInteraction:true,
+  var r1=rep('push',{ok:parsed,tag:tag});
+  var r2=self.registration.showNotification(d.title||'Approval needed',{
+    body:d.body||'A secret was requested',tag:tag,requireInteraction:true,
     data:{url:'/'},actions:[{action:'open',title:'Review'}],renotify:true,
-    timestamp:Date.now()}));});
+    timestamp:t0}).then(function(){return rep('show',{ok:true,tag:tag,ms:Date.now()-t0});},
+    function(err){return rep('show',{ok:false,tag:tag,err:em(err),ms:Date.now()-t0});});
+  e.waitUntil(Promise.all([r1,r2]));});
+self.addEventListener('notificationclose',function(e){
+  var tag=(e.notification&&e.notification.tag)||'';
+  e.waitUntil(rep('notificationclose',{tag:tag,note:'dismissed'}));});
+self.addEventListener('pushsubscriptionchange',function(e){
+  e.waitUntil(rep('pushsubscriptionchange'));});
 self.addEventListener('notificationclick',function(e){
-  e.notification.close();
+  var tag=(e.notification&&e.notification.tag)||'',action=e.action||'',t0=Date.now();
+  try{e.notification.close();}catch(x){}
   tell({type:'diag',what:'notification clicked',v:SW_VERSION});
-  // Focus an open dashboard tab (preferring one already on "/"); if focusing is
-  // refused or there is no tab, open a new one so a click never does nothing.
-  e.waitUntil(self.clients.matchAll({type:'window',includeUncontrolled:true}).then(function(cs){
+  var shown=T0[tag];
+  function step(name,ok,err){return rep(name,{ok:ok,tag:tag,err:err?em(err):undefined,ms:Date.now()-t0});}
+  // Robust chain: focus an open dashboard window, navigating it to "/" first if it
+  // is elsewhere; on any failure or no window, open one. Every step is reported.
+  var chain=self.clients.matchAll({type:'window',includeUncontrolled:true}).then(function(cs){
+    var paths=cs.slice(0,5).map(function(c){try{return new URL(c.url).pathname;}catch(x){return '?';}});
+    var info={tag:tag,action:action,clients:cs.length,client_paths:paths};
+    if(shown)info.ms=Date.now()-shown;
     var pick=null;
     for(var i=0;i<cs.length;i++){
       if(!('focus' in cs[i]))continue;
-      if(!pick||new URL(cs[i].url).pathname==='/')pick=cs[i];}
-    if(!pick)return self.clients.openWindow('/');
-    return pick.focus().then(function(c){
-      if(c&&c.postMessage)c.postMessage({type:'poll'});
-      return c;}).catch(function(){return self.clients.openWindow('/');});
-  }).catch(function(){return self.clients.openWindow('/');}));});
+      var p='';try{p=new URL(cs[i].url).pathname;}catch(x){}
+      if(!pick||p==='/')pick=cs[i];}
+    return rep('notificationclick',info).then(function(){
+      if(!pick)return null;
+      var pp='';try{pp=new URL(pick.url).pathname;}catch(x){}
+      var nav=Promise.resolve(pick);
+      if(pp!=='/'&&'navigate' in pick){
+        nav=pick.navigate('/').then(function(c){
+          return step('click_navigate',true).then(function(){return c||pick;});},
+          function(err){return step('click_navigate',false,err).then(function(){return pick;});});}
+      return nav.then(function(c){
+        return (c||pick).focus().then(function(f){
+          try{(f||c||pick).postMessage({type:'poll'});}catch(x){}
+          return step('click_focus',true).then(function(){return f||c||pick;});});
+      }).catch(function(err){
+        return step('click_focus',false,err).then(function(){throw err;});});
+    });
+  }).catch(function(err){
+    return null;
+  }).then(function(done){
+    if(done)return rep('click_outcome',{ok:true,tag:tag,state:'focused',ms:Date.now()-t0});
+    return self.clients.openWindow('/').then(function(w){
+      return step('click_openwindow',true).then(function(){
+        return rep('click_outcome',{ok:true,tag:tag,state:'opened',ms:Date.now()-t0});});
+    },function(err){
+      return step('click_openwindow',false,err).then(function(){
+        return rep('click_outcome',{ok:false,tag:tag,state:'failed',ms:Date.now()-t0});});
+    });
+  }).catch(function(){});
+  e.waitUntil(chain);});
 """
 
 def _agent_label(ua):
@@ -1711,10 +1842,59 @@ def approval_handler(broker):
                 return self._redirect("/settings?note=" + ("push_test_ok" if ok else "push_failed"))
             return self._json(404, {"ok": False})
 
+        _ce_state = {}
+
+        def _client_event(self, user):
+            peer, fwd = self.client_address[0], self._fwd()
+            try:
+                n = int(self.headers.get("Content-Length", 0))
+            except ValueError:
+                n = -1
+            ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            if (self.headers.get("X-Requested-With") != "asb" or ctype != "application/json"
+                    or not self._same_origin()):
+                self.close_connection = True
+                return self._json(403, {"ok": False})
+            if n < 0 or n > 2048:
+                self.close_connection = True
+                return self._json(413, {"ok": False})
+            raw = self.rfile.read(n)
+            try:
+                ev = sanitize_client_event(json.loads(raw.decode("utf-8")))
+            except (ValueError, UnicodeDecodeError):
+                ev = None
+            if ev is None:
+                return self._json(400, {"ok": False})
+            now = time.time()
+            with _CE_LOCK:
+                st = self._ce_state.setdefault(user, {"t": now, "n": 0, "drop": 0})
+                if now - st["t"] >= 60:
+                    prev = st["drop"]
+                    st.update(t=now, n=0, drop=0)
+                    if prev > 1:
+                        broker.log("client_event_dropped", user=user, dropped=prev,
+                                   limit_per_min=_CE_LIMIT, final=True, peer=peer, client_ip=fwd)
+                st["n"] += 1
+                over = st["n"] > _CE_LIMIT
+                if over:
+                    st["drop"] += 1
+                    first = st["drop"] == 1
+            if over:
+                if first:
+                    broker.log("client_event_dropped", user=user, dropped=1,
+                               limit_per_min=_CE_LIMIT, peer=peer, client_ip=fwd)
+            else:
+                broker.log("client_event", user=user, peer=peer, client_ip=fwd, **ev)
+            self.send_response(204)
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+
         def do_POST(self):
             user = self._user()
             if user is None:
                 return
+            if self.path.split("?")[0].rstrip("/") == "/push/event":
+                return self._client_event(user)
             form = urllib.parse.parse_qs(
                 self.rfile.read(min(int(self.headers.get("Content-Length", 0)), 8192)).decode())
             path = self.path.split("?")[0].rstrip("/")
