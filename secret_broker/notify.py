@@ -3,11 +3,15 @@
 A transport only *delivers the link* to the approval page; approval itself
 always happens on that page (behind SSO). Contract:
 
-    send(title, message, url, tag, names=None) -> None
+    send(title, message, url, tag, names=None, context=None) -> None
                                              raise NotifyError if not delivered.
                                              `names` is the list of secret names,
                                              for transports that must not carry
                                              the longer message (web push).
+                                             `context` (optional keyword, only
+                                             passed to transports that accept it)
+                                             is {"rid", "risk", "action_token"}
+                                             for web push action buttons.
     resolved(tag, status)          -> None   optional, best effort: called when
                                              the request is approved/denied/expired
 
@@ -26,19 +30,23 @@ class NotifyError(Exception):
     pass
 
 
-def deliver(transport, title, message, url, tag, names=None):
-    """Call transport.send, passing `names` only to transports that accept it
-    (those written against the older four-argument contract do not)."""
+def deliver(transport, title, message, url, tag, names=None, context=None):
+    """Call transport.send, passing `names` / `context` only to transports that
+    accept them (those written against the older contracts do not)."""
     send = transport.send
     try:
         params = inspect.signature(send).parameters
-        takes = "names" in params or any(
-            p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+        var_kw = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+        takes = "names" in params or var_kw
+        takes_ctx = "context" in params or var_kw
     except (TypeError, ValueError):
-        takes = False
+        takes = takes_ctx = False
+    kw = {}
     if takes:
-        return send(title, message, url, tag, names=names)
-    return send(title, message, url, tag)
+        kw["names"] = names
+    if takes_ctx:
+        kw["context"] = context
+    return send(title, message, url, tag, **kw)
 
 
 class TickerNotifier:
@@ -131,11 +139,11 @@ class MultiNotifier:
     def __init__(self, notifiers):
         self._n = list(notifiers)
 
-    def send(self, title, message, url, tag, names=None):
+    def send(self, title, message, url, tag, names=None, context=None):
         errors, ok = [], 0
         for n in self._n:
             try:
-                deliver(n, title, message, url, tag, names)
+                deliver(n, title, message, url, tag, names, context)
                 ok += 1
             except (NotifyError, OSError) as e:
                 errors.append(f"{type(n).__name__}: {e}")
@@ -174,8 +182,8 @@ def build(cfg, read_secret, push_store=None):
         elif kind == "webpush":
             if push_store is None:
                 raise ValueError("webpush transport needs a push store")
-            from .webpush import WebPushNotifier
-            out.append(WebPushNotifier(push_store))
+            from .webpush import WebPushNotifier, parse_actions
+            out.append(WebPushNotifier(push_store, parse_actions(cfg.get("webpush"))))
         else:
             raise ValueError(f"unknown notify transport {kind!r}")
     if not out:
@@ -190,8 +198,9 @@ class FakeNotifier:
         self.sent = []
         self._on_send = on_send
 
-    def send(self, title, message, url, tag, names=None):
-        self.sent.append({"title": title, "message": message, "url": url, "tag": tag})
+    def send(self, title, message, url, tag, names=None, context=None):
+        self.sent.append({"title": title, "message": message, "url": url, "tag": tag,
+                          "context": context})
         if self._on_send:
             self._on_send(url)
 

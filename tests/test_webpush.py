@@ -422,10 +422,383 @@ class Listener(t.Dashboard):
             time.sleep(0.1)
         self.assertTrue(self.sender.calls)
         data = json.loads(self.sender.calls[0]["data"])
-        self.assertEqual(sorted(data), ["body", "tag", "title"])
+        self.assertEqual(sorted(data), ["actions", "body", "rid", "tag", "title", "token"])
         self.assertEqual(data["body"], "svc")
         self.assertNotIn("SEKRIT", self.sender.calls[0]["data"])
         self.assertNotIn("path-with-detail", self.sender.calls[0]["data"])
+
+
+class ParseActions(unittest.TestCase):
+    def test_defaults_and_valid(self):
+        self.assertEqual(webpush.parse_actions(None), {"approve_max_risk": "high", "deny": True})
+        self.assertEqual(webpush.parse_actions({}), {"approve_max_risk": "high", "deny": True})
+        self.assertEqual(webpush.parse_actions({"actions": {"approve_max_risk": "low", "deny": False}}),
+                         {"approve_max_risk": "low", "deny": False})
+
+    def test_invalid_names_the_field(self):
+        for bad, field in (({"approve_max_risk": "critical"}, "approve_max_risk"),
+                           ({"approve_max_risk": 3}, "approve_max_risk"),
+                           ({"deny": "yes"}, "deny"), ({"nope": 1}, "nope"), ("x", "actions")):
+            with self.assertRaises(ValueError) as cm:
+                webpush.parse_actions({"actions": bad})
+            self.assertIn(field, str(cm.exception))
+
+    def test_actions_per_risk_and_setting(self):
+        def acts(mx, deny, risk):
+            n = webpush.WebPushNotifier(make_store(), {"approve_max_risk": mx, "deny": deny})
+            return n.actions_for(risk)
+        for risk in ("low", "medium", "high", None):
+            self.assertEqual(acts("high", True, risk), ["deny", "approve"])
+            self.assertEqual(acts("none", True, risk), ["deny"])
+        self.assertEqual(acts("low", True, "low"), ["deny", "approve"])
+        self.assertEqual(acts("low", True, "medium"), ["deny"])
+        self.assertEqual(acts("low", True, None), ["deny"])
+        self.assertEqual(acts("medium", True, "medium"), ["deny", "approve"])
+        self.assertEqual(acts("medium", True, "high"), ["deny"])
+        self.assertEqual(acts("medium", False, "high"), [])
+        self.assertEqual(acts("high", False, "high"), ["approve"])
+
+    def test_context_is_only_passed_to_notifiers_that_take_it(self):
+        from secret_broker import notify
+        got = {}
+
+        class Old:
+            def send(self, title, message, url, tag):
+                got["old"] = True
+
+        class Names:
+            def send(self, title, message, url, tag, names=None):
+                got["names"] = names
+
+        class New:
+            def send(self, title, message, url, tag, names=None, context=None):
+                got["ctx"] = context
+        for n in (Old(), Names(), New()):
+            notify.deliver(n, "t", "m", "u", "g", ["a"], {"rid": "r"})
+        self.assertEqual((got["old"], got["names"], got["ctx"]), (True, ["a"], {"rid": "r"}))
+
+
+class PushDecide(t.Dashboard):
+    """Approve / Deny buttons on the notification: POST /push/decide."""
+
+    def setUp(self):
+        super().setUp()
+        self.sender = Sender()
+        self.store = make_store(self.sender)
+        self.broker.push = self.store
+        self.store.add("alice", EP, P256DH, AUTH)
+        self.set_actions()
+
+    def set_actions(self, **actions):
+        self.broker.notifier = webpush.WebPushNotifier(
+            self.store, webpush.parse_actions({"actions": actions}))
+
+    def pushed(self, n=1):
+        end = time.time() + 5
+        while len(self.sender.calls) < n and time.time() < end:
+            time.sleep(0.05)
+        self.assertGreaterEqual(len(self.sender.calls), n)
+        return json.loads(self.sender.calls[n - 1]["data"])
+
+    def pd(self, body, user="alice", hdr=None, raw=None):
+        import urllib.request
+        h = {"X-authentik-username": user, "Content-Type": "application/json",
+             "X-Requested-With": "asb"}
+        h.update(hdr or {})
+        h = {k: v for k, v in h.items() if v is not None}
+        data = raw if raw is not None else json.dumps(body).encode()
+        try:
+            r = urllib.request.urlopen(urllib.request.Request(
+                self.abase + "/push/decide", data=data, headers=h, method="POST"), timeout=10)
+            return r.status, r.read().decode()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode()
+
+    def audit_text(self):
+        with open(self.audit) as f:
+            return f.read()
+
+    def test_payload_has_actions_rid_and_token_but_no_details(self):
+        rid = self.ask("/path-with-detail?token=SEKRIT")
+        d = self.pushed()
+        self.assertEqual(sorted(d), ["actions", "body", "rid", "tag", "title", "token"])
+        self.assertEqual(d["actions"], ["deny", "approve"])
+        self.assertEqual(d["rid"], rid)
+        self.assertEqual(d["body"], "svc")
+        self.assertNotIn("SEKRIT", json.dumps(d))
+        self.assertGreaterEqual(len(d["token"]), 22)       # 128 bits, base64url
+
+    def test_config_controls_the_listed_actions(self):
+        self.set_actions(approve_max_risk="none")
+        self.ask()
+        self.assertEqual(self.pushed(1)["actions"], ["deny"])
+        self.set_actions(deny=False)
+        self.ask("/y")
+        self.assertEqual(self.pushed(2)["actions"], ["approve"])
+
+    def test_risk_ordering_gates_approve(self):
+        self.set_actions(approve_max_risk="low")
+        self.broker.summarizer = t._Stub("Reads things", "medium")
+        self.ask()
+        self.assertEqual(self.pushed(1)["actions"], ["deny"])
+        self.broker.summarizer = t._Stub("Reads things", "low")
+        self.ask("/y")
+        self.assertEqual(self.pushed(2)["actions"], ["deny", "approve"])
+
+    def test_no_actions_means_no_token_in_the_payload(self):
+        self.set_actions(approve_max_risk="none", deny=False)
+        self.ask()
+        d = self.pushed()
+        self.assertEqual(sorted(d), ["body", "tag", "title"])
+
+    def test_approve_by_push_delivers_and_is_audited_as_push(self):
+        rid = self.ask()
+        d = self.pushed()
+        code, body = self.pd({"rid": rid, "token": d["token"], "decision": "approve"}, user="alice")
+        self.assertEqual(code, 200)
+        self.assertEqual(json.loads(body), {"ok": True, "decision": "approve"})
+        self.assertEqual(self.result(rid)["status"], "approved")
+        (dec,) = self.events("decided")
+        self.assertEqual((dec["channel"], dec["approver"], dec["decision"]),
+                         ("push", "alice", "approve"))
+        self.assertFalse(dec["always_requested"])
+        (ok,) = self.events("approved")
+        self.assertEqual(ok["channel"], "push")
+
+    def test_deny_by_push_denies(self):
+        rid = self.ask()
+        d = self.pushed()
+        code, body = self.pd({"token": d["token"], "decision": "deny"})   # rid optional
+        self.assertEqual((code, json.loads(body)), (200, {"ok": True, "decision": "deny"}))
+        self.assertEqual(self.result(rid)["status"], "denied")
+        (den,) = self.events("denied")
+        self.assertEqual(den["channel"], "push")
+        self.assertEqual(den["approver"], "alice")
+
+    def test_no_always_allow_rule_is_ever_created(self):
+        rid = self.ask()
+        d = self.pushed()
+        self.pd({"rid": rid, "token": d["token"], "decision": "approve", "always": True,
+                 "decision_extra": "approve_always"})
+        self.assertEqual(self.events("policy_change"), [])
+        self.assertEqual(self.broker.cfg["secrets"]["svc"].get("approval", "prompt"), "prompt")
+        self.assertFalse(self.events("decided")[0]["always_requested"])
+
+    def test_replay_after_decision_is_410_and_changes_nothing(self):
+        rid = self.ask()
+        d = self.pushed()
+        self.assertEqual(self.pd({"rid": rid, "token": d["token"], "decision": "deny"})[0], 200)
+        before = self.audit_text()
+        self.assertEqual(self.pd({"rid": rid, "token": d["token"], "decision": "approve"})[0], 410)
+        self.assertEqual(self.pd({"token": d["token"], "decision": "approve"})[0], 410)
+        self.assertEqual(self.result(rid)["status"], "denied")
+        self.assertEqual(len(self.events("decided")), 1)
+        self.assertEqual(self.events("approved"), [])
+        self.assertNotIn(d["token"], self.audit_text())
+        self.assertEqual(before.count('"decided"'), self.audit_text().count('"decided"'))
+
+    def test_dashboard_decision_kills_the_token(self):
+        rid = self.ask()
+        d = self.pushed()
+        self.decide(rid, "deny")
+        self.assertEqual(self.pd({"rid": rid, "token": d["token"], "decision": "approve"})[0], 410)
+        self.assertEqual(self.result(rid)["status"], "denied")
+
+    def test_wrong_token_is_403_and_leaves_the_request_pending(self):
+        rid = self.ask()
+        d = self.pushed()
+        self.assertEqual(self.pd({"rid": rid, "token": "x" * 22, "decision": "approve"})[0], 403)
+        self.assertEqual(self.pd({"token": "x" * 22, "decision": "approve"})[0], 403)
+        self.assertEqual(self.events("decided"), [])
+        self.assertEqual(self.pd({"rid": rid, "token": d["token"], "decision": "approve"})[0], 200)
+
+    def test_token_is_bound_to_its_request(self):
+        rid1 = self.ask("/a")
+        d1 = self.pushed(1)
+        rid2 = self.ask("/b")
+        d2 = self.pushed(2)
+        self.assertNotEqual(d1["token"], d2["token"])
+        self.assertEqual(self.pd({"rid": rid2, "token": d1["token"], "decision": "approve"})[0], 403)
+        self.assertEqual(self.pd({"rid": rid1, "token": d2["token"], "decision": "approve"})[0], 403)
+        self.assertEqual(self.pd({"rid": rid1, "token": d1["token"], "decision": "deny"})[0], 200)
+        self.assertEqual(self.result(rid1)["status"], "denied")
+        self.assertEqual(self.broker._by_id[rid2].status, "pending")
+
+    def test_unknown_request_and_bad_bodies(self):
+        self.assertEqual(self.pd({"rid": "nope", "token": "x" * 22, "decision": "approve"})[0], 404)
+        self.assertEqual(self.pd({"token": "x", "decision": "maybe"})[0], 400)
+        self.assertEqual(self.pd({"decision": "approve"})[0], 400)
+        self.assertEqual(self.pd(None, raw=b"not json")[0], 400)
+        self.assertEqual(self.pd(None, raw=b"[1]")[0], 400)
+        self.assertEqual(self.pd({"token": "a" * 3000, "decision": "deny"})[0], 413)
+
+    def test_guard_headers_and_user_are_required(self):
+        rid = self.ask()
+        d = self.pushed()
+        ok = {"rid": rid, "token": d["token"], "decision": "approve"}
+        self.assertEqual(self.pd(ok, hdr={"X-Requested-With": None})[0], 403)
+        self.assertEqual(self.pd(ok, hdr={"X-Requested-With": "x"})[0], 403)
+        self.assertEqual(self.pd(ok, hdr={"Content-Type": "text/plain"})[0], 403)
+        self.assertEqual(self.pd(ok, hdr={"Content-Type": "application/x-www-form-urlencoded"})[0], 403)
+        self.assertEqual(self.pd(ok, hdr={"Sec-Fetch-Site": "cross-site"})[0], 403)
+        self.assertEqual(self.pd(ok, user="mallory")[0], 403)
+        self.assertEqual(self.events("decided"), [])
+        self.assertEqual(self.pd(ok)[0], 200)
+
+    def test_expired_request_is_410(self):
+        rid = self.ask()
+        d = self.pushed()
+        self.broker._by_id[rid].expires = time.time() - 1
+        self.assertEqual(self.pd({"rid": rid, "token": d["token"], "decision": "approve"})[0], 410)
+        self.assertEqual(self.events("decided"), [])
+        self.assertEqual(self.broker._by_id[rid].status, "expired")
+
+    def test_response_never_carries_request_details(self):
+        rid = self.ask("/path-with-detail?token=SEKRIT")
+        d = self.pushed()
+        for body in ({"rid": rid, "token": "x" * 22, "decision": "approve"},
+                     {"rid": rid, "token": d["token"], "decision": "approve"},
+                     {"rid": rid, "token": d["token"], "decision": "approve"}):
+            _, text = self.pd(body)
+            self.assertNotIn("SEKRIT", text)
+            self.assertNotIn("svc", text)
+            self.assertNotIn(d["token"], text)
+
+    def test_token_never_reaches_audit_or_history(self):
+        rid = self.ask()
+        d = self.pushed()
+        self.pd({"rid": rid, "token": d["token"], "decision": "approve"})
+        self.result(rid)
+        self.assertNotIn(d["token"], self.audit_text())
+        code, page = self.get("/")
+        self.assertNotIn(d["token"], page)
+
+    def test_service_worker_has_v7_decide_and_fallbacks(self):
+        import urllib.request
+        js = urllib.request.urlopen(urllib.request.Request(
+            self.abase + "/sw.js", headers={"X-authentik-username": "alice"})).read().decode()
+        self.assertEqual(broker_mod.SW_VERSION, "7")
+        self.assertIn("SW_VERSION='7'", js)
+        for needle in ("/push/decide", "X-Requested-With", "credentials:'same-origin'",
+                       "redirect:'manual'", "action_click", "action_decide",
+                       "Could not '+verb+' - tap to review", "'Approved'", "'Denied'",
+                       "maxActions", "openWindow"):
+            self.assertIn(needle, js)
+
+    # -- worker simulation under node --------------------------------------
+    NODE_HARNESS = r"""
+const fs=require('fs');
+const src=fs.readFileSync(process.argv[2],'utf8');
+const scenario=process.argv[3], action=process.argv[4];
+const listeners={}, shown=[], fetches=[], closed=[];
+global.setTimeout=(f,ms)=>{return setImmediate(f);};
+const reg={showNotification:(t,o)=>{shown.push({t,o});return Promise.resolve();},
+  getNotifications:()=>Promise.resolve([{close(){closed.push(1);}}])};
+global.self={addEventListener:(n,f)=>{listeners[n]=f;},registration:reg,
+  clients:{matchAll:()=>Promise.resolve([]),claim:()=>Promise.resolve(),openWindow:(u)=>{fetches.push('open '+u);return Promise.resolve({});}},
+  skipWaiting:()=>Promise.resolve(),Notification:{maxActions:2}};
+global.Notification={maxActions:+(process.env.MAXA||2)};
+global.fetch=(u,o)=>{
+  fetches.push(u+' '+(o&&o.body||''));
+  if(u==='/push/event')return Promise.resolve({status:204});
+  if(scenario==='net')return Promise.reject(new TypeError('Failed to fetch'));
+  if(scenario==='redirect')return Promise.resolve({status:0,type:'opaqueredirect'});
+  return Promise.resolve({status:scenario==='gone'?410:200,type:'basic'});
+};
+new Function(src).call(global);
+(async()=>{
+  let p;
+  listeners.push({data:{json:()=>({title:'Secret request [LOW]',body:'svc',tag:'secret-abc',
+    actions:['deny','approve'],rid:'RID',token:'TOK'})},waitUntil:(x)=>{p=x;}});
+  await p;
+  const first=shown[0];
+  shown.length=0;fetches.length=0;
+  p=null;
+  listeners.notificationclick({action,notification:{tag:'secret-abc',data:first.o.data,close(){}},waitUntil:(x)=>{p=x;}});
+  await p;
+  await new Promise(r=>setTimeout(r,10));
+  console.log(JSON.stringify({first:{actions:first.o.actions.map(a=>a.action),data:first.o.data},shown,
+    fetches,closed:closed.length}));
+})();
+"""
+
+    def run_worker(self, scenario, action, maxa=2):
+        import subprocess
+        import shutil
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is not installed")
+        d = tempfile.mkdtemp()
+        with open(os.path.join(d, "sw.js"), "w") as f:
+            f.write(broker_mod._SERVICE_WORKER)
+        with open(os.path.join(d, "h.js"), "w") as f:
+            f.write(self.NODE_HARNESS)
+        chk = subprocess.run([node, "--check", os.path.join(d, "sw.js")], capture_output=True, text=True)
+        self.assertEqual(chk.returncode, 0, chk.stderr)
+        r = subprocess.run([node, os.path.join(d, "h.js"), os.path.join(d, "sw.js"), scenario, action],
+                           capture_output=True, text=True, timeout=30,
+                           env={**os.environ, "MAXA": str(maxa)})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.loads(r.stdout.strip().splitlines()[-1])
+
+    def decide_fetches(self, out):
+        return [f for f in out["fetches"] if f.startswith("/push/decide")]
+
+    def beacon_kinds(self, out):
+        return [json.loads(f.split(" ", 1)[1]) for f in out["fetches"] if f.startswith("/push/event ")]
+
+    def test_worker_renders_buttons_deny_first_and_caps_to_browser_max(self):
+        out = self.run_worker("ok", "open")
+        self.assertEqual(out["first"]["actions"], ["deny", "approve"])
+        self.assertEqual(out["first"]["data"]["token"], "TOK")
+        out1 = self.run_worker("ok", "open", maxa=1)
+        self.assertEqual(out1["first"]["actions"], ["deny"])
+        out3 = self.run_worker("ok", "open", maxa=3)
+        self.assertEqual(out3["first"]["actions"], ["deny", "approve", "open"])
+
+    def test_worker_approve_success_shows_short_names_only_followup(self):
+        out = self.run_worker("ok", "approve")
+        (post,) = self.decide_fetches(out)
+        self.assertEqual(json.loads(post.split(" ", 1)[1]),
+                         {"rid": "RID", "token": "TOK", "decision": "approve"})
+        (n,) = out["shown"]
+        self.assertEqual(n["t"], "Approved: svc")
+        self.assertEqual(n["o"]["tag"], "secret-abc")
+        self.assertFalse(n["o"]["requireInteraction"])
+        self.assertEqual(out["closed"], 1)                 # auto-closed
+        kinds = [b["kind"] for b in self.beacon_kinds(out)]
+        self.assertEqual(kinds, ["action_click", "action_decide"])
+        dec = self.beacon_kinds(out)[1]
+        self.assertTrue(dec["ok"])
+        self.assertEqual(dec["note"], "http 200")
+        self.assertNotIn("TOK", json.dumps(self.beacon_kinds(out)))
+
+    def test_worker_deny_success(self):
+        out = self.run_worker("ok", "deny")
+        self.assertEqual(json.loads(self.decide_fetches(out)[0].split(" ", 1)[1])["decision"], "deny")
+        self.assertEqual(out["shown"][0]["t"], "Denied: svc")
+
+    def test_worker_410_shows_could_not_and_tap_opens_app(self):
+        out = self.run_worker("gone", "approve")
+        (n,) = out["shown"]
+        self.assertEqual(n["t"], "Could not approve - tap to review")
+        self.assertEqual(n["o"]["data"], {"url": "/"})
+        self.assertEqual(out["closed"], 0)
+        dec = self.beacon_kinds(out)[1]
+        self.assertEqual((dec["kind"], dec["ok"], dec["note"]), ("action_decide", False, "http 410"))
+
+    def test_worker_network_failure_and_sso_redirect(self):
+        for scenario, note in (("net", "network"), ("redirect", "http 0 redirect")):
+            out = self.run_worker(scenario, "deny")
+            self.assertEqual(out["shown"][0]["t"], "Could not deny - tap to review")
+            dec = self.beacon_kinds(out)[1]
+            self.assertFalse(dec["ok"])
+            self.assertEqual(dec["note"], note)
+
+    def test_worker_review_click_does_not_decide(self):
+        out = self.run_worker("ok", "open")
+        self.assertEqual(self.decide_fetches(out), [])
+        self.assertIn("open /", out["fetches"])
 
 
 if __name__ == "__main__":

@@ -291,6 +291,63 @@ the same panel; **Send a test push** checks the whole path.
   also System Settings > Notifications). The open-tab notification above stands
   down on a device that is subscribed, so you do not get two.
 
+#### Approve / Deny buttons on the notification
+
+The notification can carry **Deny** and **Approve** buttons (Chrome desktop and
+Android), so a request is decided without opening the page. Tapping the body or
+**Review** still opens the dashboard. Chrome shows at most `Notification.maxActions`
+buttons (often 2): they are ordered Deny, Approve, Review, and the worker keeps
+only as many as the browser allows. The visible text stays names-only.
+
+```json
+"webpush": {"actions": {"approve_max_risk": "high", "deny": true}}
+```
+
+- `approve_max_risk`: `none` | `low` | `medium` | `high` (default `high`, so every
+  request gets Approve). A request gets Approve only when its risk level is at or
+  below this; `none` removes Approve, `low` offers it only for low-risk requests.
+  A request with no risk verdict counts as high.
+- `deny` (default `true`): show the Deny button.
+- An invalid value stops the broker at startup, naming the field.
+
+The server picks the buttons per notification and lists them in the (encrypted)
+payload: `{"title","body","tag","actions":["deny","approve"],"rid":"...","token":"..."}`.
+`rid` and `token` are present only when at least one button is listed. The token
+is random (128 bits), bound to that request id, single use; only its SHA-256 is
+kept in memory, never logged or written to the audit log or history, and it dies
+when the request is decided (by any channel), expires, or the broker restarts.
+
+`POST /push/decide` (approval listener, same SSO identity and trusted-proxy checks
+as every other POST there; the worker's fetch sends the SSO session cookie).
+It requires `X-Requested-With: asb`, `Content-Type: application/json` and a
+same-origin request; no CSRF form token, since the single-use token plays that
+role. Body (max 2 KB): `{"rid": "...", "token": "...", "decision": "approve"|"deny"}`
+(`rid` optional; without it the token alone selects the pending request).
+
+| Status | Meaning |
+| --- | --- |
+| 200 `{"ok":true,"decision":...}` | decided |
+| 403 | missing guard header / content type / cross-site, or wrong token |
+| 404 | unknown request id |
+| 410 | already decided, expired, or token already spent (no state change) |
+| 400 / 413 | malformed body / body over 2 KB |
+
+Responses never contain request details, URLs or values. The decision runs
+through the same code as the dashboard `/decide` (same single-decision claim,
+checks and audit events) with `channel: push` and the approver taken from the SSO
+header. A notification never creates an always-allow rule. Audit:
+`decided` and `approved`/`denied` carry `channel: "push"`; refused attempts log
+`push_decide_refused`. The worker also reports `action_click` and `action_decide`
+(`ok`, `note: "http 200"` / `"network"`, `err`) through `/push/event`. On success
+it shows a brief "Approved: <names>" / "Denied: <names>" notification that closes
+itself after about 4 seconds; on any failure (SSO redirect, 401/403/410, network)
+it shows "Could not approve - tap to review", which opens the dashboard.
+
+Security note: anyone who can tap the notification on an unlocked device that
+holds the browser's SSO session can approve from it, without seeing the request
+details. Use `approve_max_risk` to limit which requests offer Approve (or `none`),
+and rely on the audit log: every push decision is recorded with the SSO user.
+
 ### Client-side diagnostics (`POST /push/event`)
 
 The service worker and the dashboard page report their own steps (install,

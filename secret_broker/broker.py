@@ -78,6 +78,7 @@ class Request:
         self.risk = None          # {"level","model","reasons"}
         self.always = None        # outcome of an "always allow" click, if any
         self.approver = None
+        self.action_hash = None   # sha256 of the push-button token; None once spent
         self.done = threading.Event()
 
 
@@ -577,7 +578,16 @@ class Broker:
         why = f"\nWhy: {'; '.join(req.risk['reasons'][:3])}" if req.risk and req.risk["reasons"] else ""
         msg = f"{head}{', '.join(req.names)} from {req.source}\n{what}{why}"
         title = f"Secret request [{req.risk['level'].upper()}]" if req.risk else "Secret request"
-        notify_mod.deliver(self.notifier, title, msg, url, f"secret-{req.id[:8]}", list(req.names))
+        token = secrets.token_urlsafe(16)           # 128 bits; only its hash is kept
+        req.action_hash = hashlib.sha256(token.encode()).digest()
+        ctx = {"rid": req.id, "risk": req.risk["level"] if req.risk else None,
+               "action_token": token}
+        try:
+            notify_mod.deliver(self.notifier, title, msg, url, f"secret-{req.id[:8]}",
+                               list(req.names), ctx)
+        except BaseException:
+            req.action_hash = None
+            raise
         self.audit("notified", req)
 
     def _resolved(self, req, status):
@@ -665,6 +675,7 @@ class Broker:
         who = {"via": "user", "approver": user, "approver_peer": peer, "approver_ip": client_ip,
                "channel": channel}
         req.approver = user
+        req.action_hash = None           # a push-button token dies with the decision
         # The decision itself is recorded and announced immediately.
         self.audit("decided", req, decision="approve" if approve else "deny",
                    always_requested=bool(always and approve), **who)
@@ -687,6 +698,39 @@ class Broker:
         # and surfaced to the client, never to the approver.
         threading.Thread(target=self._release_and_finish, args=(req, who), daemon=True).start()
         return req
+
+    def decide_push(self, rid, token, approve, user, peer=None, client_ip=None):
+        """Decision from a browser notification button. Returns (http_status, req).
+        403 bad token; 404 unknown; 410 already decided/expired. The token is bound
+        to its request, single use, and dies with the request. Goes through
+        decide() (never creates an always-allow rule)."""
+        digest = hashlib.sha256((token or "").encode()).digest()
+        with self._lock:
+            self._expire_locked()
+            if rid:
+                req = self._by_id.get(rid)
+                if req is None:
+                    return 404, None
+                if req.status != "pending":
+                    return 410, None
+                cands = [req]
+            else:
+                cands = [r for r in self._by_id.values() if r.status == "pending"]
+            match = None
+            for r in cands:
+                if r.action_hash is not None and hmac.compare_digest(r.action_hash, digest):
+                    match = r
+            if match is None:
+                code = 403 if cands else 410
+            else:
+                code = None
+                nonce = match.nonce
+                match.action_hash = None            # spent, whatever happens next
+        if code is not None:
+            self.log("push_decide_refused", user=user, peer=peer, client_ip=client_ip, status=code)
+            return code, None
+        done = self.decide(nonce, approve, user, peer, client_ip, always=False, channel="push")
+        return (200, done) if done is not None else (410, None)
 
     def _release_and_finish(self, req, who):
         try:
@@ -1296,7 +1340,7 @@ _DASH_JS = r'''
 
 # Single source of truth for the worker version: rendered into the worker, the
 # X-SW-Version header on /sw.js, and the Settings page ("expected" version).
-SW_VERSION = "6"
+SW_VERSION = "7"
 
 _SERVICE_WORKER = r"""
 var SW_VERSION='__SW_VERSION__';
@@ -1331,10 +1375,23 @@ self.addEventListener('push',function(e){
   var tag=d.tag||'secret-request',t0=Date.now();T0[tag]=t0;
   tell({type:'diag',what:'push received',v:SW_VERSION});
   var r1=rep('push',{ok:parsed,tag:tag});
+  // Buttons: only what the payload lists (Deny, Approve), then Review, capped to
+  // what this browser/platform allows. The notification body click always opens.
+  var data={url:'/',names:String(d.body||'').slice(0,200)};
+  var acts=[];
+  if(d.token&&d.rid&&Array.isArray(d.actions)){
+    data.rid=String(d.rid);data.token=String(d.token);
+    if(d.actions.indexOf('deny')>=0)acts.push({action:'deny',title:'Deny'});
+    if(d.actions.indexOf('approve')>=0)acts.push({action:'approve',title:'Approve'});
+  }
+  acts.push({action:'open',title:'Review'});
+  var mx=(self.Notification&&typeof Notification.maxActions==='number')?Notification.maxActions:2;
+  acts=acts.slice(0,Math.max(mx,0));
   var r2=self.registration.showNotification(d.title||'Approval needed',{
     body:d.body||'A secret was requested',tag:tag,requireInteraction:true,
-    data:{url:'/'},actions:[{action:'open',title:'Review'}],renotify:true,
-    timestamp:t0}).then(function(){return rep('show',{ok:true,tag:tag,ms:Date.now()-t0});},
+    data:data,actions:acts,renotify:true,
+    timestamp:t0}).then(function(){return rep('show',{ok:true,tag:tag,ms:Date.now()-t0,
+      note:acts.map(function(a){return a.action;}).join(',')});},
     function(err){return rep('show',{ok:false,tag:tag,err:em(err),ms:Date.now()-t0});});
   e.waitUntil(Promise.all([r1,r2]));});
 self.addEventListener('notificationclose',function(e){
@@ -1344,13 +1401,14 @@ self.addEventListener('pushsubscriptionchange',function(e){
   e.waitUntil(rep('pushsubscriptionchange'));});
 self.addEventListener('notificationclick',function(e){
   var tag=(e.notification&&e.notification.tag)||'',action=e.action||'',t0=Date.now();
+  var nd=(e.notification&&e.notification.data)||{};
   try{e.notification.close();}catch(x){}
   tell({type:'diag',what:'notification clicked',v:SW_VERSION});
   var shown=T0[tag];
   function step(name,ok,err){return rep(name,{ok:ok,tag:tag,err:err?em(err):undefined,ms:Date.now()-t0});}
   // Robust chain: focus an open dashboard window, navigating it to "/" first if it
   // is elsewhere; on any failure or no window, open one. Every step is reported.
-  var chain=self.clients.matchAll({type:'window',includeUncontrolled:true}).then(function(cs){
+  function openApp(){return self.clients.matchAll({type:'window',includeUncontrolled:true}).then(function(cs){
     var paths=cs.slice(0,5).map(function(c){try{return new URL(c.url).pathname;}catch(x){return '?';}});
     var info={tag:tag,action:action,clients:cs.length,client_paths:paths};
     if(shown)info.ms=Date.now()-shown;
@@ -1385,8 +1443,42 @@ self.addEventListener('notificationclick',function(e){
       return step('click_openwindow',false,err).then(function(){
         return rep('click_outcome',{ok:false,tag:tag,state:'failed',ms:Date.now()-t0});});
     });
-  }).catch(function(){});
-  e.waitUntil(chain);});
+  }).catch(function(){});}
+  // Approve / Deny straight from the notification: one POST with the single-use
+  // token from the payload; the reply is a short follow-up notification.
+  function followUp(text,ok){
+    var o={body:'',tag:tag,renotify:true,requireInteraction:false,data:{url:'/'}};
+    if(ok){
+      return self.registration.showNotification(text,o).then(function(){
+        return new Promise(function(res){setTimeout(function(){
+          self.registration.getNotifications({tag:tag}).then(function(ns){
+            ns.forEach(function(n){try{n.close();}catch(x){}});res();},function(){res();});
+        },4000);});},function(){});
+    }
+    o.requireInteraction=true;
+    return self.registration.showNotification(text,o).catch(function(){});
+  }
+  function decideFlow(){
+    var verb=action==='approve'?'approve':'deny',done=action==='approve'?'Approved':'Denied';
+    var names=String(nd.names||'').slice(0,120);
+    rep('action_click',{tag:tag,action:action,ok:!!nd.token});
+    if(!nd.token||!nd.rid){
+      rep('action_decide',{tag:tag,action:action,ok:false,note:'no token',ms:Date.now()-t0});
+      return followUp('Could not '+verb+' - tap to review',false);}
+    return fetch('/push/decide',{method:'POST',credentials:'same-origin',redirect:'manual',
+      headers:{'Content-Type':'application/json','X-Requested-With':'asb'},
+      body:JSON.stringify({rid:nd.rid,token:nd.token,decision:verb})}).then(function(r){
+        var ok=r.status===200;
+        return rep('action_decide',{tag:tag,action:action,ok:ok,
+          note:'http '+r.status+(r.type==='opaqueredirect'?' redirect':''),ms:Date.now()-t0}).then(function(){
+          return ok?followUp(done+(names?': '+names:''),true):followUp('Could not '+verb+' - tap to review',false);});
+      },function(err){
+        return rep('action_decide',{tag:tag,action:action,ok:false,err:em(err),note:'network',
+          ms:Date.now()-t0}).then(function(){return followUp('Could not '+verb+' - tap to review',false);});
+      }).catch(function(){});
+  }
+  if(action==='approve'||action==='deny')e.waitUntil(decideFlow());
+  else e.waitUntil(openApp());});
 // Settings page probes: {type:'version'} is answered with the running version
 // (echoing the caller's id); {type:'skip'} lets a waiting worker take over now.
 self.addEventListener('message',function(e){
@@ -2003,12 +2095,44 @@ def approval_handler(broker):
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
 
+        def _push_decide(self, user):
+            ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            try:
+                n = int(self.headers.get("Content-Length", 0))
+            except ValueError:
+                n = -1
+            if (self.headers.get("X-Requested-With") != "asb" or ctype != "application/json"
+                    or not self._same_origin()):
+                self.close_connection = True
+                broker.log("push_decide_refused", user=user, peer=self.client_address[0],
+                           client_ip=self._fwd(), status=403, reason="guard")
+                return self._json(403, {"ok": False})
+            if n < 0 or n > 2048:
+                self.close_connection = True
+                return self._json(413, {"ok": False})
+            try:
+                body = json.loads(self.rfile.read(n).decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                body = None
+            if (not isinstance(body, dict) or body.get("decision") not in ("approve", "deny")
+                    or not isinstance(body.get("token"), str) or not body["token"]
+                    or not isinstance(body.get("rid", ""), str)):
+                return self._json(400, {"ok": False})
+            code, _ = broker.decide_push(body.get("rid") or None, body["token"],
+                                         body["decision"] == "approve", user,
+                                         self.client_address[0], self._fwd())
+            if code == 200:
+                return self._json(200, {"ok": True, "decision": body["decision"]})
+            return self._json(code, {"ok": False})
+
         def do_POST(self):
             user = self._user()
             if user is None:
                 return
             if self.path.split("?")[0].rstrip("/") == "/push/event":
                 return self._client_event(user)
+            if self.path.split("?")[0].rstrip("/") == "/push/decide":
+                return self._push_decide(user)
             form = urllib.parse.parse_qs(
                 self.rfile.read(min(int(self.headers.get("Content-Length", 0)), 8192)).decode())
             path = self.path.split("?")[0].rstrip("/")
