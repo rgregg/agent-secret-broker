@@ -276,7 +276,7 @@ class Broker:
                  "_tls": {"fingerprint": fp, "verify": verify}}
         entry.pop("guidance", None)
         entry.pop("ssh_hosts", None)
-        if ssh_hosts and (ssh_hosts["known"] or ssh_hosts["allowed"]):
+        if ssh_hosts and (ssh_hosts["known"] or ssh_hosts["allowed"] or ssh_hosts["allow_forwarded"]):
             entry["ssh_hosts"] = ssh_hosts      # parsed; never part of discovery/status output
         if note:
             entry["guidance"] = note
@@ -287,9 +287,13 @@ class Broker:
         """Validate a key's `ssh_hosts` metadata -> {"known": {fp: [names]}, "allowed": [..]|None}."""
         if not isinstance(raw, dict):
             raise ValueError("ssh_hosts must be an object")
-        extra = sorted(set(raw) - {"known_hosts", "allowed_hosts"})
+        extra = sorted(set(raw) - {"known_hosts", "allowed_hosts", "allow_forwarded"})
         if extra:
-            raise ValueError(f"ssh_hosts has unknown field {extra[0]!r} (known_hosts, allowed_hosts)")
+            raise ValueError(f"ssh_hosts has unknown field {extra[0]!r} "
+                             "(known_hosts, allowed_hosts, allow_forwarded)")
+        fwd = raw.get("allow_forwarded", False)
+        if not isinstance(fwd, bool):
+            raise ValueError("ssh_hosts.allow_forwarded must be true or false")
 
         def strings(field, max_n, max_len):
             v = raw.get(field)
@@ -309,7 +313,7 @@ class Broker:
             if any(re.search(r"\s", a) for a in allowed):
                 raise ValueError("ssh_hosts.allowed_hosts entries are a host name or a SHA256: fingerprint")
             allowed = [a.rstrip("=") if a.startswith("SHA256:") else a.lower() for a in allowed]
-        return {"known": known, "allowed": allowed}
+        return {"known": known, "allowed": allowed, "allow_forwarded": fwd}
 
     @staticmethod
     def _auto_meta(item, info):
@@ -494,7 +498,8 @@ class Broker:
             return {}
         return {"host_bound": bool(host.get("bound")), "host_fp": host.get("fp"),
                 "host_type": host.get("type"), "host_name": ", ".join(host.get("names") or []) or None,
-                "claimed_dest": host.get("claimed"), "forwarding": bool(host.get("forwarding"))}
+                "claimed_dest": host.get("claimed"), "forwarding": bool(host.get("forwarding")),
+                "host_lines": sshkey.host_lines(host)}
 
     # -- policy -----------------------------------------------------------
     @staticmethod
@@ -822,17 +827,21 @@ class Broker:
         spec["data_bytes"] = len(data)
         spec["fingerprint"] = sshkey.fingerprint(sshkey.blob_from_line(sc["ssh_public_key"]))
         spec["host"] = host = self._ssh_host(data, spec.get("binds"), spec.get("claimed_dest"), sc)
-        spec["ssh"] = sshkey.describe_data(data, host_known=bool(host and host["bound"]))
+        spec["ssh"] = sshkey.describe_data(data, host_known=bool(host and host.get("fp")))
         spec.pop("binds", None)
 
     @staticmethod
     def _ssh_host(data, binds, claimed, sc):
-        """Server identity for a login signature: the verified bound host key (if
-        any), the client's claimed destination, and the key's allowed_hosts policy.
-        Returns the host dict (None for non-login data); raises SshRefused."""
+        """Server identity for a login signature, and the key's allowed_hosts policy.
+
+        Two independent sources: the session-bind chain the agent connection
+        carried (verified here; only the LAST bind is this login's own session),
+        and the host key inside host-bound login data. Returns the host dict (None
+        for non-login data); raises SshRefused."""
         claimed = claimed if isinstance(claimed, str) and _CLAIM_RE.fullmatch(claimed) else None
         policy = sc.get("ssh_hosts") or {}
-        allowed = policy.get("allowed")
+        allowed, known = policy.get("allowed"), policy.get("known") or {}
+        ua = sshkey.parse_userauth(data)
         sid = sshkey.userauth_session_id(data)
         if sid is None:
             # commit signing and other non-login data carry no server to verify
@@ -840,31 +849,55 @@ class Broker:
                 raise SshRefused("this key may only sign logins to approved servers", "host_unverified",
                                  claimed_dest=claimed)
             return None
-        valid = []
-        for b in (binds if isinstance(binds, list) else [])[:sshkey.MAX_BINDS]:
-            try:
-                hk, bsid, sig = (base64.b64decode(b[k], validate=True)
-                                 for k in ("hostkey_b64", "session_id_b64", "sig_b64"))
-                fp, ktype = sshkey.verify_bind(hk, bsid, sig)
-            except (sshkey.SshKeyError, KeyError, TypeError, ValueError, binascii.Error):
-                continue                    # a bind that does not verify is as good as none
-            valid.append((bsid, fp, ktype, b.get("forwarding") is True))
-        host = {"bound": False, "claimed": claimed}
-        if valid:
-            match = next((v for v in valid if v[0] == sid), None)
-            if match is None:
+        binds = binds if isinstance(binds, list) else []
+        hops = []
+        if len(binds) <= sshkey.MAX_BINDS:
+            for b in binds:
+                try:
+                    hk, bsid, sig = (base64.b64decode(b[k], validate=True)
+                                     for k in ("hostkey_b64", "session_id_b64", "sig_b64"))
+                    fp, ktype = sshkey.verify_bind(hk, bsid, sig)
+                except (sshkey.SshKeyError, KeyError, TypeError, ValueError, binascii.Error):
+                    hops = []                   # a chain with a broken link proves nothing
+                    break
+                hops.append({"sid": bsid, "fp": fp, "type": ktype, "forwarding": b.get("forwarding") is True,
+                             "names": known.get(fp, [])})
+        host = {"bound": False, "claimed": claimed, "hops": [], "forwarding": False,
+                "chain_mismatch": False}
+        if hops:
+            if hops[-1]["sid"] == sid:
+                host.update(bound=True, hops=[{k: v for k, v in h.items() if k != "sid"} for h in hops],
+                            forwarding=any(h["forwarding"] for h in hops))
+            elif any(h["sid"] == sid for h in hops):
+                host["chain_mismatch"] = True   # the bind is for an earlier hop, not this login
+            else:
                 raise SshRefused("the server identity bound to this connection is for a different "
                                  "ssh session than the one being signed", "session_mismatch",
-                                 claimed_dest=claimed, host_fp=valid[0][1])
-            _, fp, ktype, fwd = match
-            host.update(bound=True, fp=fp, type=ktype, forwarding=fwd,
-                        names=(policy.get("known") or {}).get(fp, []))
+                                 claimed_dest=claimed, host_fp=hops[-1]["fp"])
+        signed = None
+        if ua and ua["hostkey"]:
+            signed = (sshkey.fingerprint(ua["hostkey"]), sshkey._blob_type(ua["hostkey"]))
+        if host["bound"] and signed and signed[0] != host["hops"][-1]["fp"]:
+            raise SshRefused("the server host key in the login data differs from the one bound "
+                             "to this connection", "host_conflict", claimed_dest=claimed,
+                             host_fp=host["hops"][-1]["fp"])
+        if host["bound"]:
+            last = host["hops"][-1]
+            host.update(fp=last["fp"], type=last["type"], names=last["names"])
+        elif signed:
+            host.update(fp=signed[0], type=signed[1], names=known.get(signed[0], []))
         if allowed:
-            if not host["bound"]:
+            def ok(fp, names):
+                return fp in allowed or any(n in allowed for n in names)
+            if not host.get("fp") or host["chain_mismatch"]:
                 raise SshRefused("this key may only sign logins to approved servers, and this "
                                  "connection did not prove which server it is (OpenSSH 8.9+ does)",
                                  "host_unverified", claimed_dest=claimed)
-            if host["fp"] not in allowed and not any(n in allowed for n in host["names"]):
+            if host["forwarding"] and not policy.get("allow_forwarded"):
+                raise SshRefused("this key may not be used through agent forwarding", "host_forwarded",
+                                 claimed_dest=claimed, host_fp=host["fp"])
+            if not ok(host["fp"], host["names"]) or (
+                    host["forwarding"] and not all(ok(h["fp"], h["names"]) for h in host["hops"])):
                 raise SshRefused("this key is not approved for that server", "host_not_allowed",
                                  claimed_dest=claimed, host_fp=host["fp"], host_type=host["type"])
         return host
@@ -2252,7 +2285,9 @@ def _describe(req):
         return (f"SSH signature with key <code>{html.escape(req.spec['fingerprint'])}</code><br>"
                 f"{html.escape(req.spec['ssh']['text'])}{host}",
                 "The private key stays in the broker; only the signature goes back. "
-                "Advisory: the request text is what the client sent.")
+                "Advisory: the request text is what the client sent. A verified server means "
+                "the other end holds that host key for this session, not that it is the host "
+                "you expect; the destination is only what the client said.")
     return ("run <code>" + html.escape(" ".join(req.spec.get("argv") or [])) + "</code>"
             + scripts_mod.card_html(req.spec.get("scripts")),
             "Advisory only: the secret is released to the requesting host and the "
@@ -2427,13 +2462,9 @@ def _detail_html(r, evs):
         add("Signing", r.get("ssh_what"))
         add("Key fingerprint", (first("ssh_signed") or {}).get("ssh_fingerprint"))
         ev = first("requested") or {}
-        if "host_bound" in ev:
-            for line in sshkey.host_lines({
-                    "bound": ev.get("host_bound"), "fp": ev.get("host_fp"), "type": ev.get("host_type"),
-                    "names": [n for n in str(ev.get("host_name") or "").split(", ") if n],
-                    "claimed": ev.get("claimed_dest"), "forwarding": ev.get("forwarding")}):
-                k, _, v = line.partition(": ")
-                add(k if _ else "Server", v if _ else line)
+        for line in ev.get("host_lines") or []:
+            k, sep, v = str(line).partition(": ")
+            add(k if sep else "Server", v if sep else line)
     add("Source (claimed by the client)", r["source"])
     add("Peer", r["peer"])
     if r["summary"]:

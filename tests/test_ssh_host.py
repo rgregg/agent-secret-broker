@@ -67,6 +67,13 @@ def login(sid, user="deploy"):
             + _s(b"publickey") + b"\x01" + _s(b"ssh-ed25519") + _s(b"K" * 51))
 
 
+def hostbound(sid, host, user="deploy"):
+    """Login data of OpenSSH 8.9+ host-bound public key auth."""
+    return (_s(sid) + bytes([50]) + _s(user.encode()) + _s(b"ssh-connection")
+            + _s(b"publickey-hostbound-v00@openssh.com") + b"\x01" + _s(b"ssh-ed25519")
+            + _s(b"K" * 51) + _s(host.blob))
+
+
 class BindVerification(unittest.TestCase):
     def test_every_host_key_type_verifies(self):
         keys = [ed25519.Ed25519PrivateKey.generate(), ec.generate_private_key(ec.SECP256R1()),
@@ -101,6 +108,44 @@ class BindVerification(unittest.TestCase):
         self.assertEqual(sshkey.userauth_session_id(login(SID_A)), SID_A)
         self.assertIsNone(sshkey.userauth_session_id(b"SSHSIG" + b"x" * 40))
         self.assertIsNone(sshkey.userauth_session_id(b""))
+
+
+class HostBound(unittest.TestCase):
+    def test_every_host_key_type_is_read_from_the_data(self):
+        for k in (ed25519.Ed25519PrivateKey.generate(), ec.generate_private_key(ec.SECP256R1()),
+                  ec.generate_private_key(ec.SECP384R1()), ec.generate_private_key(ec.SECP521R1()),
+                  rsa.generate_private_key(65537, 2048)):
+            h = Host(k)
+            d = sshkey.describe_data(hostbound(SID_A, h, user="bob"))
+            self.assertEqual(d["kind"], "userauth")
+            self.assertEqual(d["hostkey"], h.blob)
+            self.assertIn("log in over SSH as 'bob'", d["text"])
+            self.assertIn(f"to server {h.fp} ({h.type})", d["text"])
+            self.assertNotIn("host not shown", d["text"])
+
+    def test_plain_publickey_is_unchanged(self):
+        d = sshkey.describe_data(login(SID_A))
+        self.assertIsNone(d["hostkey"])
+        self.assertEqual(d["text"], "log in over SSH as 'deploy' (service 'ssh-connection', "
+                                    "both client-supplied); host not shown by SSH")
+
+    def test_truncated_or_garbage_hostbound_data_has_no_host(self):
+        h = Host()
+        good = hostbound(SID_A, h)
+        for bad in (good[:-1], good[:-len(h.blob) - 4], good + b"x",
+                    good[:-len(h.blob)] + b"\0" * len(h.blob)):
+            d = sshkey.describe_data(bad)
+            self.assertIsNone(d["hostkey"], bad[-8:])
+            self.assertEqual(d["kind"], "userauth")
+        self.assertEqual(sshkey.describe_data(good[:20])["kind"], "unknown")
+
+    def test_unrecognised_text_is_informative_and_never_raw(self):
+        d = sshkey.describe_data(b"\x00\x00\x01\x04" + b"\xff" * 260)
+        self.assertEqual(d["kind"], "unknown")
+        self.assertIn("264 bytes of unrecognised data (not an SSH login or SSHSIG message", d["text"])
+        self.assertNotIn("\xff", d["text"])
+        self.assertIn("one length-prefixed string", sshkey.describe_data(_s(b"x" * 10))["text"])
+        self.assertNotIn("length-prefixed", sshkey.describe_data(b"abcdefgh")["text"])
 
 
 class KnownHosts(unittest.TestCase):
@@ -346,6 +391,117 @@ class Verified(HostBase):
         self.assertEqual(self.broker._by_id[json.loads(body)["id"]].risk["level"], "high")
 
 
+class Chain(HostBase):
+    """Session binds form a chain, like OpenSSH's own agent: only the last one is this login."""
+    hop, final = Host(), Host(ec.generate_private_key(ec.SECP256R1()))
+    ssh_hosts = {"known_hosts": [hop.line("jump.example.com"), final.line("target.example.com")]}
+
+    def test_chain_display_with_forwarding(self):
+        _, body = self.sign(login(SID_B), [self.hop.bind(SID_A, True), self.final.bind(SID_B)])
+        card = self.card(body)
+        self.assertIn(f"Server: {self.final.fp} (ecdsa-sha2-nistp256) - known as target.example.com", card)
+        self.assertIn(f"Agent forwarded through: {self.hop.fp} (ssh-ed25519) [jump.example.com] (forwarding) -&gt; "
+                      f"{self.final.fp} (ecdsa-sha2-nistp256) [target.example.com]", card)
+        self.assertIn("Agent forwarding: this key may be used from the remote host", card)
+        self.assertIn("not that it is the host you expect", card)
+        self.assertIn("Agent forwarded through", self.notifier.sent[0]["message"])
+        self.assertTrue(self.events("requested")[0]["forwarding"])
+        self.assertIn("Agent forwarded through", " ".join(self.events("requested")[0]["host_lines"]))
+
+    def test_chain_without_forwarding_is_labelled_a_chain(self):
+        _, body = self.sign(login(SID_B), [self.hop.bind(SID_A), self.final.bind(SID_B)])
+        card = self.card(body)
+        self.assertIn("Bind chain:", card)
+        self.assertNotIn("Agent forwarding", card)
+
+    def test_match_against_an_earlier_bind_is_unverified(self):
+        _, body = self.sign(login(SID_A), [self.hop.bind(SID_A, True), self.final.bind(SID_B)])
+        card = self.card(body)
+        self.assertIn("Server identity not verified (the bind is for an earlier hop", card)
+        self.assertNotIn("Server:", card)
+        self.assertFalse(self.events("requested")[0]["host_bound"])
+
+    def test_a_broken_link_voids_the_chain(self):
+        bad = self.hop.bind(SID_A, True, sig=sshkey.sign(self.hop.key, SID_B))
+        _, body = self.sign(login(SID_B), [bad, self.final.bind(SID_B)])
+        self.assertIn("Server identity not verified", self.card(body))
+
+    def test_chain_length_is_bounded(self):
+        binds = [self.hop.bind(SID_A)] * sshkey.MAX_BINDS + [self.final.bind(SID_B)]
+        _, body = self.sign(login(SID_B), binds)
+        self.assertIn("Server identity not verified", self.card(body))
+        binds = [self.hop.bind(SID_A)] * (sshkey.MAX_BINDS - 1) + [self.final.bind(SID_B)]
+        _, body = self.sign(login(SID_B), binds)
+        self.assertIn(f"Server: {self.final.fp}", self.card(body))
+
+
+class ChainPolicy(HostBase):
+    hop, final, other = Host(), Host(), Host()
+    ssh_hosts = {"known_hosts": [hop.line("jump.example.com"), final.line("target.example.com")],
+                 "allowed_hosts": ["target.example.com"]}
+
+    def forwarded(self):
+        return [self.hop.bind(SID_A, True), self.final.bind(SID_B)]
+
+    def test_forwarded_use_is_refused_by_default(self):
+        self.assertEqual(self.sign(login(SID_B), self.forwarded())[0], 403)
+        self.assertEqual(self.sign(login(SID_B), [self.final.bind(SID_B)])[0], 202)   # not forwarded: fine
+        self.assertEqual([r["reason"] for r in self.refused()], ["host_forwarded"])
+
+    def test_earlier_bind_match_is_refused(self):
+        self.assertEqual(self.sign(login(SID_A), [self.final.bind(SID_A), self.final.bind(SID_B)])[0], 403)
+        self.assertEqual([r["reason"] for r in self.refused()], ["host_unverified"])
+
+
+class ChainPolicyAllowForwarded(ChainPolicy):
+    ssh_hosts = {**ChainPolicy.ssh_hosts, "allow_forwarded": True,
+                 "allowed_hosts": ["target.example.com", "jump.example.com"]}
+
+    def test_all_hops_must_be_allowed(self):
+        self.assertEqual(self.sign(login(SID_B), self.forwarded())[0], 202)
+        self.assertEqual(self.sign(login(SID_B), [self.other.bind(SID_A, True), self.final.bind(SID_B)])[0], 403)
+        self.assertEqual([r["reason"] for r in self.refused()], ["host_not_allowed"])
+
+    # the base class expectations differ when forwarding is allowed
+    test_forwarded_use_is_refused_by_default = None
+
+
+class HostBoundPolicy(HostBase):
+    good, bad = Host(), Host()
+    ssh_hosts = {"known_hosts": [good.line("web.example.com")], "allowed_hosts": ["web.example.com"]}
+
+    def test_hostbound_enforces_without_a_bind(self):
+        code, body = self.sign(hostbound(SID_A, self.good))
+        self.assertEqual(code, 202)
+        card = self.card(body)
+        self.assertIn(f"Server (host key in the signed login data): {self.good.fp} (ssh-ed25519)"
+                      " - known as web.example.com", card)
+        self.assertEqual(self.sign(hostbound(SID_A, self.bad))[0], 403)
+        self.assertEqual(self.sign(login(SID_A))[0], 403)                 # plain publickey: unbound
+        self.assertEqual([r["reason"] for r in self.refused()], ["host_not_allowed", "host_unverified"])
+
+    def test_bind_and_signed_host_key_must_agree(self):
+        self.assertEqual(self.sign(hostbound(SID_A, self.good), [self.good.bind(SID_A)])[0], 202)
+        code, _ = self.sign(hostbound(SID_A, self.good), [self.bad.bind(SID_A)])
+        self.assertEqual(code, 403)
+        self.assertEqual([r["reason"] for r in self.refused()], ["host_conflict"])
+
+
+class HostBoundNoPolicy(HostBase):
+    def test_conflict_is_refused_even_without_a_policy(self):
+        a, b = Host(), Host()
+        self.assertEqual(self.sign(hostbound(SID_A, a), [b.bind(SID_A)])[0], 403)
+        self.assertEqual(self.refused()[0]["reason"], "host_conflict")
+
+    def test_signed_host_shown_unnamed(self):
+        h = Host(ec.generate_private_key(ec.SECP384R1()))
+        _, body = self.sign(hostbound(SID_A, h))
+        card = self.card(body)
+        self.assertIn(f"Server (host key in the signed login data): {h.fp} (ecdsa-sha2-nistp384)", card)
+        self.assertIn(f"to server {h.fp}", card)
+        self.assertFalse(self.events("requested")[0]["host_bound"])
+
+
 class Allowed(HostBase):
     good, bad = Host(), Host()
     ssh_hosts = {"known_hosts": [good.line("web.example.com"), bad.line("evil.example.com")],
@@ -453,13 +609,15 @@ class Config(unittest.TestCase):
     def test_valid(self):
         h = Host()
         _, e = self.entry({"known_hosts": [h.line("a")], "allowed_hosts": ["A", "SHA256:abc="]})
-        self.assertEqual(e["ssh_hosts"], {"known": {h.fp: ["a"]}, "allowed": ["a", "SHA256:abc"]})
+        self.assertEqual(e["ssh_hosts"], {"known": {h.fp: ["a"]}, "allowed": ["a", "SHA256:abc"],
+                                       "allow_forwarded": False})
         _, e = self.entry({})
         self.assertNotIn("ssh_hosts", e)            # an empty object is no policy
 
     def test_errors_name_the_field(self):
         for bad, word in (("x", "ssh_hosts must be an object"), ({"allowed": []}, "unknown field 'allowed'"),
                           ({"allowed_hosts": []}, "allowed_hosts needs at least one"),
+                          ({"allow_forwarded": "yes"}, "allow_forwarded must be true or false"),
                           ({"allowed_hosts": "a"}, "ssh_hosts.allowed_hosts"),
                           ({"allowed_hosts": ["a"] * 51}, "up to 50"),
                           ({"allowed_hosts": ["a b"]}, "host name or a SHA256"),

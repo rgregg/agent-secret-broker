@@ -96,17 +96,34 @@ socket, and every signature ssh asks for becomes a broker request (mode
     signature over the session id. `asb ssh-agent` accepts it (it replies
     `SSH_AGENT_SUCCESS`; any other extension, or a malformed bind, gets
     `SSH_AGENT_FAILURE`, which OpenSSH treats as "agent does not support it") and
-    remembers it per agent connection (up to 16, including the forwarding flag).
-    The broker checks the signature (ed25519, ECDSA P-256/384/521, RSA with
-    SHA-2 or legacy SHA-1 host keys), and that the session id inside the userauth
-    data being signed is the bound one. The card then reads `Server: SHA256:...
-    (ssh-ed25519)`, plus `known as host1, host2` when the key's `ssh_hosts`
-    `known_hosts` lists that fingerprint. A bind whose signature does not verify
-    is dropped and the request is shown as unverified; a valid bind for a
-    *different* session (a replay from another connection) is refused outright
-    (`ssh_sign_refused`, reason `session_mismatch`). git over ssh binds too.
-    Agent forwarding (`is_forwarding`) adds "Agent forwarding: this key may be
-    used from the remote host".
+    remembers it per agent connection, as an ordered chain (up to 16, each with
+    its forwarding flag). The broker checks every signature (ed25519, ECDSA
+    P-256/384/521, RSA with SHA-2 or legacy SHA-1 host keys) and that the session
+    id inside the userauth data being signed is the one of the **last** bind
+    (the connection actually being signed for). A match against only an earlier
+    bind, a chain with an invalid link, or a chain longer than 16 is shown as
+    "Server identity not verified"; a chain that matches no bind at all (a bind
+    replayed from another connection) is refused (`ssh_sign_refused`, reason
+    `session_mismatch`). The card reads `Server: SHA256:... (ssh-ed25519)`, plus
+    `known as host1, host2` when the key's `ssh_hosts.known_hosts` lists that
+    fingerprint. What this proves: the other end of that session holds that host
+    key. It does not prove the login is going to the host you expected. git over
+    ssh binds too.
+    If any bind in the chain has `is_forwarding` set, the key is being used from a
+    remote host: the card shows "Agent forwarded through: hop -> hop" with each
+    hop's fingerprint, name and flag, and "Agent forwarding: this key may be used
+    from the remote host".
+  - *Host key in the signed login (host-bound auth).* OpenSSH 8.9+ against a
+    server that also supports it (OpenSSH 8.9+ servers do) signs logins with the
+    method `publickey-hostbound-v00@openssh.com`, whose signed data ends with the
+    server's host key. The server rejects the login if that is not its own key, so
+    the signature is only usable at that host. The card shows it as "Server (host
+    key in the signed login data)" and "log in over SSH as 'user' to server
+    SHA256:...". It needs no session-bind (but is still client-supplied bytes, so
+    it is a different label from a bind-verified server). When both exist they must
+    agree, otherwise the request is refused (`host_conflict`). Plain `publickey`
+    (older client or server) carries no host: "host not shown by SSH". Data that is
+    neither an SSH login nor SSHSIG is described as "N bytes of unrecognised data".
   - *Destination (claimed).* With `asb ssh-agent -- <command>` the client reads the
     destination from the command line (`ssh [-l/-p/-J/-o HostName=...] [user@]host`,
     scp/sftp `user@host:path` and `-P`, `rsync -e 'ssh -p N'`, git `ssh://` and
@@ -119,8 +136,8 @@ socket, and every signature ssh asks for becomes a broker request (mode
     With `-J`, the claim is the final host (`(via jump)` is appended) and the
     jump hop's own login shows that same claim; the verified Server line tells
     the two apart.
-  - Not verified (old OpenSSH, a non-ssh client, a failed bind): the card says
-    "Server identity not verified". Commit signing (SSHSIG) has no server.
+  - Not verified (old OpenSSH or server, a non-ssh client, a failed bind, no
+    host-bound auth): the card says "Server identity not verified". Commit signing (SSHSIG) has no server.
   - The key is still never released and signing stays rated HIGH whatever the
     model says; the deterministic summary input includes the server and
     destination lines.
@@ -132,7 +149,8 @@ socket, and every signature ssh asks for becomes a broker request (mode
        "vars": {"DEPLOY_SSH_KEY": {"field": "private_key"}},
        "ssh_hosts": {
          "known_hosts": ["web.example.com,10.0.0.5 ssh-ed25519 AAAA..."],
-         "allowed_hosts": ["web.example.com", "SHA256:abc..."]}}
+         "allowed_hosts": ["web.example.com", "SHA256:abc..."],
+         "allow_forwarded": false}}
 
   `known_hosts` (up to 200 plain known_hosts lines, 2 KB each) maps host key
   fingerprints to names for display; copy lines from `~/.ssh/known_hosts`
@@ -141,9 +159,13 @@ socket, and every signature ssh asks for becomes a broker request (mode
   names appear as `h:2222`. `allowed_hosts` (up to 50) is a list of names from
   `known_hosts` or `SHA256:` fingerprints. When it is set, a signature is refused
   (HTTP 403, audit `ssh_sign_refused` with reason `host_not_allowed`,
-  `host_unverified` or `session_mismatch`) unless a verified bind proves the
-  server is on the list, so an unbound request (old OpenSSH, failed verification,
-  commit signing) is refused: it fails closed. When it is not set, requests
+  `host_unverified`, `host_forwarded`, `host_conflict` or `session_mismatch`) unless a verified bind proves the
+  server is on the list (by the bind-verified key or by the host key in a host-bound
+  login), so an unbound request (old OpenSSH or server, plain `publickey`, failed
+  verification, commit signing) is refused: it fails closed. A request whose bind
+  chain shows agent forwarding is refused (`host_forwarded`) unless
+  `"allow_forwarded": true`; then every hop's host key must also be on the list. A
+  bind that disagrees with the host key in the login data is `host_conflict`. When it is not set, requests
   proceed as before with whatever identity information exists. An empty list is a
   config error (name the field), not "allow everything". Neither `ssh_hosts` nor
   its contents appear in `list`, `which`, `status`, or the agent's audit view;

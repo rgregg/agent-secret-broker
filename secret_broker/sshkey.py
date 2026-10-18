@@ -125,14 +125,49 @@ def _shown(raw, limit=48):
     return repr(text[:limit] + ("..." if len(text) > limit else ""))
 
 
+HOSTBOUND = b"publickey-hostbound-v00@openssh.com"
+
+
+def parse_userauth(data):
+    """Parse the data of an SSH public key login signature, or None.
+
+    {"sid", "user", "service", "method", "hostkey"}: `hostkey` is the server host
+    key blob of a host-bound login (OpenSSH 8.9+, method publickey-hostbound-v00)
+    and None for plain `publickey` or when that field cannot be read.
+    """
+    try:
+        r = _Reader(data)
+        sid = r.string()
+        if r.byte() != 50:                  # SSH_MSG_USERAUTH_REQUEST
+            return None
+        out = {"sid": sid, "user": r.string(), "service": r.string(), "method": r.string(), "hostkey": None}
+        if out["method"] == b"publickey":
+            return out
+        if out["method"] == HOSTBOUND:
+            try:
+                r.byte()                    # TRUE: a signature follows
+                r.string()                  # public key algorithm
+                r.string()                  # public key blob
+                hk = r.string()
+                if r.i == len(data) and _blob_type(hk) in _HOSTKEY_TYPES:
+                    out["hostkey"] = hk
+            except (IndexError, struct.error):
+                pass
+            return out
+    except (IndexError, struct.error):
+        pass
+    return None
+
+
 def describe_data(data, host_known=False):
     """What is being signed, as far as it can be told, for the approval prompt.
 
-    Returns {"kind", "text"}. The data is client-supplied, so this is what the
-    bytes *say*, not a promise about the connection they belong to: an ssh
-    userauth blob carries the account name but not the host being logged in to
-    (see verify_bind for the part that can be proved). `host_known` drops the
-    "host not shown" caveat when the caller shows a verified server instead.
+    Returns {"kind", "text", "hostkey"}. The data is client-supplied, so this is
+    what the bytes *say*, not a promise about the connection they belong to. A
+    plain userauth blob carries the account name but not the host; a host-bound
+    one (OpenSSH 8.9+ with a server that supports it) names the server host key,
+    which the server itself checks. `host_known` drops the "host not shown"
+    caveat when the caller shows a server identity instead.
     """
     if data.startswith(b"SSHSIG"):
         try:
@@ -141,18 +176,20 @@ def describe_data(data, host_known=False):
             return {"kind": "sshsig", "text": f"sign a message (namespace {ns}, e.g. git commit signing)"}
         except (IndexError, struct.error):
             return {"kind": "sshsig", "text": "sign a message (SSHSIG)"}
-    try:
-        r = _Reader(data)
-        r.string()                      # session id
-        if r.byte() == 50:              # SSH_MSG_USERAUTH_REQUEST
-            user, service, method = _shown(r.string()), _shown(r.string()), r.string()
-            if method == b"publickey":
-                return {"kind": "userauth",
-                        "text": f"log in over SSH as {user} (service {service}, "
-                                "both client-supplied)" + ("" if host_known else "; host not shown by SSH")}
-    except (IndexError, struct.error):
-        pass
-    return {"kind": "unknown", "text": f"sign {len(data)} unrecognised bytes"}
+    ua = parse_userauth(data)
+    if ua:
+        user, service = _shown(ua["user"]), _shown(ua["service"])
+        text = f"log in over SSH as {user} (service {service}, both client-supplied)"
+        if ua["hostkey"]:
+            text += f" to server {fingerprint(ua['hostkey'])} ({_blob_type(ua['hostkey'])})"
+        elif not host_known:
+            text += "; host not shown by SSH"
+        return {"kind": "userauth", "text": text, "hostkey": ua["hostkey"]}
+    hint = ""
+    if len(data) > 4 and struct.unpack(">I", data[:4])[0] == len(data) - 4:
+        hint = ", one length-prefixed string"
+    return {"kind": "unknown", "hostkey": None,
+            "text": f"sign {len(data)} bytes of unrecognised data (not an SSH login or SSHSIG message{hint})"}
 
 
 # -- server identity ---------------------------------------------------------
@@ -172,14 +209,8 @@ def _blob_type(blob):
 
 def userauth_session_id(data):
     """The session id a userauth signature covers, or None if `data` is not one."""
-    try:
-        r = _Reader(data)
-        sid = r.string()
-        if r.byte() == 50 and 16 <= len(sid) <= 64:
-            return sid
-    except (IndexError, struct.error):
-        pass
-    return None
+    ua = parse_userauth(data)
+    return ua["sid"] if ua and 16 <= len(ua["sid"]) <= 64 else None
 
 
 def verify_bind(hostkey, session_id, sig):
@@ -249,19 +280,33 @@ def parse_known_hosts(lines):
     return out
 
 
+def _hop(h):
+    out = f"{h['fp']} ({h['type']})"
+    if h.get("names"):
+        out += " [" + ", ".join(h["names"]) + "]"
+    return out + (" (forwarding)" if h.get("forwarding") else "")
+
+
 def host_lines(host):
     """Plain-text lines describing the server side of an ssh_sign request (the
     caller escapes them). `host` is the request's spec["host"] dict or None."""
     if not host:
         return []
     out = []
-    if host.get("bound"):
-        line = f"Server: {host['fp']} ({host['type']})"
+    if host.get("fp"):
+        label = "Server" if host.get("bound") else "Server (host key in the signed login data)"
+        line = f"{label}: {host['fp']} ({host['type']})"
         if host.get("names"):
             line += " - known as " + ", ".join(host["names"])
         out.append(line)
     else:
-        out.append("Server identity not verified")
+        out.append("Server identity not verified" + (
+            " (the bind is for an earlier hop, not this login)" if host.get("chain_mismatch") else ""))
+    hops = host.get("hops") or []
+    if host.get("forwarding"):
+        out.append("Agent forwarded through: " + " -> ".join(_hop(h) for h in hops))
+    elif len(hops) > 1:
+        out.append("Bind chain: " + " -> ".join(_hop(h) for h in hops))
     if host.get("claimed"):
         out.append(f"Destination (claimed by the client): {host['claimed']}")
     if host.get("forwarding"):
