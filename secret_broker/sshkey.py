@@ -300,8 +300,9 @@ def host_lines(host):
             line += " - known as " + ", ".join(host["names"])
         out.append(line)
     else:
-        out.append("Server identity not verified" + (
-            " (the bind is for an earlier hop, not this login)" if host.get("chain_mismatch") else ""))
+        why = (" (the connection sent an invalid session bind)" if host.get("bind_invalid") else
+               " (the bind is for an earlier hop, not this login)" if host.get("chain_mismatch") else "")
+        out.append("Server identity not verified" + why)
     hops = host.get("hops") or []
     if host.get("forwarding"):
         out.append("Agent forwarded through: " + " -> ".join(_hop(h) for h in hops))

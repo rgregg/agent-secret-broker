@@ -101,7 +101,7 @@ socket, and every signature ssh asks for becomes a broker request (mode
     P-256/384/521, RSA with SHA-2 or legacy SHA-1 host keys) and that the session
     id inside the userauth data being signed is the one of the **last** bind
     (the connection actually being signed for). A match against only an earlier
-    bind, a chain with an invalid link, or a chain longer than 16 is shown as
+    bind, is shown as
     "Server identity not verified"; a chain that matches no bind at all (a bind
     replayed from another connection) is refused (`ssh_sign_refused`, reason
     `session_mismatch`). The card reads `Server: SHA256:... (ssh-ed25519)`, plus
@@ -159,13 +159,19 @@ socket, and every signature ssh asks for becomes a broker request (mode
   names appear as `h:2222`. `allowed_hosts` (up to 50) is a list of names from
   `known_hosts` or `SHA256:` fingerprints. When it is set, a signature is refused
   (HTTP 403, audit `ssh_sign_refused` with reason `host_not_allowed`,
-  `host_unverified`, `host_forwarded`, `host_conflict` or `session_mismatch`) unless a verified bind proves the
+  `host_unverified`, `host_forwarded`, `host_conflict`, `bind_invalid` or `session_mismatch`) unless a verified bind proves the
   server is on the list (by the bind-verified key or by the host key in a host-bound
   login), so an unbound request (old OpenSSH or server, plain `publickey`, failed
   verification, commit signing) is refused: it fails closed. A request whose bind
   chain shows agent forwarding is refused (`host_forwarded`) unless
   `"allow_forwarded": true`; then every hop's host key must also be on the list. A
-  bind that disagrees with the host key in the login data is `host_conflict`. When it is not set, requests
+  bind that disagrees with the host key in the login data is `host_conflict`. If the
+  connection sent any session bind that fails verification (or is malformed, or the
+  chain exceeds 16 and the agent flags `bind_overflow`), forwarding cannot be ruled
+  out: the host key in the login data is then ignored and the request is refused
+  as `bind_invalid` regardless of `allow_forwarded`. Without `allowed_hosts` it
+  proceeds as "Server identity not verified (the connection sent an invalid session
+  bind)". The login data's host key is used only when the connection sent no binds. When it is not set, requests
   proceed as before with whatever identity information exists. An empty list is a
   config error (name the field), not "allow everything". Neither `ssh_hosts` nor
   its contents appear in `list`, `which`, `status`, or the agent's audit view;

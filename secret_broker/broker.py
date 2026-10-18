@@ -826,12 +826,14 @@ class Broker:
         spec["data"], spec["flags"] = data, flags
         spec["data_bytes"] = len(data)
         spec["fingerprint"] = sshkey.fingerprint(sshkey.blob_from_line(sc["ssh_public_key"]))
-        spec["host"] = host = self._ssh_host(data, spec.get("binds"), spec.get("claimed_dest"), sc)
+        spec["host"] = host = self._ssh_host(data, spec.get("binds"), spec.get("claimed_dest"), sc,
+                                  spec.get("bind_overflow"))
         spec["ssh"] = sshkey.describe_data(data, host_known=bool(host and host.get("fp")))
         spec.pop("binds", None)
+        spec.pop("bind_overflow", None)
 
     @staticmethod
-    def _ssh_host(data, binds, claimed, sc):
+    def _ssh_host(data, binds, claimed, sc, overflow=False):
         """Server identity for a login signature, and the key's allowed_hosts policy.
 
         Two independent sources: the session-bind chain the agent connection
@@ -849,21 +851,31 @@ class Broker:
                 raise SshRefused("this key may only sign logins to approved servers", "host_unverified",
                                  claimed_dest=claimed)
             return None
+        # Any bind sent that cannot be verified (bad link, malformed, too many) means
+        # forwarding cannot be ruled out: never fall back to the login data's host key.
+        invalid = overflow is True or (binds is not None and not isinstance(binds, list))
         binds = binds if isinstance(binds, list) else []
         hops = []
-        if len(binds) <= sshkey.MAX_BINDS:
+        if len(binds) > sshkey.MAX_BINDS:
+            invalid = True
+        else:
             for b in binds:
                 try:
                     hk, bsid, sig = (base64.b64decode(b[k], validate=True)
                                      for k in ("hostkey_b64", "session_id_b64", "sig_b64"))
                     fp, ktype = sshkey.verify_bind(hk, bsid, sig)
                 except (sshkey.SshKeyError, KeyError, TypeError, ValueError, binascii.Error):
-                    hops = []                   # a chain with a broken link proves nothing
+                    invalid = True
                     break
                 hops.append({"sid": bsid, "fp": fp, "type": ktype, "forwarding": b.get("forwarding") is True,
                              "names": known.get(fp, [])})
+        if invalid:
+            hops = []
+        if invalid and allowed:
+            raise SshRefused("this key may only sign logins to approved servers, and this connection "
+                             "sent an invalid session bind", "bind_invalid", claimed_dest=claimed)
         host = {"bound": False, "claimed": claimed, "hops": [], "forwarding": False,
-                "chain_mismatch": False}
+                "chain_mismatch": False, "bind_invalid": invalid}
         if hops:
             if hops[-1]["sid"] == sid:
                 host.update(bound=True, hops=[{k: v for k, v in h.items() if k != "sid"} for h in hops],
@@ -884,7 +896,7 @@ class Broker:
         if host["bound"]:
             last = host["hops"][-1]
             host.update(fp=last["fp"], type=last["type"], names=last["names"])
-        elif signed:
+        elif signed and not invalid and not binds:
             host.update(fp=signed[0], type=signed[1], names=known.get(signed[0], []))
         if allowed:
             def ok(fp, names):
@@ -2621,7 +2633,8 @@ def client_handler(broker, client_key):
                             "ssh": body.get("ssh") is True}
                 elif mode == "ssh_sign":
                     spec = {"data_b64": body.get("data_b64"), "flags": body.get("flags", 0),
-                            "binds": body.get("binds"), "claimed_dest": body.get("claimed_dest")}
+                            "binds": body.get("binds"), "claimed_dest": body.get("claimed_dest"),
+                            "bind_overflow": body.get("bind_overflow") is True}
                 else:
                     raise ValueError("bad mode")
                 if mode != "env" and body.get("scripts") is not None:

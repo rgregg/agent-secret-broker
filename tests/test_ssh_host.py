@@ -232,8 +232,10 @@ class AgentExtension(unittest.TestCase):
         self.assertEqual(conn["binds"], [])
         for _ in range(asb.MAX_BINDS):
             asb.agent_reply(ok, conn)
+        self.assertFalse(conn.get("overflow"))
         self.assertEqual(asb.agent_reply(ok, conn), fail)                        # bounded
         self.assertEqual(len(conn["binds"]), asb.MAX_BINDS)
+        self.assertTrue(conn["overflow"])                                        # and flagged
 
 
 class HostBase(Harness):
@@ -487,6 +489,52 @@ class HostBoundPolicy(HostBase):
         self.assertEqual([r["reason"] for r in self.refused()], ["host_conflict"])
 
 
+class BindInvalid(HostBase):
+    """One broken bind must not let the login data's host key stand in for the chain."""
+    good, hop = Host(), Host()
+    ssh_hosts = {"known_hosts": [good.line("web.example.com")], "allowed_hosts": ["web.example.com"],
+                 "allow_forwarded": True}
+
+    def broken(self):
+        return [self.hop.bind(SID_A, True, sig=sshkey.sign(self.hop.key, SID_B)), self.good.bind(SID_B)]
+
+    def test_broken_link_is_refused_even_with_allowed_signed_host_and_allow_forwarded(self):
+        self.assertEqual(self.sign(hostbound(SID_B, self.good), self.broken())[0], 403)
+        self.assertEqual(self.sign(hostbound(SID_B, self.good), [{"junk": 1}])[0], 403)
+        self.assertEqual(self.sign(hostbound(SID_B, self.good), "notalist")[0], 403)
+        self.assertEqual([r["reason"] for r in self.refused()], ["bind_invalid"] * 3)
+
+    def test_overflow_is_bind_invalid(self):
+        binds = [self.good.bind(SID_A)] * (sshkey.MAX_BINDS + 1)
+        self.assertEqual(self.sign(hostbound(SID_A, self.good), binds)[0], 403)
+        body = {"mode": "ssh_sign", "names": ["deploy"], "flags": 0, "bind_overflow": True,
+                "data_b64": base64.b64encode(hostbound(SID_A, self.good)).decode(),
+                "binds": [self.good.bind(SID_A)]}
+        self.assertEqual(self.api("POST", "/v1/requests", body)[0], 403)      # what the agent sends
+        self.assertEqual([r["reason"] for r in self.refused()], ["bind_invalid"] * 2)
+
+    def test_no_binds_with_valid_hostbound_data_still_accepted(self):
+        self.assertEqual(self.sign(hostbound(SID_B, self.good))[0], 202)
+        self.assertEqual(self.sign(hostbound(SID_B, self.good), [])[0], 202)
+
+
+class BindInvalidNoPolicy(HostBase):
+    def test_proceeds_unbound_with_the_note_and_without_the_signed_host(self):
+        h = Host()
+        bad = [h.bind(SID_A, True, sig=sshkey.sign(h.key, SID_B))]
+        code, body = self.sign(hostbound(SID_A, h), bad, claimed="x.example:22")
+        self.assertEqual(code, 202)
+        card = self.card(body)
+        self.assertIn("Server identity not verified (the connection sent an invalid session bind)", card)
+        self.assertNotIn("Server (host key", card)
+        self.assertIn("Destination (claimed by the client): x.example:22", card)
+        self.assertIn("invalid session bind", self.notifier.sent[0]["message"])
+        ev = self.events("requested")[0]
+        self.assertFalse(ev["host_bound"])
+        self.assertFalse(ev["forwarding"])
+        self.assertIn("invalid session bind", " ".join(ev["host_lines"]))
+
+
 class HostBoundNoPolicy(HostBase):
     def test_conflict_is_refused_even_without_a_policy(self):
         a, b = Host(), Host()
@@ -518,7 +566,7 @@ class Allowed(HostBase):
         # non-login data (commit signing) cannot be tied to a server
         self.assertEqual(self.sign(b"SSHSIG" + _s(b"git") + _s(b"") + _s(b"sha512") + _s(b"h" * 64))[0], 403)
         self.assertEqual([r["reason"] for r in self.refused()],
-                         ["host_not_allowed", "host_unverified", "host_unverified", "host_unverified"])
+                         ["host_not_allowed", "host_unverified", "bind_invalid", "host_unverified"])
         self.assertEqual(len(self.events("requested")), 1)
 
     def test_refusal_text_does_not_list_the_policy(self):

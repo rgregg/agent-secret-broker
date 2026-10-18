@@ -582,8 +582,11 @@ def agent_reply(msg, conn=None):
         kind, body = msg[0], msg[1:]
         if kind == AGENTC_EXTENSION:
             (name,), rest = _strings(body, 1)
-            if name != BIND_EXT or conn is None or len(conn["binds"]) >= MAX_BINDS:
+            if name != BIND_EXT or conn is None:
                 return fail                 # OpenSSH carries on without the extension
+            if len(conn["binds"]) >= MAX_BINDS:
+                conn["overflow"] = True     # the broker then treats the whole chain as invalid
+                return fail
             (hostkey, sid, sig), rest = _strings(rest, 3)
             if len(rest) != 1 or rest[0] > 1:
                 return fail
@@ -609,6 +612,8 @@ def agent_reply(msg, conn=None):
                    "data_b64": base64.b64encode(data).decode()}
             if conn and conn["binds"]:
                 req["binds"] = conn["binds"]
+            if conn and conn.get("overflow"):
+                req["bind_overflow"] = True
             if conn and conn.get("claim"):
                 req["claimed_dest"] = conn["claim"]
             r = obtain(req)
