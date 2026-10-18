@@ -711,9 +711,19 @@ minutes further requests for the same secret are approved without a tap. The
 grant ends by itself at an absolute deadline (using it does not extend it) and
 can be revoked early.
 
-- **Per secret name.** A request naming several secrets creates one grant for
-  each; a later request is auto-approved only when *every* secret it names has an
-  active grant. Granting again for a secret replaces its grant (restarting the clock).
+- **Bound to the exact set of secrets.** A grant belongs to the set of secret
+  names the human approved. A later request is covered only when its set of
+  names *equals* a granted set (order does not matter); a request for a subset or
+  a superset prompts. Granting again for the same set replaces that grant
+  (restarting the clock).
+- **Scoped by method class.** A grant made from an `http` request with method
+  GET, HEAD or OPTIONS (`scope: read`) covers only those methods later; a later
+  POST/PUT/PATCH/DELETE falls through to a normal prompt (`grant_skipped`,
+  `reason: method`). A grant made from any other method (`scope: any`) covers
+  all methods. `ssh_sign` has no method: its grant (`scope: any`) covers signing
+  for that key. The card's menu text says which applies.
+- **Risk does not block creating one.** HIGH-rated requests (every `ssh_sign` is
+  rated high) can still be approved with a grant; only `max_risk` limits use.
 - **Modes where the value never leaves the broker:** `http` and `ssh_sign`
   (a deploy session needs many logins). `env` and `store` (create or update)
   always ask: the value reaches the agent, or credentials change. A grant picked
@@ -735,12 +745,12 @@ can be revoked early.
   `approval: allow` policy already approved; a request that policy escalated
   because of risk can still be approved by a grant when the ceiling allows.
 - **Persistence.** Active grants live in `grants.json` next to the audit log
-  (atomic write, mode 0600; secret names, times, grant id and creator only). It
+  (atomic write, mode 0600; secret names, scope, times, grant id and creator only). It
   is reloaded on start, so a redeploy does not drop them. Expired entries and
   entries whose deadline is further out than `max_minutes` are dropped on load;
   a corrupt file fails closed (no grants, `grants_file_corrupt` audit warning).
 - **Revoking.** The **Policies** tab has an "Active grants" card above "Always
-  allowed": secret, live time left, who allowed it, and a **Revoke** button
+  allowed": all secrets in the set, reads only / all requests, live time left, who allowed it, and a **Revoke** button
   (`POST /grants/revoke`, CSRF-checked). Programmatic: `Broker.revoke_grant`.
 - **Settings** shows the config line (on/off, durations, ceiling).
   `GET /v1/status` reports only `features.timed_grants` (a bool). Which secrets
@@ -752,17 +762,17 @@ Audit events (all but the last three carry the request `id`):
 | Event | Fields |
 | --- | --- |
 | `decided` / `approved` | `grant_minutes` when the approver chose a grant (`via: user`, `channel`) |
-| `grant_created` | `grant_ids`, `grant_minutes`, `expires_at`, `created_by`, `channel`, `approver_peer`, `approver_ip` |
+| `grant_created` | `grant_id`, `scope`, `grant_minutes`, `expires_at`, `created_by`, `channel`, `approver_peer`, `approver_ip` |
 | `grant_refused` | `reason` (ineligible mode); the approver's usual `channel`/`approver` fields |
-| `grant_used` | `grant_ids`, `grant_left_s` |
-| `approved` (auto) | `via: policy`, `grant_id`, `grant_ids`, `grant_left_s` |
-| `grant_skipped` | `reason: risk`, `grant_ids`, `risk_level`, `max_risk` |
-| `grant_revoked` | `grant_id`, `secret`, `created_by`, `revoked_by`, `left_s`, `peer`, `client_ip` |
-| `grant_expired` | `grant_id`, `secret`, `expires_at`, `created_by` (recorded lazily on the next check, by a 15 s sweep, or on load) |
+| `grant_used` | `grant_id`, `scope`, `grant_left_s` |
+| `approved` (auto) | `via: policy`, `grant_id`, `grant_left_s` |
+| `grant_skipped` | `reason: risk` or `method`, `grant_id`, `scope`, `risk_level`, `max_risk` |
+| `grant_revoked` | `grant_id`, `secrets`, `scope`, `created_by`, `revoked_by`, `left_s`, `peer`, `client_ip` |
+| `grant_expired` | `grant_id`, `secrets`, `expires_at`, `created_by` (recorded lazily on the next check, by a 15 s sweep, or on load) |
 | `grants_file_corrupt`, `grant_dropped`, `grants_file_write_failed` | `warning` / `reason`, `error` |
 
 For any API that exposes audit events outside the approver UI: treat `grant_*`
-events and the `grant_id`, `grant_ids`, `grant_left_s` fields as policy context
+events and the `grant_id`, `scope`, `grant_left_s` fields as policy context
 and show a grant-approved request as a plain `approved`. The history rows and
 pop-over show "Decided by: time-boxed grant (auto-approved), 12 min left when
 used".
