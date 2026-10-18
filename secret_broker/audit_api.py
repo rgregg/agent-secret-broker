@@ -82,7 +82,10 @@ WHITELIST = {
 HIDDEN = frozenset({
     "startup", "assessed", "escalated", "notified", "decided",
     "policy_changed", "policy_change_refused", "policy_change_failed", "policies_viewed",
-    "ha_hook_any_device", "config_warning", "client_event",
+    "ha_hook_any_device", "config_warning",
+    # time-boxed grants are approval policy context: a grant-approved request shows as plain "approved"
+    "grant_created", "grant_refused", "grant_used", "grant_skipped", "grant_revoked", "grant_expired",
+    "grant_dropped", "grants_file_corrupt", "grants_file_write_failed", "client_event",
     # exist only when a human was asked to decide (policy / presence by absence)
     "decision_refused", "dashboard_decide_refused", "push_decide_refused", "ha_decide_refused",
     "link_decide_refused",
