@@ -13,8 +13,7 @@ import threading
 
 from .backends import BwBackend, BwServeBackend, FileBackend
 from .broker import Broker, serve
-from . import grants, notify, risk
-from .summarize import OpenRouterSummarizer
+from . import grants, notify, risk, riskmodel
 
 
 def _read(path):
@@ -62,10 +61,7 @@ def main():
     summarizer = None
     sc = cfg.get("summary")
     if sc:
-        summarizer = OpenRouterSummarizer(
-            _read(sc["api_key_file"]), sc["model"], timeout=sc.get("timeout", 4.0),
-            max_content_chars=sc.get("max_content_chars", 300),
-            send_content=sc.get("send_content", True))
+        summarizer = riskmodel.build(sc, _read)     # validates, naming the field
     broker = Broker(cfg, backend, notifier, audit=cfg.get("audit_log"), summarizer=summarizer,
                     background_load=True, push=push)
     bind = os.environ.get("BIND", "0.0.0.0")
