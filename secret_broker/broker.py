@@ -71,12 +71,12 @@ class Channel:
         self.may_create_always = may_create_always  # may create an always-allow rule
 
 
-# Registry of decision channels; the key is the `channel` audit field. Add a
-# future Home Assistant hook here, e.g. "ha": Channel(True, False).
+# Registry of decision channels; the key is the `channel` audit field.
 CHANNELS = {
     "dashboard": Channel(token_required=False, may_create_always=True),   # POST /decide
     "link": Channel(token_required=False, may_create_always=True),        # POST /a/<nonce>
     "push": Channel(token_required=True, may_create_always=False),        # POST /push/decide
+    "ha": Channel(token_required=True, may_create_always=False),          # POST /v1/hooks/ha/decide
 }
 
 
@@ -119,6 +119,13 @@ class Broker:
         self.action_policy = notify_mod.parse_action_policy(
             config.get("notify_actions"), "notify_actions")
         self._audit = audit if isinstance(audit, AuditLog) else AuditLog(audit)
+        self.ha_hook = notify_mod.parse_ha_hook(
+            config.get("ha_hook"), lambda p: open(p).read().strip())
+        self._ha_rate = {}              # source ip -> {"t", "n", "drop"}
+        self._ha_rate_lock = threading.Lock()
+        if self.ha_hook is not None and not self.ha_hook["allowed_devices"]:
+            self.log("ha_hook_any_device", warning="ha_hook.allowed_devices is empty: "
+                     "any device id is accepted (it is recorded, not verified)")
         self.history = History(self._audit._path)
         self._csrf_key = secrets.token_bytes(32)    # per process: tokens die with a restart
         self._lock = threading.Lock()
@@ -685,6 +692,27 @@ class Broker:
             return any(ip in ipaddress.ip_network(n, strict=False) for n in nets)
         except ValueError:
             return False
+
+    HA_LIMIT_PER_MIN = 60
+
+    def ha_rate_ok(self, ip):
+        """Fixed-window limit on the Home Assistant hook, per source IP. The
+        first drop in a window is audited."""
+        now = time.time()
+        with self._ha_rate_lock:
+            if len(self._ha_rate) > 1024:
+                self._ha_rate = {k: v for k, v in self._ha_rate.items() if now - v["t"] < 60}
+            st = self._ha_rate.setdefault(ip, {"t": now, "n": 0, "drop": 0})
+            if now - st["t"] >= 60:
+                st.update(t=now, n=0, drop=0)
+            st["n"] += 1
+            if st["n"] <= self.HA_LIMIT_PER_MIN:
+                return True
+            st["drop"] += 1
+            first = st["drop"] == 1
+        if first:
+            self.log("ha_decide_dropped", peer=ip, limit_per_min=self.HA_LIMIT_PER_MIN)
+        return False
 
     def csrf_token(self, user):
         """Token a page must echo back with a decision. Bound to the identity, so
@@ -1655,7 +1683,57 @@ def client_handler(broker, client_key):
                 return False
             return True
 
+        def _ha_decide(self):
+            """POST /v1/hooks/ha/decide, authenticated by the dedicated hook key
+            only (the agent client key is refused here, the hook key everywhere
+            else). Responses never carry request details."""
+            hook = broker.ha_hook
+            peer = self.client_address[0]
+            if hook is None:
+                return _json(self, 404, {"error": "not found"})
+            if not broker.ha_rate_ok(peer):
+                self.close_connection = True
+                return _json(self, 429, {"ok": False})
+            auth = self.headers.get("Authorization", "")
+            presented = auth[7:] if auth[:7].lower() == "bearer " else ""
+            if not (presented and secrets.compare_digest(presented.encode(), hook["key"].encode())):
+                broker.log("auth_failed", peer=peer, method=self.command,
+                           path="/v1/hooks/ha/decide")
+                self.close_connection = True
+                return _json(self, 403, {"ok": False})
+            try:
+                n = int(self.headers.get("Content-Length", 0))
+            except ValueError:
+                n = -1
+            if n < 0 or n > 2048:
+                self.close_connection = True
+                return _json(self, 413 if n > 2048 else 400, {"ok": False})
+            try:
+                body = json.loads(self.rfile.read(n).decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                body = None
+            ok_id = lambda v, mx: isinstance(v, str) and re.fullmatch(  # noqa: E731
+                r"[A-Za-z0-9_-]{1,%d}" % mx, v) is not None
+            dev = body.get("device") if isinstance(body, dict) else None
+            dev = None if dev == "" else dev        # templates send "" for "no device id"
+            if (not isinstance(body, dict) or body.get("decision") not in ("approve", "deny")
+                    or not ok_id(body.get("rid"), 64) or not ok_id(body.get("token"), 128)
+                    or (dev is not None and not (isinstance(dev, str)
+                                                 and notify_mod.DEVICE_RE.match(dev)))):
+                return _json(self, 400, {"ok": False})
+            if hook["allowed_devices"] and dev not in hook["allowed_devices"]:
+                broker.log("ha_decide_refused", user=f"ha:{dev or 'unknown'}", peer=peer,
+                           status=403, reason="device not allowed")
+                return _json(self, 403, {"ok": False})
+            code, _ = broker.decide_via("ha", body["rid"], body["decision"], f"ha:{dev or 'unknown'}",
+                                        token=body["token"], peer=peer)
+            if code == 200:
+                return _json(self, 200, {"ok": True, "decision": body["decision"]})
+            return _json(self, code, {"ok": False})
+
         def do_POST(self):
+            if self.path.split("?")[0] == "/v1/hooks/ha/decide":
+                return self._ha_decide()
             if not self._authed() or self.path != "/v1/requests":
                 return
             try:
@@ -2252,6 +2330,9 @@ def approval_handler(broker):
 
 
 def serve(broker, client_addr, approval_addr, client_key):
+    if broker.ha_hook is not None and secrets.compare_digest(
+            broker.ha_hook["key"].encode(), client_key.encode()):
+        raise ValueError("ha_hook key must differ from the agent client key")
     c = ThreadingHTTPServer(client_addr, client_handler(broker, client_key))
     a = ThreadingHTTPServer(approval_addr, approval_handler(broker))
     for s in (c, a):

@@ -149,7 +149,8 @@ delivered if at least one succeeds.
     ]
 
 - `ticker`: Home Assistant `ticker.notify`; delivery is verified, since
-  Ticker returns 200 even when it drops a notification.
+  Ticker returns 200 even when it drops a notification. With `ha_hook`
+  configured (below) it also renders Approve/Deny buttons.
 - `telegram`: message with one URL button to the approval page (no callback
   buttons, so nothing can be approved from inside the chat). The message is
   edited to APPROVED/DENIED/EXPIRED when settled.
@@ -172,7 +173,8 @@ A transport implements:
   on `n.tag`).
 - `supports_actions = ("approve", "deny")` (optional, default none): the action
   ids it can render. Each transport only receives the actions it supports, so
-  ticker and Telegram always get none. The token exists only if at least one
+  Telegram always gets none, and ticker gets some only when `ha_hook` is
+  configured. The token exists only if at least one
   transport carries actions; the broker keeps just its SHA-256.
 - `action_policy` (optional): per-transport override, see below.
 
@@ -202,8 +204,8 @@ global values). Invalid values stop the broker at startup naming the field
 
 ### Decision channels
 
-Every decision (dashboard `/decide`, approval-link page, `/push/decide`, future
-hooks) goes through `Broker.decide_via(channel, rid, decision, actor, *,
+Every decision (dashboard `/decide`, approval-link page, `/push/decide`,
+`/v1/hooks/ha/decide`) goes through `Broker.decide_via(channel, rid, decision, actor, *,
 token=None, always=False, nonce=None, peer=None, client_ip=None, **audit_extra)`
 -> `(http_status, request)`; `decision` is `approve|deny`. It alone enforces the
 single-decision claim, the constant-time token check (spent on match; any
@@ -219,8 +221,100 @@ own authentication (SSO header, CSRF/origin, `X-Requested-With`):
 | `dashboard` | no | yes |
 | `link` (`/a/<nonce>`) | no | yes |
 | `push` | yes | no |
+| `ha` (`/v1/hooks/ha/decide`) | yes | no |
 
-A Home Assistant hook would add e.g. `"ha": Channel(True, False)` there.
+### Home Assistant action buttons (`ha_hook`)
+
+Approve/Deny buttons on the iPhone `ticker.notify` notification (Home Assistant
+companion app actionable notifications). Tapping one makes Home Assistant call
+the broker, so nothing is opened. Config:
+
+    "ha_hook": {
+      "key_file": "/run/secrets/asb_hook_key",   // or "key": "..." (tests); >= 32 chars
+      "allowed_devices": ["phone-1"]             // optional
+    }
+
+- Without `ha_hook` the endpoint answers 404 and the ticker transport carries
+  no actions (buttons require a configured hook). The usual `notify_actions`
+  policy decides which buttons a request gets (default: Deny and Approve for
+  every risk level).
+- The hook key is a dedicated secret, different from the agent client key
+  (startup refuses equal keys). It is accepted only on this endpoint, and the
+  client key is refused here with 403 and the hook key everywhere else with 401.
+- `allowed_devices`: when non-empty, a `device` not listed (or absent) is refused
+  403 and audited as `ha_decide_refused`. When empty or omitted every device is
+  accepted and one `ha_hook_any_device` warning is logged at startup. The
+  device is always recorded as approver `ha:<device or unknown>`; it is
+  asserted by the caller, not verified.
+- Startup validation names the field: `ha_hook.key_file` (missing, unreadable,
+  short), `ha_hook.key`, `ha_hook.allowed_devices` (not a list of strings).
+
+Ticker action ids (Deny first, title shown on the button):
+
+    {"action": "ASB|deny|<rid>|<token>",    "title": "Deny"}
+    {"action": "ASB|approve|<rid>|<token>", "title": "Approve"}
+
+`rid` and `token` are url-safe (about 22 chars each; the id stays under 100
+characters). The token is the same single-use per-request token as Web Push; the
+broker keeps only its hash. The notification text is unchanged.
+
+Endpoint, on the client listener (the port agents use):
+
+    POST /v1/hooks/ha/decide
+    Authorization: Bearer <hook key>
+    {"rid": "...", "token": "...", "decision": "approve|deny", "device": "phone-1"}
+
+`device` is optional (empty = absent), max 64 chars of `A-Za-z0-9_.:-`. Body cap 2 KB. Status:
+200 `{"ok": true, "decision": ...}` decided; 400 malformed; 403 bad or missing
+hook key, wrong token, or device not allowed; 404 unknown request (or hook not
+configured); 410 already decided, expired or token spent; 413 oversize; 429 more
+than 60 calls/min from one source IP (first drop per window audited as
+`ha_decide_dropped`). Responses never include request details. Decisions run
+through `decide_via("ha", ...)`: audit `channel: ha`, approver `ha:<device>`,
+never an always-allow rule.
+
+Security: anyone who controls Home Assistant, or holds the hook key plus a
+pending request's token, can approve that request. The token is single-use and
+dies with the request, and the agent client key can never approve. The client
+listener has no trusted-peer allow-list (only the approval listener has
+`approval_trusted_peers`), so restrict who can reach port 8800 at the network
+level if that matters.
+
+Home Assistant example (placeholders only). `secrets.yaml`: `asb_hook_key`.
+
+    rest_command:
+      asb_decide:
+        url: "https://broker.example/v1/hooks/ha/decide"
+        method: POST
+        headers:
+          Authorization: !secret asb_hook_key_header   # "Bearer <hook key>"
+          Content-Type: application/json
+        payload: >-
+          {"rid": "{{ rid }}", "token": "{{ token }}",
+           "decision": "{{ decision }}", "device": "{{ device }}"}
+
+    automation:
+      - alias: Secret broker action buttons
+        trigger:
+          - platform: event
+            event_type: mobile_app_notification_action
+        condition:
+          - condition: template
+            value_template: "{{ trigger.event.data.action.startswith('ASB|') }}"
+        action:
+          - variables:
+              parts: "{{ trigger.event.data.action.split('|') }}"
+          - service: rest_command.asb_decide
+            data:
+              decision: "{{ parts[1] }}"
+              rid: "{{ parts[2] }}"
+              token: "{{ parts[3] }}"
+              device: "{{ trigger.event.data.device_id | default('') }}"
+
+`rest_command` headers are templates, so a secret can hold the whole header value
+(`Bearer <key>`); `!secret` is resolved in YAML. An empty `device` counts as absent
+(approver `ha:unknown`; refused if `allowed_devices` is set). The companion-app docs do not document `device_id` in the event
+data; check the event in Developer Tools before relying on it.
 
 
 Messages cross whatever service carries them and include secret names, the
@@ -504,7 +598,8 @@ Events: `startup` (policies in force), `requested`, `assessed`, `notified`,
 policy, approver, reported client IP, latency), `http_executed`, `delivered`,
 `escalated`, `stored`, `policy_changed`, `policy_change_refused`, `policy_change_failed`, and
 security events `auth_failed`, `rejected`, `approval_viewed`,
-`approval_forbidden`, `approval_stale`, `bad_request`, `discovery`.
+`approval_forbidden`, `approval_stale`, `bad_request`, `discovery`,
+`ha_decide_refused`, `ha_decide_dropped`, `ha_hook_any_device`.
 
     python -m secret_broker.audit verify audit.jsonl
     python -m secret_broker.audit show audit.jsonl approved names=example-api

@@ -26,6 +26,7 @@ request is delivered if at least one transport succeeds.
 import dataclasses
 import inspect
 import json
+import re
 import secrets
 import threading
 import time
@@ -186,8 +187,50 @@ def adapt(transport):
     return LegacyAdapter(transport, "names" in params or var_kw, "context" in params or var_kw)
 
 
+HOOK_KEY_MIN = 32
+_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")       # url-safe: needs no escaping anywhere
+DEVICE_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
+
+
+def parse_ha_hook(raw, read_secret):
+    """Validate `ha_hook` -> {"key": str, "allowed_devices": [str]} or None when
+    not configured. Raises ValueError naming the field."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError("ha_hook must be an object")
+    for k in raw:
+        if k not in ("key", "key_file", "allowed_devices"):
+            raise ValueError(f"ha_hook.{k} is not a known option")
+    if ("key" in raw) == ("key_file" in raw):
+        raise ValueError("ha_hook needs exactly one of key_file or key")
+    if "key_file" in raw:
+        if not isinstance(raw["key_file"], str) or not raw["key_file"]:
+            raise ValueError("ha_hook.key_file must be a path")
+        try:
+            key = read_secret(raw["key_file"])
+        except OSError:
+            raise ValueError("ha_hook.key_file is missing or unreadable") from None
+        field = "ha_hook.key_file"
+    else:
+        key, field = raw["key"], "ha_hook.key"
+    if not isinstance(key, str) or len(key) < HOOK_KEY_MIN:
+        raise ValueError(f"{field}: the hook key must be at least {HOOK_KEY_MIN} characters")
+    devs = raw.get("allowed_devices", [])
+    if (not isinstance(devs, list)
+            or not all(isinstance(d, str) and DEVICE_RE.match(d) for d in devs)):
+        raise ValueError("ha_hook.allowed_devices must be a list of strings "
+                         "(1-64 chars of A-Za-z0-9_.:-)")
+    return {"key": key, "allowed_devices": list(devs)}
+
+
 class TickerNotifier:
-    def __init__(self, ha_url, ha_token, category="general", timeout=15):
+    """ticker.notify. With `actions_enabled` (the broker has an `ha_hook`) it
+    can render Approve/Deny buttons whose action id is
+    `ASB|<decision>|<rid>|<token>`; without a hook it supports no actions."""
+
+    def __init__(self, ha_url, ha_token, category="general", timeout=15, actions_enabled=False):
+        self.supports_actions = ("approve", "deny") if actions_enabled else ()
         self._url = ha_url.rstrip("/")
         self._token = ha_token
         self._category = category
@@ -202,18 +245,34 @@ class TickerNotifier:
         with urllib.request.urlopen(req, timeout=self._timeout) as r:
             return json.load(r)
 
+    def action_list(self, n):
+        """Companion-app actions for this notification (Deny first), or [].
+        Ids are `ASB|<decision>|<rid>|<token>`; rid and token are url-safe, and
+        anything else (never expected) drops the buttons rather than risk a
+        malformed id."""
+        if not self.supports_actions or not n.actions or not n.action_token:
+            return []
+        if not (_ID_RE.match(n.rid or "") and _ID_RE.match(n.action_token)):
+            return []
+        return [{"action": f"ASB|{a.id}|{n.rid}|{n.action_token}", "title": a.label}
+                for a in n.actions if a.id in self.supports_actions]
+
     def send(self, n):
         """Send the push and confirm Ticker actually delivered it to a device.
 
         ticker.notify returns 200 even when the category is `never` for every
         subscriber, so check the sensor's newest notification afterwards.
         """
-        self._call("/api/services/ticker/notify", {
+        body = {
             "category": self._category,
             "title": n.title,
             "message": n.text,
             "data": {"url": n.url, "clickAction": n.url, "tag": n.tag},
-        })
+        }
+        acts = self.action_list(n)
+        if acts:
+            body["actions"] = acts
+        self._call("/api/services/ticker/notify", body)
         time.sleep(1.5)
         state = self._call(f"/api/states/sensor.ticker_{self._category}")
         notes = state.get("attributes", {}).get("notifications") or []
@@ -314,7 +373,8 @@ def build(cfg, read_secret, push_store=None):
                     if sp.get("actions") is not None else None)
         if kind == "ticker":
             out.append(TickerNotifier(sp["ha_url"], read_secret(sp["ha_token_file"]),
-                                      sp.get("category", "general")))
+                                      sp.get("category", "general"),
+                                      actions_enabled=cfg.get("ha_hook") is not None))
         elif kind == "telegram":
             out.append(TelegramNotifier(read_secret(sp["bot_token_file"]), sp["chat_id"],
                                         sp.get("api_base", "https://api.telegram.org")))

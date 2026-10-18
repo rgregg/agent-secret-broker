@@ -51,6 +51,7 @@ def main():
     if cfg.get("webpush") is not None:
         from .webpush import parse_actions
         parse_actions(cfg["webpush"])       # fail at startup on a bad webpush.actions
+    notify.parse_ha_hook(cfg.get("ha_hook"), _read)     # fail at startup, naming the field
     push = None
     if any(sp.get("type") == "webpush" for sp in cfg.get("notify") or []):
         from .webpush import store_from_config
