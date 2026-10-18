@@ -7,7 +7,7 @@
   asb store NAME --ssh < private_key          move an SSH private key into the broker
   asb update NAME [--var V]                   < value
   asb which HOST|URL                          is a credential available? (no approval)
-  asb ssh-agent [-- command args...]          local ssh-agent; keys stay in the broker
+  asb ssh-agent [--socket PATH] [-- command args...]  local ssh-agent; keys stay in the broker
   asb fingerprint HOST[:PORT]                 print a server certificate's sha256 (for tls_fingerprint)
   asb http NAME METHOD URL [-H 'K: V']... [-d BODY | -d @file | -d @-]
                                               broker makes the call itself
@@ -110,7 +110,7 @@ SSH key: asb store NAME --ssh < unencrypted_private_key   (no --hosts; use with 
 
 Replace the value of an existing credential (asks for approval). Value on stdin.
 example: printf '%s' "$NEW" | asb update myapi""",
-    "ssh-agent": """usage: asb ssh-agent [-- command [args...]]
+    "ssh-agent": """usage: asb ssh-agent [--socket PATH] [-- command [args...]]
 
 Serve the ssh-agent protocol on a private local socket. ssh, git and scp that
 find it through SSH_AUTH_SOCK offer the broker's SSH keys and ask the broker to
@@ -118,6 +118,10 @@ sign; each signature waits for the human's approval and the private key never
 reaches this machine. With a command, the agent runs just for that command and
 exits with its code. Without one it prints `SSH_AUTH_SOCK=...; export ...` and
 keeps serving (use: eval "$(asb ssh-agent)").
+--socket PATH listens at that fixed path instead of a temp one, for a long-lived
+agent (a systemd user service) that ~/.ssh/config points at with IdentityAgent.
+It replaces a stale socket, refuses to start over a live one, and removes the
+socket when stopped.
 example: asb ssh-agent -- git -C repo pull""",
     "fingerprint": """usage: asb fingerprint HOST[:PORT]
 
@@ -324,15 +328,52 @@ def serve_agent(path):
     return Server(path, Handler)
 
 
-def run_ssh_agent(cmd):
+def run_ssh_agent(cmd, socket_path=None):
     import shutil
+    import signal
     import tempfile
     import threading
-    d = tempfile.mkdtemp(prefix="asb-agent-")        # 0700: only this user can reach the socket
-    path = os.path.join(d, "agent.sock")
-    srv = serve_agent(path)
-    os.chmod(path, 0o600)
+    if socket_path:
+        # A fixed, long-lived socket (a systemd user service, say). The directory
+        # must already exist and be ours alone; a stale socket from a dead agent is
+        # replaced, a live one is an error.
+        path = os.path.abspath(os.path.expanduser(socket_path))
+        parent = os.path.dirname(path)
+        st = os.stat(parent) if os.path.isdir(parent) else die(f"{parent} is not a directory")
+        if st.st_uid != os.getuid() or st.st_mode & 0o022:
+            die(f"{parent} must be owned by you and not writable by others")
+        if os.path.lexists(path):
+            import stat
+            if not stat.S_ISSOCK(os.lstat(path).st_mode):
+                die(f"{path} exists and is not a socket; not replacing it")
+            probe = socket.socket(socket.AF_UNIX)
+            try:
+                probe.connect(path)
+            except OSError:
+                os.unlink(path)
+            else:
+                die(f"an agent is already listening on {path}")
+            finally:
+                probe.close()
+        d = None
+    else:
+        d = tempfile.mkdtemp(prefix="asb-agent-")    # 0700: only this user can reach the socket
+        path = os.path.join(d, "agent.sock")
+    old_umask = os.umask(0o177)
     try:
+        srv = serve_agent(path)
+    finally:
+        os.umask(old_umask)
+    os.chmod(path, 0o600)
+
+    def on_term(*_):
+        raise SystemExit(0)                          # a clean stop for systemd; finally still runs
+    signal.signal(signal.SIGTERM, on_term)
+    try:
+        if socket_path and not cmd:
+            print(f"asb: ssh-agent listening on {path}", file=sys.stderr)
+            srv.serve_forever()
+            return 0
         if not cmd:
             print(f"SSH_AUTH_SOCK={path}; export SSH_AUTH_SOCK;")
             sys.stdout.flush()
@@ -344,7 +385,10 @@ def run_ssh_agent(cmd):
         return 130
     finally:
         srv.server_close()
-        shutil.rmtree(d, ignore_errors=True)
+        if d:
+            shutil.rmtree(d, ignore_errors=True)
+        elif os.path.lexists(path):
+            os.unlink(path)
 
 
 def mask(text, values):
@@ -378,9 +422,14 @@ def main(argv):
             print(HELP[argv[0]])
             return 0
     if argv[0] == "ssh-agent":
-        if argv[1:2] not in ([], ["--"]) or (argv[1:2] == ["--"] and len(argv) < 3):
+        rest, sock = argv[1:], None
+        if rest[:1] == ["--socket"]:
+            if len(rest) < 2:
+                die(HELP["ssh-agent"])
+            sock, rest = rest[1], rest[2:]
+        if rest[:1] not in ([], ["--"]) or (rest[:1] == ["--"] and len(rest) < 2):
             die(HELP["ssh-agent"])
-        return run_ssh_agent(argv[2:])
+        return run_ssh_agent(rest[1:], sock)
 
     if argv[0] in ("store", "update"):
         if len(argv) < 2:

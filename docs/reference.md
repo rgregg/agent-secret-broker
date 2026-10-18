@@ -39,6 +39,26 @@ socket, and every signature ssh asks for becomes a broker request (mode
   deriving the public key from the value. An SSH key item you add to the broker's
   collection yourself is adopted automatically, signing-only. `asb list` shows the
   key with no variables, and `list`/`which` expose only the public half.
+- **Always on.** Run one long-lived agent on a fixed socket and point ssh at it, so
+  `ssh`, `git` and `scp` use the broker's keys with no environment setup. Each
+  login still waits for your approval.
+
+      # ~/.config/systemd/user/asb-ssh-agent.service
+      [Unit]
+      Description=asb SSH agent (keys stay in the secret broker)
+      [Service]
+      ExecStart=%h/.local/bin/asb ssh-agent --socket %t/asb-agent.sock
+      Restart=on-failure
+      [Install]
+      WantedBy=default.target
+
+      # ~/.ssh/config  (%t is $XDG_RUNTIME_DIR, usually /run/user/UID)
+      Host *
+          IdentityAgent /run/user/1000/asb-agent.sock
+
+  Enable it with `systemctl --user enable --now asb-ssh-agent`. `--socket` replaces
+  a stale socket, refuses to start over a live one, requires a directory only you
+  can write to, and removes the socket on stop.
 - Only unencrypted OpenSSH-format ed25519, ECDSA and RSA (2048+ bits, SHA-2
   signatures only) keys are accepted: the broker is what protects the key, so
   there is no passphrase to type. Remove a passphrase from a copy with

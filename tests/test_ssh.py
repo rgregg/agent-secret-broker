@@ -277,5 +277,80 @@ class BrokerSshDenied(BrokerSsh):
     test_agent_protocol_end_to_end = None
 
 
+class AgentSocket(unittest.TestCase):
+    """`asb ssh-agent --socket PATH`: the long-lived form a service uses."""
+    CLI = os.path.join(os.path.dirname(__file__), "..", "client", "asb")
+
+    def start(self, path):
+        import subprocess
+        return subprocess.Popen([sys.executable, self.CLI, "ssh-agent", "--socket", path],
+                                stderr=subprocess.PIPE, text=True,
+                                env={**os.environ, "SECRET_BROKER_URL": "http://127.0.0.1:1",
+                                     "SECRET_BROKER_KEY": "k"})
+
+    def wait_for(self, path):
+        import time
+        import socket
+        for _ in range(100):
+            probe = socket.socket(socket.AF_UNIX)
+            try:
+                probe.connect(path)
+                return
+            except OSError:
+                pass
+            finally:
+                probe.close()
+            time.sleep(0.05)
+        self.fail("agent socket never appeared")
+
+    def test_fixed_socket_lifecycle(self):
+        import signal
+        import socket
+        import stat
+        import tempfile
+        d = tempfile.mkdtemp()
+        os.chmod(d, 0o700)
+        path = os.path.join(d, "agent.sock")
+        dead = socket.socket(socket.AF_UNIX)            # a stale socket from a dead agent
+        dead.bind(path)
+        dead.close()
+        p = self.start(path)
+        self.addCleanup(lambda: p.poll() is None and p.kill())
+        self.wait_for(path)
+        self.assertTrue(stat.S_ISSOCK(os.stat(path).st_mode))
+        self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
+        # a second agent must not steal a live socket
+        q = self.start(path)
+        self.assertNotEqual(q.wait(10), 0)
+        self.assertIn("already listening", q.stderr.read())
+        c = socket.socket(socket.AF_UNIX)
+        c.connect(path)                                 # still the first agent
+        c.close()
+        p.send_signal(signal.SIGTERM)
+        self.assertEqual(p.wait(10), 0)
+        self.assertFalse(os.path.exists(path))
+
+    def test_does_not_replace_a_regular_file(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        os.chmod(d, 0o700)
+        path = os.path.join(d, "agent.sock")
+        with open(path, "w") as f:
+            f.write("precious")
+        p = self.start(path)
+        self.assertNotEqual(p.wait(10), 0)
+        self.assertIn("not a socket", p.stderr.read())
+        with open(path) as f:
+            self.assertEqual(f.read(), "precious")
+
+    def test_refuses_a_shared_directory(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        os.chmod(d, 0o777)
+        p = self.start(os.path.join(d, "agent.sock"))
+        self.assertNotEqual(p.wait(10), 0)
+        self.assertIn("not writable by others", p.stderr.read())
+
+
 if __name__ == "__main__":
     unittest.main()
