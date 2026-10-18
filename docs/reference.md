@@ -184,9 +184,43 @@ else, the request counts as **high**, so a missing verdict can only make the
 broker ask more. The rating is shown on the push and approval page and recorded
 in the audit log (`assessed`). Because the model reads attacker-influenced
 text, treat it as a hint for a human who also sees the raw request; where it
-carries weight is `allow` secrets: with `"risk": {"escalate_auto_at": "high"}`
-such a secret is still prompted at or above that level, so set it to `medium`
-if you want only `low` requests released unprompted.
+carries weight is `allow` secrets, through `risk.auto_approve_max`.
+
+### Auto-approve level: `risk.auto_approve_max`
+
+    "risk": {"auto_approve_max": "low"}      # none | low | medium | high, default low
+
+An *auto-eligible* request (an `approval: allow` secret, in the modes it is
+allowed for: http unless `auto_modes` adds more; plus creating a new credential
+unless `store.create` is `prompt`) is released without a prompt only when its
+model risk level is **at or below** this setting. Otherwise a human is asked
+and an `escalated` event is audited.
+
+| Value | Auto-approves |
+|---|---|
+| `none` | nothing: every request asks a human, even for `allow` secrets |
+| `low` (default) | requests rated low |
+| `medium` | low and medium |
+| `high` | every risk level: risk never blocks an eligible request |
+
+`high` does not make more secrets or modes eligible; `approval: prompt`
+secrets and modes outside `auto_modes` still ask. A request with no model
+verdict (no `summary` model configured, a timeout, an error, or an
+unrecognised answer) counts as **high**. **That makes `high` fail open: with
+it, an outage of the analysis model lets eligible requests through unprompted.**
+Prefer `medium` or lower unless you want exactly that.
+
+The effective value is recorded as `auto_max` on `escalated` events and on the
+`approved` event of an auto-approval (shown in the request detail pop-over),
+appears read-only on the Settings page, and is reported as
+`features.auto_approve_max` by `GET /v1/status`. It is validated at startup
+(`risk.auto_approve_max must be one of none, low, medium, high`).
+
+Legacy spelling: `risk.escalate_auto_at` ("prompt at or above this level") is
+still read when `auto_approve_max` is absent and means one level below it:
+`low` = `none`, `medium` = `low` (the old default), `high` = `medium`. If both
+are present `auto_approve_max` wins and a `config_warning` event is logged at
+startup.
 
 Optional one-line summaries come from a cheap OpenRouter model (`summary`
 block). They are labelled unverified and never replace the raw request.
@@ -442,8 +476,10 @@ An agent can add or rotate credentials, always with a fresh approval:
 The approval listener serves a small web app with three tabs: **Requests**,
 **Policies** and **Settings**. **Requests** (`/`) is a live list of pending
 requests, each with **Approve**, **Deny** and (where the usual rules allow it)
-an **Always allow** menu, and below it the most recent decisions (the full,
-filterable list is at `/history`). It is for when the phone is out of reach: open the site, sign in
+an **Always allow** menu, and below it the most recent decisions as a list. A
+history row opens a pop-over with everything recorded for that request (see
+[Request history](#request-history)); **Search and filter all history** expands
+the same list in place. It is for when the phone is out of reach: open the site, sign in
 through your SSO, decide. New requests appear within a few seconds, the tab
 title shows how many are waiting, and with scripting disabled the same forms
 still work as ordinary page loads.
@@ -613,18 +649,39 @@ CORS, which is never granted). Bodies over 2 KB are refused; the answer is 204.
 
 ## Request history
 
-`/history` on the approval listener (linked from the Requests tab; same SSO gate
-and identity check as the approval page) lists recent requests with how each ended: **approved**,
-**auto-approved** (policy), **denied**, **expired**, **failed**, or **pending**.
-Each row shows the time, secret, what was asked (method and URL without its
-query string, the store operation, or "env"), risk, who decided, and how long
-the decision and delivery took. "(not collected)" marks an approval whose
-result the client never fetched. Filters: outcome, secret, mode; 50 per page.
+The Requests tab (`/`) shows pending cards on top and, below them, the recent
+requests as one list: secret, what was asked (method and URL without its query
+string, the store operation, or "env"), an outcome pill (**approved**,
+**auto-approved** (policy), **denied**, **expired**, **failed**) and the time.
+**Search and filter all history** expands that same list in place: a search
+box (secret, URL, source, summary, approver, id), outcome / secret / mode
+filters, and **Show more** (25 at a time, up to 500). Filters and paging are
+fetched as fragments, so the page neither reloads nor changes layout; the
+state is kept in the URL (`/?view=all&q=...`), and the live poll refreshes the
+list with it. `/history` redirects to `/?view=all`.
+
+Each row is a button. Selecting it (click, Enter or Space) opens a modal
+pop-over (a bottom sheet on phones; Escape, the backdrop or **Close** dismisses
+it and focus returns to the row) loaded from `GET /request/<id>?fragment=1`
+(same SSO gate and identity check as the other pages). It shows the request id,
+secrets, mode, the request as recorded (URL without query, the env command
+line, the store or ssh description), source and peer (client-supplied),
+the unverified summary, risk level with the model verdict and reasons, the
+outcome, who decided and through which channel (dashboard, push, ha, link,
+policy), the approver, timestamps and durations (requested, decided, released,
+delivered), upstream HTTP status and response size, and a timeline of every
+audit event for that request id with its recorded fields. Only a fixed list
+of fields is shown; urls, bodies and anything unlisted are not. A pending
+request has no detail (409; it has a card), an unknown or malformed id is 404,
+and the nonce and action tokens are never shown. All text is HTML-escaped on
+the server.
 
 It is derived from the audit log, which stays the only record: events sharing a
-request id are folded into one row, incrementally, with at most the most recent
-5000 requests kept in memory. No values, header values or bodies are ever
-shown (the log does not contain them).
+request id are folded into one row (and one event list), incrementally, with at
+most the most recent 5000 requests kept in memory; a detail view reads that
+index, not the file. No values, header values or bodies are ever shown (the log
+does not contain them). "(not collected)" in the pop-over marks an approval
+whose result the client never fetched.
 
 ## Always allow
 
@@ -636,7 +693,7 @@ when it would mean something:
 - HTTP mode only: the broker makes the call, so the value never leaves it. Never
   offered for env mode.
 - One secret per request.
-- Not from a request that is itself rated at or above `risk.escalate_auto_at`.
+- Not from a request rated high, or one the current `risk.auto_approve_max` would not auto-approve (the rule would not take effect for such a request).
 
 The rules are enforced on the server, so a forged form field is refused and
 audited (`policy_change_refused`). Changes are audited as `policy_changed`
@@ -672,7 +729,7 @@ values, header values or bodies.
 Events: `startup` (policies in force), `requested`, `assessed`, `notified`,
 `secret_read`, `approved`/`denied`/`expired`/`failed` (with `via` user or
 policy, approver, reported client IP, latency), `http_executed`, `delivered`,
-`escalated`, `stored`, `policy_changed`, `policy_change_refused`, `policy_change_failed`, and
+`escalated`, `stored`, `request_detail_viewed`, `config_warning`, `policy_changed`, `policy_change_refused`, `policy_change_failed`, and
 security events `auth_failed`, `rejected`, `approval_viewed`,
 `approval_forbidden`, `approval_stale`, `bad_request`, `discovery`,
 `ha_decide_refused`, `ha_decide_dropped`, `ha_hook_any_device`.

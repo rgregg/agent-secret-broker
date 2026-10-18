@@ -7,12 +7,38 @@ them, and URLs are shown without their query string.
 """
 import json
 import os
+import re
 import threading
 import urllib.parse
 from collections import OrderedDict
 
 OUTCOMES = ("pending", "approved", "auto-approved", "denied", "expired", "failed")
 _FINAL = ("approved", "denied", "expired", "failed")
+
+# Fields kept per event for the detail view. A whitelist, not a copy: anything
+# not named here (urls, argv, bodies, anything unforeseen) never reaches a page.
+_EV_KEYS = ("reason", "reasons", "model", "risk", "error", "via", "channel", "decision",
+            "approver", "approver_peer", "approver_ip", "always_requested", "latency_ms",
+            "duration_ms", "upstream_status", "response_bytes", "secret", "vars", "kind",
+            "to_peer", "auto_max", "ssh_fingerprint", "sign_bytes", "value_bytes", "op",
+            "item", "field", "key", "hosts")
+_MAX_EVENTS = 60            # per request
+_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
+
+
+def valid_id(rid):
+    """Request ids are url-safe tokens; anything else is not looked up."""
+    return isinstance(rid, str) and bool(_ID_RE.match(rid))
+
+
+def _clean(v, depth=0):
+    if isinstance(v, str):
+        return "".join(ch if ch.isprintable() else " " for ch in v)[:300]
+    if isinstance(v, (bool, int, float)) or v is None:
+        return v
+    if isinstance(v, (list, tuple)) and depth == 0:
+        return [_clean(x, 1) for x in v[:20]]
+    return None
 
 
 def _short_url(url):
@@ -28,11 +54,13 @@ class History:
         self._max = max_requests
         self._lock = threading.Lock()
         self._rows = OrderedDict()
+        self._events = {}               # request id -> [whitelisted event dicts]
         self._pos = 0
         self._ino = None
 
     def _reset(self):
         self._rows.clear()
+        self._events.clear()
         self._pos = 0
 
     def refresh(self):
@@ -73,10 +101,21 @@ class History:
                 "method": rec.get("method"), "url": _short_url(rec.get("url")),
                 "op": rec.get("op"), "item": rec.get("item"), "field": rec.get("field"),
                 "key": rec.get("key"), "hosts": rec.get("hosts"), "final_seq": -1,
-                "ssh_what": rec.get("ssh_what"),
+                "ssh_what": rec.get("ssh_what"), "peer": rec.get("peer"),
+                "argv": _clean(rec.get("argv")), "risk_reasons": None, "risk_model": None,
             }
+            self._events[rid] = []
             while len(self._rows) > self._max:
-                self._rows.popitem(last=False)
+                self._events.pop(self._rows.popitem(last=False)[0], None)
+        evs = self._events[rid]
+        if len(evs) < _MAX_EVENTS:
+            e = {"event": ev, "ts": rec.get("ts"), "time": rec.get("time")}
+            for k in _EV_KEYS:
+                if k in rec and (v := _clean(rec[k])) is not None:
+                    e[k] = v
+            evs.append(e)
+        if ev == "assessed":
+            row["risk_reasons"], row["risk_model"] = _clean(rec.get("reasons")), rec.get("model")
         if rec.get("risk"):
             row["risk"] = rec["risk"]
         if rec.get("summary"):
@@ -95,7 +134,22 @@ class History:
             if ev == "approved" and row["via"] == "policy":
                 row["outcome"] = "auto-approved"
 
-    def rows(self, pending_ids=(), outcome=None, secret=None, mode=None):
+    def detail(self, rid, pending_ids=()):
+        """(row, events) for one request, or (None, None) when unknown. A request
+        still open is returned with outcome "pending" for the caller to refuse."""
+        if not valid_id(rid):
+            return None, None
+        self.refresh()
+        with self._lock:
+            row = self._rows.get(rid)
+            if row is None:
+                return None, None
+            row, evs = dict(row), [dict(e) for e in self._events.get(rid, [])]
+        if row["outcome"] == "pending" and rid not in pending_ids:
+            row["outcome"] = "unknown"
+        return row, evs
+
+    def rows(self, pending_ids=(), outcome=None, secret=None, mode=None, q=None):
         """Newest first. `pending_ids` are requests the broker still holds open;
         a row with no final event that is not among them ended without a record."""
         self.refresh()
@@ -111,6 +165,13 @@ class History:
             rows = [r for r in rows if secret in r["names"]]
         if mode:
             rows = [r for r in rows if r["mode"] == mode]
+        if q:
+            q = q.lower()
+            rows = [r for r in rows if q in " ".join(
+                str(x) for x in (r["id"], ", ".join(r["names"]), r["method"], r["url"], r["source"],
+                                 r["summary"], r["approver"], r["error"], r["ssh_what"], r["op"],
+                                 r["mode"], " ".join(r["argv"] or ()))
+                if x).lower()]
         return rows
 
     def secrets_seen(self):

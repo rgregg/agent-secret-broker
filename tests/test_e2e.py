@@ -760,7 +760,7 @@ class RiskFlow(Harness):
     model_risk = "low"
 
     def tweak(self, cfg):
-        cfg["risk"] = {"escalate_auto_at": "high"}
+        cfg["risk"] = {"auto_approve_max": "medium"}
 
     def setUp(self):
         super().setUp()
@@ -809,6 +809,157 @@ class RiskFlowModelRaises(RiskFlow):
 
     # parent tests assume a low model verdict
     test_low_risk_allow_secret_is_auto_released = None
+
+
+class AutoApproveMax(Harness):
+    """risk.auto_approve_max: the highest model risk at which an eligible request skips the prompt."""
+    decision = None
+
+    def tweak(self, cfg):
+        cfg["secrets"]["svc"]["approval"] = "allow"
+
+    def http(self, name="svc"):
+        url = f"http://127.0.0.1:{self.up.server_address[1]}/x"
+        return self.api("POST", "/v1/requests", {
+            "mode": "http", "names": [name], "method": "GET", "url": url,
+            "headers": {"Authorization": "Bearer {{SVC_TOKEN}}"}})
+
+    def test_every_setting_against_every_verdict(self):
+        for setting in risk_mod.AUTO_MAX:
+            for verdict in ("low", "medium", "high", None):
+                with self.subTest(setting=setting, verdict=verdict):
+                    self.broker._auto_max = setting
+                    self.broker.summarizer = _Stub("x", verdict) if verdict else None
+                    self.broker._by_id.clear()          # keep under MAX_PENDING
+                    before = (len(self.notifier.sent), len(self.events("approved")))
+                    self.http()
+                    want_auto = setting != "none" and risk_mod.rank(verdict or "high") <= (
+                        risk_mod.rank(setting) if setting != "none" else -1)
+                    self.assertEqual(len(self.events("approved")) - before[1], 1 if want_auto else 0)
+                    self.assertEqual(len(self.notifier.sent) - before[0], 0 if want_auto else 1)
+                    if want_auto:
+                        self.assertEqual(self.events("approved")[-1]["auto_max"], setting)
+                    else:
+                        self.assertEqual(self.events("escalated")[-1]["auto_max"], setting)
+
+    def test_none_blocks_even_allow_secrets_and_store_create(self):
+        self.broker._auto_max = "none"
+        self.broker.summarizer = _Stub("x", "low")
+        self.http()
+        self.assertEqual(len(self.notifier.sent), 1)
+        self.assertIn("auto-approve is off", self.events("escalated")[-1]["reason"])
+        self.api("POST", "/v1/requests", {"mode": "store", "names": ["new-one"], "op": "create",
+                                          "value": "v", "allowed_hosts": ["127.0.0.1"]})
+        self.assertEqual(len(self.notifier.sent), 2)
+
+    def test_high_opens_risk_only_for_eligible_secrets_and_modes(self):
+        self.broker._auto_max = "high"
+        self.broker.summarizer = None                      # no verdict counts as high
+        self.http()
+        self.assertEqual(len(self.events("approved")), 1)
+        self.assertEqual(self.notifier.sent, [])
+        # approval: prompt stays a prompt at any setting
+        self.broker.cfg["secrets"]["svc"]["approval"] = "prompt"
+        self.http()
+        self.assertEqual(len(self.notifier.sent), 1)
+        # an allow secret is only auto for http unless auto_modes adds more
+        self.broker.cfg["secrets"]["svc"]["approval"] = "allow"
+        self.api("POST", "/v1/requests", {"mode": "env", "names": ["svc"], "argv": ["true"]})
+        self.assertEqual(len(self.notifier.sent), 2)
+        self.assertEqual(len(self.events("approved")), 1)
+
+    def test_default_is_low_and_status_reports_it(self):
+        self.assertEqual(self.broker.auto_approve_max(), "low")
+        _, b = self.api("GET", "/v1/status")
+        self.assertEqual(json.loads(b)["features"]["auto_approve_max"], "low")
+        self.assertNotIn("escalate", b)
+
+    def test_settings_page_shows_the_line(self):
+        for setting, text in (("none", "Off (every request asks a human)"), ("low", "Up to low risk"),
+                              ("medium", "Up to medium risk"), ("high", "Any risk level")):
+            self.broker._auto_max = setting
+            _, body = req(self.abase + "/settings", headers={"X-authentik-username": "alice"})
+            self.assertIn("<b>Auto-approve</b>", body)
+            self.assertIn(text, body)
+            self.assertIn("risk.auto_approve_max", body)
+
+    def test_always_allow_is_not_offered_when_the_setting_would_block_it(self):
+        self.broker.cfg["secrets"]["svc"]["approval"] = "prompt"
+        self.broker.summarizer = _Stub("x", "medium")
+        for setting, offered in (("none", False), ("low", False), ("medium", True), ("high", True)):
+            self.broker._auto_max = setting
+            self.broker._by_id.clear()
+            self.http()
+            r = list(self.broker._by_id.values())[-1]
+            self.assertEqual(self.broker.always_allow_eligibility(r)[0], offered, setting)
+        self.broker.summarizer = _Stub("x", "high")
+        self.broker._by_id.clear()
+        self.http()
+        self.assertFalse(self.broker.always_allow_eligibility(list(self.broker._by_id.values())[-1])[0])
+
+
+class AutoApproveConfig(unittest.TestCase):
+    parse = staticmethod(risk_mod.parse_auto_approve_max)
+
+    def test_default_and_explicit_values(self):
+        self.assertEqual(self.parse(None), ("low", None))
+        self.assertEqual(self.parse({}), ("low", None))
+        for v in ("none", "low", "medium", "high"):
+            self.assertEqual(self.parse({"auto_approve_max": v}), (v, None))
+
+    def test_legacy_escalate_auto_at_maps_one_level_down(self):
+        for old, new in (("low", "none"), ("medium", "low"), ("high", "medium")):
+            self.assertEqual(self.parse({"escalate_auto_at": old}), (new, None))
+
+    def test_both_present_new_wins_and_warns(self):
+        got, warn = self.parse({"auto_approve_max": "high", "escalate_auto_at": "low"})
+        self.assertEqual(got, "high")
+        self.assertIn("escalate_auto_at is ignored", warn)
+
+    def test_invalid_values_name_the_field(self):
+        for raw, field in (({"auto_approve_max": "all"}, "risk.auto_approve_max"),
+                           ({"auto_approve_max": 3}, "risk.auto_approve_max"),
+                           ({"escalate_auto_at": "none"}, "risk.escalate_auto_at"),
+                           ({"escalate_auto_at": "bogus"}, "risk.escalate_auto_at"), ("high", "risk")):
+            with self.assertRaises(ValueError) as cm:
+                self.parse(raw)
+            self.assertIn(field, str(cm.exception))
+
+    def test_auto_ok_treats_a_missing_level_as_high(self):
+        for mx, want in (("none", False), ("low", False), ("medium", False), ("high", True)):
+            self.assertEqual(risk_mod.auto_ok(None, mx), want)
+            self.assertEqual(risk_mod.auto_ok("bogus", mx), want)
+
+    def _broker(self, risk):
+        d = tempfile.mkdtemp()
+        path = os.path.join(d, "v.json")
+        with open(path, "w") as f:
+            json.dump({}, f)
+        cfg = {"approve_base_url": "https://s.example", "allowed_user": "a", "ttl_seconds": 5}
+        if risk is not None:
+            cfg["risk"] = risk
+        return Broker(cfg, FileBackend(path), FakeNotifier(), os.path.join(d, "audit.jsonl")), d
+
+    def test_broker_validates_at_startup_and_logs_the_warning(self):
+        with self.assertRaises(ValueError) as cm:
+            self._broker({"auto_approve_max": "everything"})
+        self.assertIn("risk.auto_approve_max", str(cm.exception))
+        b, d = self._broker({"auto_approve_max": "medium", "escalate_auto_at": "high"})
+        self.assertEqual(b.auto_approve_max(), "medium")
+        with open(os.path.join(d, "audit.jsonl")) as f:
+            warns = [json.loads(line) for line in f if '"config_warning"' in line]
+        self.assertEqual(len(warns), 1)
+        self.assertEqual(self._broker({"escalate_auto_at": "high"})[0].auto_approve_max(), "medium")
+        self.assertEqual(self._broker(None)[0].auto_approve_max(), "low")
+
+    def test_main_rejects_a_bad_value_before_starting(self):
+        r = subprocess.run([sys.executable, "-m", "secret_broker"], capture_output=True, text=True,
+                           cwd=os.path.join(os.path.dirname(__file__), ".."),
+                           env={**os.environ, "BROKER_CONFIG": json.dumps(
+                               {"backend": {"type": "file", "path": "/nonexistent"},
+                                "risk": {"auto_approve_max": "bogus"}})})
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("risk.auto_approve_max", r.stderr)
 
 
 class FakeTelegram(BaseHTTPRequestHandler):
@@ -1213,7 +1364,7 @@ class AlwaysAllow(Harness):
     decision = None
 
     def tweak(self, cfg):
-        cfg["risk"] = {"escalate_auto_at": "high"}
+        cfg["risk"] = {"auto_approve_max": "medium"}
 
     def setUp(self):
         super().setUp()
@@ -1688,27 +1839,36 @@ class TlsPolicyRules(unittest.TestCase):
 
 
 class HistoryPage(Harness):
+    """The history list lives on the Requests tab (`/`); rows open a detail view."""
     ttl = 1
 
     def tweak(self, cfg):
-        cfg["risk"] = {"escalate_auto_at": "high"}
+        cfg["risk"] = {"auto_approve_max": "medium"}
 
     def setUp(self):
         super().setUp()
         self.broker.summarizer = _Stub("Reads things", "low")
 
-    def call(self, path="/x?token=QUERYSECRET", decision="approve", wait=5):
+    def call(self, path="/x?token=QUERYSECRET", decision="approve", wait=5, **extra):
         self.decision = decision
         url = f"http://127.0.0.1:{self.up.server_address[1]}{path}"
         _, body = self.api("POST", "/v1/requests", {
             "mode": "http", "names": ["svc"], "method": "GET", "url": url,
-            "headers": {"Authorization": "Bearer {{SVC_TOKEN}}"}})
+            "headers": {"Authorization": "Bearer {{SVC_TOKEN}}"}, **extra})
         rid = json.loads(body)["id"]
         _, b = self.api("GET", f"/v1/requests/{rid}?wait={wait}")
         return rid, json.loads(b)
 
-    def page(self, query="", user="alice"):
-        return req(self.abase + "/history" + query, headers={"X-authentik-username": user})
+    def page(self, query="?view=all", user="alice"):
+        return req(self.abase + "/" + query, headers={"X-authentik-username": user})
+
+    def result(self, rid):
+        _, b = self.api("GET", f"/v1/requests/{rid}?wait=5")
+        return json.loads(b)
+
+    def detail(self, rid, user="alice", frag=True):
+        return req(self.abase + f"/request/{rid}" + ("?fragment=1" if frag else ""),
+                   headers={"X-authentik-username": user})
 
     def test_every_outcome_is_listed_and_nothing_sensitive_is(self):
         self.call(decision="approve")
@@ -1720,32 +1880,94 @@ class HistoryPage(Harness):
         code, body = self.page()
         self.assertEqual(code, 200)
         for label in ("approved", "denied", "expired", "auto-approved"):
-            self.assertIn(f"<b>{label}", body)
+            self.assertRegex(body, rf"<span class='pill \w+'>{label}</span>")
         self.assertIn("svc", body)
         self.assertIn("/x?...", body)                                         # query string hidden
         for secret in (SECRET, "QUERYSECRET"):
             self.assertNotIn(secret, body)
 
-    def test_filters_and_forbidden_identity(self):
+    def test_rows_are_buttons_with_request_ids_and_the_page_has_the_dialog(self):
+        rid, _ = self.call()
+        _, body = self.page("")
+        self.assertIn(f"<button type=button class=hrow data-id='{rid}'", body)
+        for want in ("<dialog id=hdlg", "id=hclose", "id=hbody", "showModal", "/request/", "data-hact=all",
+                     "id=hform", "id=hlist"):
+            self.assertIn(want, body)
+        self.assertNotIn("<table", body)                                      # one list, no table layout
+        self.assertNotIn("Back to Requests", body)
+        # collapsed: the filter form is present but hidden
+        self.assertIn("id=hform class=hfilters method=get action='/' hidden", body)
+        self.assertNotIn(" hidden", self.page("?view=all")[1].split("id=hform")[1].split(">")[0])
+
+    def test_old_history_url_redirects(self):
+        class NoFollow(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, *a, **k):
+                return None
+        op = urllib.request.build_opener(NoFollow)
+        for path, want in (("/history", "/?view=all"), ("/history?outcome=denied&page=3", "/?view=all&outcome=denied")):
+            with self.assertRaises(urllib.error.HTTPError) as cm:
+                op.open(urllib.request.Request(self.abase + path,
+                                               headers={"X-authentik-username": "alice"}), timeout=10)
+            self.assertEqual((cm.exception.code, cm.exception.headers["Location"]), (303, want))
+        self.assertEqual(req(self.abase + "/history", headers={"X-authentik-username": "mallory"})[0], 403)
+
+    def test_filters_search_and_paging_return_the_same_row_markup(self):
+        rids = [self.call(path=f"/p{i}")[0] for i in range(3)]
+        self.call(path="/needle", decision="deny")
+        _, full = self.page("?view=all")
+        _, frag = self.page("?fragment=1&view=all")
+        self.assertNotIn("<nav", frag)
+        self.assertIn(frag[frag.index("<div id=hlist"):frag.index("</main>")], full)               # identical list block
+        for rid in rids:
+            self.assertIn(f"data-id='{rid}'", frag)
+        # outcome filter and search return list rows only, in the same markup
+        _, f1 = self.page("?fragment=1&view=all&outcome=denied")
+        self.assertIn("<button type=button class=hrow", f1)
+        self.assertEqual(f1.count("class=hrow"), 1)
+        self.assertEqual(self.page("?fragment=1&view=all&q=needle")[1].count("class=hrow"), 1)
+        self.assertEqual(self.page("?fragment=1&view=all&q=NEEDLE")[1].count("class=hrow"), 1)
+        self.assertIn("No requests match", self.page("?fragment=1&view=all&q=zzz-none")[1])
+        # paging: "show more" extends the same list; limit is clamped
+        _, collapsed = self.page("?fragment=1")
+        self.assertEqual(collapsed.count("class=hrow"), 4)
+        self.assertIn("data-hact=all", collapsed)
+        _, p1 = self.page("?fragment=1&view=all&limit=2")
+        self.assertEqual(p1.count("class=hrow"), 4)                           # floor is one page
+        self.assertIn("4 requests", p1)
+        _, evil = self.page("?view=all&q=<script>&outcome=bogus&limit=zzz&mode=<b>")
+        self.assertNotIn("<script>", evil)
+        self.assertNotIn("<b>&", evil.split("id=hform")[1].split("</form>")[0])
+
+    def test_show_more_link_appears_when_rows_remain(self):
+        from secret_broker import broker as bmod
+        old = bmod.HIST_PAGE
+        bmod.HIST_PAGE = 2
+        try:
+            for i in range(3):
+                self.call(path=f"/m{i}")
+            _, body = self.page("?fragment=1&view=all")
+            self.assertEqual(body.count("class=hrow"), 2)
+            self.assertIn("data-hact=more", body)
+            self.assertIn("Show more (1 older)", body)
+            self.assertIn("limit=4", body)
+            self.assertEqual(self.page("?fragment=1&view=all&limit=4")[1].count("class=hrow"), 3)
+        finally:
+            bmod.HIST_PAGE = old
+
+    def test_forbidden_identity(self):
         self.call(decision="approve")
-        self.call(decision="deny")
-        _, body = self.page("?outcome=denied")
-        self.assertIn("<b>denied", body)
-        self.assertNotIn("<b>approved", body)
-        _, body = self.page("?outcome=bogus&page=zzz&mode=<script>")           # bad input is ignored
-        self.assertNotIn("<script>", body)
         self.assertEqual(self.page(user="mallory")[0], 403)
-        self.assertEqual(len(self.events("history_viewed")), 2)       # the refused view is not "viewed"
+        self.assertEqual(self.page("?fragment=1&view=all", user="")[0], 403)
 
     def test_pages_are_responsive_and_not_frameable(self):
         self.call(decision="approve")
         r = urllib.request.urlopen(urllib.request.Request(
-            self.abase + "/history", headers={"X-authentik-username": "alice"}), timeout=10)
+            self.abase + "/?view=all", headers={"X-authentik-username": "alice"}), timeout=10)
         body = r.read().decode() + r.headers.get("Content-Security-Policy")
         self.assertEqual(r.headers.get("X-Frame-Options"), "DENY")
         self.assertIn("frame-ancestors 'none'", r.headers.get("Content-Security-Policy"))
         for want in ("width=device-width", "color-scheme", "@media (max-width:42rem)",
-                     "data-label=Outcome", "prefers-color-scheme:dark", "<nav class=tabs>", "Agent Secret Broker",
+                     "dialog.dlg", "prefers-color-scheme:dark", "<nav class=tabs>", "Agent Secret Broker",
                      "rel=icon", "img-src data:"):
             self.assertIn(want, body)
         # the decision page uses the same shell and big tap targets
@@ -1766,6 +1988,12 @@ class HistoryPage(Harness):
         _, body = self.page()
         self.assertIn("create credential", body)
         self.assertNotIn("the-new-credential-VALUE", body)
+        rid = self.events("requested")[0]["id"]
+        code, d = self.detail(rid)
+        self.assertEqual(code, 200)
+        self.assertIn("create credential", d)
+        self.assertIn("hist-new", d)
+        self.assertNotIn("the-new-credential-VALUE", d)
 
     def test_rows_survive_a_new_history_object_and_follow_the_log(self):
         from secret_broker.history import History
@@ -1776,6 +2004,145 @@ class HistoryPage(Harness):
         self.call(decision="deny")                                            # log grows after the index was built
         self.assertEqual([r["outcome"] for r in h.rows()], ["denied", "approved"])
 
+    # -- detail view ---------------------------------------------------------
+    def test_detail_for_an_approved_http_request(self):
+        rid, _ = self.call("/x?token=QUERYSECRET")
+        code, d = self.detail(rid)
+        self.assertEqual(code, 200)
+        self.assertNotIn("<html", d)                                          # a fragment, not a page
+        for want in (rid, "svc", "GET http://127.0.0.1:", "/x?...", "alice", "approval link",
+                     "Reads things", "unverified", "LOW", "model rated it low", "approved",
+                     "Upstream HTTP status", ">200<", "Response size", "Timeline", "requested", "assessed",
+                     "notified", "decided", "secret_read", "http_executed", "delivered", "Source",
+                     "Peer", "Time to decision"):
+            self.assertIn(want, d)
+        for bad in (SECRET, "QUERYSECRET", self.events("requested")[0]["prev"]):
+            self.assertNotIn(bad, d)
+        order = [d.index(f"<b>{ev}</b>") for ev in ("requested", "assessed", "decided",
+                                                    "secret_read", "http_executed", "approved", "delivered")]
+        self.assertEqual(order, sorted(order))
+        # the full page (no fragment) renders the same content in the shell
+        code, page = self.detail(rid, frag=False)
+        self.assertEqual(code, 200)
+        self.assertIn("<nav class=tabs>", page)
+        self.assertIn(rid, page)
+
+    def test_detail_for_denied_expired_and_policy_requests(self):
+        exp, _ = self.call(path="/e", decision=None, wait=3)
+        _, d = self.detail(exp)
+        self.assertIn("expired", d)
+        self.assertIn("nobody", d)
+        self.broker.cfg["secrets"]["svc"]["approval"] = "allow"
+        auto, _ = self.call(decision=None)
+        _, d = self.detail(auto)
+        self.assertIn("policy (auto-approved)", d)
+        self.assertIn("auto-approve limit: medium", d)
+        self.assertIn("auto_max=medium", d)                                   # why, on the timeline
+        self.broker.cfg["secrets"]["svc"]["approval"] = "prompt"
+        den, _ = self.call(decision="deny")
+        _, d = self.detail(den)
+        self.assertIn("denied", d)
+        self.assertIn("deny", d)
+        self.assertIn("approval link", d)
+
+    def test_detail_for_escalated_and_env_requests(self):
+        self.broker.cfg["secrets"]["svc"]["approval"] = "allow"
+        self.broker.summarizer = _Stub("Dangerous", "high")
+        self.decision = "approve"
+        _, body = self.api("POST", "/v1/requests", {
+            "mode": "http", "names": ["svc"], "method": "DELETE",
+            "url": f"http://127.0.0.1:{self.up.server_address[1]}/x",
+            "headers": {"Authorization": "Bearer {{SVC_TOKEN}}"}})
+        rid = json.loads(body)["id"]
+        self.result(rid)
+        _, d = self.detail(rid)
+        self.assertIn("Auto-approve", d)
+        self.assertIn("above auto_approve_max medium", d)
+        self.assertIn("HIGH", d)
+        self.broker.cfg["secrets"]["svc"]["approval"] = "prompt"
+        _, body = self.api("POST", "/v1/requests", {
+            "mode": "env", "names": ["svc"], "argv": ["echo", "<script>alert(1)</script>"]})
+        rid = json.loads(body)["id"]
+        self.result(rid)
+        _, d = self.detail(rid)
+        self.assertIn("<code>echo &lt;script&gt;alert(1)&lt;/script&gt;</code>", d)
+        self.assertNotIn("<script>", d)
+        self.assertIn("env", d)
+        self.assertNotIn(SECRET, d)
+
+    def test_detail_escapes_hostile_strings(self):
+        evil = "<script>alert(1)</script>"
+        self.broker.summarizer = _Stub(evil, "low")
+        self.decision = "approve"
+        _, body = self.api("POST", "/v1/requests", {
+            "mode": "http", "names": ["svc"], "method": "GET", "source": evil + "<img src=x onerror=1>",
+            "url": f"http://127.0.0.1:{self.up.server_address[1]}/<script>x</script>",
+            "headers": {"Authorization": "Bearer {{SVC_TOKEN}}"}})
+        rid = json.loads(body)["id"]
+        self.result(rid)
+        for frag in (True, False):
+            _, d = self.detail(rid, frag=frag)
+            self.assertNotIn("<script>alert", d.replace("<script nonce", ""))
+            self.assertNotIn("<img src=x", d)
+            self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", d)
+        _, lst = self.page()
+        self.assertNotIn("<script>x", lst)
+        self.assertNotIn("<img src=x", lst)
+
+    def test_detail_unknown_malformed_and_pending(self):
+        self.call()
+        for bad in ("nosuchid12345678", "../../etc/passwd", "a", "x" * 200, "%2e%2e%2fsecret", "id%3Brm",
+                    "id%20with%20space", "..%5C..%5Cwin", "abc/def"):
+            code, d = self.detail(bad)
+            self.assertEqual(code, 404, bad)
+            self.assertNotIn("Traceback", d)
+        self.assertEqual(self.detail("")[0], 404)
+        self.decision = None
+        url = f"http://127.0.0.1:{self.up.server_address[1]}/x"
+        _, b = self.api("POST", "/v1/requests", {
+            "mode": "http", "names": ["svc"], "method": "GET", "url": url,
+            "headers": {"Authorization": "Bearer {{SVC_TOKEN}}"}})
+        pend = json.loads(b)["id"]
+        code, d = self.detail(pend)
+        self.assertEqual(code, 409)
+        self.assertNotIn(self.broker._by_id[pend].nonce, d)
+        self.assertNotIn(pend, self.page("?view=all")[1].split("id=hlist")[1])  # not in the list either
+
+    def test_detail_never_exposes_nonce_or_tokens(self):
+        rid, _ = self.call()
+        r = self.broker._by_id[rid]
+        _, d = self.detail(rid)
+        _, lst = self.page("?view=all")
+        for blob in (d, lst):
+            self.assertNotIn(r.nonce, blob)
+            self.assertNotIn(self.broker.csrf_token("alice"), d)
+        with open(self.audit) as f:
+            self.assertNotIn(r.nonce, f.read())
+
+    def test_detail_requires_the_same_auth_as_other_pages(self):
+        rid, _ = self.call()
+        for user in ("mallory", ""):
+            code, d = self.detail(rid, user=user)
+            self.assertEqual(code, 403)
+            self.assertNotIn(rid, d)
+        code, _ = req(self.abase + f"/request/{rid}?fragment=1")
+        self.assertEqual(code, 403)
+        self.broker.cfg["approval_trusted_peers"] = ["10.9.9.0/24"]
+        self.assertEqual(self.detail(rid)[0], 403)
+
+    def test_detail_does_not_rescan_the_log(self):
+        rid, _ = self.call()
+        self.detail(rid)
+        folded = []
+        orig = self.broker.history._fold
+        self.broker.history._fold = lambda rec: (folded.append(rec), orig(rec))[1]
+        try:
+            self.detail(rid)
+            self.detail(rid)
+            self.assertEqual([r["event"] for r in folded if r.get("id") == rid], [])
+        finally:
+            self.broker.history._fold = orig
+
 
 class Dashboard(Harness):
     """Approve/deny from the web UI: same decision path, plus CSRF protection."""
@@ -1783,7 +2150,7 @@ class Dashboard(Harness):
     ttl = 60
 
     def tweak(self, cfg):
-        cfg["risk"] = {"escalate_auto_at": "high"}
+        cfg["risk"] = {"auto_approve_max": "medium"}
 
     def setUp(self):
         super().setUp()
@@ -2316,7 +2683,8 @@ class StatusEndpoint(Harness):
         self.assertIsInstance(st["uptime_s"], int)
         self.assertEqual(st["backend"], {"type": "file", "ok": True})
         self.assertEqual(st["notifiers"], ["ticker"])
-        self.assertEqual(st["features"], {"ha_hook": True, "ssh": False, "webpush_actions": False})
+        self.assertEqual(st["features"], {"ha_hook": True, "ssh": False, "webpush_actions": False,
+                                         "auto_approve_max": "low"})
 
     def test_leaks_no_names_hosts_or_config(self):
         _, body = self.status()

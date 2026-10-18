@@ -42,6 +42,7 @@ from .history import History, OUTCOMES
 
 MAX_PENDING = 3
 DENY_COOLDOWN = 60
+HIST_RECENT, HIST_PAGE, HIST_MAX = 8, 25, 500   # history rows: collapsed, per page, ceiling
 MAX_RESPONSE_BYTES = 1_000_000
 MAX_REQUEST_BYTES = 8_000_000
 MAX_STORE_VALUE = 65_536
@@ -140,9 +141,9 @@ class Broker:
         self._denied_at = {}
         if hasattr(backend, "on_event"):
             backend.on_event = self.log
-        esc = config.get("risk", {}).get("escalate_auto_at")
-        if esc is not None and esc not in risk_mod.LEVELS:
-            raise ValueError(f"risk.escalate_auto_at must be one of {risk_mod.LEVELS}")
+        self._auto_max, warn = risk_mod.parse_auto_approve_max(config.get("risk"), "risk")
+        if warn:
+            self.log("config_warning", warning=warn)
         if background_load:
             # Listen right away; the first requests wait on the same lock.
             self._refreshing.acquire()
@@ -361,7 +362,8 @@ class Broker:
             "backend": {"type": btype, "ok": bool(self._backend_ok)},
             "notifiers": notifiers,
             "features": {"ha_hook": self.ha_hook is not None, "ssh": has_ssh,
-                         "webpush_actions": "webpush" in notifiers and self.push is not None},
+                         "webpush_actions": "webpush" in notifiers and self.push is not None,
+                         "auto_approve_max": self._auto_max},
         }
 
     def _refresh_if(self, stale_after, wait=True):
@@ -452,19 +454,17 @@ class Broker:
             return False, "already always-allowed"
         if not hasattr(self.backend, "set_meta"):
             return False, "the vault backend cannot record this"
-        esc = self._escalate_at()
-        if esc:
-            if req.risk and risk_mod.rank(req.risk["level"]) >= risk_mod.rank(esc):
-                return False, f"this request is rated {req.risk['level']}; such requests always prompt"
+        if req.risk:
+            lvl = req.risk["level"]
+            if lvl == "high" or not risk_mod.auto_ok(lvl, self._auto_max):
+                return False, f"this request is rated {lvl}; such requests always prompt"
         return True, ""
 
-    def _escalate_at(self):
-        """Level at or above which an `allow` secret is prompted anyway.
-
-        Defaults to medium, so only a request the model rated low (or, with no
-        model verdict, nothing: that counts as high) is released unprompted.
-        """
-        return self.cfg.get("risk", {}).get("escalate_auto_at") or "medium"
+    def auto_approve_max(self):
+        """Highest risk level at which an auto-eligible request is released
+        unprompted: none|low|medium|high (default low; see risk.auto_approve_max).
+        A missing model verdict counts as high."""
+        return self._auto_max
 
     def _persist_approval(self, name, value, user):
         """Write the new policy into the item's broker metadata in the vault."""
@@ -570,9 +570,11 @@ class Broker:
         req.summary, req.risk = a["summary"], {k: a[k] for k in ("level", "model", "reasons")}
         self.audit("assessed", req, model=a["model"], reasons=a["reasons"])
         auto = self._auto_allowed(mode, names, spec)
-        esc = self._escalate_at()
-        if auto and esc and risk_mod.rank(a["level"]) >= risk_mod.rank(esc):
-            self.audit("escalated", req, reason=f"risk {a['level']} >= {esc}; policy allow overridden")
+        auto_max = self._auto_max
+        if auto and not risk_mod.auto_ok(a["level"], auto_max):
+            why = ("auto-approve is off (risk.auto_approve_max none)" if auto_max == "none" else
+                   f"risk {a['level']} is above auto_approve_max {auto_max}")
+            self.audit("escalated", req, auto_max=auto_max, reason=f"{why}; policy allow overridden")
             auto = False
         if auto:
             if mode == "store":
@@ -580,9 +582,10 @@ class Broker:
             try:
                 result = self._release(req)
             except (BackendError, OSError, ValueError) as e:
-                self._finish(req, "failed", error=f"release failed: {e}", via="policy")
+                self._finish(req, "failed", error=f"release failed: {e}", via="policy",
+                             auto_max=auto_max)
             else:
-                self._finish(req, "approved", result=result, via="policy")
+                self._finish(req, "approved", result=result, via="policy", auto_max=auto_max)
             return req
         try:
             self._push(req)
@@ -1235,7 +1238,6 @@ html{-webkit-text-size-adjust:100%}
 body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
 main{max-width:72rem;margin:0 auto;padding:1.25rem 1rem 3rem}
 main.narrow>*{max-width:46rem}
-.back{display:inline-block;margin:0 0 .6rem;font-size:.85rem;text-decoration:none}
 .top{background:var(--card);border-bottom:1px solid var(--line)}
 .bar{display:flex;align-items:center;gap:.65rem;max-width:72rem;margin:0 auto;padding:.7rem 1rem}
 .tabs{--edge:max(1rem,calc((100% - 72rem)/2 + 1rem))}
@@ -1268,6 +1270,7 @@ border-radius:.5rem;border:1px solid var(--line);background:var(--card);color:va
 .btn.deny{color:var(--bad)}
 .btn.sm,td button{min-height:1.8rem;padding:.15rem .65rem;font-size:.8rem}
 [hidden]{display:none!important}
+body:has(dialog[open]){overflow:hidden}
 button:disabled{opacity:.6;cursor:default}
 details.more{margin-left:auto;font-size:.85rem}
 details.more summary{cursor:pointer;color:var(--muted);list-style:none;padding:.35rem .2rem}
@@ -1289,11 +1292,45 @@ border-radius:.5rem;padding:.5rem .8rem;margin:0 0 .9rem}
 .offline{border-left-color:var(--bad)}
 .empty{color:var(--muted);text-align:center;padding:1.2rem}
 .hist{list-style:none;margin:0;padding:0}
-.hist li{display:flex;align-items:center;gap:.7rem;padding:.6rem 1rem;border-bottom:1px solid var(--line)}
-.hist li:last-child{border-bottom:0}.hist .what{min-width:0;flex:1}
-.hist .what small{display:block;font-family:ui-monospace,Menlo,monospace;font-size:.75rem}
+.hist li{border-bottom:1px solid var(--line)}
+.hist li:last-child{border-bottom:0}
+.hist .hrow{display:flex;align-items:center;gap:.7rem;width:100%;min-height:0;padding:.6rem 1rem;border:0;
+border-radius:0;background:none;text-align:left;font-weight:400;font-size:inherit}
+.hist .hrow:hover{background:var(--hov)}
+.hist .hrow:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+.hist .what{min-width:0;flex:1}.hist .what b{font-weight:600}
+.hist .what small{display:block;font-family:ui-monospace,Menlo,monospace;font-size:.75rem;overflow-wrap:anywhere}
 .hist .when{color:var(--muted);font-size:.8rem;white-space:nowrap}
-.card.flush{padding:0}.card.flush .more-link{display:block;padding:.6rem 1rem;border-top:1px solid var(--line);font-size:.85rem}
+.card.flush{padding:0;overflow:hidden}
+.card.flush .more-link{display:block;padding:.6rem 1rem;border-top:1px solid var(--line);font-size:.85rem}
+.hfoot{display:flex;flex-wrap:wrap;gap:0 1.25rem;align-items:center;border-top:1px solid var(--line)}
+.hfoot .more-link,.card.flush .hfoot .more-link{border-top:0}.hfoot .muted{font-size:.8rem;margin-left:auto;padding-right:1rem}
+.hfilters{display:flex;flex-wrap:wrap;gap:.5rem;padding:.7rem 1rem;border-bottom:1px solid var(--line)}
+.hfilters input,.hfilters select{font:inherit;min-height:2.25rem;flex:1 1 9rem;padding:.2rem .5rem;
+border-radius:.5rem;border:1px solid var(--line);background:var(--card);color:var(--fg)}
+.hfilters input{flex-basis:100%}
+dialog.dlg{padding:0;border:1px solid var(--line);border-radius:.8rem;background:var(--card);color:var(--fg);
+width:min(46rem,calc(100% - 2rem));max-height:calc(100dvh - 3rem);overflow:hidden}
+dialog.dlg[open]{display:flex;flex-direction:column}
+dialog.dlg::backdrop{background:rgba(0,0,0,.55)}
+.dhead{display:flex;align-items:center;gap:.8rem;padding:.7rem 1rem;border-bottom:1px solid var(--line)}
+.dhead h2{flex:1;font-size:1rem}
+.dbody{overflow:auto;padding:.4rem 1rem 1.2rem;overscroll-behavior:contain}
+.dtitle{display:flex;flex-wrap:wrap;align-items:center;gap:.5rem;margin:.6rem 0 .2rem}
+.dtitle b{font-size:1.1rem;overflow-wrap:anywhere}
+dl.kv{display:grid;grid-template-columns:9rem minmax(0,1fr);gap:.35rem .9rem;margin:.6rem 0}
+dl.kv dt{color:var(--muted);font-size:.8rem;padding-top:.1rem}dl.kv dd{margin:0;overflow-wrap:anywhere}
+dl.kv code,.tl code{font-family:ui-monospace,Menlo,monospace;font-size:.82rem}
+.tl{list-style:none;margin:0;padding:0;border-left:2px solid var(--line)}
+.tl li{padding:.15rem 0 .5rem .8rem;position:relative;overflow-wrap:anywhere}
+.tl li::before{content:"";position:absolute;left:-.38rem;top:.55rem;width:.6rem;height:.6rem;border-radius:50%;
+background:var(--line)}
+.tl time{color:var(--muted);font-size:.78rem;margin-right:.4rem}.tl .ev{display:block;color:var(--muted);
+font-size:.78rem;font-family:ui-monospace,Menlo,monospace}
+@media (max-width:42rem){
+ dialog.dlg{width:100%;max-width:100%;margin:auto 0 0;max-height:92dvh;border-radius:.8rem .8rem 0 0;border-bottom:0}
+ dl.kv{grid-template-columns:1fr;gap:.05rem}dl.kv dd{margin-bottom:.45rem}
+}
 .devices{list-style:none;padding:0;margin:0}.devices li{display:flex;gap:.8rem;align-items:center;
 padding:.7rem 1rem;border-top:1px solid var(--line)}
 .srow{display:flex;align-items:center;gap:1rem;padding:.75rem 0;border-top:1px solid var(--line)}
@@ -1302,9 +1339,6 @@ padding:.7rem 1rem;border-top:1px solid var(--line)}
 .chead{display:flex;align-items:center;gap:.8rem;padding:1rem 1rem .2rem}.chead h2{margin:0;flex:1}
 .cnote{margin:0;padding:0 1rem .6rem}
 .notify{margin:.5rem 0}.notify .btn{margin-right:.5rem}
-.filters{display:flex;flex-wrap:wrap;gap:.5rem;margin:0 0 .9rem}
-.filters select{font:inherit;min-height:2.25rem;flex:1 1 9rem;padding:.2rem .5rem;border-radius:.5rem;
-border:1px solid var(--line);background:var(--card);color:var(--fg)}
 .tbl{width:100%;border-collapse:collapse;background:var(--card);border:1px solid var(--line);border-radius:.7rem;
 overflow:hidden}
 .tbl th{text-align:left;font-size:.75rem;color:var(--muted);padding:.55rem .8rem;border-bottom:1px solid var(--line)}
@@ -1312,7 +1346,6 @@ overflow:hidden}
 .tbl tr:last-child td{border-bottom:0}
 .tbl td[data-label=Time],.tbl td[data-label=Outcome],.tbl td[data-label=Risk],.tbl td[data-label=Took]
 {white-space:nowrap;overflow-wrap:normal}
-.pager{display:flex;gap:1.25rem;align-items:center;flex-wrap:wrap}
 @media (max-width:42rem){
  main{padding:.9rem .75rem 2.5rem}
  .who{display:none}
@@ -1401,7 +1434,10 @@ _DASH_JS = r'''
   report('page_load',{note:location.pathname,state:document.visibilityState});
   var cards=document.getElementById('cards'), flash=document.getElementById('flash'),
       off=document.getElementById('offline'), recent=document.getElementById('recent'),
-      last=cards?cards.getAttribute('data-version'):null;
+      last=cards?cards.getAttribute('data-version'):null,
+      hl=document.getElementById('hlist'), hform=document.getElementById('hform'),
+      hs={all:hl?hl.getAttribute('data-all')==='1':false,limit:hl?+hl.getAttribute('data-limit'):0},
+      hseq=0, hmore=25;
   function secs(){document.querySelectorAll('time[data-exp]').forEach(function(t){
     var s=Math.max(0,Math.floor(t.getAttribute('data-exp')-Date.now()/1000));
     t.textContent='expires in '+s+'s';});}
@@ -1568,17 +1604,69 @@ _DASH_JS = r'''
     if(sr)sr.addEventListener('click',swcheck);
     if(su)su.addEventListener('click',swupdate);
     swcheck();}
+  // History list: one component, one query. hq() is the state (view, filters, how
+  // many rows) as a query string; polls and filter changes fetch the same fragment.
+  function hq(){
+    var p=new URLSearchParams();
+    if(hs.all){p.set('view','all');
+      ['q','outcome','secret','mode'].forEach(function(k){
+        var el=hform&&hform.elements[k];if(el&&el.value)p.set(k,el.value);});
+      if(hs.limit>hmore)p.set('limit',hs.limit);}
+    return p.toString();}
   function poll(){
     if(!cards)return Promise.resolve();
-    return fetch('/?fragment=1',{credentials:'same-origin',cache:'no-store'})
+    var seq=hseq,q=hq();
+    return fetch('/?fragment=1'+(q?'&'+q:''),{credentials:'same-origin',cache:'no-store'})
       .then(function(r){if(!r.ok)throw 0;return r.text();})
-      .then(function(h){var d=parse(h),c=d.getElementById('cards'),rc=d.getElementById('recent');
+      .then(function(h){var d=parse(h),c=d.getElementById('cards'),nl=d.getElementById('hlist');
         if(c&&c.getAttribute('data-version')!==last){
           last=c.getAttribute('data-version');cards.innerHTML=c.innerHTML;bind();
-          if(recent&&rc)recent.innerHTML=rc.innerHTML;
           track(ids(c));}
+        if(hl&&nl&&seq===hseq&&nl.innerHTML!==hl.innerHTML)hl.innerHTML=nl.innerHTML;
         off.hidden=true;secs();title();})
       .catch(function(){off.hidden=false;});}
+  function hload(){
+    hseq++;if(hform)hform.hidden=!hs.all;
+    try{var q=hq();history.replaceState(null,'',q?'/?'+q:'/');}catch(x){}
+    return poll();}
+  var htimer=null;
+  if(hform){
+    hform.addEventListener('submit',function(e){e.preventDefault();hs.limit=hmore;hload();});
+    hform.addEventListener('change',function(){hs.limit=hmore;hload();});
+    hform.addEventListener('input',function(e){if(e.target.name!=='q')return;
+      clearTimeout(htimer);htimer=setTimeout(function(){hs.limit=hmore;hload();},300);});}
+  // Detail pop-over: the server renders (and escapes) the fragment; it is the
+  // only thing put into the dialog, and the dialog sits outside the polled areas.
+  var dlg=document.getElementById('hdlg'), dbody=document.getElementById('hbody'),
+      dseq=0, dfor=null, dopener=null;
+  function opendetail(btn){
+    var id=btn.getAttribute('data-id');
+    if(!dlg||!dlg.showModal){location.href='/request/'+encodeURIComponent(id);return;}
+    var n=++dseq;dfor=id;dopener=btn;
+    dbody.textContent='Loading...';
+    if(!dlg.open)dlg.showModal();
+    fetch('/request/'+encodeURIComponent(id)+'?fragment=1',{credentials:'same-origin',cache:'no-store'})
+      .then(function(r){return r.text().then(function(t){return {s:r.status,t:t};});})
+      .then(function(o){if(n!==dseq)return;
+        if(o.s===200)dbody.innerHTML=o.t;
+        else dbody.textContent=o.s===409?'This request is still waiting; decide it from its card.'
+          :'This request is not in the history.';})
+      .catch(function(){if(n===dseq)dbody.textContent='Could not load the details.';});}
+  if(dlg){
+    dlg.addEventListener('click',function(e){if(e.target===dlg)dlg.close();});
+    var dc=document.getElementById('hclose');if(dc)dc.addEventListener('click',function(){dlg.close();});
+    dlg.addEventListener('close',function(){dseq++;
+      // the list may have been redrawn while open: find the row again by id
+      var b=recent&&dfor?recent.querySelector('button.hrow[data-id="'+dfor+'"]'):null;
+      var t=b||dopener;if(t&&t.isConnected)t.focus();dfor=dopener=null;});}
+  if(recent)recent.addEventListener('click',function(e){
+    var a=e.target.closest('[data-hact]');
+    if(a){e.preventDefault();var k=a.getAttribute('data-hact');
+      if(k==='all'){hs.all=true;hs.limit=hmore;}
+      else if(k==='less'){hs.all=false;hs.limit=0;}
+      else if(k==='more'){hs.limit+=hmore;}
+      hload();return;}
+    var b=e.target.closest('button.hrow');if(b)opendetail(b);});
   function bind(){document.querySelectorAll('form.decide').forEach(function(f){
     if(f.getAttribute('data-bound'))return;f.setAttribute('data-bound','1');
     f.addEventListener('submit',function(e){
@@ -1856,6 +1944,130 @@ def _iso(t):
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
 
 
+_CHANNEL_LABEL = {"dashboard": "web dashboard", "push": "browser push notification",
+                  "ha": "Home Assistant", "link": "approval link"}
+_AUTO_LABEL = {"none": "off (every request asks a human)", "low": "up to low risk",
+               "medium": "up to medium risk",
+               "high": "any risk level, including requests with no model verdict"}
+
+
+def _utc(t):
+    return time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(t)) if t else ""
+
+
+def _secs(a, b):
+    if not a or not b or b < a:
+        return ""
+    d = b - a
+    return f"{d:.1f}s" if d < 120 else f"{int(d // 60)}m {int(d % 60)}s"
+
+
+def _ev_val(v):
+    if isinstance(v, bool):
+        return "yes" if v else "no"
+    if isinstance(v, list):
+        return ", ".join(str(x) for x in v)
+    return str(v)
+
+
+def _detail_html(r, evs):
+    """Server-escaped detail of one finished request: the history row plus its
+    audit events (whitelisted fields only; see history._EV_KEYS)."""
+    e = html.escape
+
+    def first(*names):
+        return next((x for x in evs if x["event"] in names), None)
+
+    def last(*names):
+        return next((x for x in reversed(evs) if x["event"] in names), None)
+    t0 = r["ts"]
+    final, decided = last("approved", "denied", "expired", "failed"), first("decided")
+    ran = last("http_executed", "stored", "ssh_signed") or last("secret_read")
+    deliv, esc = first("delivered"), first("escalated")
+    run = first("http_executed")
+    outcome = r["outcome"]
+    kind = ("ok" if outcome in ("approved", "auto-approved") else
+            "bad" if outcome in ("denied", "failed") else "plain")
+    label = outcome + (" (not collected)" if outcome in ("approved", "auto-approved")
+                       and not r["delivered"] and r["mode"] != "store" else "")
+    rows = []
+
+    def add(k, v, raw=False):
+        if v not in (None, "", []):
+            rows.append(f"<dt>{e(k)}</dt><dd>{v if raw else e(str(v))}</dd>")
+    add("Request id", f"<code>{e(r['id'])}</code>", True)
+    add("Secrets", ", ".join(r["names"]))
+    add("Mode", r["mode"])
+    if r["mode"] == "http":
+        add("Request", f"{r['method'] or ''} {r['url'] or ''}".strip())
+    elif r["mode"] == "env":
+        add("Command", "<code>" + e(" ".join(r["argv"] or [])) + "</code>", True)
+    elif r["mode"] == "store":
+        add("Operation", f"{r['op'] or 'store'} credential")
+        add("Vault item", r["item"])
+        add("Field", r["field"])
+        add("Key", r["key"])
+        add("Allowed hosts", ", ".join(r["hosts"] or []))
+        if (last("stored") or {}).get("value_bytes") is not None:
+            add("Value size", f"{last('stored')['value_bytes']} bytes (never recorded)")
+    else:
+        add("Signing", r.get("ssh_what"))
+        add("Key fingerprint", (first("ssh_signed") or {}).get("ssh_fingerprint"))
+    add("Source (claimed by the client)", r["source"])
+    add("Peer", r["peer"])
+    if r["summary"]:
+        add("Summary", f"{e(r['summary'])} <small class=muted>(unverified, from client-supplied text)"
+            "</small>", True)
+    if r["risk"]:
+        reasons = "; ".join(r["risk_reasons"] or [])
+        add("Risk", f"<span class='risk {e(r['risk'])}'><b>{e(r['risk'].upper())}</b></span> "
+            + e(reasons) + (f" <small class=muted>(model verdict: {e(str(r['risk_model']))})</small>"
+                            if r["risk_model"] else ""), True)
+    add("Outcome", f"<span class='pill {kind}'>{e(label)}</span>"
+        + (f" {e(r['error'])}" if r["error"] else ""), True)
+    if r["via"] == "policy":
+        am = (final or {}).get("auto_max")
+        add("Decided by", "policy (auto-approved)" + (f", auto-approve limit: {am}" if am else ""))
+    elif decided:
+        who = decided.get("approver") or ""
+        how = _CHANNEL_LABEL.get(decided.get("channel"), decided.get("channel") or "")
+        add("Decided by", f"{who} via {how}" if who else how)
+        if who.startswith("ha:"):
+            add("Device", who[3:])
+        add("Approver address", ", ".join(x for x in (decided.get("approver_peer"),
+                                                      decided.get("approver_ip")) if x))
+        add("Decision", (decided.get("decision") or "")
+            + (" and always allow" if decided.get("always_requested") else ""))
+    elif outcome == "expired":
+        add("Decided by", "nobody (expired unanswered)")
+    elif r["approver"]:
+        add("Decided by", r["approver"])
+    if esc:
+        add("Auto-approve", esc.get("reason"))
+    add("Requested", _utc(t0))
+    add("Decided", _utc((decided or final or {}).get("ts")))
+    add("Released", _utc((ran or {}).get("ts")))
+    add("Delivered to client", _utc((deliv or {}).get("ts")))
+    add("Time to decision", _secs(t0, (decided or final or {}).get("ts")))
+    if r["latency_ms"] is not None:
+        add("Total until final", f"{r['latency_ms'] / 1000:.1f}s")
+    if run:
+        add("Upstream call took", f"{run['duration_ms'] / 1000:.2f}s" if run.get("duration_ms") is not None else "")
+        add("Upstream HTTP status", run.get("upstream_status"))
+        add("Response size", f"{run['response_bytes']} bytes" if run.get("response_bytes") is not None else "")
+    tl = []
+    for x in evs:
+        extra = " ".join(f"{k}={_ev_val(v)}" for k, v in x.items() if k not in ("event", "ts", "time"))
+        t = (x.get("time") or "")[11:19]
+        dt = _secs(t0, x.get("ts"))
+        tl.append(f"<li><time>{e(t)}</time><b>{e(x['event'])}</b>"
+                  + (f" <small class=muted>+{e(dt)}</small>" if dt and x.get("ts") != t0 else "")
+                  + (f"<span class=ev>{e(extra)}</span>" if extra else "") + "</li>")
+    return (f"<div class=dtitle><b>{e(', '.join(r['names']))}</b>"
+            f"<span class='pill {kind}'>{e(label)}</span></div>"
+            f"<dl class=kv>{''.join(rows)}</dl><h3>Timeline</h3><ol class=tl>{''.join(tl)}</ol>")
+
+
 def client_handler(broker, client_key):
     class H(BaseHTTPRequestHandler):
         def log_message(self, *a):
@@ -2026,7 +2238,7 @@ def approval_handler(broker):
             return (self._same_origin()
                     and hmac.compare_digest(token or "", broker.csrf_token(user)))
 
-        def _dashboard(self, user, fragment=False, note=""):
+        def _dashboard(self, user, fragment=False, note="", q=None):
             notes = {"approved": "Approved. Releasing now.", "denied": "Denied.",
                      "always": "Approved, and always allowed from now on.",
                      "stale": "That request was already handled or has expired.",
@@ -2067,21 +2279,49 @@ def approval_handler(broker):
                      "<div class='card empty'>Nothing is waiting for approval.</div>")
             block = f"<div id=cards class=cards data-version='{version}'>{inner}</div>"
             pend_ids = {r.id for r in broker._by_id.values() if r.status == "pending"}
-            recent = self._recent_history(broker.history.rows(pend_ids))
+            a = self._hist_args(q or {})
             if fragment:
-                return _page(self, 200, block + recent, nav=False)
+                return _page(self, 200, block + self._hist_list(a, pend_ids), nav=False)
+            recent = self._recent_history(a, pend_ids)
             msg = notes.get(note, "")
             _page(self, 200,
                   f"<div id=flash class=flash{'' if msg else ' hidden'}>{html.escape(msg)}</div>"
                   "<div id=offline class='flash offline' hidden>Cannot reach the broker (signed out?). "
                   "Reload this page.</div><h3 style='margin-top:0'>Waiting for you</h3>"
-                  + block + recent, script=_DASH_JS, tab="requests", badge=len(reqs), user=user)
+                  + block + recent + self._detail_dialog(), script=_DASH_JS, tab="requests",
+                  badge=len(reqs), user=user)
 
-        def _recent_history(self, rows):
-            good = ("approved", "auto-approved")
-            bad = ("denied", "failed")
+        def _hist_args(self, q):
+            """History list state from a query string: view=all turns on the search
+            box, filters and paging; without it the list is the last few rows."""
+            def arg(k):
+                return (q.get(k) or [""])[0][:60]
+            a = {"all": arg("view") == "all", "q": arg("q").strip(), "outcome": "", "secret": "",
+                 "mode": ""}
+            if a["all"]:
+                if arg("outcome") in OUTCOMES + ("unknown",) and arg("outcome") != "pending":
+                    a["outcome"] = arg("outcome")
+                a["secret"] = arg("secret")
+                if arg("mode") in ("http", "env", "store", "ssh_sign"):
+                    a["mode"] = arg("mode")
+            try:
+                n = int(arg("limit") or HIST_PAGE)
+            except ValueError:
+                n = HIST_PAGE
+            a["limit"] = min(max(n, HIST_PAGE), HIST_MAX) if a["all"] else HIST_RECENT
+            return a
+
+        def _hist_list(self, a, pend_ids):
+            """The `#hlist` block: rows, then the footer. The same markup for the
+            first view, filtered views, "show more" and the live poll."""
+            rows = [r for r in broker.history.rows(
+                pend_ids, a["outcome"] or None, a["secret"] or None, a["mode"] or None,
+                a["q"] or None) if r["outcome"] != "pending"]
+            total, rows = len(rows), rows[:a["limit"]]
+            good, bad = ("approved", "auto-approved"), ("denied", "failed")
+            today = time.strftime("%Y-%m-%d", time.gmtime())
             items = []
-            for r in [r for r in rows if r["outcome"] != "pending"][:8]:
+            for r in rows:
                 if r["mode"] == "http":
                     what = f"{r['method'] or ''} {r['url'] or ''}".strip()
                 elif r["mode"] == "store":
@@ -2091,15 +2331,91 @@ def approval_handler(broker):
                 else:
                     what = "env"
                 kind = "ok" if r["outcome"] in good else "bad" if r["outcome"] in bad else "plain"
+                when = r["time"][11:16] if r["time"][:10] == today else r["time"][5:10] + " " + r["time"][11:16]
                 items.append(
-                    f"<li><div class=what><b>{html.escape(', '.join(r['names']))}</b>"
-                    f"<small>{html.escape(what[:90])}</small></div>"
+                    f"<li><button type=button class=hrow data-id='{html.escape(r['id'])}' "
+                    f"aria-haspopup=dialog><span class=what><b>{html.escape(', '.join(r['names']))}</b>"
+                    f"<small>{html.escape(what[:120])}</small></span>"
                     f"<span class='pill {kind}'>{html.escape(r['outcome'])}</span>"
-                    f"<span class=when>{html.escape(r['time'][11:16] or r['time'])}</span></li>")
-            body = ("".join(items) if items else "<li class=muted>No requests yet.</li>")
+                    f"<span class=when title='{html.escape(r['time'])}'>{html.escape(when)}</span>"
+                    "</button></li>")
+            if items:
+                body = "".join(items)
+            else:
+                body = ("<li class='muted empty'>No requests match.</li>" if a["all"] or a["q"] else
+                        "<li class='muted empty'>No requests yet.</li>")
+            if a["all"]:
+                qs = urllib.parse.urlencode(
+                    [("view", "all")] + [(k, a[k]) for k in ("q", "outcome", "secret", "mode") if a[k]])
+                foot = ""
+                if total > len(rows):
+                    foot += (f"<a class=more-link data-hact=more href='/?{html.escape(qs)}"
+                             f"&amp;limit={a['limit'] + HIST_PAGE}'>Show more "
+                             f"({total - len(rows)} older)</a>")
+                foot += "<a class=more-link data-hact=less href='/'>Show recent only</a>"
+                foot += f"<span class=muted>{total} request{'' if total == 1 else 's'}</span>"
+            else:
+                foot = ("<a class=more-link data-hact=all href='/?view=all'>"
+                        "Search and filter all history</a>")
+            return (f"<div id=hlist data-all={'1' if a['all'] else '0'} data-limit={a['limit']}>"
+                    f"<ul class=hist>{body}</ul><div class=hfoot>{foot}</div></div>")
+
+        def _recent_history(self, a, pend_ids):
+            def opt(vals, cur, label):
+                o = "".join(f"<option value='{html.escape(v)}'{' selected' if v == cur else ''}>"
+                            f"{html.escape(v)}</option>" for v in vals)
+                return f"<option value=''>{label}</option>{o}"
+            outcomes = tuple(o for o in OUTCOMES if o != "pending") + ("unknown",)
+            form = (f"<form id=hform class=hfilters method=get action='/'{'' if a['all'] else ' hidden'}>"
+                    "<input type=hidden name=view value=all>"
+                    f"<input type=search name=q value='{html.escape(a['q'])}' maxlength=60 "
+                    "placeholder='Search secret, URL, source, id' aria-label='Search history'>"
+                    f"<select name=outcome aria-label=Outcome>{opt(outcomes, a['outcome'], 'any outcome')}</select>"
+                    f"<select name=secret aria-label=Secret>"
+                    f"{opt(broker.history.secrets_seen(), a['secret'], 'any secret')}</select>"
+                    f"<select name=mode aria-label=Mode>"
+                    f"{opt(('http', 'env', 'store', 'ssh_sign'), a['mode'], 'any mode')}</select>"
+                    "<noscript><button>Filter</button></noscript></form>")
             return ("<section id=recent><h3>History</h3><div class='card flush'>"
-                    f"<ul class=hist>{body}</ul>"
-                    "<a class=more-link href='/history'>Search and filter all history</a></div></section>")
+                    f"{form}{self._hist_list(a, pend_ids)}</div></section>")
+
+        def _detail_dialog(self):
+            return ("<dialog id=hdlg class=dlg aria-labelledby=hdt><div class=dhead>"
+                    "<h2 id=hdt>Request details</h2>"
+                    "<button type=button id=hclose class='btn sm'>Close</button></div>"
+                    "<div id=hbody class=dbody></div></dialog>")
+
+        def _request_detail(self, user, rid, fragment):
+            """GET /request/<id>: everything the audit log holds about one finished
+            request, as server-escaped HTML. Pending requests are refused (they
+            have cards); an unknown or malformed id is a plain 404."""
+            pend_ids = {r.id for r in broker._by_id.values() if r.status == "pending"}
+            row, evs = broker.history.detail(rid, pend_ids)
+            if row is None or rid in pend_ids or row["outcome"] == "pending":
+                code = 404 if row is None else 409
+                msg = "Request not found." if row is None else "That request is still waiting."
+                if fragment:
+                    return self._fragment(code, f"<p class=muted>{msg}</p>")
+                return _page(self, code, f"<h1>{msg}</h1>", tab="requests",
+                             badge=len(broker.pending()), user=user)
+            broker.log("request_detail_viewed", peer=self.client_address[0],
+                       client_ip=self._fwd(), request_id=rid)
+            body = _detail_html(row, evs)
+            if fragment:
+                return self._fragment(200, body)
+            _page(self, 200, "<h1>Request</h1><div class=card>" + body + "</div>",
+                  tab="requests", badge=len(broker.pending()), user=user)
+
+        def _fragment(self, code, body):
+            raw = body.encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(raw)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'")
+            self.end_headers()
+            self.wfile.write(raw)
 
         def _settings_page(self, user, note=""):
             token = broker.csrf_token(user)
@@ -2107,11 +2423,17 @@ def approval_handler(broker):
                      "push_test_ok": "Test push sent. It should arrive even with the browser closed.",
                      "push_failed": "The test push was not delivered to any device."}
             msg = notes.get(note, "")
+            auto = _AUTO_LABEL[broker.auto_approve_max()]
             push_row = self._push_enable_row(token) if broker.push is not None else ""
             devices = self._push_devices(token) if broker.push is not None else ""
             _page(self, 200,
                   "<h1>Settings</h1>"
                   f"<div class=flash{'' if msg else ' hidden'}>{html.escape(msg)}</div>"
+                  "<section class=card><h2>Broker</h2><div class=srow><div class=t>"
+                  "<b>Auto-approve</b><small class=muted>"
+                  f"{html.escape(auto[0].upper() + auto[1:])}."
+                  " Applies only to secrets set to always allow; set in the broker config "
+                  "(risk.auto_approve_max).</small></div></div></section>"
                   "<section class=card><h2>This browser</h2>"
                   "<div class=srow><div class=t><b>Notifications while this page is open</b>"
                   "<small id=notify-state class=muted></small></div>"
@@ -2227,77 +2549,10 @@ def approval_handler(broker):
                      "<tbody>" + "".join(rows) + "</tbody></table>" if rows else
                      "<div class='card empty'>Nothing is always allowed. Every use asks you first.</div>")
             _page(self, 200, f"<h1>Policies</h1>{note}<h3 style='margin-top:0'>Always allowed</h3>"
-                  "<p><small class=muted>These secrets are released without asking when the request is "
-                  "rated low risk. Revoke to ask every time again.</small></p>" + table,
+                  "<p><small class=muted>These secrets are released without asking when the request's "
+                  f"risk is within the auto-approve limit ({_AUTO_LABEL[broker.auto_approve_max()]}). "
+                  "Revoke to ask every time again.</small></p>" + table,
                   tab="policies", badge=len(broker.pending()), user=user)
-
-        def _history_page(self, user=""):
-            q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
-
-            def arg(k):
-                return (q.get(k) or [""])[0][:60]
-            outcome = arg("outcome") if arg("outcome") in OUTCOMES + ("unknown",) else ""
-            secret, mode = arg("secret"), arg("mode") if arg("mode") in ("http", "env", "store", "ssh_sign") else ""
-            try:
-                page = max(1, int(arg("page") or 1))
-            except ValueError:
-                page = 1
-            pending = {r.id for r in broker._by_id.values() if r.status == "pending"}
-            rows = broker.history.rows(pending, outcome or None, secret or None, mode or None)
-            per = 50
-            total, rows = len(rows), rows[(page - 1) * per: page * per]
-
-            def opt(vals, cur, label):
-                o = "".join(f"<option value='{html.escape(v)}'{' selected' if v == cur else ''}>"
-                            f"{html.escape(v)}</option>" for v in vals)
-                return f"<option value=''>{label}</option>{o}"
-            form = ("<form method=get class=filters>"
-                    f"<select name=outcome>{opt(OUTCOMES + ('unknown',), outcome, 'any outcome')}</select> "
-                    f"<select name=secret>{opt(broker.history.secrets_seen(), secret, 'any secret')}</select> "
-                    f"<select name=mode>{opt(('http', 'env', 'store', 'ssh_sign'), mode, 'any mode')}</select> "
-                    "<button>Filter</button></form>")
-            body = []
-            for r in rows:
-                if r["mode"] == "http":
-                    what = f"{r['method'] or ''} {r['url'] or ''}"
-                elif r["mode"] == "store":
-                    what = (f"{r['op'] or 'store'} credential: item {r['item']!r} field {r['field']}"
-                            + (f" key {r['key']}" if r.get("key") else ""))
-                elif r["mode"] == "ssh_sign":
-                    what = f"ssh: {r.get('ssh_what') or 'signature'}"
-                else:
-                    what = "env: value released to the requesting host"
-                if r["outcome"] in ("approved", "auto-approved") and not r["delivered"]:
-                    label = r["outcome"] + " (not collected)"
-                else:
-                    label = r["outcome"]
-                who = ("policy" if r["via"] == "policy" else
-                       (r["approver"] or "")) if r["outcome"] not in ("pending", "expired", "unknown") else ""
-                lat = f"{r['latency_ms'] / 1000:.1f}s" if r["latency_ms"] else ""
-                note = html.escape(r["error"] or r["summary"] or "")[:200]
-                body.append(
-                    "<tr>"
-                    f"<td data-label=Time>{html.escape(r['time'])}</td>"
-                    f"<td data-label=Outcome><span><b>{html.escape(label)}</b>"
-                    f"{' (escalated to a prompt)' if r['escalated'] else ''}</span></td>"
-                    f"<td data-label=Secret>{html.escape(', '.join(r['names']))}</td>"
-                    f"<td data-label=Request><span>{html.escape(what)}<br><small>{note}</small></span></td>"
-                    f"<td data-label=Risk>{html.escape(r['risk'] or '')}</td>"
-                    f"<td data-label='Decided by'>{html.escape(who)}</td>"
-                    f"<td data-label=Took>{lat}</td></tr>")
-            nav = ""
-            if total > per:
-                base = urllib.parse.urlencode({k: v for k, v in
-                                               (("outcome", outcome), ("secret", secret), ("mode", mode)) if v})
-                prev = f"<a href='?{base}&page={page - 1}'>newer</a>" if page > 1 else ""
-                nxt = f"<a href='?{base}&page={page + 1}'>older</a>" if page * per < total else ""
-                nav = f"<p class=pager>{prev} {nxt} <span class=muted>{total} requests</span></p>"
-            _page(self, 200, "<a class=back href='/'>&larr; Back to Requests</a><h1>History</h1>" + form
-                  + "<table class=tbl><thead><tr><th>Time (UTC)</th><th>Outcome</th><th>Secret</th>"
-                  "<th>Request</th><th>Risk</th><th>Decided by</th><th>Took</th></tr></thead><tbody>"
-                  + "".join(body) + f"</tbody></table>{nav}"
-                  + ("" if body else "<p class=muted>No requests match.</p>"), wide=True,
-                  tab="requests", badge=len(broker.pending()), user=user)
 
         def do_GET(self):
             user = self._user()
@@ -2311,10 +2566,17 @@ def approval_handler(broker):
                 frag = q.get("fragment", [""])[0] == "1"
                 if not frag:
                     broker.log("dashboard_viewed", peer=self.client_address[0], client_ip=self._fwd())
-                return self._dashboard(user, fragment=frag, note=(q.get("note") or [""])[0][:12])
+                return self._dashboard(user, fragment=frag, note=(q.get("note") or [""])[0][:12], q=q)
             if self.path.split("?")[0].rstrip("/") == "/history":
-                broker.log("history_viewed", peer=self.client_address[0], client_ip=self._fwd())
-                return self._history_page(user)
+                # the old standalone table: the same list now lives on the Requests tab
+                q = urllib.parse.parse_qs(u.query)
+                keep = [("view", "all")] + [(k, (q.get(k) or [""])[0][:60])
+                                            for k in ("outcome", "secret", "mode") if (q.get(k) or [""])[0]]
+                return self._redirect("/?" + urllib.parse.urlencode(keep))
+            if u.path.startswith("/request/"):
+                q = urllib.parse.parse_qs(u.query)
+                return self._request_detail(user, u.path[len("/request/"):],
+                                            q.get("fragment", [""])[0] == "1")
             if self.path.split("?")[0].rstrip("/") == "/settings":
                 q = urllib.parse.parse_qs(u.query)
                 return self._settings_page(user, (q.get("note") or [""])[0][:12])

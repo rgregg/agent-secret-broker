@@ -68,8 +68,10 @@ Settings are a JSON object in the `BROKER_CONFIG` environment variable of
 | `approval_trusted_peers` | CIDR of the proxy's network, for example `["172.23.0.0/16"]`. The listener refuses every other caller. Strongly recommended |
 | `notify` | One or more transports, see step 5 |
 
-Useful optional keys: `risk.escalate_auto_at` (`medium` recommended: an
-always-allowed secret is released unprompted only for low-risk requests),
+Useful optional keys: `risk.auto_approve_max` (`low`, the default, is
+recommended: an always-allowed secret is released unprompted only for low-risk
+requests; `none` turns auto-approval off, `high` lets every risk level through
+and fails open when the analysis model is down; see the reference),
 `summary` (a one-line AI summary of each request via OpenRouter, marked
 unverified), `ttl_seconds` (how long a request waits, default 300),
 `audit_log`. All keys are in `deploy/config.example.json`.
