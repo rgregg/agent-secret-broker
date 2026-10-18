@@ -272,7 +272,9 @@ class JevAnalyzer:
                 summary, src = deterministic_summary(mode, names, spec), "deterministic"
         self.last_cost = cost
         return {"summary": summary, "risk": level, "cost": cost,
-                "summary_source": src, "summary_reason": reason}
+                "summary_source": src, "summary_reason": reason,
+                "summary_model": (getattr(self._describer, "_model", None)
+                                  if src == "model" else None)}
 
     def _describe(self, mode, names, spec):
         try:
