@@ -36,6 +36,9 @@ Check it:
     asb list [--json]                     # everything available
     asb status [--json]                   # broker version, uptime, catalog health (no approval)
 
+    asb audit [--request ID] [--event E[,E]] [--secret NAME] [--since 15m] [--tail] [--json]
+    asb audit verify                      # is the audit log's hash chain intact?
+
     asb http NAME METHOD URL [-H 'K: V']... [-d BODY | -d @file | -d @-]
         e.g.  asb http grafana GET https://grafana.example.com/api/health \
                   -H 'Authorization: Bearer {{GRAFANA_TOKEN}}'
@@ -50,6 +53,15 @@ Check it:
   version (git sha), uptime, catalog count, invalid and adopted items, and whether
   the vault backend is healthy. It lists no secret names or hosts. Use it to verify a
   deploy ([deploy.md](deploy.md)).
+- `asb audit` is for debugging: what happened to my request? It reads a
+  **redacted** view of the broker's audit log (`GET /v1/audit`, see
+  [reference.md](reference.md#audit-api-for-the-agent)) with the agent's own client key and
+  needs no approval. `asb audit --request ID` (the id is in the broker's reply) prints that
+  request's timeline; `--since 15m`, `--event failed`, `--secret NAME` and `--source S`
+  filter; `--limit N` (default 100, max 500) with `--before SEQ` / `--after SEQ` pages;
+  `--tail` follows new events every 2 seconds until Ctrl-C; `--json` prints the broker's
+  response. It never shows risk verdicts, approval policy or values; full detail stays in
+  the approval site's History page. `asb audit verify` checks the log's hash chain.
 - `{{VAR}}` placeholders (the names `which` and `list` show) are replaced
   **inside the broker** in the URL, headers and body, so the agent never sees the
   value. This is `http` mode and it is the one to prefer.
@@ -69,7 +81,7 @@ Check it:
 | Code | Meaning |
 |---|---|
 | 0 | OK |
-| 1 | Nothing found (`which`, `list`) |
+| 1 | Nothing found (`which`, `list`, `audit`); `audit verify`: the chain is broken |
 | 2 | Usage or configuration error |
 | 3 | Broker unreachable, or it refused the request (`status` too) |
 | 4 | Denied by you or by policy |

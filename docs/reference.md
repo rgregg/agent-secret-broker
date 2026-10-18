@@ -740,6 +740,86 @@ security events `auth_failed`, `rejected`, `approval_viewed`,
 `verify` detects edited or removed records mid-file. Tail truncation is not
 detectable from the file alone: keep the log off the agent's host.
 
+### Audit API for the agent
+
+`GET /v1/audit` and `GET /v1/audit/verify` on the client API, authenticated like the other
+`/v1` endpoints with `X-Client-Key` (no key, a wrong key or the Home Assistant hook key: 401).
+They give the agent a **redacted** read-only view so it can debug its own requests
+(`asb audit`). No approval is needed. The full record stays in the audit file and the SSO
+History page.
+
+Why redacted: what the agent can see must not reveal approval context (which secrets
+auto-approve, risk verdicts and reasons, policy), or the agent could favor credentials that
+skip the prompt. Redaction is a **whitelist**: for each event type only the fields below are
+returned; an unknown event type is returned as `seq`, `ts`, `event`, `request` only, and
+unknown fields are dropped. `startup`, `assessed`, `escalated`, `notified`, `decided`,
+`policy_changed`, `policy_change_refused`, `policy_change_failed`, `policies_viewed` and
+`ha_hook_any_device` are not returned at all (several carry policy; `notified` and `decided`
+exist only when a human was asked, so their absence would mark an auto-approved request).
+A request that policy approved shows `approved` with `channel` and `approver` null, the
+same shape as a human approval. Never returned: risk, model verdict, reasons, summary text,
+`via`, `always_requested`, latency on decisions, the `adopted` and catalog name lists, secret
+values, tokens, nonces, hashes, `prev`, approver IPs.
+
+Parameters (all optional; unknown, repeated or malformed ones are a 400 with a short message):
+
+| Parameter | Meaning |
+|---|---|
+| `request=ID` | one request's timeline (default order `asc`) |
+| `event=A,B` | event types (lowercase names, up to 20) |
+| `secret=NAME` | requests/reads that name this secret |
+| `since=`, `until=` | ISO-8601 (`2026-10-18T01:02:03Z`) or relative `90s`, `15m`, `2h`, `3d` |
+| `source=S` | the client label (`user@host`) that made the request |
+| `limit=N` | 1-500, default 100 |
+| `before=SEQ` / `after=SEQ` | cursors (not both): older than / newer than that seq |
+| `order=asc\|desc` | default `desc`; `asc` with `request=` or `after=` |
+
+Response: `{"events": [{"seq", "ts" (ISO UTC), "event", "request" (id or null), ...fields}],
+"next": seq or null, "truncated": bool, "count": n}`. `next` is the value to pass as `before`
+(order `desc`) or `after` (order `asc`) to continue; null means the scan reached the end.
+`truncated` is true when the response hit its size cap, the scan bound, or the query reached
+the edge of the indexed window.
+
+Limits: 60 requests per minute per client key (bounded limiter map, oldest evicted); response
+body capped at 256 KB; a query examines at most 50,000 lines; the index covers the newest 64 MB
+of the log and the newest 5,000 request ids, kept incrementally (a query seeks, it does not
+rescan the file). Successful queries are not themselves audited.
+
+`GET /v1/audit/verify` walks the whole file once (20 s budget, one at a time) and returns
+only `{"ok": bool, "events": n, "first_bad_seq": n|null}`; `first_bad_seq` is the first
+record that does not chain from its predecessor (an edited record is reported as its
+successor). Tail truncation is still undetectable from the file alone.
+
+Whitelist (output field from the recorded field; every event also has `seq`, `ts`, `event`,
+`request`):
+
+| Event | Fields returned |
+|---|---|
+| `requested` | names, mode, source, peer, method, url, argv, op, field, ssh_kind, fingerprint |
+| `rejected` | names, mode, source, peer, url, reason (already returned to the client) |
+| `approved`, `denied`, `expired` | channel (dashboard, push, ha, link or null), approver (null for policy) |
+| `failed` | error_class (notify_failed, release_failed, timeout, tls, dns, connection, vault, other), channel, approver |
+| `secret_read` | secret, vars (variable names) |
+| `delivered` | kind |
+| `http_executed` | upstream_status, response_bytes, duration_ms |
+| `http_failed` | error_class |
+| `stored` | names, op, field, duration_ms |
+| `ssh_signed` | fingerprint |
+| `decision_refused`, `<channel>_decide_refused` | channel, decision/status, reason class (action_not_offered, guard, device_not_allowed, other) |
+| `approval_viewed` | found |
+| `auth_failed` | peer, method |
+| `bad_request` | peer, error |
+| `discovery` | peer, host, found (names) |
+| `catalog_loaded` | count, invalid_count (not names) |
+| `backend_ready` | duration_ms |
+| `push_subscribed`, `push_revoked`, `push_refused`, `push_test` | device, removed, reason, delivered |
+| `client_event` | kind, v, state, ok, err, note, tag, action, clients, ms, queued, visible, client_paths |
+| `client_event_dropped` | dropped, final |
+| `approval_stale`, `approval_forbidden`, `csrf_refused`, `dashboard_viewed`, `history_viewed`, `ha_decide_dropped`, `catalog_error`, `backend_error` | envelope only |
+
+Residual signals the agent can still infer: a decision with `channel` null is a policy
+approval, and the time between `requested` and `approved` is milliseconds for one.
+
 ## Threat model, honestly
 
 - **Protects against** an agent (or prompt injection steering it) using

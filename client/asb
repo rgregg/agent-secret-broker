@@ -8,6 +8,9 @@
   asb update NAME [--var V]                   < value
   asb which HOST|URL                          is a credential available? (no approval)
   asb status [--json]                         broker version, uptime, catalog health (no approval)
+  asb audit [--request ID] [--event E[,E]] [--secret NAME] [--since 15m] [--tail] [--json]
+                                              what happened to my requests? (redacted; no approval)
+  asb audit verify                            is the broker's audit log intact?
   asb ssh-agent [--socket PATH] [-- command args...]  local ssh-agent; keys stay in the broker
   asb fingerprint HOST[:PORT]                 print a server certificate's sha256 (for tls_fingerprint)
   asb http NAME METHOD URL [-H 'K: V']... [-d BODY | -d @file | -d @-]
@@ -74,8 +77,16 @@ Checking the broker (after a deploy)
   asb status --json    the same for scripts; no secret names or hosts are included
   No approval needed; exit 3 if the broker is unreachable or refuses the key.
 
+Debugging
+  asb audit --request ID      what happened to one request (ID is in the broker's reply)
+  asb audit --since 15m       recent events; filter with --event, --secret, --source
+  asb audit --tail            follow new events (Ctrl-C to stop); --json for scripts
+  Redacted by design: it shows requests, outcomes, who decided and how the call went,
+  but never risk verdicts or reasons, approval policy, or values. No approval needed;
+  exit 1 if nothing matches, 3 if the broker is unreachable or refuses the key.
+
 Exit codes
-  0 ok            1 nothing found (which/list)     2 usage or config error
+  0 ok            1 nothing found (which/list/audit)     2 usage or config error
   3 broker unreachable or refused the request
   4 denied by the human (or the policy)            5 expired or timed out waiting
   22 http: the upstream answered with status >= 400 (body is still printed)
@@ -101,6 +112,21 @@ Show the running broker's build version (git sha), uptime, catalog size
 needed; reads the broker's in-memory state, no secret names or hosts. Exit 3 if
 the broker is unreachable. Use it to verify a deploy.
 example: asb status --json""",
+    "audit": """usage: asb audit [--request ID] [--event E[,E]] [--secret NAME] [--since T]
+                 [--until T] [--source S] [--limit N] [--before SEQ | --after SEQ]
+                 [--json] [--tail]
+       asb audit verify
+
+Read the broker's audit log, redacted: events for your requests (requested,
+approved, denied, expired, failed, secret_read, http_executed, delivered, ...)
+with who decided and how it ended. Never shows risk, approval policy or values.
+No approval needed. T is ISO-8601 (2026-10-18T01:02:03Z) or relative: 90s 15m 2h 3d.
+--request ID shows one request's whole timeline. --limit defaults to 100 (max 500).
+--tail prints recent events then polls every 2s until Ctrl-C. --json prints the
+broker's response. `verify` checks the log's hash chain (exit 1 if it is broken).
+Exit 1 when nothing matches, 2 usage, 3 broker unreachable or refused.
+example: asb audit --request AbC123
+         asb audit --event failed --since 1h""",
     "http": """usage: asb http NAME[,NAME] METHOD URL [-H 'K: V']... [-d BODY | -d @file | -d @-]
 
 The broker makes the HTTP call itself and replaces {{VAR}} in the URL, headers and
@@ -404,6 +430,96 @@ def run_ssh_agent(cmd, socket_path=None):
             os.unlink(path)
 
 
+AUDIT_FLAGS = {"--request": "request", "--event": "event", "--secret": "secret", "--since": "since",
+               "--until": "until", "--source": "source", "--limit": "limit", "--before": "before",
+               "--after": "after"}
+AUDIT_SKIP = ("seq", "ts", "event", "request")
+
+
+def audit_line(ev):
+    """One human line: time, event, short request id, then the event's fields."""
+    parts = []
+    for k, v in ev.items():
+        if k in AUDIT_SKIP or v is None:
+            continue
+        if isinstance(v, list):
+            v = ",".join(str(x) for x in v)
+        elif isinstance(v, bool):
+            v = "yes" if v else "no"
+        parts.append(f"{k}={v}")
+    return f"{ev['ts'][:19]}Z  {ev['event']:<16} {(ev.get('request') or '-')[:8]:<8}  " + " ".join(parts)
+
+
+def audit_get(base, key, path):
+    code, r = call(base, key, path, timeout=30)
+    if code == 400:
+        die(r.get("error", "bad request"), EXIT_USAGE)
+    if code != 200:
+        die(r.get("error", f"broker returned {code}"), EXIT_BROKER)
+    return r
+
+
+def run_audit(argv):
+    if argv[:1] == ["verify"]:
+        if argv[1:]:
+            die(HELP["audit"])
+        base, key = config()
+        r = audit_get(base, key, "/v1/audit/verify")
+        if r["ok"]:
+            print(f"audit log ok: {r['events']} events, hash chain intact")
+            return 0
+        print(f"audit log BROKEN: chain fails at seq {r['first_bad_seq']} "
+              f"({r['events']} events checked)", file=sys.stderr)
+        return EXIT_NOT_FOUND
+    flags, as_json, tail, i = {}, False, False, 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--json":
+            as_json = True
+        elif a == "--tail":
+            tail = True
+        elif a in AUDIT_FLAGS and i + 1 < len(argv):
+            flags[AUDIT_FLAGS[a]] = argv[i + 1]
+            i += 1
+        else:
+            die(f"unexpected argument {a!r}\n" + HELP["audit"])
+        i += 1
+    if tail and ("request" in flags or "before" in flags or "after" in flags):
+        die("--tail follows the whole log; combine it with --event/--secret/--source only")
+    base, key = config()
+    qs = lambda extra: "/v1/audit?" + urllib.parse.urlencode({**flags, **extra})  # noqa: E731
+    if not tail:
+        r = audit_get(base, key, qs({}))
+        if as_json:
+            print(json.dumps(r, indent=2))
+        else:
+            evs = r["events"] if flags.get("request") or "after" in flags else r["events"][::-1]
+            for ev in evs:
+                print(audit_line(ev))
+            if r["truncated"] or r["next"] is not None:
+                arrow = "--after" if "after" in flags or flags.get("request") else "--before"
+                print(f"asb: more events available; continue with {arrow} {r['next']}"
+                      if r["next"] is not None else "asb: older history is not indexed",
+                      file=sys.stderr)
+        return 0 if r["events"] else EXIT_NOT_FOUND
+    flags.setdefault("limit", "20")
+    last = None
+    try:
+        while True:
+            if last is None:
+                r = audit_get(base, key, qs({}))
+                evs = r["events"][::-1]
+            else:
+                r = audit_get(base, key, qs({"after": last, "order": "asc", "limit": "500"}))
+                evs = r["events"]
+            for ev in evs:
+                print(json.dumps(ev) if as_json else audit_line(ev), flush=True)
+                last = ev["seq"]
+            time.sleep(2)
+    except KeyboardInterrupt:
+        return 0
+
+
 def mask(text, values):
     for v in sorted(values, key=len, reverse=True):
         if len(v) >= 6:
@@ -530,6 +646,9 @@ def main(argv):
         print(f"notify:   {', '.join(r['notifiers']) or 'none'}")
         return 0
 
+    if argv[0] == "audit":
+        return run_audit(argv[1:])
+
     if argv[0] == "which":
         if len(argv) != 2:
             die(HELP["which"])
@@ -571,7 +690,7 @@ def main(argv):
         return 0 if r["status"] < 400 else EXIT_HTTP_ERROR
 
     if "--" not in argv:
-        die(f"unknown command {argv[0]!r}.\ncommands: list, which, status, http, store, update, "
+        die(f"unknown command {argv[0]!r}.\ncommands: list, which, status, audit, http, store, update, "
             "ssh-agent, fingerprint, help, guide; or: asb NAME -- command\n"
             "start with `asb guide`")
     i = argv.index("--")

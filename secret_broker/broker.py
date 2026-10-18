@@ -33,6 +33,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .audit import AuditLog
 from .backends import BackendError
+from . import audit_api
 from . import notify as notify_mod
 from .notify import NotifyError
 from . import risk as risk_mod
@@ -1221,10 +1222,12 @@ def _do_http(spec, env, tls=None):
 
 
 # -- HTTP layer -------------------------------------------------------------
-def _json(h, code, obj):
+def _json(h, code, obj, headers=None):
     raw = json.dumps(obj).encode()
     h.send_response(code)
     h.send_header("Content-Type", "application/json")
+    for k, v in (headers or {}).items():
+        h.send_header(k, v)
     h.send_header("Content-Length", str(len(raw)))
     h.end_headers()
     h.wfile.write(raw)
@@ -2081,6 +2084,9 @@ def _detail_html(r, evs):
 
 
 def client_handler(broker, client_key):
+    audit_view = audit_api.AuditApi(broker._audit._path, Broker.rate_map_make_room)
+    key_id = hashlib.sha256(client_key.encode()).hexdigest()[:16]
+
     class H(BaseHTTPRequestHandler):
         def log_message(self, *a):
             pass
@@ -2187,6 +2193,9 @@ def client_handler(broker, client_key):
             u = urllib.parse.urlsplit(self.path)
             if u.path == "/v1/status":
                 return _json(self, 200, broker.status())
+            if u.path in ("/v1/audit", "/v1/audit/verify"):
+                code, body, hdrs = audit_view.handle(u.path, u.query, key_id)
+                return _json(self, code, body, hdrs)
             if u.path == "/v1/secrets":
                 q = urllib.parse.parse_qs(u.query)
                 host = q.get("host", [None])[0]
