@@ -96,7 +96,7 @@ class History:
             row = self._rows[rid] = {
                 "id": rid, "ts": rec["ts"], "time": rec["time"], "names": rec.get("names") or [],
                 "mode": rec.get("mode"), "source": rec.get("source"), "outcome": "pending",
-                "via": None, "approver": None, "risk": None, "summary": None, "error": None,
+                "via": None, "approver": None, "risk": None, "summary": None, "summary_model": None, "error": None,
                 "latency_ms": None, "delivered": False, "escalated": False,
                 "method": rec.get("method"), "url": _short_url(rec.get("url")),
                 "op": rec.get("op"), "item": rec.get("item"), "field": rec.get("field"),
@@ -120,6 +120,8 @@ class History:
             row["risk"] = rec["risk"]
         if rec.get("summary"):
             row["summary"] = rec["summary"]
+            if rec.get("summary_model"):
+                row["summary_model"] = rec["summary_model"]
         if ev == "escalated":
             row["escalated"] = True
         elif ev == "delivered":

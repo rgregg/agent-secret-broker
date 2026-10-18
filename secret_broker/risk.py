@@ -24,28 +24,29 @@ def rank(level):
 
 
 def assess(mode, names, spec, analyzer=None):
-    """Return {"level", "model", "reasons", "summary"}."""
-    summary, model_risk = None, None
+    """Return {"level", "model", "reasons", "summary", "summary_model"}."""
+    summary, model_risk, summary_model = None, None, None
     if analyzer is not None:
         try:
             if hasattr(analyzer, "analyze"):
                 got = analyzer.analyze(mode, names, spec) or {}
                 summary, model_risk = got.get("summary"), got.get("risk")
+                summary_model = got.get("summary_model")
             else:
                 summary = analyzer.summarize(mode, names, spec)
         except Exception:  # noqa: BLE001
-            summary, model_risk = None, None
+            summary, model_risk, summary_model = None, None, None
     if model_risk not in LEVELS:
         model_risk = None
     if mode == "store" and spec.get("op") == "create":
         # adding a credential cannot read or change an existing one, and a human
         # always approves it, so it is low whatever the model thinks
-        return {"level": "low", "model": model_risk, "summary": summary,
+        return {"level": "low", "model": model_risk, "summary": summary, "summary_model": summary_model,
                 "reasons": ["adds a new credential (a human approves every store)"]}
     if model_risk is None:
-        return {"level": "high", "model": None, "summary": summary,
+        return {"level": "high", "model": None, "summary": summary, "summary_model": summary_model, "summary_model": summary_model,
                 "reasons": ["no model verdict; treated as high"]}
-    return {"level": model_risk, "model": model_risk, "summary": summary,
+    return {"level": model_risk, "model": model_risk, "summary": summary, "summary_model": summary_model,
             "reasons": [f"model rated it {model_risk}"]}
 
 

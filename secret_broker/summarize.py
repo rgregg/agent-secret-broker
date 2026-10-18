@@ -62,7 +62,7 @@ class OpenRouterSummarizer:
         self._max, self._send, self._base = max_content_chars, send_content, base_url.rstrip("/")
 
     def analyze(self, mode, names, spec):
-        """Return {"summary": str|None, "risk": "low|medium|high"|None}, or None
+        """Return {"summary": str|None, "risk": "low|medium|high"|None, "summary_model": str}, or None
         on any failure. A non-JSON reply is treated as a bare summary."""
         payload = {
             "model": self._model,
@@ -93,7 +93,8 @@ class OpenRouterSummarizer:
             except (json.JSONDecodeError, AttributeError):
                 pass
         summary = " ".join(summary.split())[:100] or None
-        return {"summary": summary, "risk": risk if risk in ("low", "medium", "high") else None}
+        return {"summary": summary, "risk": risk if risk in ("low", "medium", "high") else None,
+                "summary_model": self._model}
 
     def summarize(self, mode, names, spec):
         got = self.analyze(mode, names, spec)
