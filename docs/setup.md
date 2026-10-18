@@ -137,6 +137,23 @@ Then request it:
 
 Your phone or browser notifies you; approve; the call returns.
 
+### Optional: tie an SSH key to servers
+
+An SSH key (`asb store NAME --ssh`) can say which servers it may log in to. Edit
+the key item's `broker` field in the vault and add
+
+    "ssh_hosts": {"known_hosts": ["web.example.com ssh-ed25519 AAAA..."],
+                  "allowed_hosts": ["web.example.com"]}
+
+`known_hosts` lines (plain format, from `ssh-keyscan` or `~/.ssh/known_hosts`;
+hashed entries are ignored) give host key fingerprints their names on the approval
+card. `allowed_hosts` (names from those lines, or `SHA256:` fingerprints) makes the
+broker refuse any signature that is not proved to be for one of them. The proof is
+OpenSSH's session-bind (client OpenSSH 8.9 or newer; git over ssh uses it too), so
+older clients and commit signing are refused for such a key. Without
+`allowed_hosts` the approval card still shows the verified server when OpenSSH
+sends it. Details and limits: [reference.md](reference.md#ssh-keys-the-broker-signs-the-key-never-leaves).
+
 ## Upgrading
 
     cd /opt/stacks/asb

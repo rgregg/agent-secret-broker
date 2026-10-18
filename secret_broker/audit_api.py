@@ -54,7 +54,9 @@ WHITELIST = {
                   # env mode scripts the client reported: paths, hashes, sizes and marker
                   # classes describe the agent's own request; script text is never logged
                   "script_paths": ("script_paths", _L), "script_sha256": ("script_sha256", _L),
-                  "script_sizes": ("script_sizes", _IL), "script_markers": ("script_markers", _L)},
+                  "script_sizes": ("script_sizes", _IL), "script_markers": ("script_markers", _L),
+                  "host_fp": ("host_fp", _S), "host_name": ("host_name", _S),
+                  "claimed_dest": ("claimed_dest", _S)},
     "rejected": {"names": ("names", _L), "mode": ("mode", _S), "source": ("source", _S),
                  "peer": ("peer", _S), "url": ("url", _S), "reason": ("reason", _S)},
     # Decision outcomes. channel/approver are ALWAYS present (null when there was
@@ -71,7 +73,8 @@ WHITELIST = {
     "http_failed": {"error_class": ("error", _ERR)},
     "stored": {"names": ("names", _L), "op": ("op", _S), "field": ("field", _S),
                "duration_ms": ("duration_ms", _I)},
-    "ssh_signed": {"fingerprint": ("ssh_fingerprint", _S)},
+    "ssh_signed": {"fingerprint": ("ssh_fingerprint", _S), "host_fp": ("host_fp", _S),
+                   "host_name": ("host_name", _S), "claimed_dest": ("claimed_dest", _S)},
     "auth_failed": {"peer": ("peer", _S), "method": ("method", _S)},
     "bad_request": {"peer": ("peer", _S), "error": ("error", _S)},
     "discovery": {"peer": ("peer", _S), "host": ("host", _S), "found": ("found", _L)},
@@ -100,6 +103,8 @@ HIDDEN = frozenset({
     "history_viewed", "request_detail_viewed", "client_event_dropped", "push_subscribed",
     "push_revoked", "push_refused",
     "push_test", "ha_decide_dropped",
+    # server-identity policy (a key's allowed_hosts) is approval context
+    "ssh_sign_refused",
 })
 
 def error_class(text):

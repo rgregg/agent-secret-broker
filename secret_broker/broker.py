@@ -89,6 +89,18 @@ CHANNELS = {
 }
 
 
+class SshRefused(PermissionError):
+    """A sign request refused on server identity; audited as ssh_sign_refused,
+    not as a plain rejection (its reason class is policy context)."""
+
+    def __init__(self, message, reason, **fields):
+        super().__init__(message)
+        self.reason, self.fields = reason, fields
+
+
+_CLAIM_RE = re.compile(r"[A-Za-z0-9@._:\[\]%,()+ -]{1,200}")
+
+
 class Request:
     def __init__(self, mode, names, spec, source, ttl, peer=None):
         self.id = secrets.token_urlsafe(16)
@@ -238,6 +250,11 @@ class Broker:
             ref0 = next(iter(raw_vars.values()))
             if (ref0 if isinstance(ref0, dict) else {}).get("field", "auto") not in ("private_key", "auto"):
                 raise ValueError("an ssh key secret's variable must use the private_key field")
+        ssh_hosts = None
+        if meta.get("ssh_hosts") is not None:
+            if not ssh:
+                raise ValueError("ssh_hosts only applies to an ssh key secret")
+            ssh_hosts = Broker._ssh_hosts(meta["ssh_hosts"])
         vars_ = {}
         for var, ref in raw_vars.items():
             ref = ref if isinstance(ref, dict) else {}
@@ -258,9 +275,41 @@ class Broker:
                  "approval": approval, "_item": item, "_meta": meta,
                  "_tls": {"fingerprint": fp, "verify": verify}}
         entry.pop("guidance", None)
+        entry.pop("ssh_hosts", None)
+        if ssh_hosts and (ssh_hosts["known"] or ssh_hosts["allowed"]):
+            entry["ssh_hosts"] = ssh_hosts      # parsed; never part of discovery/status output
         if note:
             entry["guidance"] = note
         return name, entry
+
+    @staticmethod
+    def _ssh_hosts(raw):
+        """Validate a key's `ssh_hosts` metadata -> {"known": {fp: [names]}, "allowed": [..]|None}."""
+        if not isinstance(raw, dict):
+            raise ValueError("ssh_hosts must be an object")
+        extra = sorted(set(raw) - {"known_hosts", "allowed_hosts"})
+        if extra:
+            raise ValueError(f"ssh_hosts has unknown field {extra[0]!r} (known_hosts, allowed_hosts)")
+
+        def strings(field, max_n, max_len):
+            v = raw.get(field)
+            if v is None:
+                return None
+            if (not isinstance(v, list) or len(v) > max_n
+                    or not all(isinstance(x, str) and 0 < len(x.strip()) <= max_len for x in v)):
+                raise ValueError(f"ssh_hosts.{field} must be a list of up to {max_n} strings "
+                                 f"(each up to {max_len} characters)")
+            return [x.strip() for x in v]
+        known = sshkey.parse_known_hosts(strings("known_hosts", 200, 2048) or [])
+        allowed = strings("allowed_hosts", 50, 255)
+        if allowed is not None:
+            if not allowed:
+                raise ValueError("ssh_hosts.allowed_hosts needs at least one entry "
+                                 "(leave it out to accept any server)")
+            if any(re.search(r"\s", a) for a in allowed):
+                raise ValueError("ssh_hosts.allowed_hosts entries are a host name or a SHA256: fingerprint")
+            allowed = [a.rstrip("=") if a.startswith("SHA256:") else a.lower() for a in allowed]
+        return {"known": known, "allowed": allowed}
 
     @staticmethod
     def _auto_meta(item, info):
@@ -430,13 +479,22 @@ class Broker:
         elif req.mode == "ssh_sign":
             sp = req.spec
             rec.update(ssh_kind=sp["ssh"]["kind"], ssh_what=sp["ssh"]["text"],
-                       ssh_fingerprint=sp.get("fingerprint"), sign_bytes=sp.get("data_bytes"))
+                       ssh_fingerprint=sp.get("fingerprint"), sign_bytes=sp.get("data_bytes"),
+                       **self._host_audit(sp.get("host")))
         else:
             rec["argv"] = (req.spec.get("argv") or [])[:50]
             if req.spec.get("scripts"):
                 # paths, hashes, sizes and marker classes only; never any script text
                 rec.update(scripts_mod.audit_fields(req.spec["scripts"]))
         self._audit.log(event, **rec)
+
+    @staticmethod
+    def _host_audit(host):
+        if not host:
+            return {}
+        return {"host_bound": bool(host.get("bound")), "host_fp": host.get("fp"),
+                "host_type": host.get("type"), "host_name": ", ".join(host.get("names") or []) or None,
+                "claimed_dest": host.get("claimed"), "forwarding": bool(host.get("forwarding"))}
 
     # -- policy -----------------------------------------------------------
     @staticmethod
@@ -612,6 +670,9 @@ class Broker:
                             raise ValueError(f"{seen[var]} and {n} both define {var}; request them separately")
                 if mode == "http":
                     self._validate_http(names, spec)
+        except SshRefused as e:
+            self.log("ssh_sign_refused", reason=e.reason, names=names, source=source, peer=peer, **e.fields)
+            raise
         except (ValueError, PermissionError) as e:
             self.log("rejected", reason=str(e), names=names, mode=mode, source=source, peer=peer,
                      url=spec.get("url") if isinstance(spec, dict) and mode == "http" else None)
@@ -759,8 +820,54 @@ class Broker:
         sc = self.cfg["secrets"][names[0]]
         spec["data"], spec["flags"] = data, flags
         spec["data_bytes"] = len(data)
-        spec["ssh"] = sshkey.describe_data(data)
         spec["fingerprint"] = sshkey.fingerprint(sshkey.blob_from_line(sc["ssh_public_key"]))
+        spec["host"] = host = self._ssh_host(data, spec.get("binds"), spec.get("claimed_dest"), sc)
+        spec["ssh"] = sshkey.describe_data(data, host_known=bool(host and host["bound"]))
+        spec.pop("binds", None)
+
+    @staticmethod
+    def _ssh_host(data, binds, claimed, sc):
+        """Server identity for a login signature: the verified bound host key (if
+        any), the client's claimed destination, and the key's allowed_hosts policy.
+        Returns the host dict (None for non-login data); raises SshRefused."""
+        claimed = claimed if isinstance(claimed, str) and _CLAIM_RE.fullmatch(claimed) else None
+        policy = sc.get("ssh_hosts") or {}
+        allowed = policy.get("allowed")
+        sid = sshkey.userauth_session_id(data)
+        if sid is None:
+            # commit signing and other non-login data carry no server to verify
+            if allowed:
+                raise SshRefused("this key may only sign logins to approved servers", "host_unverified",
+                                 claimed_dest=claimed)
+            return None
+        valid = []
+        for b in (binds if isinstance(binds, list) else [])[:sshkey.MAX_BINDS]:
+            try:
+                hk, bsid, sig = (base64.b64decode(b[k], validate=True)
+                                 for k in ("hostkey_b64", "session_id_b64", "sig_b64"))
+                fp, ktype = sshkey.verify_bind(hk, bsid, sig)
+            except (sshkey.SshKeyError, KeyError, TypeError, ValueError, binascii.Error):
+                continue                    # a bind that does not verify is as good as none
+            valid.append((bsid, fp, ktype, b.get("forwarding") is True))
+        host = {"bound": False, "claimed": claimed}
+        if valid:
+            match = next((v for v in valid if v[0] == sid), None)
+            if match is None:
+                raise SshRefused("the server identity bound to this connection is for a different "
+                                 "ssh session than the one being signed", "session_mismatch",
+                                 claimed_dest=claimed, host_fp=valid[0][1])
+            _, fp, ktype, fwd = match
+            host.update(bound=True, fp=fp, type=ktype, forwarding=fwd,
+                        names=(policy.get("known") or {}).get(fp, []))
+        if allowed:
+            if not host["bound"]:
+                raise SshRefused("this key may only sign logins to approved servers, and this "
+                                 "connection did not prove which server it is (OpenSSH 8.9+ does)",
+                                 "host_unverified", claimed_dest=claimed)
+            if host["fp"] not in allowed and not any(n in allowed for n in host["names"]):
+                raise SshRefused("this key is not approved for that server", "host_not_allowed",
+                                 claimed_dest=claimed, host_fp=host["fp"], host_type=host["type"])
+        return host
 
     def _validate_http(self, names, spec):
         u = urllib.parse.urlsplit(spec["url"])
@@ -795,7 +902,8 @@ class Broker:
                     f"{' key ' + sp['key'] if sp.get('key') else ''} "
                     f"({sp['value_bytes']} bytes, value not shown)")
         elif req.mode == "ssh_sign":
-            what = f"SSH key {req.spec['fingerprint']}: {req.spec['ssh']['text']}"
+            what = "\n".join([f"SSH key {req.spec['fingerprint']}: {req.spec['ssh']['text']}"]
+                             + sshkey.host_lines(req.spec.get("host")))
         else:
             what = "run: " + " ".join(req.spec.get("argv") or [])[:200]
         head = f"{req.summary} (unverified)\n" if req.summary else ""
@@ -2140,8 +2248,9 @@ def _describe(req):
                 "An update replaces the current value; the old one is kept in the item's "
                 "previous_value field. This will not run without your approval.")
     if req.mode == "ssh_sign":
+        host = "".join("<br>" + html.escape(x) for x in sshkey.host_lines(req.spec.get("host")))
         return (f"SSH signature with key <code>{html.escape(req.spec['fingerprint'])}</code><br>"
-                f"{html.escape(req.spec['ssh']['text'])}",
+                f"{html.escape(req.spec['ssh']['text'])}{host}",
                 "The private key stays in the broker; only the signature goes back. "
                 "Advisory: the request text is what the client sent.")
     return ("run <code>" + html.escape(" ".join(req.spec.get("argv") or [])) + "</code>"
@@ -2317,6 +2426,14 @@ def _detail_html(r, evs):
     else:
         add("Signing", r.get("ssh_what"))
         add("Key fingerprint", (first("ssh_signed") or {}).get("ssh_fingerprint"))
+        ev = first("requested") or {}
+        if "host_bound" in ev:
+            for line in sshkey.host_lines({
+                    "bound": ev.get("host_bound"), "fp": ev.get("host_fp"), "type": ev.get("host_type"),
+                    "names": [n for n in str(ev.get("host_name") or "").split(", ") if n],
+                    "claimed": ev.get("claimed_dest"), "forwarding": ev.get("forwarding")}):
+                k, _, v = line.partition(": ")
+                add(k if _ else "Server", v if _ else line)
     add("Source (claimed by the client)", r["source"])
     add("Peer", r["peer"])
     if r["summary"]:
@@ -2472,7 +2589,8 @@ def client_handler(broker, client_key):
                             "var": body.get("var"), "allowed_hosts": body.get("allowed_hosts"),
                             "ssh": body.get("ssh") is True}
                 elif mode == "ssh_sign":
-                    spec = {"data_b64": body.get("data_b64"), "flags": body.get("flags", 0)}
+                    spec = {"data_b64": body.get("data_b64"), "flags": body.get("flags", 0),
+                            "binds": body.get("binds"), "claimed_dest": body.get("claimed_dest")}
                 else:
                     raise ValueError("bad mode")
                 if mode != "env" and body.get("scripts") is not None:

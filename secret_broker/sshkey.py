@@ -125,12 +125,14 @@ def _shown(raw, limit=48):
     return repr(text[:limit] + ("..." if len(text) > limit else ""))
 
 
-def describe_data(data):
+def describe_data(data, host_known=False):
     """What is being signed, as far as it can be told, for the approval prompt.
 
     Returns {"kind", "text"}. The data is client-supplied, so this is what the
     bytes *say*, not a promise about the connection they belong to: an ssh
-    userauth blob carries the account name but not the host being logged in to.
+    userauth blob carries the account name but not the host being logged in to
+    (see verify_bind for the part that can be proved). `host_known` drops the
+    "host not shown" caveat when the caller shows a verified server instead.
     """
     if data.startswith(b"SSHSIG"):
         try:
@@ -147,7 +149,121 @@ def describe_data(data):
             if method == b"publickey":
                 return {"kind": "userauth",
                         "text": f"log in over SSH as {user} (service {service}, "
-                                "both client-supplied); host not shown by SSH"}
+                                "both client-supplied)" + ("" if host_known else "; host not shown by SSH")}
     except (IndexError, struct.error):
         pass
     return {"kind": "unknown", "text": f"sign {len(data)} unrecognised bytes"}
+
+
+# -- server identity ---------------------------------------------------------
+BIND_EXT = b"session-bind@openssh.com"
+MAX_BINDS = 16                  # per agent connection
+_HOSTKEY_TYPES = ("ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384",
+                  "ecdsa-sha2-nistp521", "ssh-rsa")
+_RSA_SIG = {b"rsa-sha2-256": hashes.SHA256(), b"rsa-sha2-512": hashes.SHA512(), b"ssh-rsa": hashes.SHA1()}
+
+
+def _blob_type(blob):
+    try:
+        return _Reader(blob).string().decode("ascii")
+    except (IndexError, struct.error, UnicodeDecodeError):
+        return ""
+
+
+def userauth_session_id(data):
+    """The session id a userauth signature covers, or None if `data` is not one."""
+    try:
+        r = _Reader(data)
+        sid = r.string()
+        if r.byte() == 50 and 16 <= len(sid) <= 64:
+            return sid
+    except (IndexError, struct.error):
+        pass
+    return None
+
+
+def verify_bind(hostkey, session_id, sig):
+    """Check an OpenSSH session-bind: `sig` is the server host key's signature
+    over the session identifier. Returns (fingerprint, key type); raises
+    SshKeyError. A valid bind proves the peer ssh talked to holds that host key;
+    it says nothing about whether that is the host the user meant."""
+    ktype = _blob_type(hostkey)
+    if ktype not in _HOSTKEY_TYPES or not 16 <= len(session_id) <= 64:
+        raise SshKeyError("unsupported host key or session id")
+    try:
+        pub = serialization.load_ssh_public_key(ktype.encode() + b" " + base64.b64encode(hostkey))
+        r = _Reader(sig)
+        algo, raw = r.string(), r.string()
+        if r.i != len(sig):
+            raise SshKeyError("trailing bytes in signature")
+        if isinstance(pub, ed25519.Ed25519PublicKey):
+            if algo != b"ssh-ed25519":
+                raise SshKeyError("signature algorithm does not match the host key")
+            pub.verify(raw, session_id)
+        elif isinstance(pub, rsa.RSAPublicKey):
+            if algo not in _RSA_SIG:
+                raise SshKeyError("signature algorithm does not match the host key")
+            pub.verify(raw, session_id, padding.PKCS1v15(), _RSA_SIG[algo])
+        elif isinstance(pub, ec.EllipticCurvePublicKey):
+            if algo != ktype.encode():
+                raise SshKeyError("signature algorithm does not match the host key")
+            from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
+            ir = _Reader(raw)
+            rr, ss = ir.string(), ir.string()
+            h = {"nistp256": hashes.SHA256(), "nistp384": hashes.SHA384(),
+                 "nistp521": hashes.SHA512()}[ktype.rsplit("-", 1)[1]]
+            pub.verify(encode_dss_signature(int.from_bytes(rr, "big"), int.from_bytes(ss, "big")),
+                       session_id, ec.ECDSA(h))
+        else:
+            raise SshKeyError("unsupported host key")
+    except SshKeyError:
+        raise
+    except Exception:  # noqa: BLE001 -- bad signature, bad key bytes, short reads
+        raise SshKeyError("host key signature does not verify") from None
+    return fingerprint(hostkey), ktype
+
+
+def parse_known_hosts(lines):
+    """Plain known_hosts lines -> {fingerprint: [names]}. Hashed (|1|...) names,
+    wildcard/negated patterns, @markers and unparseable lines are ignored."""
+    out = {}
+    for line in lines:
+        f = str(line).split()
+        if len(f) < 3 or f[0].startswith(("#", "@", "|")) or f[1] not in _HOSTKEY_TYPES:
+            continue
+        try:
+            blob = base64.b64decode(f[2], validate=True)
+        except ValueError:
+            continue
+        if _blob_type(blob) != f[1]:
+            continue
+        for n in f[0].split(","):
+            n = n.strip().lower()
+            if n.startswith("[") and "]:" in n:             # [host]:port
+                host, _, port = n[1:].partition("]:")
+                n = host if port == "22" else f"{host}:{port}"
+            if n and not n.startswith(("|", "!")) and not any(c in n for c in "*?"):
+                names = out.setdefault(fingerprint(blob), [])
+                if n not in names and len(names) < 20:
+                    names.append(n)
+    return out
+
+
+def host_lines(host):
+    """Plain-text lines describing the server side of an ssh_sign request (the
+    caller escapes them). `host` is the request's spec["host"] dict or None."""
+    if not host:
+        return []
+    out = []
+    if host.get("bound"):
+        line = f"Server: {host['fp']} ({host['type']})"
+        if host.get("names"):
+            line += " - known as " + ", ".join(host["names"])
+        out.append(line)
+    else:
+        out.append("Server identity not verified")
+    if host.get("claimed"):
+        out.append(f"Destination (claimed by the client): {host['claimed']}")
+    if host.get("forwarding"):
+        out.append("Agent forwarding: this key may be used from the remote host")
+    return out

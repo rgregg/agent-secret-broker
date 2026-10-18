@@ -49,6 +49,10 @@ def assess(mode, names, spec, analyzer=None, guidance=None):
         # always approves it, so it is low whatever the model thinks
         return {"level": "low", "model": model_risk, **out,
                 "reasons": ["adds a new credential (a human approves every store)"]}
+    if mode == "ssh_sign":
+        # a signature authenticates as the user to a server: high whatever the model says
+        return {"level": "high", "model": model_risk, "summary": summary, "summary_model": summary_model,
+                "reasons": ["an SSH signature authenticates as you; always high"]}
     if model_risk is None:
         return {"level": "high", "model": None, **out,
                 "reasons": ["no model verdict; treated as high"]}

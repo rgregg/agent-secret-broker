@@ -53,6 +53,12 @@ Check it:
   version (git sha), uptime, catalog count, invalid and adopted items, and whether
   the vault backend is healthy. It lists no secret names or hosts. Use it to verify a
   deploy ([deploy.md](deploy.md)).
+- `asb ssh-agent -- ssh|scp|sftp|rsync|git ...` also reads the destination from the
+  wrapped command line and sends it as an unverified "claimed destination" with
+  each signature request (nothing is sent if it cannot be told; `eval "$(asb
+  ssh-agent)"` has no command, so no claim). The agent also accepts OpenSSH's
+  `session-bind@openssh.com` so the broker can verify the server's host key
+  (OpenSSH 8.9+). See [reference.md](reference.md#ssh-keys-the-broker-signs-the-key-never-leaves).
 - `asb audit` is for debugging: what happened to my request? It reads a
   **redacted** view of the broker's audit log (`GET /v1/audit`, see
   [reference.md](reference.md#audit-api-for-the-agent)) with the agent's own client key and

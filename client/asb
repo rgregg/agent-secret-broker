@@ -24,6 +24,7 @@ asb guide           the manual for agents: workflow, placeholders, approvals, ex
 """
 import base64
 import hashlib
+import shlex
 import json
 import os
 import re
@@ -170,7 +171,10 @@ find it through SSH_AUTH_SOCK offer the broker's SSH keys and ask the broker to
 sign; each signature waits for the human's approval and the private key never
 reaches this machine. With a command, the agent runs just for that command and
 exits with its code. Without one it prints `SSH_AUTH_SOCK=...; export ...` and
-keeps serving (use: eval "$(asb ssh-agent)").
+keeps serving (use: eval "$(asb ssh-agent)"). With a command, the destination it
+names (ssh, scp, sftp, rsync -e ssh, git remotes) is sent to the broker as an
+unverified claim; a bare agent has no command, so no claim. OpenSSH 8.9+ also
+proves the server's host key to the broker (session-bind).
 --socket PATH listens at that fixed path instead of a temp one, for a long-lived
 agent (a systemd user service) that ~/.ssh/config points at with IdentityAgent.
 It replaces a stale socket, refuses to start over a live one, and removes the
@@ -300,6 +304,236 @@ def parse_flags(argv, allowed):
 # -- ssh-agent protocol (draft-miller-ssh-agent) ------------------------------
 AGENT_FAILURE, AGENTC_REQUEST_IDENTITIES, AGENT_IDENTITIES_ANSWER = 5, 11, 12
 AGENTC_SIGN_REQUEST, AGENT_SIGN_RESPONSE = 13, 14
+AGENT_SUCCESS, AGENTC_EXTENSION = 6, 27
+BIND_EXT = b"session-bind@openssh.com"
+MAX_BINDS = 16              # per agent connection
+
+
+def _strings(b, n):
+    """n length-prefixed strings from the front of b, then whatever is left."""
+    out = []
+    for _ in range(n):
+        ln = int.from_bytes(b[:4], "big")
+        if len(b) < 4 + ln:
+            raise ValueError("short string")
+        out.append(b[4:4 + ln])
+        b = b[4 + ln:]
+    return out, b
+
+
+# -- claimed destination: what the wrapped command line says it connects to ----
+# Unverified by construction (ssh_config can rename hosts, a script can do
+# anything); the broker shows it as "claimed by the client".
+_SSH_VAL = set("BbcDEeFIiJLlmOopQRSWw")             # ssh options that take an argument
+_SCP_VAL = set("cDFiJloPS")
+_SFTP_VAL = set("BbcDFiJloPRSs")
+_HOST_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]*$|^[0-9A-Fa-f:.]*:[0-9A-Fa-f:.]*$")
+_USER_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]*$")
+
+
+def _walk(args, val_opts):
+    """Split ssh-style args into ([(opt char, value)], operands). Stops at the
+    first operand when val_opts is for ssh (the rest is the remote command)."""
+    opts, ops, i = [], [], 0
+    while i < len(args):
+        a = args[i]
+        i += 1
+        if a == "--":
+            ops += args[i:]
+            break
+        if a.startswith("-") and len(a) > 1:
+            j = 1
+            while j < len(a):
+                c = a[j]
+                if c in val_opts:
+                    v = a[j + 1:] or (args[i] if i < len(args) else "")
+                    if not a[j + 1:]:
+                        i += 1
+                    opts.append((c, v))
+                    break
+                j += 1
+            continue
+        ops.append(a)
+    return opts, ops
+
+
+def _o_pairs(opts):
+    """-o Key=Value / -o 'Key Value' -> {lower key: value} (first wins, like ssh)."""
+    out = {}
+    for c, v in opts:
+        if c == "o":
+            k, _, val = v.replace("=", " ", 1).partition(" ")
+            out.setdefault(k.strip().lower(), val.strip())
+    return out
+
+
+def _fmt(user, host, port, jump=None):
+    if not host or not _HOST_RE.match(host) or (user and not _USER_RE.match(user)):
+        return None
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        return None
+    if not 0 < port < 65536:
+        return None
+    h = f"[{host}]" if ":" in host else host
+    out = (f"{user}@" if user else "") + f"{h}:{port}"
+    if jump:
+        out += f" (via {jump})"
+    return out[:200]
+
+
+def _split_target(t):
+    """[user@]host | ssh://[user@]host[:port][/..] -> (user, host, port|None)."""
+    user = port = None
+    url = t.startswith(("ssh://", "scp://", "sftp://"))
+    if url:
+        t = t.split("://", 1)[1].split("/", 1)[0]
+    if "@" in t:
+        user, _, t = t.rpartition("@")
+    if t.startswith("["):
+        host, _, rest = t[1:].partition("]")
+        if rest.startswith(":") and rest[1:]:
+            port = rest[1:]
+    elif url and t.count(":") == 1:
+        host, _, port = t.partition(":")
+    else:
+        host = t
+    return user or None, host, port
+
+
+def _jump_note(jump):
+    hops = [h for h in (jump or "").split(",") if h]
+    if not hops or not all(re.fullmatch(r"[A-Za-z0-9@._:\[\]%-]+", h) for h in hops):
+        return None
+    return hops[0] + (f"+{len(hops) - 1}" if len(hops) > 1 else "")
+
+
+def _build(user, host, port, opts, jump_opt=None):
+    o = _o_pairs(opts)
+    host = o.get("hostname") or host
+    user = user or o.get("user")
+    port = port or o.get("port") or "22"
+    return _fmt(user, host, port, _jump_note(jump_opt or o.get("proxyjump")))
+
+
+def _first(opts):
+    d = {}
+    for c, v in opts:
+        d.setdefault(c, v)
+    return d
+
+
+def _ssh_claim(args):
+    """ssh [options] [user@]host [command]: the first operand is the destination."""
+    opts, i = [], 0
+    while i < len(args):
+        a = args[i]
+        i += 1
+        if a == "--":
+            break
+        if not (a.startswith("-") and len(a) > 1):
+            i -= 1
+            break
+        for j in range(1, len(a)):
+            if a[j] in _SSH_VAL:
+                if a[j + 1:]:
+                    opts.append((a[j], a[j + 1:]))
+                elif i < len(args):
+                    opts.append((a[j], args[i]))
+                    i += 1
+                break
+    if i >= len(args):
+        return None
+    user, host, port = _split_target(args[i])
+    d = _first(opts)
+    return _build(user or d.get("l"), host, port or d.get("p"), opts, d.get("J"))
+
+
+def _rsync_args(args):
+    """-> (remote shell command string, operands) for an rsync command line."""
+    rsh, ops, i = "ssh", [], 0
+    while i < len(args):
+        a = args[i]
+        i += 1
+        if a.startswith("--rsh="):
+            rsh = a[6:]
+        elif a == "--rsh" and i < len(args):
+            rsh, i = args[i], i + 1
+        elif a.startswith("-") and not a.startswith("--") and a.endswith("e") and i < len(args):
+            rsh, i = args[i], i + 1                 # -e CMD, or a cluster ending in e (-ae CMD)
+        elif not a.startswith("-"):
+            ops.append(a)
+    return rsh, ops
+
+
+def _remote_operand(a):
+    """`[user@]host:path` / `scp://...` operand of scp, sftp or rsync -> (user, host, port) or None."""
+    if a.startswith(("scp://", "sftp://", "ssh://")):
+        t = _split_target(a)
+        return t if t[1] else None
+    if a.startswith(("rsync://", "-", "/", ".", "~")):
+        return None
+    head = a.split("/", 1)[0]
+    if "@" in head:
+        user, _, rest = a.partition("@")
+    else:
+        user, rest = None, a
+    if rest.startswith("["):
+        host, _, after = rest[1:].partition("]")
+        return (user, host, None) if after.startswith(":") else None
+    if "::" in rest.split("/", 1)[0]:
+        return None                         # host::module is an rsync daemon, not ssh
+    host, sep, _path = rest.partition(":")
+    return (user, host, None) if sep and "/" not in host else None
+
+
+def claimed_destination(argv):
+    """The `user@host:port` the command line says it will connect to, or None
+    when that cannot be told confidently. Never runs anything."""
+    try:
+        if not argv:
+            return None
+        prog, args = os.path.basename(argv[0]), list(argv[1:])
+        if prog == "ssh":
+            return _ssh_claim(args)
+        if prog in ("scp", "sftp", "rsync"):
+            val = _SCP_VAL if prog == "scp" else _SFTP_VAL if prog == "sftp" else set()
+            if prog == "rsync":
+                rsh, ops = _rsync_args(args)
+                words = shlex.split(rsh)
+                if not words or os.path.basename(words[0]) != "ssh":
+                    return None
+                sopts = _walk(words[1:], _SSH_VAL)[0]
+            else:
+                opts, ops = _walk(args, val)
+                sopts = [("p" if c == "P" else c, v) for c, v in opts]
+            if prog == "sftp":
+                ops = ops[:1]
+                targets = {_remote_operand(ops[0]) or _split_target(ops[0])} if ops else set()
+            else:
+                targets = {t for t in map(_remote_operand, ops) if t}
+            if len(targets) != 1:
+                return None             # nothing remote, or several different hosts
+            (user, host, port), = targets
+            d = _first(sopts)
+            return _build(user or d.get("l"), host, port or d.get("p"), sopts, d.get("J"))
+        if prog == "git":
+            cands = set()
+            for a in args:
+                if a.startswith("ssh://"):
+                    cands.add(_split_target(a))
+                elif "@" in a.split(":", 1)[0] and not a.startswith(("-", "/", ".")):
+                    t = _remote_operand(a)      # git@host:org/repo (user@ required: refspecs have colons)
+                    if t:
+                        cands.add(t)
+            if len(cands) != 1:
+                return None
+            (user, host, port), = cands
+            return _fmt(user, host, port or "22")
+    except (ValueError, IndexError):
+        return None
+    return None
 
 
 def _s(b):
@@ -337,11 +571,28 @@ def _ssh_identities():
     return out
 
 
-def agent_reply(msg):
-    """Answer one ssh-agent request. Anything unsupported is a plain failure."""
+def agent_reply(msg, conn=None):
+    """Answer one ssh-agent request. Anything unsupported is a plain failure.
+
+    `conn` is the per-connection state of a served agent ({"binds": [...],
+    "claim": str|None}); without it session binding cannot be remembered, so
+    that extension is refused like any other."""
     fail = bytes([AGENT_FAILURE])
     try:
         kind, body = msg[0], msg[1:]
+        if kind == AGENTC_EXTENSION:
+            (name,), rest = _strings(body, 1)
+            if name != BIND_EXT or conn is None or len(conn["binds"]) >= MAX_BINDS:
+                return fail                 # OpenSSH carries on without the extension
+            (hostkey, sid, sig), rest = _strings(rest, 3)
+            if len(rest) != 1 or rest[0] > 1:
+                return fail
+            # The broker verifies the signature; the agent only remembers the bind.
+            conn["binds"].append({"hostkey_b64": base64.b64encode(hostkey).decode(),
+                                  "session_id_b64": base64.b64encode(sid).decode(),
+                                  "sig_b64": base64.b64encode(sig).decode(),
+                                  "forwarding": rest[0] == 1})
+            return bytes([AGENT_SUCCESS])
         if kind == AGENTC_REQUEST_IDENTITIES:
             ids = _ssh_identities()
             return (bytes([AGENT_IDENTITIES_ANSWER]) + len(ids).to_bytes(4, "big")
@@ -354,8 +605,13 @@ def agent_reply(msg):
             name = next((nm for nm, b in _ssh_identities() if b == blob), None)
             if name is None:
                 return fail
-            r = obtain({"mode": "ssh_sign", "names": [name], "flags": flags,
-                        "data_b64": base64.b64encode(data).decode()})
+            req = {"mode": "ssh_sign", "names": [name], "flags": flags,
+                   "data_b64": base64.b64encode(data).decode()}
+            if conn and conn["binds"]:
+                req["binds"] = conn["binds"]
+            if conn and conn.get("claim"):
+                req["claimed_dest"] = conn["claim"]
+            r = obtain(req)
             return bytes([AGENT_SIGN_RESPONSE]) + _s(base64.b64decode(r["ssh_signature"]))
     except SystemExit:          # obtain() reported a denial/timeout on stderr
         return fail
@@ -364,16 +620,17 @@ def agent_reply(msg):
     return fail
 
 
-def serve_agent(path):
+def serve_agent(path, claim=None):
     import socketserver
 
     class Handler(socketserver.BaseRequestHandler):
         def handle(self):
+            conn = {"binds": [], "claim": claim}
             while True:
                 msg = _read_msg(self.request)
                 if msg is None:
                     return
-                self.request.sendall(_s(agent_reply(msg)))
+                self.request.sendall(_s(agent_reply(msg, conn)))
 
     class Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
         daemon_threads = True
@@ -414,7 +671,7 @@ def run_ssh_agent(cmd, socket_path=None):
         path = os.path.join(d, "agent.sock")
     old_umask = os.umask(0o177)
     try:
-        srv = serve_agent(path)
+        srv = serve_agent(path, claimed_destination(cmd) if cmd else None)
     finally:
         os.umask(old_umask)
     os.chmod(path, 0o600)

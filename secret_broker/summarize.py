@@ -16,6 +16,7 @@ import urllib.request
 
 from . import guidance as guidance_mod
 from . import scripts as scripts_mod
+from . import sshkey
 
 SYSTEM = (
     "You label API requests for a human approver. Reply with ONLY a JSON "
@@ -52,6 +53,8 @@ def describe(mode, names, spec, max_content_chars=300, send_content=True):
         lines.append(f"value: <{len(spec.get('value') or '')} chars, not shown>")
     elif mode == "ssh_sign":
         lines.append(f"operation: sign with an SSH key ({spec['ssh']['text']})")
+        for line in sshkey.host_lines(spec.get("host")):
+            lines.append(line[0].lower() + line[1:])
     else:
         cmd = " ".join(spec.get("argv") or [])
         lines.append("command: " + (cmd[:max_content_chars] if send_content else "<not shown>"))

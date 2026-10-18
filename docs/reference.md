@@ -87,13 +87,67 @@ socket, and every signature ssh asks for becomes a broker request (mode
   `ssh-keygen -p -N '' -f COPY` before storing it, then delete the on-disk key.
 - An update must carry the same key (same public key); a different key is a new
   credential.
-- **What the prompt can and cannot tell you.** SSH signs a login with the account
-  name and a session id but not the host. The prompt says what the bytes say
-  ("log in over SSH as 'deploy'", or "sign a message, namespace 'git'" for commit
-  signing) and names the key, but the host a client connects to is not
-  something the broker can see or enforce, unlike `http` mode's `allowed_hosts`.
-  The grants are therefore per key and per use: keep a key's server-side
-  `authorized_keys` access as narrow as you would for a deploy key.
+- **What the prompt tells you about the server.** An SSH login signature carries
+  the account name and a session id but not the host, so the broker gets host
+  identity from two layers, shown on the approval card, in the notification and in
+  the history pop-over:
+  - *Server (verified).* OpenSSH 8.9+ sends `session-bind@openssh.com` to the
+    agent before authenticating: the server's host key and that host key's
+    signature over the session id. `asb ssh-agent` accepts it (it replies
+    `SSH_AGENT_SUCCESS`; any other extension, or a malformed bind, gets
+    `SSH_AGENT_FAILURE`, which OpenSSH treats as "agent does not support it") and
+    remembers it per agent connection (up to 16, including the forwarding flag).
+    The broker checks the signature (ed25519, ECDSA P-256/384/521, RSA with
+    SHA-2 or legacy SHA-1 host keys), and that the session id inside the userauth
+    data being signed is the bound one. The card then reads `Server: SHA256:...
+    (ssh-ed25519)`, plus `known as host1, host2` when the key's `ssh_hosts`
+    `known_hosts` lists that fingerprint. A bind whose signature does not verify
+    is dropped and the request is shown as unverified; a valid bind for a
+    *different* session (a replay from another connection) is refused outright
+    (`ssh_sign_refused`, reason `session_mismatch`). git over ssh binds too.
+    Agent forwarding (`is_forwarding`) adds "Agent forwarding: this key may be
+    used from the remote host".
+  - *Destination (claimed).* With `asb ssh-agent -- <command>` the client reads the
+    destination from the command line (`ssh [-l/-p/-J/-o HostName=...] [user@]host`,
+    scp/sftp `user@host:path` and `-P`, `rsync -e 'ssh -p N'`, git `ssh://` and
+    `user@host:path` remotes; remote-only arguments, never a subprocess) and sends
+    `user@host:port` with each sign request. If it cannot tell confidently
+    (no remote operand, two different hosts, `git push` with a configured remote,
+    anything odd) it sends nothing. The card says "Destination (claimed by the
+    client)": ssh_config can rename hosts and any script can lie, so treat it as a
+    hint. A bare `eval "$(asb ssh-agent)"` has no command, so there is no claim.
+    With `-J`, the claim is the final host (`(via jump)` is appended) and the
+    jump hop's own login shows that same claim; the verified Server line tells
+    the two apart.
+  - Not verified (old OpenSSH, a non-ssh client, a failed bind): the card says
+    "Server identity not verified". Commit signing (SSHSIG) has no server.
+  - The key is still never released and signing stays rated HIGH whatever the
+    model says; the deterministic summary input includes the server and
+    destination lines.
+- **Restricting a key to servers: `ssh_hosts`.** Add an optional object to the key
+  item's `broker` metadata (the vault item is the only place; there is no
+  separate catalog):
+
+      {"ssh": true, "ssh_public_key": "ssh-ed25519 AAAA...",
+       "vars": {"DEPLOY_SSH_KEY": {"field": "private_key"}},
+       "ssh_hosts": {
+         "known_hosts": ["web.example.com,10.0.0.5 ssh-ed25519 AAAA..."],
+         "allowed_hosts": ["web.example.com", "SHA256:abc..."]}}
+
+  `known_hosts` (up to 200 plain known_hosts lines, 2 KB each) maps host key
+  fingerprints to names for display; copy lines from `~/.ssh/known_hosts`
+  (`ssh-keyscan -t ed25519 web.example.com` works). Hashed entries (`|1|...`),
+  wildcards, `!negations` and `@markers` are ignored, bad lines too; `[h]:2222`
+  names appear as `h:2222`. `allowed_hosts` (up to 50) is a list of names from
+  `known_hosts` or `SHA256:` fingerprints. When it is set, a signature is refused
+  (HTTP 403, audit `ssh_sign_refused` with reason `host_not_allowed`,
+  `host_unverified` or `session_mismatch`) unless a verified bind proves the
+  server is on the list, so an unbound request (old OpenSSH, failed verification,
+  commit signing) is refused: it fails closed. When it is not set, requests
+  proceed as before with whatever identity information exists. An empty list is a
+  config error (name the field), not "allow everything". Neither `ssh_hosts` nor
+  its contents appear in `list`, `which`, `status`, or the agent's audit view;
+  the refusal message does not say what is allowed.
 - `approval: allow` only auto-approves signing if `auto_modes` includes
   `ssh_sign`; "always allow" is never offered for it.
 
@@ -917,6 +971,8 @@ decision. Hidden on purpose:
   `approval_viewed`, `request_detail_viewed`, `approval_stale`, `approval_forbidden`,
   `csrf_refused`, `dashboard_viewed`, `history_viewed`, `push_subscribed`, `push_revoked`,
   `push_refused`, `push_test`, `ha_decide_dropped`.
+- Server-identity policy: `ssh_sign_refused` (a key's `ssh_hosts.allowed_hosts` is approval
+  policy; the refusal itself is already returned to the client without the allowed list).
 - Browser telemetry: every `client_event` (page loads, visibility, service-worker delivery
   diagnostics) and `client_event_dropped`. Even the delivery diagnostics only occur when a
   human was notified or acted, and the rest shows whether a page is open. The full
@@ -963,7 +1019,7 @@ Whitelist (output field from the recorded field; every event also has `seq`, `ts
 
 | Event | Fields returned |
 |---|---|
-| `requested` | names, mode, source, peer, method, url, argv, op, field, ssh_kind, fingerprint, script_paths, script_sha256, script_sizes, script_markers (env scripts: never any text) |
+| `requested` | names, mode, source, peer, method, url, argv, op, field, ssh_kind, fingerprint, script_paths, script_sha256, script_sizes, script_markers (env scripts: never any text), host_fp, host_name, claimed_dest |
 | `rejected` | names, mode, source, peer, url, reason (already returned to the client) |
 | `approved`, `denied`, `expired` | channel (dashboard, push, ha, link or null), approver (null for policy) |
 | `failed` | error_class (release_failed, timeout, tls, dns, connection, vault, other), channel, approver |
@@ -972,7 +1028,7 @@ Whitelist (output field from the recorded field; every event also has `seq`, `ts
 | `http_executed` | upstream_status, response_bytes, duration_ms |
 | `http_failed` | error_class |
 | `stored` | names, op, field, duration_ms |
-| `ssh_signed` | fingerprint |
+| `ssh_signed` | fingerprint, host_fp, host_name, claimed_dest |
 | `auth_failed` | peer, method |
 | `bad_request` | peer, error (the message the broker already returned to the agent) |
 | `discovery` | peer, host, found (names) |
