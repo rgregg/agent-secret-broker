@@ -375,27 +375,89 @@ class ActionPolicyAtDecision(Hook):
         self.assertEqual(self.broker.decide_via("push", rid, "approve", "u", token=n.action_token)[0], 403)
 
 
+def ipn(i):
+    return f"10.{i // 65536}.{(i // 256) % 256}.{i % 256}"
+
+
 class RateMapBound(Hook):
-    def test_ha_rate_map_capped_and_legit_ip_limited(self):
+    def test_valid_key_map_capped_evicts_oldest_serves_newest(self):
         b, cap = self.broker, self.broker.RATE_MAP_CAP
         self.assertEqual(cap, 4096)
         for i in range(10000):
-            b.ha_rate_ok(f"10.{i // 65536}.{(i // 256) % 256}.{i % 256}")
+            self.assertTrue(b.ha_rate_ok(ipn(i)), i)            # never refused for being full
             self.assertLessEqual(len(b._ha_rate), cap)
+            b._ha_rate[ipn(i)]["t"] += i * 1e-6                 # strictly increasing window starts
         self.assertEqual(len(b._ha_rate), cap)
-        self.assertFalse(b.ha_rate_ok("192.0.2.1"))             # full of live entries: refused
-        for st in b._ha_rate.values():                          # expire them: new IPs fit again
-            st["t"] -= 120
-        self.assertTrue(b.ha_rate_ok("192.0.2.1"))
-        self.assertLessEqual(len(b._ha_rate), cap)
+        self.assertIn(ipn(9999), b._ha_rate)                    # newest served and tracked
+        self.assertNotIn(ipn(0), b._ha_rate)                    # oldest evicted
+        self.assertIn(ipn(10000 - cap), b._ha_rate)
+        self.assertNotIn(ipn(10000 - cap - 1), b._ha_rate)
         res = [b.ha_rate_ok("192.0.2.2") for _ in range(65)]
         self.assertEqual((res[:60].count(True), res[60:].count(True)), (60, 0))
+        self.assertLessEqual(len(b._ha_rate), cap)
 
-    def test_rate_map_full_helper_prunes_expired_only(self):
+    def test_window_expiry_still_works(self):
+        b = self.broker
+        for _ in range(60):
+            self.assertTrue(b.ha_rate_ok("192.0.2.9"))
+        self.assertFalse(b.ha_rate_ok("192.0.2.9"))
+        b._ha_rate["192.0.2.9"]["t"] -= 120
+        self.assertTrue(b.ha_rate_ok("192.0.2.9"))
+
+    def test_make_room_prunes_expired_before_evicting(self):
         now = time.time()
-        m = {i: {"t": now - (120 if i % 2 else 0)} for i in range(self.broker.RATE_MAP_CAP)}
-        self.assertFalse(self.broker.rate_map_full(m, now))
-        self.assertEqual(len(m), self.broker.RATE_MAP_CAP // 2)
+        cap = self.broker.RATE_MAP_CAP
+        m = {i: {"t": now - (120 if i % 2 else 0)} for i in range(cap)}
+        self.broker.rate_map_make_room(m, now)
+        self.assertEqual(len(m), cap // 2)
+        m = {i: {"t": now - i * 0.001} for i in range(cap)}      # all live: evict oldest only
+        self.broker.rate_map_make_room(m, now)
+        self.assertEqual(len(m), cap - 1)
+        self.assertNotIn(cap - 1, m)
+
+    def test_bad_key_flood_creates_no_state_and_cannot_lock_out_ha(self):
+        b = self.broker
+        for i in range(10000):
+            b.ha_unauth_ok(ipn(i))
+        self.assertEqual(len(b._ha_rate), 0)
+        # shared bucket exhausted (429 for bad key), yet the keyed caller is served
+        self.assertFalse(b.ha_unauth_ok("203.0.113.5"))
+        self.assertEqual(len(b._ha_rate), 0)
+        res = [b.ha_rate_ok("198.51.100.7") for _ in range(65)]
+        self.assertEqual((res[:60].count(True), res[60:].count(True)), (60, 0))
+
+    def test_bad_key_http_flood_shared_bucket_429_and_valid_key_still_ok(self):
+        b, lim = self.broker, self.broker.HA_UNAUTH_LIMIT_PER_MIN
+        self.assertEqual(lim, 120)
+        codes = [self.hook({"rid": "r"}, key="w" * 40)[0] for _ in range(lim + 5)]
+        self.assertEqual(codes[:lim].count(403), lim)
+        self.assertEqual(set(codes[lim:]), {429})
+        self.assertEqual(len(b._ha_rate), 0)                    # no per-IP state for bad keys
+        self.assertEqual(len(self.events("ha_decide_dropped")), 1)
+        code, _ = self.hook({"rid": "r", "token": "t", "decision": "deny", "device": "phone-1"})
+        self.assertEqual(code, 404)                             # valid key passes the limiter
+        self.assertEqual(len(b._ha_rate), 1)
+        self.assertEqual(self.hook({"rid": "r"}, key=None)[0], 429)   # missing key: same bucket
+        b._ha_unauth["t"] -= 120                                # window expiry resets the bucket
+        self.assertEqual(self.hook({"rid": "r"}, key="w" * 40)[0], 403)
+
+    def test_ha_http_valid_key_limited_per_ip(self):
+        b = self.broker
+        for i in range(500):
+            b.ha_unauth_ok(ipn(i))
+        codes = [self.hook({"rid": "r", "token": "t", "decision": "deny", "device": "phone-1"})[0]
+                 for _ in range(62)]
+        self.assertEqual((codes[:60].count(404), set(codes[60:])), (60, {429}))
+
+    def test_push_event_map_bounded_serves_new_users(self):
+        m, cap, now = {}, Broker.RATE_MAP_CAP, time.time()
+        for i in range(10000):
+            Broker.rate_map_make_room(m, now)
+            m[f"u{i}"] = {"t": now + i * 1e-6, "n": 0, "drop": 0}
+            self.assertLessEqual(len(m), cap)
+        self.assertEqual(len(m), cap)
+        self.assertIn("u9999", m)
+        self.assertNotIn("u0", m)
 
 
 class HookEmptyDevices(Hook):

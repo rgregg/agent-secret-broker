@@ -124,6 +124,7 @@ class Broker:
         self.ha_hook = notify_mod.parse_ha_hook(
             config.get("ha_hook"), lambda p: open(p).read().strip())
         self._ha_rate = {}              # source ip -> {"t", "n", "drop"}; <= RATE_MAP_CAP
+        self._ha_unauth = {"t": 0.0, "n": 0, "drop": 0}   # shared bad-key bucket
         self._ha_rate_lock = threading.Lock()
         if self.ha_hook is not None and not self.ha_hook["allowed_devices"]:
             self.log("ha_hook_any_device", warning="ha_hook.allowed_devices is empty: "
@@ -770,25 +771,29 @@ class Broker:
     HA_LIMIT_PER_MIN = 60
     RATE_MAP_CAP = 4096     # hard bound on every per-IP / per-user limiter map
 
+    HA_UNAUTH_LIMIT_PER_MIN = 120   # ONE shared bucket for all missing/wrong-key hook requests
+
     @staticmethod
-    def rate_map_full(m, now, window=60):
-        """Prune expired entries from limiter map `m`; True if it is still at
-        RATE_MAP_CAP (the caller then treats a NEW key as rate-limited rather
-        than growing the map). Call with the map's lock held."""
+    def rate_map_make_room(m, now, window=60):
+        """Make room for one NEW key in limiter map `m` without ever refusing
+        it: when at RATE_MAP_CAP, prune expired entries, and if still full
+        evict the entry with the oldest window start. Call with the map's lock
+        held."""
         if len(m) >= Broker.RATE_MAP_CAP:
             for k in [k for k, v in m.items() if now - v["t"] >= window]:
                 del m[k]
-        return len(m) >= Broker.RATE_MAP_CAP
+            while len(m) >= Broker.RATE_MAP_CAP:
+                del m[min(m, key=lambda k: m[k]["t"])]
 
     def ha_rate_ok(self, ip):
-        """Fixed-window limit on the Home Assistant hook, per source IP. The
-        first drop in a window is audited."""
+        """Fixed-window limit on the Home Assistant hook, per source IP. Only
+        called for requests that presented the correct hook key. The first drop
+        in a window is audited."""
         now = time.time()
         with self._ha_rate_lock:
             st = self._ha_rate.get(ip)
             if st is None:
-                if self.rate_map_full(self._ha_rate, now):
-                    return False        # map full of live entries: refuse, do not grow
+                self.rate_map_make_room(self._ha_rate, now)
                 st = self._ha_rate[ip] = {"t": now, "n": 0, "drop": 0}
             if now - st["t"] >= 60:
                 st.update(t=now, n=0, drop=0)
@@ -799,6 +804,26 @@ class Broker:
             first = st["drop"] == 1
         if first:
             self.log("ha_decide_dropped", peer=ip, limit_per_min=self.HA_LIMIT_PER_MIN)
+        return False
+
+    def ha_unauth_ok(self, ip):
+        """Shared fixed-window limit for hook requests with a missing/wrong key.
+        Creates no per-source state, so bad-key traffic cannot fill or churn the
+        per-IP map or starve the authenticated caller. First drop per window is
+        audited."""
+        now = time.time()
+        with self._ha_rate_lock:
+            st = self._ha_unauth
+            if now - st["t"] >= 60:
+                st.update(t=now, n=0, drop=0)
+            st["n"] += 1
+            if st["n"] <= self.HA_UNAUTH_LIMIT_PER_MIN:
+                return True
+            st["drop"] += 1
+            first = st["drop"] == 1
+        if first:
+            self.log("ha_decide_dropped", peer=ip, limit_per_min=self.HA_UNAUTH_LIMIT_PER_MIN,
+                     unauthenticated=True)
         return False
 
     def csrf_token(self, user):
@@ -1814,16 +1839,18 @@ def client_handler(broker, client_key):
             peer = self.client_address[0]
             if hook is None:
                 return _json(self, 404, {"error": "not found"})
-            if not broker.ha_rate_ok(peer):
-                self.close_connection = True
-                return _json(self, 429, {"ok": False})
             auth = self.headers.get("Authorization", "")
             presented = auth[7:] if auth[:7].lower() == "bearer " else ""
             if not (presented and secrets.compare_digest(presented.encode(), hook["key"].encode())):
+                self.close_connection = True
+                if not broker.ha_unauth_ok(peer):       # shared bucket, no per-IP state
+                    return _json(self, 429, {"ok": False})
                 broker.log("auth_failed", peer=peer, method=self.command,
                            path="/v1/hooks/ha/decide")
-                self.close_connection = True
                 return _json(self, 403, {"ok": False})
+            if not broker.ha_rate_ok(peer):
+                self.close_connection = True
+                return _json(self, 429, {"ok": False})
             try:
                 n = int(self.headers.get("Content-Length", 0))
             except ValueError:
@@ -2345,10 +2372,8 @@ def approval_handler(broker):
             with _CE_LOCK:
                 st = self._ce_state.get(user)
                 if st is None:
-                    if Broker.rate_map_full(self._ce_state, now):
-                        st = {"t": now, "n": _CE_LIMIT + 1, "drop": 2}   # full: drop, untracked
-                    else:
-                        st = self._ce_state[user] = {"t": now, "n": 0, "drop": 0}
+                    Broker.rate_map_make_room(self._ce_state, now)   # full: evict oldest
+                    st = self._ce_state[user] = {"t": now, "n": 0, "drop": 0}
                 if now - st["t"] >= 60:
                     prev = st["drop"]
                     st.update(t=now, n=0, drop=0)

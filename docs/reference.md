@@ -245,9 +245,13 @@ token), and the token is not spent. Dashboard and approval-link decisions are
 unaffected.
 
 Per-source rate-limit maps (the HA hook per IP, `/push/event` per user) are
-capped at 4096 entries. When the cap is reached, expired entries are pruned; if
-it is still full a new key is treated as rate-limited (429 / dropped) instead of
-growing the map.
+capped at 4096 entries and never refuse a legitimate new caller for being full:
+at the cap, expired entries are pruned and, if still full, the entry with the
+oldest window start is evicted. The HA hook checks the hook key first (constant
+time): a correct key gets the per-IP limit (60/min); a missing or wrong key gets
+403 and is limited by ONE shared bucket (120/min across all sources, 429 when
+exhausted, one `ha_decide_dropped` audit line per window) that creates no per-IP
+state, so bad-key floods cannot lock out Home Assistant.
 
 ### Decision channels
 
