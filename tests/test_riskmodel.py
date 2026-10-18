@@ -68,7 +68,8 @@ class Jev(unittest.TestCase):
 
     def test_summary_is_deterministic_and_marked(self):
         with mock.patch.object(riskmodel, "_post_json", lambda *a: answer("low")):
-            got = self.make().analyze("http", ["x"], dict(HTTP))
+            got = riskmodel.JevAnalyzer("KEY-123", summary_mode="deterministic").analyze("http", ["x"], dict(HTTP))
+        self.assertEqual(got["summary_source"], "deterministic")
         self.assertTrue(got["summary"].startswith("auto: DELETE target.invalid/v1/x"))
         self.assertNotIn(SECRET, got["summary"])
 
@@ -80,14 +81,6 @@ class Jev(unittest.TestCase):
             self.assertIsNone(a["model"])
         with mock.patch.object(riskmodel, "_post_json", lambda *a: {"answers": {"risk": {"choice": "banana"}}}):
             self.assertEqual(risk.assess("http", ["x"], dict(HTTP), self.make())["level"], "high")
-
-    def test_chat_summary_option(self):
-        chat = summarize.FakeSummarizer("Deletes a thing")
-        chat.summarize = lambda m, n, s: "Deletes a thing"
-        with mock.patch.object(riskmodel, "_post_json", lambda *a: answer("low")):
-            got = riskmodel.JevAnalyzer("k", summary_mode="chat", summarizer=chat).analyze("http", ["x"], dict(HTTP))
-        self.assertEqual(got["summary"], "Deletes a thing")
-        self.assertEqual(got["risk"], "low")
 
 
 class Floor(unittest.TestCase):
@@ -145,6 +138,11 @@ class Config(unittest.TestCase):
         a = riskmodel.build({"type": "jev", "api_key_file": "/k"}, self.read)
         self.assertIsInstance(a.inner, riskmodel.JevAnalyzer)
         self.assertEqual(a.inner._model, "typesafe/jev-1.14")
+        self.assertEqual(a.inner._summary_mode, "chat")           # default
+        self.assertEqual(a.inner._describer._model, "openai/gpt-5-mini")
+        for mode in ("deterministic", "none"):
+            b = riskmodel.build({"type": "jev", "api_key_file": "/k", "summary_text": mode}, self.read)
+            self.assertIsNone(b.inner._describer)
 
     def test_validation_names_field(self):
         cases = {
@@ -154,7 +152,10 @@ class Config(unittest.TestCase):
             "summary.timeout": {"type": "jev", "api_key_file": "/k", "timeout": -1},
             "summary.high_threshold": {"type": "jev", "api_key_file": "/k", "high_threshold": 3},
             "summary.summary_text": {"type": "jev", "api_key_file": "/k", "summary_text": "x"},
-            "summary.summary_model": {"type": "jev", "api_key_file": "/k", "summary_text": "chat"},
+            "summary.summary_model": {"type": "jev", "api_key_file": "/k", "summary_model": ""},
+            "summary.summary_timeout": {"type": "jev", "api_key_file": "/k", "summary_timeout": 0},
+            "summary.summary_max_per_minute": {"type": "jev", "api_key_file": "/k", "summary_max_per_minute": 0},
+            "summary.summary_concurrency": {"type": "jev", "api_key_file": "/k", "summary_concurrency": "x"},
             "summary.prompt": {"model": "m", "api_key_file": "/k", "prompt": "x"},
             "summary.bogus": {"type": "jev", "api_key_file": "/k", "bogus": 1},
         }

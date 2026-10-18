@@ -155,7 +155,8 @@ def deterministic_summary(mode, names, spec):
             s = f["operation"]
         else:
             s = "run " + f["command"]
-        return ("auto: " + " ".join(s.split()))[:100]
+        s = "".join(c if 32 <= ord(c) < 127 else "?" for c in " ".join(s.split()))   # display-safe
+        return ("auto: " + s)[:100]
     except Exception:  # noqa: BLE001
         return None
 
@@ -210,12 +211,12 @@ class JevAnalyzer:
 
     def __init__(self, api_key, model=DEFAULT_JEV_MODEL, timeout=6.0, base_url=DEFAULT_JEV_BASE,
                  max_content_chars=400, send_content=True, high_threshold=0.5, low_threshold=0.5,
-                 summary_mode="deterministic", summarizer=None):
+                 summary_mode="chat", describer=None):
         self._key, self._model, self._timeout = api_key, model, timeout
         self._base = base_url.rstrip("/")
         self._max, self._send = max_content_chars, send_content
         self._hi, self._lo = high_threshold, low_threshold
-        self._summary_mode, self._chat = summary_mode, summarizer
+        self._summary_mode, self._describer = summary_mode, describer
         self.last_cost = None
 
     def payload(self, mode, names, spec):
@@ -252,19 +253,31 @@ class JevAnalyzer:
             return None, cost
 
     def analyze(self, mode, names, spec):
-        if self._summary_mode == "chat" and self._chat is not None:
+        """The level comes from classify() alone. The description (display only)
+        is produced independently and can never change it."""
+        src = reason = None
+        if self._summary_mode == "chat" and self._describer is not None:
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-                fut = ex.submit(self._chat.summarize, mode, names, spec)
+                fut = ex.submit(self._describe, mode, names, spec)
                 level, cost = self.classify(mode, names, spec)
-                try:
-                    summary = fut.result(timeout=self._timeout + 1)
-                except Exception:  # noqa: BLE001
-                    summary = None
+                d = fut.result()
+            summary, src, reason = d["text"], d["source"], d["reason"]
         else:
             level, cost = self.classify(mode, names, spec)
-            summary = deterministic_summary(mode, names, spec) if self._summary_mode != "none" else None
+            if self._summary_mode == "none":
+                summary = None
+            else:
+                summary, src = deterministic_summary(mode, names, spec), "deterministic"
         self.last_cost = cost
-        return {"summary": summary, "risk": level, "cost": cost}
+        return {"summary": summary, "risk": level, "cost": cost,
+                "summary_source": src, "summary_reason": reason}
+
+    def _describe(self, mode, names, spec):
+        try:
+            return self._describer.describe(mode, names, spec)
+        except Exception:  # noqa: BLE001
+            return {"text": deterministic_summary(mode, names, spec), "source": "deterministic",
+                    "reason": "error"}
 
     def summarize(self, mode, names, spec):
         return self.analyze(mode, names, spec)["summary"]
@@ -325,7 +338,7 @@ class FloorAnalyzer:
     def analyze(self, mode, names, spec):
         if mode == "ssh_sign":
             return {"summary": deterministic_summary(mode, names, spec), "risk": "high",
-                    "cost": None}
+                    "cost": None, "summary_source": "deterministic", "summary_reason": None}
         return self.inner.analyze(mode, names, spec)
 
     def summarize(self, mode, names, spec):
@@ -339,7 +352,8 @@ _KEYS = {
     "openrouter": {"type", "api_key_file", "model", "timeout", "max_content_chars", "send_content",
                    "prompt", "base_url"},
     "jev": {"type", "api_key_file", "model", "timeout", "max_content_chars", "send_content",
-            "base_url", "high_threshold", "low_threshold", "summary_text", "summary_model"},
+            "base_url", "high_threshold", "low_threshold", "summary_text", "summary_model",
+            "summary_timeout", "summary_max_per_minute", "summary_concurrency"},
 }
 
 
@@ -376,11 +390,17 @@ def validate_config(sc):
             v = sc.get(k, 0.5)
             if isinstance(v, bool) or not isinstance(v, (int, float)) or not 0 < v <= 1:
                 raise ValueError(f"summary.{k} must be a number in (0, 1]")
-        if sc.get("summary_text", "deterministic") not in ("deterministic", "chat", "none"):
-            raise ValueError("summary.summary_text must be 'deterministic', 'chat' or 'none'")
-        if sc.get("summary_text") == "chat" and not (isinstance(sc.get("summary_model"), str)
-                                                       and sc["summary_model"]):
-            raise ValueError("summary.summary_model is required when summary.summary_text is 'chat'")
+        if sc.get("summary_text", "chat") not in ("chat", "deterministic", "none"):
+            raise ValueError("summary.summary_text must be 'chat', 'deterministic' or 'none'")
+        if "summary_model" in sc and not (isinstance(sc["summary_model"], str) and sc["summary_model"]):
+            raise ValueError("summary.summary_model must be a non-empty string")
+        t = sc.get("summary_timeout", 4.0)
+        if isinstance(t, bool) or not isinstance(t, (int, float)) or not 0 < t <= 60:
+            raise ValueError("summary.summary_timeout must be a number of seconds, 0 < t <= 60")
+        for k, hi in (("summary_max_per_minute", 6000), ("summary_concurrency", 64)):
+            v = sc.get(k, 1)
+            if isinstance(v, bool) or not isinstance(v, int) or not 1 <= v <= hi:
+                raise ValueError(f"summary.{k} must be an integer 1-{hi}")
     return typ
 
 
@@ -398,14 +418,16 @@ def build(sc, read):
         if sc.get("prompt", "legacy") == "legacy":
             return FloorAnalyzer(summarize.OpenRouterSummarizer(key, sc["model"], **kw))
         return FloorAnalyzer(ChatAnalyzer(key, sc["model"], prompt="rubric", **kw))
-    chat = None
-    if sc.get("summary_text") == "chat":
-        chat = summarize.OpenRouterSummarizer(key, sc["summary_model"], timeout=sc.get("timeout", 6.0),
-                                              max_content_chars=sc.get("max_content_chars", 300),
-                                              send_content=sc.get("send_content", True))
+    describer = None
+    if sc.get("summary_text", "chat") == "chat":
+        from .description import Describer
+        describer = Describer(
+            key, sc.get("summary_model", "openai/gpt-5-mini"), timeout=sc.get("summary_timeout", 4.0),
+            max_content_chars=sc.get("max_content_chars", 400), send_content=sc.get("send_content", True),
+            max_per_minute=sc.get("summary_max_per_minute", 30), concurrency=sc.get("summary_concurrency", 4))
     return FloorAnalyzer(JevAnalyzer(
         key, sc.get("model", DEFAULT_JEV_MODEL), timeout=sc.get("timeout", 6.0),
         base_url=sc.get("base_url", DEFAULT_JEV_BASE),
         max_content_chars=sc.get("max_content_chars", 400), send_content=sc.get("send_content", True),
         high_threshold=sc.get("high_threshold", 0.5), low_threshold=sc.get("low_threshold", 0.5),
-        summary_mode=sc.get("summary_text", "deterministic"), summarizer=chat))
+        summary_mode=sc.get("summary_text", "chat"), describer=describer))
