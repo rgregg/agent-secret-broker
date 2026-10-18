@@ -13,7 +13,7 @@ import threading
 
 from .backends import BwBackend, BwServeBackend, FileBackend
 from .broker import Broker, serve
-from . import notify, risk
+from . import grants, notify, risk
 from .summarize import OpenRouterSummarizer
 
 
@@ -47,6 +47,7 @@ def main():
     if not cfg:
         ap.error("no settings: set BROKER_CONFIG or pass --config")
     risk.parse_auto_approve_max(cfg.get("risk"), "risk")    # fail at startup, naming the field
+    grants.parse_config(cfg.get("timed_grants"))            # fail at startup, naming the field
     backend = build_backend(cfg)
     notify.parse_action_policy(cfg.get("notify_actions"), "notify_actions")   # fail at startup
     if cfg.get("webpush") is not None:
