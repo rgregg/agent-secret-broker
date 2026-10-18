@@ -28,9 +28,9 @@ sensitivity of the service.
 - `jev`: `typesafe/jev-1.14` through OpenRouter's Decisions API
   (`POST https://openrouter.ai/api/alpha/decisions`, alpha). One `choice`
   question with criteria `low`/`medium`/`high`; the answer carries per-option
-  probabilities. It cannot write text, so the summary is built
-  deterministically from the request fields ("auto: DELETE host/path") unless
-  `summary_text` is `chat`.
+  probabilities. It cannot write text, so the description comes from a
+  separate chat model (below), or from the deterministic technical line
+  ("auto: DELETE host/path") when that is disabled or fails.
 
 The request is described to the model as a data object (mode, secret names,
 method, host, path, header NAMES, body or command excerpt). Query strings,
@@ -38,6 +38,48 @@ header values, credential values and key material are never sent. The
 description is client-supplied and untrusted: the rubric tells the model to
 treat any instruction in it as data and to rate attempts to influence the
 rating one level higher.
+
+## The AI description (display only)
+
+With `summary_text: chat` (the jev default) a chat model (`summary_model`,
+default `openai/gpt-5-mini`) writes a short plain-language phrase, for example
+"Deleting a virtual machine in Proxmox", in parallel with the decision call. It
+is display only: the risk level, approval, grants and `allow` policy never read
+it (a test asserts the verdict is identical whatever the description says).
+The approver still sees the raw method and URL or command beside it, and the
+UI label should read "AI description (unverified, written from agent-supplied
+text)".
+
+Safety measures:
+
+- Input is the minimal structured request (mode, secret names, method, host,
+  path without query string, header names, a body or command excerpt of
+  `max_content_chars`), inside a data block with a random per-call boundary.
+  Never secret values, header values, query strings or key material.
+- The prompt asks for one 3-12 word action phrase in plain language and
+  forbids opinions and approvals; a request that speaks to the reviewer is
+  described as "Request contains text addressed to the reviewer".
+- Every reply is sanitized in code (`description.sanitize`): single line, ASCII
+  only (control, bidi and zero-width characters are rejected), no markdown,
+  HTML, URLs, emails, code, paths, hostnames, IPs, status codes, HTTP verbs or
+  API jargon, no shouted tokens, no quote of the prompt, no safety or approval
+  language (`FORBIDDEN_PHRASES`), capped at 160 characters.
+- Consistency (best effort): for a mutating request (POST/PUT/PATCH/DELETE other
+  than a POST that is clearly a query, a write-looking command, a store request
+  or ssh signing) the description must contain a write-class verb
+  (`WRITE_VERBS`) and no minimizing language (`MINIMIZING`: nothing, without, no
+  change, only, just, merely, read-only, does not ...). Read requests are not
+  checked.
+- Any rejection, timeout, error or rate cap replaces the description with the
+  deterministic `auto:` line. The audit `assessed` event records
+  `summary_source` (`model` or `deterministic`) and `summary_reason`
+  (`rejected`, `timeout`, `error`, `rate_limited`), never the rejected text.
+- Bounds: `summary_timeout` (4 s), `summary_concurrency` (4),
+  `summary_max_per_minute` (30), responses capped at 16 KB. The key is never
+  logged.
+- Endpoint: descriptions go to `summary_base_url` (default OpenRouter). If
+  `base_url` is custom and `summary_base_url` is not set, descriptions are
+  disabled (startup warning) instead of using the default endpoint.
 
 ## Deterministic rules
 
@@ -51,6 +93,7 @@ rating one level higher.
 
     asb openrouter -- python tools/risk_eval/run.py --provider jev
     asb openrouter -- python tools/risk_eval/run.py --provider chat --prompt legacy
+    asb openrouter -- python tools/risk_eval/run.py --descriptions   # description pipeline
     python tools/risk_eval/run.py --dry-run          # no network
 
 `tools/risk_eval/cases.jsonl` holds labelled cases (one JSON object per line:
@@ -67,5 +110,8 @@ read from `OPENROUTER_TOKEN` and never printed.
 The rubric, examples and criteria are the `RUBRIC` and `CRITERIA` constants in
 `secret_broker/riskmodel.py`. Edit, re-run the harness on both splits, and check
 the under-flag rate before the over-flag rate. Keep few-shot examples distinct
-from the eval cases so the eval stays honest. Add real misclassifications from
+from the eval cases so the eval stays honest. `tools/risk_eval/inject_cases.jsonl` holds adversarial requests for the
+description pipeline (`--descriptions` reports raw-model obedience before the
+sanitizer, obedience after it, rejection rate, plain-language pass rate, word
+counts, latency and cost). Add real misclassifications from
 the audit log (`assessed` events) to `cases.jsonl` as new cases.

@@ -144,6 +144,45 @@ class Config(unittest.TestCase):
             b = riskmodel.build({"type": "jev", "api_key_file": "/k", "summary_text": mode}, self.read)
             self.assertIsNone(b.inner._describer)
 
+    def test_summary_base_url_rules(self):
+        from secret_broker import description
+        calls = []
+        with mock.patch.object(description, "_post_json", lambda *a: calls.append(a)), \
+                mock.patch.object(riskmodel, "_post_json", lambda *a: calls.append(a)):
+            # default: describer talks to OpenRouter
+            a = riskmodel.build({"type": "jev", "api_key_file": "/k"}, self.read)
+            self.assertEqual(a.inner._describer._base, "https://openrouter.ai/api/v1")
+            self.assertEqual(a.config_warnings, [])
+            # custom base_url without summary_base_url: no describer, deterministic, warned, no network
+            b = riskmodel.build({"type": "jev", "api_key_file": "/k", "base_url": "https://gw.example.com/api"},
+                                self.read)
+            self.assertIsNone(b.inner._describer)
+            self.assertEqual(b.inner._summary_mode, "deterministic")
+            self.assertIn("summary_base_url", b.config_warnings[0])
+            self.assertEqual(calls, [])
+            # both set: used
+            c = riskmodel.build({"type": "jev", "api_key_file": "/k", "base_url": "https://gw.example.com/api",
+                                 "summary_base_url": "https://chat.example.com/v1"}, self.read)
+            self.assertEqual(c.inner._describer._base, "https://chat.example.com/v1")
+            self.assertEqual(c.config_warnings, [])
+            # explicit default base_url is not custom
+            d = riskmodel.build({"type": "jev", "api_key_file": "/k", "base_url": "https://openrouter.ai/api/"},
+                                self.read)
+            self.assertIsNotNone(d.inner._describer)
+            # deterministic/none never need it
+            e = riskmodel.build({"type": "jev", "api_key_file": "/k", "base_url": "https://gw.example.com/api",
+                                 "summary_text": "none"}, self.read)
+            self.assertEqual(e.config_warnings, [])
+
+    def test_url_validation(self):
+        for k, v in (("base_url", "http://evil.example.com"), ("summary_base_url", "ftp://x"),
+                     ("summary_base_url", "https://"), ("base_url", "https://h/?a=1")):
+            with self.assertRaises(ValueError) as cm:
+                riskmodel.build({"type": "jev", "api_key_file": "/k", k: v}, self.read)
+            self.assertIn(f"summary.{k}", str(cm.exception))
+        riskmodel.build({"type": "jev", "api_key_file": "/k", "base_url": "http://localhost:9/api",
+                         "summary_base_url": "http://127.0.0.1:9/v1"}, self.read)
+
     def test_validation_names_field(self):
         cases = {
             "summary.type": {"type": "gemini", "api_key_file": "/k"},

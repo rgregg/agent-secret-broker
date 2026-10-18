@@ -90,6 +90,52 @@ class PlainLanguage(unittest.TestCase):
         self.assertEqual(D.sanitize("Unclear what this request does")[1], None)
 
 
+class MutatingStrictness(unittest.TestCase):
+    CASES = [
+        ("Only checking the server", "http", {"method": "DELETE", "url": "https://h/x"}),
+        ("Retrieving a list", "http", {"method": "POST", "url": "https://h/api/delete"}),
+        ("Nothing is changed", "http", {"method": "PUT", "url": "https://h/x"}),
+        ("Without modifying anything, updating a record", "http", {"method": "PATCH", "url": "https://h/x"}),
+        ("Deleting a record, just a read-only look", "http", {"method": "DELETE", "url": "https://h/x"}),
+        ("Updating a thing, no impact", "http", {"method": "PUT", "url": "https://h/x"}),
+        ("Deleting a thing that does not matter", "http", {"method": "DELETE", "url": "https://h/x"}),
+        ("Merely updating a record", "http", {"method": "PATCH", "url": "https://h/x"}),
+        ("Viewing settings", "http", {"method": "DELETE", "url": "https://h/x"}),
+        ("Listing files", "env", {"argv": ["rm", "-rf", "/srv"]}),
+        ("Reading a credential", "store", {"op": "update"}),
+        ("Checking a server", "ssh_sign", {"ssh": {}}),
+        ("Retrieving a list", "http", {"method": "POST", "url": "https://h/x", "body": '{"query":"drop table x"}'}),
+    ]
+    GOOD = [
+        ("Deleting a virtual machine in Proxmox", "http", {"method": "DELETE", "url": "https://h/x"}),
+        ("Rotating a secret", "http", {"method": "POST", "url": "https://h/x/rotate"}),
+        ("Turning off a light", "http", {"method": "POST", "url": "https://h/api/services/light/turn_off"}),
+        ("Logging in to a server over SSH", "ssh_sign", {"ssh": {}}),
+        ("Signing a code commit with an SSH key", "ssh_sign", {"ssh": {}}),
+        ("Updating a saved credential", "store", {"op": "update"}),
+        ("Deploying a new release", "http", {"method": "POST", "url": "https://h/deploy"}),
+        ("Running a backup script", "env", {"argv": ["sh", "-c", "backup.sh > out"]}),
+        ("Retrieving a list of models from OpenAI", "http", {"method": "GET", "url": "https://h/models"}),
+        ("Searching a photo library", "http", {"method": "POST", "url": "https://h/api/search", "body": "{}"}),
+        ("Checking only the health of a server", "http", {"method": "GET", "url": "https://h/health"}),
+        ("Unclear what this request does", "http", {"method": "DELETE", "url": "https://h/x"}),
+    ]
+
+    def test_bypasses_rejected(self):
+        for text, mode, spec in self.CASES:
+            self.assertFalse(D.consistent_with(text, mode, spec), text)
+
+    def test_valid_pass(self):
+        for text, mode, spec in self.GOOD:
+            self.assertTrue(D.consistent_with(text, mode, spec), text)
+
+    def test_end_to_end_reason_class(self):
+        d = D.Describer("k")
+        with mock.patch.object(D, "_post_json", lambda *a: reply("Only checking the server")):
+            r = d.describe("http", ["x"], dict(HTTP_DEL))
+        self.assertEqual((r["source"], r["reason"]), ("deterministic", "rejected"))
+
+
 class Consistency(unittest.TestCase):
     def test_read_claim_on_mutation_rejected(self):
         self.assertFalse(D.consistent_with("Reads a dashboard", "http", HTTP_DEL))

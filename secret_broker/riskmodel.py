@@ -23,6 +23,7 @@ model says: an explicit decision, see docs/risk.md.
 """
 import concurrent.futures
 import json
+import logging
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -32,6 +33,7 @@ from . import summarize
 LEVELS = ("low", "medium", "high")
 DEFAULT_JEV_MODEL = "typesafe/jev-1.14"
 DEFAULT_JEV_BASE = "https://openrouter.ai/api"
+DESCRIBER_DEFAULT_BASE = "https://openrouter.ai/api/v1"
 
 RUBRIC = """\
 You rate how risky ONE request is for a human approver. The request asks the \
@@ -329,6 +331,8 @@ class ChatAnalyzer(summarize.OpenRouterSummarizer):
 
 
 class FloorAnalyzer:
+    config_warnings = ()
+
     """Wraps an analyzer; ssh_sign requests are always HIGH, with no model call
     (so no signing data goes to a third party)."""
 
@@ -353,8 +357,16 @@ _KEYS = {
                    "prompt", "base_url"},
     "jev": {"type", "api_key_file", "model", "timeout", "max_content_chars", "send_content",
             "base_url", "high_threshold", "low_threshold", "summary_text", "summary_model",
-            "summary_timeout", "summary_max_per_minute", "summary_concurrency"},
+            "summary_timeout", "summary_max_per_minute", "summary_concurrency", "summary_base_url"},
 }
+
+
+def _check_url(u, field):
+    p = urllib.parse.urlsplit(u) if isinstance(u, str) else None
+    ok = p is not None and p.hostname and not p.query and not p.fragment and (
+        p.scheme == "https" or (p.scheme == "http" and p.hostname in ("localhost", "127.0.0.1", "::1")))
+    if not ok:
+        raise ValueError(f"{field} must be an https URL (http only for localhost)")
 
 
 def validate_config(sc):
@@ -381,8 +393,9 @@ def validate_config(sc):
         raise ValueError("summary.max_content_chars must be an integer 0-5000")
     if "send_content" in sc and not isinstance(sc["send_content"], bool):
         raise ValueError("summary.send_content must be true or false")
-    if "base_url" in sc and not (isinstance(sc["base_url"], str) and sc["base_url"].startswith("http")):
-        raise ValueError("summary.base_url must be an http(s) URL")
+    for k in ("base_url", "summary_base_url"):
+        if k in sc:
+            _check_url(sc[k], f"summary.{k}")
     if typ == "openrouter" and sc.get("prompt", "legacy") not in ("legacy", "rubric"):
         raise ValueError("summary.prompt must be 'legacy' or 'rubric'")
     if typ == "jev":
@@ -418,16 +431,27 @@ def build(sc, read):
         if sc.get("prompt", "legacy") == "legacy":
             return FloorAnalyzer(summarize.OpenRouterSummarizer(key, sc["model"], **kw))
         return FloorAnalyzer(ChatAnalyzer(key, sc["model"], prompt="rubric", **kw))
-    describer = None
-    if sc.get("summary_text", "chat") == "chat":
+    describer, mode, warnings = None, sc.get("summary_text", "chat"), []
+    custom = bool(base) and base.rstrip("/") != DEFAULT_JEV_BASE
+    if mode == "chat" and custom and not sc.get("summary_base_url"):
+        # never send request details and the key to the default endpoint when the
+        # operator pointed the main provider somewhere else
+        msg = "summary_text chat disabled: set summary_base_url (summary.base_url is custom)"
+        warnings.append(msg)
+        logging.getLogger("secret_broker").warning(msg)
+        mode = "deterministic"
+    if mode == "chat":
         from .description import Describer
         describer = Describer(
             key, sc.get("summary_model", "openai/gpt-5-mini"), timeout=sc.get("summary_timeout", 4.0),
             max_content_chars=sc.get("max_content_chars", 400), send_content=sc.get("send_content", True),
+            base_url=sc.get("summary_base_url", DESCRIBER_DEFAULT_BASE),
             max_per_minute=sc.get("summary_max_per_minute", 30), concurrency=sc.get("summary_concurrency", 4))
-    return FloorAnalyzer(JevAnalyzer(
+    fa = FloorAnalyzer(JevAnalyzer(
         key, sc.get("model", DEFAULT_JEV_MODEL), timeout=sc.get("timeout", 6.0),
         base_url=sc.get("base_url", DEFAULT_JEV_BASE),
         max_content_chars=sc.get("max_content_chars", 400), send_content=sc.get("send_content", True),
         high_threshold=sc.get("high_threshold", 0.5), low_threshold=sc.get("low_threshold", 0.5),
-        summary_mode=sc.get("summary_text", "chat"), describer=describer))
+        summary_mode=mode, describer=describer))
+    fa.config_warnings = warnings
+    return fa

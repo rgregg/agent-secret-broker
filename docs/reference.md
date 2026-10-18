@@ -243,9 +243,13 @@ Set `type` to pick another:
 | `prompt` | `openrouter` | `legacy` | `legacy` (old prompt) or `rubric` (the prompt in docs/risk.md) |
 | `high_threshold` | `jev` | 0.5 | rate HIGH when P(high) >= this |
 | `low_threshold` | `jev` | 0.5 | a `low` answer with P(low) below this becomes `medium` |
-| `summary_text` | `jev` | `deterministic` | `deterministic` (one line built from the request fields, prefixed `auto:`), `chat` (a second, parallel chat call with `summary_model`) or `none` |
-| `summary_model` | `jev` | none | chat model for `summary_text: chat` |
-| `base_url` | both | OpenRouter | override the endpoint root |
+| `summary_text` | `jev` | `chat` | `chat` (a chat model writes a plain-language description, in parallel with the decision call, display only), `deterministic` (a technical one-liner prefixed `auto:`) or `none` |
+| `summary_model` | `jev` | `openai/gpt-5-mini` | chat model for `summary_text: chat` |
+| `summary_timeout` | `jev` | 4 | seconds for the description call; slow or failed falls back to the `auto:` line |
+| `summary_max_per_minute` | `jev` | 30 | cap on description calls; excess uses the `auto:` line |
+| `summary_concurrency` | `jev` | 4 | simultaneous description calls |
+| `summary_base_url` | `jev` | `https://openrouter.ai/api/v1` | chat endpoint root for descriptions. Required when `base_url` is custom (otherwise descriptions are disabled with a startup warning, so request details and the key are never sent to the default endpoint) |
+| `base_url` | both | OpenRouter | override the decision/chat endpoint root (https; http only for localhost) |
 
 Config with an explicit `type` rejects unknown keys at startup, naming the field
 (`summary.<key>`); a block without `type` keeps ignoring extra keys as before.

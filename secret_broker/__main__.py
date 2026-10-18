@@ -62,6 +62,8 @@ def main():
     sc = cfg.get("summary")
     if sc:
         summarizer = riskmodel.build(sc, _read)     # validates, naming the field
+        for w in getattr(summarizer, "config_warnings", ()):
+            print("warning:", w, flush=True)
     broker = Broker(cfg, backend, notifier, audit=cfg.get("audit_log"), summarizer=summarizer,
                     background_load=True, push=push)
     bind = os.environ.get("BIND", "0.0.0.0")

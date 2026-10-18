@@ -107,13 +107,25 @@ _MD_LINK_RE = re.compile(r"\[[^\]]*\]\([^)]*\)")
 _TWO_SENTENCES_RE = re.compile(r"[.!?]\s+[A-Z]")
 _READ_WORD = re.compile(r"\b(?:read\w*|fetch\w*|list\w*|quer\w*|check\w*|retriev\w*|get\w*|view\w*|"
                         r"look\w*|inspect\w*|search\w*|show\w*|download\w*)\b", re.I)
-_WRITE_WORD = re.compile(r"\b(?:creat\w*|updat\w*|delet\w*|remov\w*|chang\w*|modif\w*|writ\w*|"
-                         r"send\w*|post\w*|push\w*|restart\w*|stop\w*|start\w*|sets?|add\w*|"
-                         r"trigger\w*|deploy\w*|submit\w*|upload\w*|revok\w*|rotat\w*|replac\w*|"
-                         r"overwrit\w*|drop\w*|kill\w*|execut\w*|run\w*|turn\w*|switch\w*|install\w*|disabl\w*|"
-                         r"enabl\w*|reboot\w*|reset\w*|purg\w*|clear\w*|mov\w*|renam\w*|"
-                         r"sign\w*|unlock\w*|lock\w*|destroy\w*|wip\w*|format\w*|refund\w*|"
-                         r"charg\w*|transfer\w*|issu\w*|generat\w*|stor\w*|sav\w*|edit\w*)\b", re.I)
+# Write-class action verbs (stems). A description of a MUTATING request must
+# contain one of these. One constant, edit here.
+WRITE_VERBS = (
+    "creat", "add", "updat", "chang", "delet", "remov", "modif", "writ", "send", "sent", "post",
+    "push", "restart", "stop", "start", "trigger", "deploy", "submit", "upload", "revok",
+    "rotat", "replac", "overwrit", "drop", "kill", "execut", "run", "install", "disabl", "enabl",
+    "reboot", "reset", "purg", "clear", "mov", "renam", "sign", "unlock", "lock", "destroy", "wip",
+    "format", "refund", "charging", "transfer", "issu", "generat", "stor", "sav", "edit", "turn",
+    "switch", "open", "clos", "disarm", "arm", "merg", "publish", "apply", "block", "unblock",
+    "reload", "sync", "cancel", "prun", "rollback", "roll back", "pull",
+    "log in", "logging in", "logs in", "sign in", "signing in",
+)
+_WRITE_WORD = re.compile(r"\b(?:" + "|".join(WRITE_VERBS) + r")\w*\b", re.I)
+# Minimizing or negating language: never acceptable for a mutating request.
+MINIMIZING = (r"nothing", r"without", r"no changes?", r"no impact", r"not \w+ed", r"not \w+ing",
+              r"only", r"just", r"merely", r"simply", r"harmless", r"read[- ]?only", r"doesn'?t",
+              r"does not", r"don'?t", r"do not", r"never", r"no effect", r"unchanged", r"no side effects?",
+              r"purely", r"strictly", r"solely", r"non-?destructive", r"n't")
+_MINIMIZING_RE = re.compile(r"(?:\b(?:" + "|".join(MINIMIZING) + r")\b|n't)", re.I)
 _CMD_WRITE_RE = re.compile(
     r"(?:^|[\s;|&/])(?:rm|rmdir|mv|dd|mkfs\S*|chmod|chown|kill|pkill|truncate|tee|sudo|reboot|"
     r"shutdown|rsync|scp|sh|bash)\b|>|\b(?:delete|drop|destroy|apply|push|install|restart|stop|"
@@ -199,22 +211,29 @@ def _looks_like_query(spec):
     return bool(_QUERYISH.search(text)) and not _MUTATEISH.search(text)
 
 
-def consistent_with(text, mode, spec):
-    """Best-effort check that a description does not call a mutating request
-    read-only. Conservative: false means 'reject'."""
-    claims_read = bool(_READ_WORD.search(text)) and not _WRITE_WORD.search(text)
-    if not claims_read:
-        return True
+def is_mutating(mode, spec):
     if mode == "http":
         m = str(spec.get("method") or "GET").upper()
         if m == "POST" and _looks_like_query(spec):
-            return True                      # POST used as a query (search, GraphQL, read RPC)
-        return m not in _MUTATING_METHODS
+            return False                     # POST used as a query (search, GraphQL, read RPC)
+        return m in _MUTATING_METHODS
     if mode == "env":
-        return not _CMD_WRITE_RE.search(" ".join(spec.get("argv") or []))
-    if mode in ("store", "ssh_sign"):
-        return False
-    return True
+        return bool(_CMD_WRITE_RE.search(" ".join(spec.get("argv") or [])))
+    return mode in ("store", "ssh_sign")
+
+
+def consistent_with(text, mode, spec):
+    """Best-effort check against hard facts (false means reject).
+
+    A mutating request (see is_mutating) needs a description with a write-class
+    verb (WRITE_VERBS) and no minimizing/negating language (MINIMIZING). A
+    non-mutating request is only checked for minimizing claims being absent where
+    they would be misleading (not checked: GET descriptions are accepted as is)."""
+    if text.lower().rstrip(".") in CANNED:
+        return True
+    if not is_mutating(mode, spec):
+        return True
+    return bool(_WRITE_WORD.search(text)) and not _MINIMIZING_RE.search(text)
 
 
 def _post_json(url, key, payload, timeout):
