@@ -24,6 +24,20 @@ def _openssh(key, password=None):
     return key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.OpenSSH, enc).decode()
 
 
+def _encrypted_pem():
+    """A passphrase-protected key made by ssh-keygen (cryptography needs bcrypt to do it)."""
+    import shutil
+    import subprocess
+    import tempfile
+    if not shutil.which("ssh-keygen"):
+        raise unittest.SkipTest("ssh-keygen not available")
+    d = tempfile.mkdtemp()
+    f = os.path.join(d, "k")
+    subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "pw", "-f", f], check=True)
+    with open(f) as fh:
+        return fh.read()
+
+
 def _s(b):
     return struct.pack(">I", len(b)) + b
 
@@ -80,7 +94,7 @@ class Signing(unittest.TestCase):
 
     def test_encrypted_and_garbage_keys_are_rejected(self):
         k = ed25519.Ed25519PrivateKey.generate()
-        for bad in (_openssh(k, b"pw"), "not a key"):
+        for bad in (_encrypted_pem(), "not a key"):
             with self.assertRaises(sshkey.SshKeyError):
                 sshkey.load_private(bad)
 
@@ -89,6 +103,14 @@ class Signing(unittest.TestCase):
         sshsig = b"SSHSIG" + _s(b"git") + _s(b"") + _s(b"sha512") + _s(b"h" * 64)
         self.assertEqual(sshkey.describe_data(sshsig)["kind"], "sshsig")
         self.assertEqual(sshkey.describe_data(b"junk")["kind"], "unknown")
+
+    def test_client_text_in_the_prompt_is_escaped_and_bounded(self):
+        evil = userauth_blob(user="root\nAPPROVED by admin" + "x" * 500, service="a\x1b[2Jb")
+        text = sshkey.describe_data(evil)["text"]
+        self.assertNotIn("\n", text)
+        self.assertNotIn("\x1b", text)
+        self.assertLess(len(text), 200)
+        self.assertIn("client-supplied", text)
 
 
 class BitwardenSshItem(unittest.TestCase):
@@ -208,7 +230,7 @@ class BrokerSsh(Harness):
         self.assertEqual(meta["allowed_hosts"], [])
 
     def test_store_ssh_rejects_encrypted_key_and_update_with_other_key(self):
-        enc = _openssh(ed25519.Ed25519PrivateKey.generate(), b"pw")
+        enc = _encrypted_pem()
         self.assertEqual(self.api("POST", "/v1/requests", {
             "mode": "store", "names": ["k2"], "op": "create", "ssh": True, "value": enc})[0], 400)
         self.assertEqual(self.api("POST", "/v1/requests", {

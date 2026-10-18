@@ -118,6 +118,13 @@ class _Reader:
         return v
 
 
+def _shown(raw, limit=48):
+    """Client-supplied bytes made safe to show an approver: printable ASCII
+    only (anything else, newlines included, is escaped), length-limited, quoted."""
+    text = "".join(c if " " <= c <= "~" else "?" for c in raw.decode("latin-1"))
+    return repr(text[:limit] + ("..." if len(text) > limit else ""))
+
+
 def describe_data(data):
     """What is being signed, as far as it can be told, for the approval prompt.
 
@@ -128,20 +135,19 @@ def describe_data(data):
     if data.startswith(b"SSHSIG"):
         try:
             r = _Reader(data[6:])
-            ns = r.string().decode("ascii", "replace")
-            return {"kind": "sshsig", "text": f"sign a message (namespace {ns!r}, e.g. git commit signing)"}
+            ns = _shown(r.string())
+            return {"kind": "sshsig", "text": f"sign a message (namespace {ns}, e.g. git commit signing)"}
         except (IndexError, struct.error):
             return {"kind": "sshsig", "text": "sign a message (SSHSIG)"}
     try:
         r = _Reader(data)
         r.string()                      # session id
         if r.byte() == 50:              # SSH_MSG_USERAUTH_REQUEST
-            user = r.string().decode("utf-8", "replace")
-            service = r.string().decode("ascii", "replace")
-            method = r.string().decode("ascii", "replace")
-            if method == "publickey":
+            user, service, method = _shown(r.string()), _shown(r.string()), r.string()
+            if method == b"publickey":
                 return {"kind": "userauth",
-                        "text": f"log in over SSH as {user!r} (service {service}); host not shown by SSH"}
+                        "text": f"log in over SSH as {user} (service {service}, "
+                                "both client-supplied); host not shown by SSH"}
     except (IndexError, struct.error):
         pass
     return {"kind": "unknown", "text": f"sign {len(data)} unrecognised bytes"}
