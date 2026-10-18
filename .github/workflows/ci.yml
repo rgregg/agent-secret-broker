@@ -42,9 +42,14 @@ jobs:
           tags: |
             type=raw,value=latest
             type=sha
+      - id: built
+        run: echo "time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
       - uses: docker/build-push-action@v6
         with:
           context: .
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+            BUILD_TIME=${{ steps.built.outputs.time }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

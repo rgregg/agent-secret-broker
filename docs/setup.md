@@ -139,7 +139,8 @@ Your phone or browser notifies you; approve; the call returns.
     docker compose pull broker && docker compose up -d --force-recreate broker
 
 `docker compose` can report "Running" with a stale image, so check the new
-behaviour afterwards (open the site, or look at the container's logs).
+behaviour afterwards: run `asb status` and compare `version` with the commit you
+expect. To deploy and verify without a shell on the host, see [deploy.md](deploy.md).
 Images are built by CI on every push to `main` as
 `ghcr.io/rgregg/agent-secret-broker:latest`; pin a tag if you prefer.
 

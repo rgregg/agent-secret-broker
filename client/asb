@@ -7,6 +7,7 @@
   asb store NAME --ssh < private_key          move an SSH private key into the broker
   asb update NAME [--var V]                   < value
   asb which HOST|URL                          is a credential available? (no approval)
+  asb status [--json]                         broker version, uptime, catalog health (no approval)
   asb ssh-agent [--socket PATH] [-- command args...]  local ssh-agent; keys stay in the broker
   asb fingerprint HOST[:PORT]                 print a server certificate's sha256 (for tls_fingerprint)
   asb http NAME METHOD URL [-H 'K: V']... [-d BODY | -d @file | -d @-]
@@ -68,6 +69,11 @@ Storing and rotating (value ONLY on stdin, never as an argument)
   printf '%s' "$VALUE" | asb update NAME [--var V]
   store creates a credential without a tap; update asks for approval.
 
+Checking the broker (after a deploy)
+  asb status           version (git sha), uptime, catalog count/invalid/adopted, backend ok
+  asb status --json    the same for scripts; no secret names or hosts are included
+  No approval needed; exit 3 if the broker is unreachable or refuses the key.
+
 Exit codes
   0 ok            1 nothing found (which/list)     2 usage or config error
   3 broker unreachable or refused the request
@@ -88,6 +94,13 @@ example: asb list --json""",
 Is a credential available for this host? Prints NAME <tab> VAR,VAR per match.
 No approval needed. Exit 1 (and a note on stderr) when nothing matches.
 example: asb which https://grafana.example.com/api/health""",
+    "status": """usage: asb status [--json]
+
+Show the running broker's build version (git sha), uptime, catalog size
+(count, invalid, adopted) and whether the vault backend is healthy. No approval
+needed; reads the broker's in-memory state, no secret names or hosts. Exit 3 if
+the broker is unreachable. Use it to verify a deploy.
+example: asb status --json""",
     "http": """usage: asb http NAME[,NAME] METHOD URL [-H 'K: V']... [-d BODY | -d @file | -d @-]
 
 The broker makes the HTTP call itself and replaces {{VAR}} in the URL, headers and
@@ -495,6 +508,28 @@ def main(argv):
             print(f"{s['name']}\t{','.join(s['vars'])}\t{','.join(s['allowed_hosts'])}")
         return 0
 
+    if argv[0] == "status":
+        if argv[1:] not in ([], ["--json"]):
+            die(HELP["status"])
+        base, key = config()
+        code, r = call(base, key, "/v1/status", timeout=15)
+        if code != 200:
+            die(r.get("error", f"broker returned {code}"), EXIT_BROKER)
+        if argv[1:] == ["--json"]:
+            print(json.dumps(r, indent=2))
+            return 0
+        c, b = r["catalog"], r["backend"]
+        d, rem = divmod(int(r["uptime_s"]), 86400)
+        h, rem = divmod(rem, 3600)
+        up = (f"{d}d " if d else "") + f"{h}h {rem // 60}m"
+        print(f"version:  {r['version']} (built {r['build_time']})")
+        print(f"uptime:   {up} (since {r['started_at']})")
+        print(f"catalog:  {c['count']} secrets, {c['invalid']} invalid, {c['adopted']} adopted"
+              f" (loaded {c['loaded_at'] or 'never'})")
+        print(f"backend:  {b['type']} {'ok' if b['ok'] else 'FAILING'}")
+        print(f"notify:   {', '.join(r['notifiers']) or 'none'}")
+        return 0
+
     if argv[0] == "which":
         if len(argv) != 2:
             die(HELP["which"])
@@ -536,7 +571,7 @@ def main(argv):
         return 0 if r["status"] < 400 else EXIT_HTTP_ERROR
 
     if "--" not in argv:
-        die(f"unknown command {argv[0]!r}.\ncommands: list, which, http, store, update, "
+        die(f"unknown command {argv[0]!r}.\ncommands: list, which, status, http, store, update, "
             "ssh-agent, fingerprint, help, guide; or: asb NAME -- command\n"
             "start with `asb guide`")
     i = argv.index("--")

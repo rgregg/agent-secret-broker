@@ -2278,6 +2278,102 @@ class StoreFlow(Harness):
         self.assertEqual(self.store()[0], 403)
 
 
+class StatusEndpoint(Harness):
+    """GET /v1/status: deploy verification without shell access to the host."""
+
+    def tweak(self, cfg):
+        cfg["ha_hook"] = {"key": "h" * 40}
+        cfg["notify"] = [{"type": "ticker", "ha_url": "http://ha.internal.example:8123"}]
+        cfg["_vault"] = {"BadItem": {"notes": "x", "broker": json.dumps({
+            "name": "badname-secret", "vars": {"B_T": {"field": "notes"}},
+            "allowed_hosts": ["bad host!"]})}}
+
+    def status(self):
+        code, body = self.api("GET", "/v1/status")
+        self.assertEqual(code, 200, body)
+        return json.loads(body), body
+
+    def test_requires_the_client_key(self):
+        self.assertEqual(self.api("GET", "/v1/status", key="wrong")[0], 401)
+        code, _ = req(self.base + "/v1/status")
+        self.assertEqual(code, 401)
+        code, _ = req(self.base + "/v1/status", headers={"Authorization": "Bearer " + "h" * 40})
+        self.assertEqual(code, 401)
+        code, _ = req(self.base + "/v1/status", headers={"X-Client-Key": "h" * 40})
+        self.assertEqual(code, 401)
+        self.assertNotEqual(self.api("GET", "/v1/status")[0], 401)
+
+    def test_shape_and_values(self):
+        st, _ = self.status()
+        self.assertEqual(set(st), {"version", "build_time", "started_at", "uptime_s", "catalog",
+                                   "backend", "notifiers", "features"})
+        self.assertEqual(set(st["catalog"]), {"count", "invalid", "adopted", "loaded_at"})
+        self.assertEqual(st["catalog"]["count"], 1)
+        self.assertEqual(st["catalog"]["invalid"], 1)
+        self.assertEqual(st["catalog"]["adopted"], 0)
+        self.assertRegex(st["catalog"]["loaded_at"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+        self.assertRegex(st["started_at"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+        self.assertIsInstance(st["uptime_s"], int)
+        self.assertEqual(st["backend"], {"type": "file", "ok": True})
+        self.assertEqual(st["notifiers"], ["ticker"])
+        self.assertEqual(st["features"], {"ha_hook": True, "ssh": False, "webpush_actions": False})
+
+    def test_leaks_no_names_hosts_or_config(self):
+        _, body = self.status()
+        for leak in ("svc", "SVC_TOKEN", "127.0.0.1", "Svc", "BadItem", "badname", "bad host",
+                     SECRET, "h" * 40, "ha.internal.example", "secrets.example", "alice", KEY):
+            self.assertNotIn(leak, body)
+
+    def test_does_not_read_the_vault(self):
+        calls = []
+        orig = self.broker.backend.catalog
+        self.broker.backend.catalog = lambda: calls.append(1) or orig()
+        self.broker._catalog_at = 0.0           # stale: a request would refresh
+        self.status()
+        self.assertEqual(calls, [])
+
+    def test_version_unknown_without_env_and_from_env_when_set(self):
+        old = {k: os.environ.pop(k, None) for k in ("BROKER_GIT_SHA", "BROKER_BUILD_TIME")}
+        try:
+            st, _ = self.status()
+            self.assertEqual((st["version"], st["build_time"]), ("unknown", "unknown"))
+            os.environ["BROKER_GIT_SHA"] = "abc1234def"
+            os.environ["BROKER_BUILD_TIME"] = "2026-10-18T01:02:03Z"
+            st, _ = self.status()
+            self.assertEqual((st["version"], st["build_time"]), ("abc1234def", "2026-10-18T01:02:03Z"))
+        finally:
+            for k, v in old.items():
+                os.environ.pop(k, None)
+                if v is not None:
+                    os.environ[k] = v
+
+    def test_backend_failure_is_reported(self):
+        def boom():
+            raise BackendError("vault down")
+        self.broker.backend.catalog = boom
+        self.broker._refresh_if(-1)
+        self.assertFalse(self.status()[0]["backend"]["ok"])
+
+    def test_cli_status_text_json_and_exit_codes(self):
+        env = dict(os.environ, SECRET_BROKER_URL=self.base, SECRET_BROKER_KEY=KEY,
+                   BROKER_GIT_SHA="abc1234def")
+        run = lambda *a, e=env: subprocess.run(  # noqa: E731
+            [sys.executable, "-I", CLI, *a], env=e, capture_output=True, text=True, timeout=30)
+        p = run("status")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("catalog:  1 secrets, 1 invalid, 0 adopted", p.stdout)
+        self.assertIn("backend:  file ok", p.stdout)
+        self.assertNotIn(SECRET, p.stdout)
+        pj = run("status", "--json")
+        self.assertEqual(json.loads(pj.stdout)["catalog"]["invalid"], 1)
+        self.assertEqual(run("status", "--bogus").returncode, 2)
+        self.assertIn("usage: asb status", run("help", "status").stdout)
+        self.assertIn("asb status", run("guide").stdout)
+        self.assertEqual(run("status", e=dict(env, SECRET_BROKER_KEY="bad")).returncode, 3)
+        dead = dict(env, SECRET_BROKER_URL="http://127.0.0.1:1")
+        self.assertEqual(run("status", e=dead).returncode, 3)
+
+
 class Cli(Harness):
     def run_cli(self, *args):
         env = dict(os.environ, SECRET_BROKER_URL=self.base, SECRET_BROKER_KEY=KEY)

@@ -113,6 +113,9 @@ class Broker:
         self.cfg["secrets"] = {}        # the catalog lives in the vault; see refresh_catalog()
         self._catalog_at = 0.0
         self._catalog_sig = None
+        self._started_at = time.time()
+        self._catalog_stats = {"count": 0, "invalid": 0, "adopted": 0, "loaded_at": None}
+        self._backend_ok = True         # False while the last vault read failed
         self._refreshing = threading.Lock()
         self._cfg_lock = threading.Lock()
         self.summarizer = summarizer
@@ -160,6 +163,7 @@ class Broker:
             try:
                 self.refresh_catalog()
             except Exception as e:  # noqa: BLE001 -- start anyway; requests retry the load
+                self._backend_ok = False
                 self.log("catalog_error", error=str(e)[:200])
             self.log("startup", policies={
                 n: {"approval": sc.get("approval", "prompt"), "auto_modes": self._auto_modes(sc)}
@@ -325,11 +329,40 @@ class Broker:
         with self._cfg_lock:
             self.cfg["secrets"] = out
             self._catalog_at = time.time()
+            self._backend_ok = True
+            self._catalog_stats = {"count": len(out), "invalid": len(bad), "adopted": len(adopted),
+                                   "loaded_at": _iso(self._catalog_at)}
         sig = json.dumps([sorted(out), bad], sort_keys=True)
         if sig != self._catalog_sig:
             self._catalog_sig = sig
             self.log("catalog_loaded", count=len(out), names=sorted(out), invalid=bad,
                      adopted=sorted(adopted))
+
+    def status(self):
+        """Deploy-verification summary for GET /v1/status. Counts and type names
+        only: no secret names, hosts, keys or config values. Reads in-memory state
+        and never touches the vault."""
+        specs = self.cfg.get("notify")
+        kinds = ([sp.get("type") for sp in specs] if specs is not None
+                 else (["ticker"] if self.cfg.get("ha_url") else []))
+        notifiers = sorted({k for k in kinds if k in ("ticker", "telegram", "webpush")})
+        bname = type(self.backend).__name__
+        btype = "bw" if bname.startswith("Bw") else "file" if bname == "FileBackend" else "local"
+        now = time.time()
+        with self._cfg_lock:
+            stats = dict(self._catalog_stats)
+            has_ssh = any(sc.get("ssh") for sc in self.cfg["secrets"].values())
+        return {
+            "version": os.environ.get("BROKER_GIT_SHA") or "unknown",
+            "build_time": os.environ.get("BROKER_BUILD_TIME") or "unknown",
+            "started_at": _iso(self._started_at),
+            "uptime_s": int(now - self._started_at),
+            "catalog": stats,
+            "backend": {"type": btype, "ok": bool(self._backend_ok)},
+            "notifiers": notifiers,
+            "features": {"ha_hook": self.ha_hook is not None, "ssh": has_ssh,
+                         "webpush_actions": "webpush" in notifiers and self.push is not None},
+        }
 
     def _refresh_if(self, stale_after, wait=True):
         if time.time() - self._catalog_at <= stale_after:
@@ -340,6 +373,7 @@ class Broker:
             if time.time() - self._catalog_at > stale_after:
                 self.refresh_catalog()
         except Exception as e:  # noqa: BLE001 -- keep serving the last good catalog
+            self._backend_ok = False
             self.log("catalog_error", error=str(e)[:200])
         finally:
             self._refreshing.release()
@@ -1818,6 +1852,10 @@ def _risk_html(req):
     return out
 
 
+def _iso(t):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+
+
 def client_handler(broker, client_key):
     class H(BaseHTTPRequestHandler):
         def log_message(self, *a):
@@ -1923,6 +1961,8 @@ def client_handler(broker, client_key):
             if not self._authed():
                 return
             u = urllib.parse.urlsplit(self.path)
+            if u.path == "/v1/status":
+                return _json(self, 200, broker.status())
             if u.path == "/v1/secrets":
                 q = urllib.parse.parse_qs(u.query)
                 host = q.get("host", [None])[0]

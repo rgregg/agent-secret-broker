@@ -16,5 +16,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY secret_broker ./secret_broker
+# Build info, reported by GET /v1/status so a deploy can be verified remotely.
+ARG GIT_SHA=unknown
+ARG BUILD_TIME=unknown
+ENV BROKER_GIT_SHA=$GIT_SHA BROKER_BUILD_TIME=$BUILD_TIME
 USER nobody
 CMD ["python", "-m", "secret_broker"]

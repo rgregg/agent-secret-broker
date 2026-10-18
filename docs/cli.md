@@ -34,6 +34,7 @@ Check it:
 
     asb which api.example.com             # which credential covers this host?
     asb list [--json]                     # everything available
+    asb status [--json]                   # broker version, uptime, catalog health (no approval)
 
     asb http NAME METHOD URL [-H 'K: V']... [-d BODY | -d @file | -d @-]
         e.g.  asb http grafana GET https://grafana.example.com/api/health \
@@ -45,6 +46,10 @@ Check it:
     printf '%s' "$VALUE" | asb update NAME                        # rotate one (needs approval)
     asb ssh-agent [-- command args...]    # use broker-held SSH keys with ssh/git (see reference.md)
 
+- `asb status` asks the broker what it is running (`GET /v1/status`): the build
+  version (git sha), uptime, catalog count, invalid and adopted items, and whether
+  the vault backend is healthy. It lists no secret names or hosts. Use it to verify a
+  deploy ([deploy.md](deploy.md)).
 - `{{VAR}}` placeholders (the names `which` and `list` show) are replaced
   **inside the broker** in the URL, headers and body, so the agent never sees the
   value. This is `http` mode and it is the one to prefer.
@@ -66,7 +71,7 @@ Check it:
 | 0 | OK |
 | 1 | Nothing found (`which`, `list`) |
 | 2 | Usage or configuration error |
-| 3 | Broker unreachable, or it refused the request |
+| 3 | Broker unreachable, or it refused the request (`status` too) |
 | 4 | Denied by you or by policy |
 | 5 | Expired or timed out waiting for approval |
 | 22 | `http`: the upstream answered with status 400 or more (body still printed) |
