@@ -249,7 +249,7 @@ Set `type` to pick another:
 | `summary_max_per_minute` | `jev` | 30 | cap on description calls; excess uses the `auto:` line |
 | `summary_concurrency` | `jev` | 4 | simultaneous description calls |
 | `summary_base_url` | `jev` | `https://openrouter.ai/api/v1` | chat endpoint root for descriptions. Required when `base_url` is custom (otherwise descriptions are disabled with a startup warning, so request details and the key are never sent to the default endpoint) |
-| `summary_read_endpoints` | `jev` | `[]` | list of `{"host": "name[:port]", "path": "/exact/path"}` for POST endpoints that are pure reads (exact match); their descriptions may use read verbs |
+| `summary_read_endpoints` | `jev` | `[]` | list of `{"host": "name[:port]", "path": "/exact/path"}` for POST endpoints that are pure reads (exact host, case-insensitive, and exact path; request must have no query string, userinfo or method-override header); their descriptions may use read verbs. Other writes get the technical `auto:` line unless the AI phrase starts with a write verb |
 | `base_url` | both | OpenRouter | override the decision/chat endpoint root (https; http only for localhost) |
 
 Config with an explicit `type` rejects unknown keys at startup, naming the field

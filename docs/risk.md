@@ -63,20 +63,21 @@ Safety measures:
   only (control, bidi and zero-width characters are rejected), no markdown,
   HTML, URLs, emails, code, paths, hostnames, IPs, status codes, HTTP verbs or
   API jargon, no shouted tokens, no quote of the prompt, no safety or approval
-  language (`FORBIDDEN_PHRASES`), capped at 160 characters.
+  language (`FORBIDDEN_PHRASES` and `FORBIDDEN_STEMS`: approv*, deny, authoris/z*, permit*, allow*), capped at 160 characters.
 - Consistency (best effort): for a mutating request (POST/PUT/PATCH/DELETE other
-  than a POST whose body is a GraphQL query document, or one to an allowlisted
-  read endpoint; a write-looking command, a store request or ssh signing) the description must START with a write-class gerund
+  than a clean POST to an allowlisted read endpoint; a write-looking command, a store request or ssh signing) the description must START with a write-class gerund
   (`WRITE_VERBS`: Deleting, Opening, Syncing ...), contain no read gerund
   (`READ_GERUNDS`: retrieving, listing, checking ...) anywhere, and no minimizing language (`MINIMIZING`: nothing, without, no
   change, only, just, merely, read-only, does not ...). Read requests are not
   checked.
-- POSTs are treated as writes unless the body is certainly a read-only GraphQL
-  query (JSON with a `query` string, no mutation or subscription; uncertain
-  means mutation) or the operator lists the exact host and path in
-  `summary_read_endpoints`. There is no keyword guessing, so genuine search-style
-  POSTs (REST search, read RPCs) fall back to the technical `auto:` line unless
-  allowlisted.
+- Every POST, PUT, PATCH and DELETE is a write. The only exemption is a POST to
+  an operator-listed read endpoint (`summary_read_endpoints`, exact host and
+  exact path, case-insensitive host) that is clean: no query string or
+  fragment, no userinfo, no backslash/whitespace/control characters or
+  percent-encoded slash or dot, no method-override header, http(s) only, and the
+  port exactly as listed. Anything not checkable counts as a write. There is no
+  GraphQL or keyword parsing, so search-style and GraphQL POSTs get the plain
+  technical `auto:` line unless allowlisted.
 - Any rejection, timeout, error or rate cap replaces the description with the
   deterministic `auto:` line. The audit `assessed` event records
   `summary_source` (`model` or `deterministic`) and `summary_reason`

@@ -38,6 +38,18 @@ class Sanitizer(unittest.TestCase):
             self.bad(f"Deleting a record that is {ph}")
             self.bad(f"Deletes a record, {ph.upper()}")
 
+    def test_approval_stems_rejected(self):
+        for w in ("approve", "approving", "approved", "approval", "deny", "denies", "denied", "denying",
+                  "authorise", "authorised", "authorize", "authorized", "authorizing", "permit", "permits",
+                  "permitted", "permitting", "allow", "allows", "allowed", "allowing"):
+            self.bad(f"Deleting a record, {w}")
+            self.bad(f"{w.capitalize()} a record")
+
+    def test_removed_leading_verbs(self):
+        for w in ("Approving", "Denying", "Making", "Logging"):
+            self.assertFalse(D.consistent_with(f"{w} a thing", "http", {"method": "POST", "url": "https://h/x"}), w)
+        self.assertTrue(D.consistent_with("Logging in to a server", "ssh_sign", {}))
+
     def test_not_confused_by_substrings(self):
         self.ok("Restarts the unsafely named okta service".replace("unsafely named ", ""),
                 "Restarts the okta service")

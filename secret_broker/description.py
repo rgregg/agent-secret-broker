@@ -98,8 +98,11 @@ FORBIDDEN_PHRASES = (
     "deny", "disregard", "system prompt", "instructions", "instruction", "reviewer",
     "as an ai", "i cannot", "i can't", "sorry",
 )
-_FORBIDDEN_RE = re.compile(r"\b(?:" + "|".join(re.escape(p) for p in
-                           sorted(FORBIDDEN_PHRASES, key=len, reverse=True)) + r")\b", re.I)
+# Stems matched on top of the phrases above (approval/permission language in any form).
+FORBIDDEN_STEMS = (r"approv\w*", r"den(?:y|ies|ied|ying)", r"authori[sz]\w*", r"permit\w*", r"allow\w*")
+_FORBIDDEN_RE = re.compile(
+    r"\b(?:" + "|".join(re.escape(p) for p in sorted(FORBIDDEN_PHRASES, key=len, reverse=True))
+    + "|" + "|".join(FORBIDDEN_STEMS) + r")\b", re.I)
 
 _URL_RE = re.compile(r"(?:[a-z][a-z0-9+.-]*://|www\.)", re.I)
 _EMAIL_RE = re.compile(r"\S+@\S+\.\S+")
@@ -120,9 +123,9 @@ WRITE_VERBS = (
     "issuing", "generating", "storing", "saving", "editing", "turning", "switching", "opening",
     "closing", "disarming", "arming", "merging", "publishing", "applying", "blocking",
     "unblocking", "reloading", "syncing", "cancelling", "canceling", "pruning", "rolling",
-    "pulling", "building", "logging", "restoring", "pausing", "resuming", "scaling", "setting",
-    "making", "granting", "assigning", "inviting", "registering", "enrolling", "paying", "pairing",
-    "committing", "tagging", "archiving", "importing", "emptying", "approving", "denying",
+    "pulling", "building", "logging in", "restoring", "pausing", "resuming", "scaling", "setting",
+    "granting", "assigning", "inviting", "registering", "enrolling", "paying", "pairing",
+    "committing", "tagging", "archiving", "importing", "emptying",
 )
 _WRITE_FIRST = re.compile(r"^(?:" + "|".join(WRITE_VERBS) + r")\b", re.I)
 # Read gerunds: never allowed anywhere in the description of a mutating request.
