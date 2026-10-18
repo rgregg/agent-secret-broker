@@ -15,6 +15,7 @@
   "ttl_seconds": 300,
   "risk": {"escalate_auto_at": "medium"},
   "audit_log": "/data/audit.jsonl",
+  "timed_grants": {"enabled": true, "durations": [5, 15, 30, 60], "max_minutes": 60, "max_risk": "high"},
   "summary": {"model": "openai/gpt-5-mini", "api_key_file": "/run/secrets/openrouter_key",
               "timeout": 4, "max_content_chars": 300, "send_content": true}
 }

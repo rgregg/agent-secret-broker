@@ -74,7 +74,9 @@ requests; `none` turns auto-approval off, `high` lets every risk level through
 and fails open when the analysis model is down; see the reference),
 `summary` (a one-line AI summary of each request via OpenRouter, marked
 unverified), `ttl_seconds` (how long a request waits, default 300),
-`audit_log`. All keys are in `deploy/config.example.json`.
+`audit_log`, `timed_grants` ("Approve for 5/15/30/60 minutes" on the approval
+card; on by default, tune or turn off with `{"enabled": false}`, see the
+reference). All keys are in `deploy/config.example.json`.
 
 Leave `serve: true` in the `backend` block: the broker then keeps one long-lived
 vault session and cannot trip the vault's login rate limit.

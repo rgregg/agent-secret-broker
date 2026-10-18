@@ -311,22 +311,22 @@ state, so bad-key floods cannot lock out Home Assistant.
 
 Every decision (dashboard `/decide`, approval-link page, `/push/decide`,
 `/v1/hooks/ha/decide`) goes through `Broker.decide_via(channel, rid, decision, actor, *,
-token=None, always=False, nonce=None, peer=None, client_ip=None, **audit_extra)`
+token=None, always=False, nonce=None, peer=None, client_ip=None, grant_minutes=None, **audit_extra)`
 -> `(http_status, request)`; `decision` is `approve|deny`. It alone enforces the
 single-decision claim, the constant-time token check (spent on match; any
-decision kills it), whether `always` may create an always-allow rule, and the
+decision kills it), whether `always` may create an always-allow rule and `grant_minutes` a time-boxed grant (400 for a duration that is not on offer, nothing claimed), and the
 audit fields (`channel`, `approver`, `approver_peer`, `approver_ip`, plus
 `audit_extra`). Status: 200 decided, 403 bad/missing token, 404 unknown, 410
 already decided/expired/token spent. Channels are registered in
 `broker.CHANNELS` (unknown channel: `ValueError`); the caller does the channel's
 own authentication (SSO header, CSRF/origin, `X-Requested-With`):
 
-| Channel | token_required | may_create_always |
-| --- | --- | --- |
-| `dashboard` | no | yes |
-| `link` (`/a/<nonce>`) | no | yes |
-| `push` | yes | no |
-| `ha` (`/v1/hooks/ha/decide`) | yes | no |
+| Channel | token_required | may_create_always | may_create_grant |
+| --- | --- | --- | --- |
+| `dashboard` | no | yes | yes |
+| `link` (`/a/<nonce>`) | no | yes | yes |
+| `push` | yes | no | no |
+| `ha` (`/v1/hooks/ha/decide`) | yes | no | no |
 
 ### Home Assistant action buttons (`ha_hook`)
 
@@ -702,6 +702,71 @@ is then left unchanged). The **Policies** tab (`/policies`, same SSO-gated liste
 secrets that are always allowed, with a **Revoke** button that puts one back to
 "prompt"; it can only tighten.
 
+## Time-boxed grants (approve for N minutes)
+
+Instead of plain Approve or Always allow, the approver can pick **Approve for N
+min** from the "Approve for a while" menu on the approval card (dashboard) or on
+the approval-link page. The request is approved as usual, and for the next N
+minutes further requests for the same secret are approved without a tap. The
+grant ends by itself at an absolute deadline (using it does not extend it) and
+can be revoked early.
+
+- **Per secret name.** A request naming several secrets creates one grant for
+  each; a later request is auto-approved only when *every* secret it names has an
+  active grant. Granting again for a secret replaces its grant (restarting the clock).
+- **Modes where the value never leaves the broker:** `http` and `ssh_sign`
+  (a deploy session needs many logins). `env` and `store` (create or update)
+  always ask: the value reaches the agent, or credentials change. A grant picked
+  on such a request is refused and audited (`grant_refused`).
+- **Only an explicit human choice creates a grant**, on the dashboard card or
+  the approval-link page, with the same SSO, CSRF and same-origin checks as the
+  other buttons. Notification buttons (`push`, `ha`) stay plain Approve/Deny and
+  can never create one. A denied or already decided request creates nothing.
+- **Config** (`timed_grants`, validated at startup with the field named in the
+  error): `enabled` (default `true`), `durations` (minutes offered; 1-6 distinct
+  whole numbers > 0 and <= `max_minutes`; default `[5, 15, 30, 60]`),
+  `max_minutes` (cap, default 60, at most 1440) and `max_risk`
+  (`none|low|medium|high`, default `high` = no ceiling). `enabled: false` hides
+  the menu, rejects grant choices and ignores any persisted grants.
+- **Risk ceiling.** A request rated above `max_risk` ignores the grant and
+  prompts normally (`grant_skipped`, `reason: risk`). A missing model verdict
+  counts as high, so it only matters when the ceiling is below `high`. `none`
+  means grants are never used. A grant is checked only for requests no
+  `approval: allow` policy already approved; a request that policy escalated
+  because of risk can still be approved by a grant when the ceiling allows.
+- **Persistence.** Active grants live in `grants.json` next to the audit log
+  (atomic write, mode 0600; secret names, times, grant id and creator only). It
+  is reloaded on start, so a redeploy does not drop them. Expired entries and
+  entries whose deadline is further out than `max_minutes` are dropped on load;
+  a corrupt file fails closed (no grants, `grants_file_corrupt` audit warning).
+- **Revoking.** The **Policies** tab has an "Active grants" card above "Always
+  allowed": secret, live time left, who allowed it, and a **Revoke** button
+  (`POST /grants/revoke`, CSRF-checked). Programmatic: `Broker.revoke_grant`.
+- **Settings** shows the config line (on/off, durations, ceiling).
+  `GET /v1/status` reports only `features.timed_grants` (a bool). Which secrets
+  currently have a grant is approval context and is not returned by any
+  agent-facing endpoint (discovery, request results, status).
+
+Audit events (all but the last three carry the request `id`):
+
+| Event | Fields |
+| --- | --- |
+| `decided` / `approved` | `grant_minutes` when the approver chose a grant (`via: user`, `channel`) |
+| `grant_created` | `grant_ids`, `grant_minutes`, `expires_at`, `created_by`, `channel`, `approver_peer`, `approver_ip` |
+| `grant_refused` | `reason` (ineligible mode); the approver's usual `channel`/`approver` fields |
+| `grant_used` | `grant_ids`, `grant_left_s` |
+| `approved` (auto) | `via: policy`, `grant_id`, `grant_ids`, `grant_left_s` |
+| `grant_skipped` | `reason: risk`, `grant_ids`, `risk_level`, `max_risk` |
+| `grant_revoked` | `grant_id`, `secret`, `created_by`, `revoked_by`, `left_s`, `peer`, `client_ip` |
+| `grant_expired` | `grant_id`, `secret`, `expires_at`, `created_by` (recorded lazily on the next check, by a 15 s sweep, or on load) |
+| `grants_file_corrupt`, `grant_dropped`, `grants_file_write_failed` | `warning` / `reason`, `error` |
+
+For any API that exposes audit events outside the approver UI: treat `grant_*`
+events and the `grant_id`, `grant_ids`, `grant_left_s` fields as policy context
+and show a grant-approved request as a plain `approved`. The history rows and
+pop-over show "Decided by: time-boxed grant (auto-approved), 12 min left when
+used".
+
 ## Vault session lifetime
 
 The vault is not kept open. With the `bw` backend it is unlocked on demand,
@@ -729,7 +794,7 @@ values, header values or bodies.
 Events: `startup` (policies in force), `requested`, `assessed`, `notified`,
 `secret_read`, `approved`/`denied`/`expired`/`failed` (with `via` user or
 policy, approver, reported client IP, latency), `http_executed`, `delivered`,
-`escalated`, `stored`, `request_detail_viewed`, `config_warning`, `policy_changed`, `policy_change_refused`, `policy_change_failed`, and
+`escalated`, `stored`, `request_detail_viewed`, `grant_created`/`grant_used`/`grant_revoked`/`grant_expired` (see Time-boxed grants), `config_warning`, `policy_changed`, `policy_change_refused`, `policy_change_failed`, and
 security events `auth_failed`, `rejected`, `approval_viewed`,
 `approval_forbidden`, `approval_stale`, `bad_request`, `discovery`,
 `ha_decide_refused`, `ha_decide_dropped`, `ha_hook_any_device`.
