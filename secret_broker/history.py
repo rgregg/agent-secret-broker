@@ -73,6 +73,7 @@ class History:
                 "method": rec.get("method"), "url": _short_url(rec.get("url")),
                 "op": rec.get("op"), "item": rec.get("item"), "field": rec.get("field"),
                 "key": rec.get("key"), "hosts": rec.get("hosts"), "final_seq": -1,
+                "ssh_what": rec.get("ssh_what"),
             }
             while len(self._rows) > self._max:
                 self._rows.popitem(last=False)

@@ -9,6 +9,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from . import sshkey
+
 
 class BackendError(Exception):
     pass
@@ -39,6 +41,10 @@ _RESERVED_FIELDS = (META_FIELD, "previous_value", "previous_replaced_at")
 def _auto_info(it):
     """What an item without broker metadata could offer: shapes only, never values.
     None when it has nothing usable (or is not a login or secure note)."""
+    if it.get("type") == 5:                 # Bitwarden's native SSH key item
+        sk = it.get("sshKey") or {}
+        pub = (sk.get("publicKey") or "").strip()
+        return {"ssh_public_key": pub} if sk.get("privateKey") and pub else None
     if it.get("type") not in (1, 2):
         return None
     login = it.get("login") or {}
@@ -249,7 +255,7 @@ class BwBackend:
 
     @staticmethod
     def _template(item, field, value, org, coll, meta=None):
-        obj = BwBackend._template_base(item, field, value, org, coll)
+        obj = BwBackend._template_base(item, field, value, org, coll, meta)
         if meta is not None:
             BwBackend._with_meta(obj, meta)
         return obj
@@ -261,9 +267,18 @@ class BwBackend:
         obj["fields"] = fields
 
     @staticmethod
-    def _template_base(item, field, value, org, coll):
+    def _template_base(item, field, value, org, coll, meta=None):
         base = {"organizationId": org, "collectionIds": [coll], "folderId": None,
                 "favorite": False, "name": item, "reprompt": 0}
+        if field == "private_key":
+            # a real Bitwarden SSH key item (type 5), so the Bitwarden apps and
+            # their SSH agent see it as one; the public half comes with the request
+            pub = (meta or {}).get("ssh_public_key")
+            if not pub:
+                raise BackendError("an SSH key item needs its public key")
+            return {**base, "type": 5, "notes": None,
+                    "sshKey": {"privateKey": value, "publicKey": pub,
+                               "keyFingerprint": sshkey.fingerprint(sshkey.blob_from_line(pub))}}
         if field == "password":
             return {**base, "type": 1, "notes": None,
                     "login": {"username": None, "password": value, "uris": []}}
@@ -274,7 +289,10 @@ class BwBackend:
 
     @staticmethod
     def _auto_field(obj):
-        """The natural secret field of an item: a login's password, else the note."""
+        """The natural secret field of an item: an SSH key's private key, a
+        login's password, else the note."""
+        if obj.get("sshKey") is not None:
+            return "private_key"
         return "password" if obj.get("login") is not None else "notes"
 
     @staticmethod
@@ -285,6 +303,9 @@ class BwBackend:
         if field == "password" and obj.get("login") is not None:
             old = obj["login"].get("password")
             obj["login"]["password"] = value
+        elif field == "private_key" and obj.get("sshKey") is not None:
+            old = obj["sshKey"].get("privateKey")
+            obj["sshKey"]["privateKey"] = value
         elif field == "notes":
             old = obj.get("notes")
             obj["notes"] = value
@@ -468,6 +489,8 @@ class BwBackend:
             self._touch()
         if field in (None, "", "auto"):
             field = self._auto_field(obj)
+        if field == "private_key" and obj.get("sshKey"):
+            return obj["sshKey"].get("privateKey") or ""
         if field == "password" and obj.get("login"):
             return obj["login"]["password"]
         if field == "username" and obj.get("login"):
