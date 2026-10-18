@@ -47,6 +47,8 @@ def describe(mode, names, spec, max_content_chars=300, send_content=True):
         if spec.get("allowed_hosts"):
             lines.append("usable for hosts: " + ", ".join(spec["allowed_hosts"]))
         lines.append(f"value: <{len(spec.get('value') or '')} chars, not shown>")
+    elif mode == "ssh_sign":
+        lines.append(f"operation: sign with an SSH key ({spec['ssh']['text']})")
     else:
         cmd = " ".join(spec.get("argv") or [])
         lines.append("command: " + (cmd[:max_content_chars] if send_content else "<not shown>"))

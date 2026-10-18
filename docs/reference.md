@@ -21,6 +21,40 @@ How the broker works, in detail. For installing and configuring it see
   into the command's environment. The command shown in the prompt is what the
   client *said* it would run; approve it only if it looks right.
 
+### SSH keys: the broker signs, the key never leaves
+
+A secret can be an SSH private key. It is never released or substituted into a
+request; instead `asb ssh-agent` serves the ssh-agent protocol on a private local
+socket, and every signature ssh asks for becomes a broker request (mode
+`ssh_sign`) that you approve like any other.
+
+    asb store deploy --ssh < ~/.ssh/id_ed25519                      # moves the key in
+    asb ssh-agent -- git push                                          # one approval per login
+    eval "$(asb ssh-agent)"                                            # or keep an agent running
+
+- **Stored as a Bitwarden SSH key item** (item type "SSH key", with private key,
+  public key and fingerprint), so the Bitwarden apps show it as one. `store --ssh`
+  creates that item and its metadata, `{"ssh": true, "ssh_public_key":
+  "ssh-ed25519 AAAA...", "vars": {"DEPLOY_SSH_KEY": {"field": "private_key"}}}`,
+  deriving the public key from the value. An SSH key item you add to the broker's
+  collection yourself is adopted automatically, signing-only. `asb list` shows the
+  key with no variables, and `list`/`which` expose only the public half.
+- Only unencrypted OpenSSH-format ed25519, ECDSA and RSA (2048+ bits, SHA-2
+  signatures only) keys are accepted: the broker is what protects the key, so
+  there is no passphrase to type. Remove a passphrase from a copy with
+  `ssh-keygen -p -N '' -f COPY` before storing it, then delete the on-disk key.
+- An update must carry the same key (same public key); a different key is a new
+  credential.
+- **What the prompt can and cannot tell you.** SSH signs a login with the account
+  name and a session id but not the host. The prompt says what the bytes say
+  ("log in over SSH as 'deploy'", or "sign a message, namespace 'git'" for commit
+  signing) and names the key, but the host a client connects to is not
+  something the broker can see or enforce, unlike `http` mode's `allowed_hosts`.
+  The grants are therefore per key and per use: keep a key's server-side
+  `authorized_keys` access as narrow as you would for a deploy key.
+- `approval: allow` only auto-approves signing if `auto_modes` includes
+  `ssh_sign`; "always allow" is never offered for it.
+
 ### Vault access: `backend.serve`
 
 By default each vault read or write launches the `bw` CLI. Set

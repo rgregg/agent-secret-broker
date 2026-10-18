@@ -36,6 +36,7 @@ from .backends import BackendError
 from . import notify as notify_mod
 from .notify import NotifyError
 from . import risk as risk_mod
+from . import sshkey
 from . import structured
 from .history import History, OUTCOMES
 
@@ -84,7 +85,7 @@ class Request:
     def __init__(self, mode, names, spec, source, ttl, peer=None):
         self.id = secrets.token_urlsafe(16)
         self.nonce = secrets.token_urlsafe(24)
-        self.mode = mode          # "env" | "http"
+        self.mode = mode          # "env" | "http" | "store" | "ssh_sign"
         self.names = names
         self.spec = spec
         self.source = source      # client-claimed
@@ -207,6 +208,19 @@ class Broker:
         raw_vars = meta.get("vars")
         if not isinstance(raw_vars, dict) or not raw_vars:
             raise ValueError("vars must be a non-empty object")
+        ssh = meta.get("ssh", False)
+        if not isinstance(ssh, bool):
+            raise ValueError("ssh must be true or false")
+        if ssh:
+            if len(raw_vars) != 1:
+                raise ValueError("an ssh key secret has exactly one variable (the private key)")
+            try:
+                sshkey.blob_from_line(str(meta.get("ssh_public_key") or ""))
+            except sshkey.SshKeyError:
+                raise ValueError("an ssh key secret needs ssh_public_key (ssh-ed25519 AAAA...)") from None
+            ref0 = next(iter(raw_vars.values()))
+            if (ref0 if isinstance(ref0, dict) else {}).get("field", "auto") not in ("private_key", "auto"):
+                raise ValueError("an ssh key secret's variable must use the private_key field")
         vars_ = {}
         for var, ref in raw_vars.items():
             ref = ref if isinstance(ref, dict) else {}
@@ -250,6 +264,10 @@ class Broker:
             host = urllib.parse.urlsplit(uri if "//" in uri else "//" + uri).hostname
             if host and _HOST_RE.match(host) and host.lower() not in hosts:
                 hosts.append(host.lower())
+        if info.get("ssh_public_key"):
+            # a Bitwarden SSH key item: only ever usable to sign, never released
+            return {"allowed_hosts": [], "vars": {f"{base}_SSH_KEY": {"field": "private_key"}},
+                    "approval": "prompt", "ssh": True, "ssh_public_key": info["ssh_public_key"]}
         if not vars_:
             return None
         return {"allowed_hosts": hosts[:10], "vars": vars_, "approval": "prompt"}
@@ -353,6 +371,10 @@ class Broker:
             sp = req.spec
             rec.update(op=sp.get("op"), item=sp.get("item"), field=sp.get("field"), key=sp.get("key"),
                        hosts=sp.get("allowed_hosts"), value_bytes=sp.get("value_bytes"))
+        elif req.mode == "ssh_sign":
+            sp = req.spec
+            rec.update(ssh_kind=sp["ssh"]["kind"], ssh_what=sp["ssh"]["text"],
+                       ssh_fingerprint=sp.get("fingerprint"), sign_bytes=sp.get("data_bytes"))
         else:
             rec["argv"] = (req.spec.get("argv") or [])[:50]
         self._audit.log(event, **rec)
@@ -453,6 +475,11 @@ class Broker:
             if host is None or host in hosts:
                 # Deliberately no approval policy or sensitivity here: whether a
                 # credential prompts must not influence which one an agent picks.
+                if sc.get("ssh"):
+                    # not usable as a {{VAR}}: only `asb ssh-agent` signs with it
+                    out.append({"name": name, "vars": [], "allowed_hosts": hosts,
+                                "ssh_public_key": sc["ssh_public_key"]})
+                    continue
                 out.append({"name": name, "vars": sorted(sc["vars"]), "allowed_hosts": hosts})
         return out
 
@@ -467,6 +494,11 @@ class Broker:
             else:
                 if not names or any(n not in secrets_cfg for n in names):
                     raise ValueError("unknown secret name")
+                if mode == "ssh_sign":
+                    self._validate_ssh_sign(names, spec)
+                elif any(secrets_cfg[n].get("ssh") for n in names):
+                    raise PermissionError("an ssh key can only be used to sign (asb ssh-agent), "
+                                          "never released or placed in a request")
                 seen = {}
                 for n in dict.fromkeys(names):
                     for var in secrets_cfg[n]["vars"]:
@@ -534,19 +566,37 @@ class Broker:
             raise ValueError(f"value is larger than {MAX_STORE_VALUE} bytes")
         spec["value_bytes"] = len(value.encode())
         secrets_cfg = self.cfg["secrets"]
+        if spec.get("ssh") and op == "create":
+            try:
+                spec["ssh_public_key"] = sshkey.public_line(sshkey.load_private(value))
+            except sshkey.SshKeyError as e:
+                raise ValueError(str(e)) from None
+            spec["allowed_hosts"] = spec.get("allowed_hosts") or []
+        elif spec.get("ssh"):
+            raise ValueError("--ssh applies when creating a credential; an update keeps its type")
+        if op == "update" and secrets_cfg.get(name, {}).get("ssh"):
+            try:
+                same = sshkey.public_line(sshkey.load_private(value)) == secrets_cfg[name]["ssh_public_key"]
+            except sshkey.SshKeyError as e:
+                raise ValueError(str(e)) from None
+            if not same:
+                raise ValueError("the new key has a different public key; store it as a new credential")
         if op == "create":
             if name in secrets_cfg:
                 raise ValueError(f"{name} already exists; use update")
             if not hasattr(self.backend, "catalog"):
                 raise PermissionError("this vault backend has no secret catalog")
             hosts = spec.get("allowed_hosts")
-            if (not isinstance(hosts, list) or not 1 <= len(hosts) <= 10
+            if (not isinstance(hosts, list) or not (0 if spec.get("ssh") else 1) <= len(hosts) <= 10
                     or not all(isinstance(h, str) and _HOST_RE.match(h) for h in hosts)):
                 raise ValueError("allowed_hosts must be 1-10 plain hostnames")
             spec["allowed_hosts"] = sorted(set(h.lower() for h in hosts))
-            spec["field"] = spec.get("field") or "notes"
+            spec["field"] = spec.get("field") or ("private_key" if spec.get("ssh") else "notes")
+            if spec.get("ssh") and spec["field"] != "private_key":
+                raise ValueError("an ssh key is stored in an SSH key item (field private_key)")
             spec["item"] = spec.get("item") or name
-            spec["var"] = spec.get("var") or re.sub(r"[^A-Za-z0-9]", "_", name).upper() + "_TOKEN"
+            spec["var"] = spec.get("var") or re.sub(r"[^A-Za-z0-9]", "_", name).upper() + (
+                "_SSH_KEY" if spec.get("ssh") else "_TOKEN")
             if not _FIELD_RE.match(spec["field"]) or spec["field"] in (
                     "previous_value", "previous_replaced_at", "broker"):
                 raise ValueError("bad field name")
@@ -577,6 +627,24 @@ class Broker:
             spec["key"] = ref.get("key")
         else:
             raise ValueError("op must be create or update")
+
+    def _validate_ssh_sign(self, names, spec):
+        if len(names) != 1 or not self.cfg["secrets"][names[0]].get("ssh"):
+            raise ValueError("ssh signing needs exactly one ssh key secret")
+        try:
+            data = base64.b64decode(spec.get("data_b64") or "", validate=True)
+        except (binascii.Error, ValueError):
+            raise ValueError("data_b64 is not valid base64") from None
+        if not data or len(data) > sshkey.MAX_SIGN_DATA:
+            raise ValueError(f"data must be 1-{sshkey.MAX_SIGN_DATA} bytes")
+        flags = spec.get("flags", 0)
+        if not isinstance(flags, int) or isinstance(flags, bool) or not 0 <= flags < 64:
+            raise ValueError("bad flags")
+        sc = self.cfg["secrets"][names[0]]
+        spec["data"], spec["flags"] = data, flags
+        spec["data_bytes"] = len(data)
+        spec["ssh"] = sshkey.describe_data(data)
+        spec["fingerprint"] = sshkey.fingerprint(sshkey.blob_from_line(sc["ssh_public_key"]))
 
     def _validate_http(self, names, spec):
         u = urllib.parse.urlsplit(spec["url"])
@@ -610,6 +678,8 @@ class Broker:
             what = (f"{sp['op']} credential: item {sp['item']!r} field {sp['field']}"
                     f"{' key ' + sp['key'] if sp.get('key') else ''} "
                     f"({sp['value_bytes']} bytes, value not shown)")
+        elif req.mode == "ssh_sign":
+            what = f"SSH key {req.spec['fingerprint']}: {req.spec['ssh']['text']}"
         else:
             what = "run: " + " ".join(req.spec.get("argv") or [])[:200]
         head = f"{req.summary} (unverified)\n" if req.summary else ""
@@ -860,6 +930,8 @@ class Broker:
             stamp = {"by": by, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
             meta = {"name": name, "vars": {sp["var"]: {"field": sp["field"]}},
                     "allowed_hosts": sp["allowed_hosts"], "approval": "prompt", "created": stamp}
+            if sp.get("ssh"):
+                meta.update(ssh=True, ssh_public_key=sp["ssh_public_key"])   # item type 5 in Bitwarden
             self.backend.put(sp["item"], sp["field"], sp["value"], create=True, meta=meta)
             _, entry = self._entry(sp["item"], meta)
             with self._cfg_lock:
@@ -879,6 +951,8 @@ class Broker:
     def _release(self, req):
         if req.mode == "store":
             return self._store(req)
+        if req.mode == "ssh_sign":
+            return self._ssh_sign(req)
         env, raw = {}, {}
         for n in req.names:
             if n not in self.cfg["secrets"]:
@@ -905,6 +979,24 @@ class Broker:
                    response_bytes=len(out["body"]), duration_ms=int((time.time() - t0) * 1000))
         return {"http": out}
 
+    def _ssh_sign(self, req):
+        name = req.names[0]
+        sc = self.cfg["secrets"].get(name)
+        if sc is None or not sc.get("ssh"):
+            raise BackendError(f"{name} is no longer an ssh key in the vault catalog")
+        (var, ref), = sc["vars"].items()
+        pem = self.backend.get(ref["item"], ref.get("field") or "auto")
+        self.audit("secret_read", req, secret=name, vars=[var])
+        try:
+            key = sshkey.load_private(structured.get(pem, ref["key"]) if ref.get("key") else pem)
+            if sshkey.public_line(key) != sc["ssh_public_key"]:
+                raise BackendError(f"{name}: the vault key no longer matches ssh_public_key")
+            sig = sshkey.sign(key, req.spec["data"], req.spec["flags"])
+        except (sshkey.SshKeyError, structured.StructuredError) as e:
+            raise BackendError(f"{name}: {e}") from None
+        self.audit("ssh_signed", req, ssh_fingerprint=req.spec["fingerprint"])
+        return {"ssh_signature": base64.b64encode(sig).decode()}
+
     def wait(self, rid, timeout):
         req = self._by_id.get(rid)
         if req is None:
@@ -924,7 +1016,7 @@ class Broker:
             else:
                 delivered = False
         if delivered:
-            self.audit("delivered", req, to_peer=peer, kind="env" if req.mode == "env" else "http_response")
+            self.audit("delivered", req, to_peer=peer, kind={"env": "env", "ssh_sign": "ssh_signature"}.get(req.mode, "http_response"))
             return {"status": "approved", **(out or {})}
         if req.status == "released":
             return {"status": "released"}
@@ -1655,6 +1747,11 @@ def _describe(req):
                 f"New value: {sp['value_bytes']} bytes (never displayed)",
                 "An update replaces the current value; the old one is kept in the item's "
                 "previous_value field. This will not run without your approval.")
+    if req.mode == "ssh_sign":
+        return (f"SSH signature with key <code>{html.escape(req.spec['fingerprint'])}</code><br>"
+                f"{html.escape(req.spec['ssh']['text'])}",
+                "The private key stays in the broker; only the signature goes back. "
+                "Advisory: the request text is what the client sent.")
     return ("run <code>" + html.escape(" ".join(req.spec.get("argv") or [])) + "</code>",
             "Advisory only: the secret is released to the requesting host and the "
             "command shown is what it <em>said</em> it would run.")
@@ -1752,7 +1849,10 @@ def client_handler(broker, client_key):
                 elif mode == "store":
                     spec = {"op": body.get("op"), "value": body.get("value"),
                             "field": body.get("field"), "item": body.get("item"),
-                            "var": body.get("var"), "allowed_hosts": body.get("allowed_hosts")}
+                            "var": body.get("var"), "allowed_hosts": body.get("allowed_hosts"),
+                            "ssh": body.get("ssh") is True}
+                elif mode == "ssh_sign":
+                    spec = {"data_b64": body.get("data_b64"), "flags": body.get("flags", 0)}
                 else:
                     raise ValueError("bad mode")
                 req = broker.create(mode, names, spec, str(body.get("source", self.client_address[0]))[:80],
@@ -1893,6 +1993,8 @@ def approval_handler(broker):
                     what = f"{r['method'] or ''} {r['url'] or ''}".strip()
                 elif r["mode"] == "store":
                     what = f"{r['op'] or 'store'} credential"
+                elif r["mode"] == "ssh_sign":
+                    what = r.get("ssh_what") or "ssh signature"
                 else:
                     what = "env"
                 kind = "ok" if r["outcome"] in good else "bad" if r["outcome"] in bad else "plain"
@@ -2042,7 +2144,7 @@ def approval_handler(broker):
             def arg(k):
                 return (q.get(k) or [""])[0][:60]
             outcome = arg("outcome") if arg("outcome") in OUTCOMES + ("unknown",) else ""
-            secret, mode = arg("secret"), arg("mode") if arg("mode") in ("http", "env", "store") else ""
+            secret, mode = arg("secret"), arg("mode") if arg("mode") in ("http", "env", "store", "ssh_sign") else ""
             try:
                 page = max(1, int(arg("page") or 1))
             except ValueError:
@@ -2059,7 +2161,7 @@ def approval_handler(broker):
             form = ("<form method=get class=filters>"
                     f"<select name=outcome>{opt(OUTCOMES + ('unknown',), outcome, 'any outcome')}</select> "
                     f"<select name=secret>{opt(broker.history.secrets_seen(), secret, 'any secret')}</select> "
-                    f"<select name=mode>{opt(('http', 'env', 'store'), mode, 'any mode')}</select> "
+                    f"<select name=mode>{opt(('http', 'env', 'store', 'ssh_sign'), mode, 'any mode')}</select> "
                     "<button>Filter</button></form>")
             body = []
             for r in rows:
@@ -2068,6 +2170,8 @@ def approval_handler(broker):
                 elif r["mode"] == "store":
                     what = (f"{r['op'] or 'store'} credential: item {r['item']!r} field {r['field']}"
                             + (f" key {r['key']}" if r.get("key") else ""))
+                elif r["mode"] == "ssh_sign":
+                    what = f"ssh: {r.get('ssh_what') or 'signature'}"
                 else:
                     what = "env: value released to the requesting host"
                 if r["outcome"] in ("approved", "auto-approved") and not r["delivered"]:

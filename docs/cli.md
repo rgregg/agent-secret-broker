@@ -43,6 +43,7 @@ Check it:
 
     printf '%s' "$VALUE" | asb store NAME --hosts a.example.com   # add a credential
     printf '%s' "$VALUE" | asb update NAME                        # rotate one (needs approval)
+    asb ssh-agent [-- command args...]    # use broker-held SSH keys with ssh/git (see reference.md)
 
 - `{{VAR}}` placeholders (the names `which` and `list` show) are replaced
   **inside the broker** in the URL, headers and body, so the agent never sees the
