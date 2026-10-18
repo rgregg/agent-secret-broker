@@ -36,6 +36,7 @@ from .backends import BackendError
 from . import audit_api
 from . import notify as notify_mod
 from .notify import NotifyError
+from . import grants as grants_mod
 from . import risk as risk_mod
 from . import sshkey
 from . import structured
@@ -69,15 +70,18 @@ class Channel:
     decide_via is responsible for the channel's own authentication (SSO header,
     CSRF / same-origin guards, ...)."""
 
-    def __init__(self, token_required, may_create_always):
+    def __init__(self, token_required, may_create_always, may_create_grant=False):
         self.token_required = token_required        # must present the request's action token
         self.may_create_always = may_create_always  # may create an always-allow rule
+        self.may_create_grant = may_create_grant    # may create a time-boxed grant
 
 
 # Registry of decision channels; the key is the `channel` audit field.
 CHANNELS = {
-    "dashboard": Channel(token_required=False, may_create_always=True),   # POST /decide
-    "link": Channel(token_required=False, may_create_always=True),        # POST /a/<nonce>
+    "dashboard": Channel(token_required=False, may_create_always=True,
+                         may_create_grant=True),                          # POST /decide
+    "link": Channel(token_required=False, may_create_always=True,
+                    may_create_grant=True),                               # POST /a/<nonce>
     "push": Channel(token_required=True, may_create_always=False),        # POST /push/decide
     "ha": Channel(token_required=True, may_create_always=False),          # POST /v1/hooks/ha/decide
 }
@@ -146,6 +150,7 @@ class Broker:
         self._auto_max, warn = risk_mod.parse_auto_approve_max(config.get("risk"), "risk")
         if warn:
             self.log("config_warning", warning=warn)
+        self._init_grants(config)
         if background_load:
             # Listen right away; the first requests wait on the same lock.
             self._refreshing.acquire()
@@ -365,7 +370,8 @@ class Broker:
             "notifiers": notifiers,
             "features": {"ha_hook": self.ha_hook is not None, "ssh": has_ssh,
                          "webpush_actions": "webpush" in notifiers and self.push is not None,
-                         "auto_approve_max": self._auto_max},
+                         "auto_approve_max": self._auto_max,
+                         "timed_grants": bool(self.grants_cfg["enabled"])},
         }
 
     def _refresh_if(self, stale_after, wait=True):
@@ -576,6 +582,8 @@ class Broker:
         self.audit("assessed", req, model=a["model"], reasons=a["reasons"])
         auto = self._auto_allowed(mode, names, spec)
         auto_max = self._auto_max
+        if not auto and self._grant_claim(req):
+            return req
         if auto and not risk_mod.auto_ok(a["level"], auto_max):
             why = ("auto-approve is off (risk.auto_approve_max none)" if auto_max == "none" else
                    f"risk {a['level']} is above auto_approve_max {auto_max}")
@@ -881,7 +889,7 @@ class Broker:
         return sorted(rows, key=lambda r: r.created)
 
     def decide_via(self, channel, rid, decision, actor, *, token=None, always=False,
-                   nonce=None, peer=None, client_ip=None, **audit_extra):
+                   nonce=None, peer=None, client_ip=None, grant_minutes=None, **audit_extra):
         """The single entry for every decision. Returns (http_status, req):
         200 decided; 403 wrong/missing token; 404 unknown; 410 already decided,
         expired or token spent (no state change). `decision` is "approve" or
@@ -899,6 +907,9 @@ class Broker:
             raise ValueError("decision must be approve or deny")
         approve = decision == "approve"
         always = bool(always and approve and ch.may_create_always)
+        grant_minutes = grant_minutes if (approve and ch.may_create_grant) else None
+        if grant_minutes is not None and not self.grant_minutes_ok(grant_minutes):
+            return 400, None            # unknown duration: nothing is claimed or changed
         check = ch.token_required or token is not None
         digest = hashlib.sha256((token or "").encode()).digest()
         stale_log, refused_log, code, req = False, False, None, None
@@ -955,6 +966,8 @@ class Broker:
         who = {"via": "user", "approver": actor, "approver_peer": peer, "approver_ip": client_ip,
                "channel": channel}
         who.update(audit_extra)
+        if grant_minutes is not None:
+            who["grant_minutes"] = grant_minutes
         req.approver = actor
         req.action_hash = None           # a push-button token dies with the decision
         # The decision itself is recorded and announced immediately.
@@ -971,6 +984,8 @@ class Broker:
                 req.always = "applied"
             else:
                 req.always = "not applied: could not write the config file"
+        if grant_minutes is not None:
+            self._grant_create(req, grant_minutes, actor, channel, who)
         self._resolved(req, "approved")
         # Releasing can take seconds (vault unlock, upstream call). It runs off
         # the request thread: the approver's page has already been answered, the
@@ -978,6 +993,104 @@ class Broker:
         # and surfaced to the client, never to the approver.
         threading.Thread(target=self._release_and_finish, args=(req, who), daemon=True).start()
         return 200, req
+
+    # -- time-boxed grants (see grants.py) ----------------------------------
+    def _init_grants(self, config):
+        self.grants_cfg = grants_mod.parse_config(config.get("timed_grants"))
+        apath = self._audit._path
+        gpath = os.path.join(os.path.dirname(os.path.abspath(apath)), "grants.json") if apath else None
+        self.grants = grants_mod.GrantStore(gpath, self.log, clock=lambda: time.time(),
+                                            max_minutes=self.grants_cfg["max_minutes"])
+        if self.grants_cfg["enabled"]:      # disabled: any persisted grants are ignored
+            self.grants.load()
+            threading.Thread(target=self._grant_sweeper, daemon=True).start()
+
+    def _grant_sweeper(self):
+        while True:
+            time.sleep(15)
+            try:
+                self.grants.sweep()         # audits grant_expired
+            except Exception:  # noqa: BLE001 -- never let the sweeper die
+                pass
+
+    def grant_minutes_ok(self, minutes):
+        c = self.grants_cfg
+        return (c["enabled"] and isinstance(minutes, int) and not isinstance(minutes, bool)
+                and minutes in c["durations"] and 0 < minutes <= c["max_minutes"])
+
+    def grant_durations(self):
+        """Minutes offered on the approval card; empty when grants are off."""
+        return list(self.grants_cfg["durations"]) if self.grants_cfg["enabled"] else []
+
+    def grant_eligibility(self, req):
+        """(ok, reason): whether an approval of `req` may also create grants."""
+        if not self.grants_cfg["enabled"]:
+            return False, "time-boxed grants are off"
+        if req.mode not in grants_mod.ELIGIBLE_MODES:
+            return False, ("env-mode requests release the value to the requesting host"
+                           if req.mode == "env" else "storing a credential always needs a fresh approval")
+        return True, ""
+
+    def active_grants(self):
+        """Active grants (with seconds left) for the Policies page."""
+        if not self.grants_cfg["enabled"]:
+            return []
+        return [{**g, "left_s": self.grants.left_s(g)} for g in self.grants.active()]
+
+    def _grant_create(self, req, minutes, actor, channel, who):
+        ok, why = self.grant_eligibility(req)
+        if not ok:
+            self.audit("grant_refused", req, reason=why, **who)
+            return
+        made = [self.grants.add(n, minutes, actor, channel, req.id) for n in dict.fromkeys(req.names)]
+        self.audit("grant_created", req, grant_ids=[g["id"] for g in made], grant_minutes=minutes,
+                   expires_at=made[0]["expires_at"], created_by=actor, channel=channel,
+                   approver_peer=who.get("approver_peer"), approver_ip=who.get("approver_ip"))
+
+    def _grant_claim(self, req):
+        """Approve `req` from active grants when every secret has one. Called from
+        create() for requests no policy already approved. Returns True when the
+        request was claimed and finished here. Checked and claimed under the
+        decision lock, so a human decision and a grant never both act."""
+        cfg = self.grants_cfg
+        if not cfg["enabled"] or req.mode not in grants_mod.ELIGIBLE_MODES:
+            return False
+        level = req.risk["level"] if req.risk else "high"
+        with self._lock:
+            got = self.grants.match(req.names)
+            if got is None:
+                return False
+            skipped = not risk_mod.auto_ok(level, cfg["max_risk"])
+            if not skipped:
+                if req.status != "pending":
+                    return False
+                req.status = "deciding"
+        ids = [g["id"] for g in got]
+        if skipped:
+            self.audit("grant_skipped", req, reason="risk", grant_ids=ids, risk_level=level,
+                       max_risk=cfg["max_risk"])
+            return False
+        left = min(self.grants.left_s(g) for g in got)
+        self.audit("grant_used", req, grant_ids=ids, grant_left_s=left)
+        try:
+            result = self._release(req)
+        except (BackendError, OSError, ValueError) as e:
+            self._finish(req, "failed", error=f"release failed: {e}", via="policy",
+                         grant_id=ids[0], grant_ids=ids, grant_left_s=left)
+        else:
+            self._finish(req, "approved", result=result, via="policy",
+                         grant_id=ids[0], grant_ids=ids, grant_left_s=left)
+        return True
+
+    def revoke_grant(self, grant_id, user, peer=None, client_ip=None):
+        """End a grant early. Returns True when it was active."""
+        g = self.grants.revoke(grant_id) if self.grants_cfg["enabled"] else None
+        if g is None:
+            return False
+        self.log("grant_revoked", grant_id=g["id"], secret=g["secret"], created_by=g["created_by"],
+                 revoked_by=user, left_s=max(0, int(g["expires_at"] - time.time())), peer=peer,
+                 client_ip=client_ip)
+        return True
 
     def decide_push(self, rid, token, approve, user, peer=None, client_ip=None):
         """Decision from a browser notification button: decide_via on the
@@ -1373,6 +1486,17 @@ _WORKING_JS = (
     "document.getElementById('f').addEventListener('submit',function(){"
     "setTimeout(function(){document.querySelectorAll('button').forEach(function(b){b.disabled=true});"
     "document.getElementById('w').hidden=false},0)});")
+
+_GRANTS_JS = r'''
+(function(){
+  function fmt(s){var m=Math.floor(s/60);return m+'m '+('0'+(s%60)).slice(-2)+'s';}
+  function tick(){var any=false;document.querySelectorAll('time[data-gexp]').forEach(function(t){
+    var s=Math.floor(t.getAttribute('data-gexp')-Date.now()/1000);
+    if(s<=0){t.textContent='expired';any=true;return;}t.textContent=fmt(s);});
+    if(any)setTimeout(function(){location.reload();},1500);}
+  tick();setInterval(tick,1000);
+})();
+'''
 
 _CE_LOCK = threading.Lock()
 _CE_LIMIT = 120          # client events per user per minute
@@ -1967,6 +2091,41 @@ _AUTO_LABEL = {"none": "off (every request asks a human)", "low": "up to low ris
                "high": "any risk level, including requests with no model verdict"}
 
 
+def _grant_menu(broker, req):
+    """The 'Approve for N minutes' menu (dashboard card or approval-link page);
+    empty when grants are off or this request cannot create one."""
+    ok, _ = broker.grant_eligibility(req)
+    mins = broker.grant_durations()
+    if not ok or not mins:
+        return ""
+    btns = "".join(
+        f"<button class=btn name=decision value='approve_grant_{m}'>"
+        f"Approve for {_fmt_minutes(m)}</button>" for m in mins)
+    return ("<details class=more><summary>Approve for a while &#9662;</summary>" + btns
+            + f"<p><small>Further requests for {html.escape(', '.join(req.names))} that the broker "
+            "runs itself are approved without asking until the time is up. Revoke any time "
+            "under Policies.</small></p></details>")
+
+
+def _fmt_minutes(m):
+    return f"{m} min" if m < 60 or m % 60 else f"{m // 60} h"
+
+
+def _parse_decision(decision):
+    """Form value -> (decision, always, grant_minutes) or None when malformed."""
+    if decision in ("approve", "deny"):
+        return decision, False, None
+    if decision == "approve_always":
+        return "approve", True, None
+    if decision.startswith("approve_grant_") and decision[14:].isdigit() and len(decision) < 22:
+        return "approve", False, int(decision[14:])
+    return None
+
+
+def _left(s):
+    return f"{s // 60}m {s % 60:02d}s"
+
+
 def _utc(t):
     return time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(t)) if t else ""
 
@@ -2040,7 +2199,13 @@ def _detail_html(r, evs):
                             if r["risk_model"] else ""), True)
     add("Outcome", f"<span class='pill {kind}'>{e(label)}</span>"
         + (f" {e(r['error'])}" if r["error"] else ""), True)
-    if r["via"] == "policy":
+    if r["via"] == "policy" and r.get("grant_id"):
+        left = (final or {}).get("grant_left_s")
+        add("Decided by", "time-boxed grant (auto-approved)"
+            + ((f", {left // 60} min left when used" if left >= 60 else ", under a minute left when used")
+               if isinstance(left, int) else "")
+            + f", grant {str(r['grant_id'])[:8]}")
+    elif r["via"] == "policy":
         am = (final or {}).get("auto_max")
         add("Decided by", "policy (auto-approved)" + (f", auto-approve limit: {am}" if am else ""))
     elif decided:
@@ -2052,7 +2217,9 @@ def _detail_html(r, evs):
         add("Approver address", ", ".join(x for x in (decided.get("approver_peer"),
                                                       decided.get("approver_ip")) if x))
         add("Decision", (decided.get("decision") or "")
-            + (" and always allow" if decided.get("always_requested") else ""))
+            + (" and always allow" if decided.get("always_requested") else "")
+            + (f" and approve for {decided['grant_minutes']} min"
+               if decided.get("grant_minutes") else ""))
     elif outcome == "expired":
         add("Decided by", "nobody (expired unanswered)")
     elif r["approver"]:
@@ -2262,6 +2429,8 @@ def approval_handler(broker):
         def _dashboard(self, user, fragment=False, note="", q=None):
             notes = {"approved": "Approved. Releasing now.", "denied": "Denied.",
                      "always": "Approved, and always allowed from now on.",
+                     "grant": "Approved, and further requests are approved for a while.",
+                     "revoked": "Grant revoked.",
                      "stale": "That request was already handled or has expired.",
                      "push_removed": "Device removed.",
                      "push_test_ok": "Test push sent. It should arrive even with the browser closed.",
@@ -2280,6 +2449,7 @@ def approval_handler(broker):
                     "<p><small>Future HTTP calls with this secret run without asking, except "
                     "requests rated at or above the risk threshold. Revoke any time under "
                     "Policies.</small></p></details>" if ok else "")
+                grant = _grant_menu(broker, r)
                 no_always = ("" if ok else
                              f"<p><small>Always allow not offered: {html.escape(why)}.</small></p>")
                 cards.append(
@@ -2294,7 +2464,7 @@ def approval_handler(broker):
                     f"<input type=hidden name=csrf value='{token}'>"
                     "<div class=actions><button class='btn approve' name=decision value=approve>"
                     "Approve</button><button class='btn deny' name=decision value=deny>Deny</button>"
-                    f"{always}</div>{no_always}</form></article>")
+                    f"{always}{grant}</div>{no_always}</form></article>")
             version = hashlib.sha256("|".join(r.id for r in reqs).encode()).hexdigest()[:16]
             inner = ("".join(cards) if cards else
                      "<div class='card empty'>Nothing is waiting for approval.</div>")
@@ -2454,7 +2624,10 @@ def approval_handler(broker):
                   "<b>Auto-approve</b><small class=muted>"
                   f"{html.escape(auto[0].upper() + auto[1:])}."
                   " Applies only to secrets set to always allow; set in the broker config "
-                  "(risk.auto_approve_max).</small></div></div></section>"
+                  "(risk.auto_approve_max).</small></div></div>"
+                  "<div class=srow><div class=t><b>Time-boxed grants</b><small class=muted>"
+                  f"{html.escape(grants_mod.describe(broker.grants_cfg))}. "
+                  "Set in the broker config (timed_grants).</small></div></div></section>"
                   "<section class=card><h2>This browser</h2>"
                   "<div class=srow><div class=t><b>Notifications while this page is open</b>"
                   "<small id=notify-state class=muted></small></div>"
@@ -2569,11 +2742,38 @@ def approval_handler(broker):
             table = ("<table class=tbl><thead><tr><th>Secret</th><th>Allowed by</th><th></th></tr></thead>"
                      "<tbody>" + "".join(rows) + "</tbody></table>" if rows else
                      "<div class='card empty'>Nothing is always allowed. Every use asks you first.</div>")
-            _page(self, 200, f"<h1>Policies</h1>{note}<h3 style='margin-top:0'>Always allowed</h3>"
+            _page(self, 200, f"<h1>Policies</h1>{note}{self._grants_section(user)}"
+                  "<h3>Always allowed</h3>"
                   "<p><small class=muted>These secrets are released without asking when the request's "
                   f"risk is within the auto-approve limit ({_AUTO_LABEL[broker.auto_approve_max()]}). "
                   "Revoke to ask every time again.</small></p>" + table,
-                  tab="policies", badge=len(broker.pending()), user=user)
+                  script=_GRANTS_JS, tab="policies", badge=len(broker.pending()), user=user)
+
+        def _grants_section(self, user):
+            """'Active grants' card on the Policies tab: who allowed what, time left, Revoke."""
+            head = ("<h3 style='margin-top:0'>Active grants</h3><p><small class=muted>Time-boxed "
+                    "approvals: until the clock runs out, requests for these secrets that the broker "
+                    "runs itself are approved without asking. Revoke to ask every time again."
+                    "</small></p>")
+            if not broker.grants_cfg["enabled"]:
+                return head + "<div class='card empty'>Time-boxed grants are turned off.</div>"
+            rows = []
+            for g in broker.active_grants():
+                rows.append(
+                    f"<tr><td data-label=Secret><b>{html.escape(g['secret'])}</b></td>"
+                    f"<td data-label='Time left'><time data-gexp='{int(g['expires_at'])}'>"
+                    f"{html.escape(_left(g['left_s']))}</time></td>"
+                    f"<td data-label='Allowed by'>{html.escape(g['created_by'])}"
+                    f" <small class=muted>({int(g['minutes'])} min)</small></td>"
+                    "<td><form method=post action='/grants/revoke' class=inline>"
+                    f"<input type=hidden name=csrf value='{broker.csrf_token(user)}'>"
+                    f"<input type=hidden name=grant value='{html.escape(g['id'])}'>"
+                    "<button>Revoke</button></form></td></tr>")
+            if not rows:
+                return head + "<div class='card empty'>No active grants</div>"
+            return (head + "<table class=tbl><thead><tr><th>Secret</th><th>Time left</th>"
+                    "<th>Allowed by</th><th></th></tr></thead><tbody>" + "".join(rows)
+                    + "</tbody></table>")
 
         def do_GET(self):
             user = self._user()
@@ -2634,7 +2834,7 @@ def approval_handler(broker):
 <div class=actions>
 <button class='btn approve' name=decision value=approve>Approve</button>
 <button class='btn deny' name=decision value=deny>Deny</button>
-</div>
+{_grant_menu(broker, req)}</div>
 {always_html}
 </form>
 <p id=w hidden>Working...</p>""", script=_WORKING_JS)
@@ -2759,7 +2959,7 @@ def approval_handler(broker):
             form = urllib.parse.parse_qs(
                 self.rfile.read(min(int(self.headers.get("Content-Length", 0)), 8192)).decode())
             path = self.path.split("?")[0].rstrip("/")
-            if path in ("/decide", "/policies", "/push/subscribe", "/push/revoke",
+            if path in ("/decide", "/policies", "/grants/revoke", "/push/subscribe", "/push/revoke",
                         "/push/test") and not self._csrf_ok(user, form.get("csrf", [""])[0]):
                 broker.log("csrf_refused", path=path, peer=self.client_address[0],
                            client_ip=self._fwd(), origin=(self.headers.get("Origin") or "")[:80],
@@ -2771,17 +2971,23 @@ def approval_handler(broker):
                 rid = form.get("id", [""])[0]
                 decision = form.get("decision", [""])[0]
                 r = broker._by_id.get(rid)
-                if decision not in ("approve", "deny", "approve_always") or r is None:
+                parsed = _parse_decision(decision)
+                if parsed is None or r is None:
                     return self._redirect("/?note=stale")
                 code, done = broker.decide_via(
-                    "dashboard", rid, "deny" if decision == "deny" else "approve", user,
-                    always=(decision == "approve_always"),
+                    "dashboard", rid, parsed[0], user, always=parsed[1], grant_minutes=parsed[2],
                     peer=self.client_address[0], client_ip=self._fwd())
                 if done is None:
-                    return self._redirect("/?note=stale")
+                    return self._redirect("/?note=" + ("bad" if code == 400 else "stale"))
                 tag = ("denied" if decision == "deny" else
-                       "always" if done.always == "applied" else "approved")
+                       "always" if done.always == "applied" else
+                       "grant" if parsed[2] is not None else "approved")
                 return self._redirect(f"/?note={tag}")
+            if path == "/grants/revoke":
+                gid = form.get("grant", [""])[0][:16]
+                done = broker.revoke_grant(gid, user, self.client_address[0], self._fwd())
+                return self._policies_page(
+                    user, f"<p>{'Grant revoked' if done else 'That grant is no longer active'}.</p>")
             if self.path.split("?")[0].rstrip("/") == "/policies":
                 name = form.get("name", [""])[0]
                 # this page can only *tighten*: granting happens in the context of a request
@@ -2792,11 +2998,15 @@ def approval_handler(broker):
                     user, f"<p>{'Updated' if done else 'Could not update'}: {html.escape(name)}</p>")
             nonce = self._nonce()
             decision = form.get("decision", [""])[0]
-            approve = decision in ("approve", "approve_always")
-            req = (broker.decide_via("link", None, "approve" if approve else "deny", user,
-                                     nonce=nonce, always=(decision == "approve_always"),
-                                     peer=self.client_address[0], client_ip=self._fwd())[1]
-                   if nonce else None)
+            parsed = _parse_decision(decision) or ("deny", False, None)
+            approve = parsed[0] == "approve"
+            code, req = (broker.decide_via("link", None, parsed[0], user, nonce=nonce,
+                                           always=parsed[1], grant_minutes=parsed[2],
+                                           peer=self.client_address[0], client_ip=self._fwd())
+                         if nonce else (404, None))
+            if code == 400:
+                return _page(self, 400, "<h1>That duration is not available</h1>"
+                             "<p>Go back and pick one of the offered options.</p>")
             if req is None:
                 return _page(self, 404, "<h1>Request not found or already handled</h1>")
             if not approve:
@@ -2807,6 +3017,10 @@ def approval_handler(broker):
                          "Revoke it at <a href='/policies'>/policies</a>.</p>")
             elif req.always:
                 extra = f"<p><small>Always allow {html.escape(req.always)}.</small></p>"
+            if parsed[2] is not None:
+                extra += (f"<p>Further requests for <b>{html.escape(', '.join(req.names))}</b> are "
+                          f"approved for {parsed[2]} minutes. Revoke it at "
+                          "<a href='/policies'>/policies</a>.</p>")
             _page(self, 200, "<h1>Approved</h1><p>Releasing now. You can close this page.</p>" + extra)
 
     return H

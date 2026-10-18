@@ -21,7 +21,8 @@ _EV_KEYS = ("reason", "reasons", "model", "risk", "error", "via", "channel", "de
             "approver", "approver_peer", "approver_ip", "always_requested", "latency_ms",
             "duration_ms", "upstream_status", "response_bytes", "secret", "vars", "kind",
             "to_peer", "auto_max", "ssh_fingerprint", "sign_bytes", "value_bytes", "op",
-            "item", "field", "key", "hosts")
+            "item", "field", "key", "hosts", "grant_id", "grant_ids", "grant_minutes",
+            "grant_left_s", "expires_at", "created_by", "max_risk", "risk_level")
 _MAX_EVENTS = 60            # per request
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 
@@ -97,7 +98,7 @@ class History:
                 "id": rid, "ts": rec["ts"], "time": rec["time"], "names": rec.get("names") or [],
                 "mode": rec.get("mode"), "source": rec.get("source"), "outcome": "pending",
                 "via": None, "approver": None, "risk": None, "summary": None, "summary_model": None, "error": None,
-                "latency_ms": None, "delivered": False, "escalated": False,
+                "latency_ms": None, "grant_id": None, "delivered": False, "escalated": False,
                 "method": rec.get("method"), "url": _short_url(rec.get("url")),
                 "op": rec.get("op"), "item": rec.get("item"), "field": rec.get("field"),
                 "key": rec.get("key"), "hosts": rec.get("hosts"), "final_seq": -1,
@@ -133,6 +134,7 @@ class History:
             row["approver"] = rec.get("approver")
             row["error"] = rec.get("error")
             row["latency_ms"] = rec.get("latency_ms")
+            row["grant_id"] = rec.get("grant_id")
             if ev == "approved" and row["via"] == "policy":
                 row["outcome"] = "auto-approved"
 
