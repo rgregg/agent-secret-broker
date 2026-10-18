@@ -174,6 +174,16 @@ class Config(unittest.TestCase):
                                  "summary_text": "none"}, self.read)
             self.assertEqual(e.config_warnings, [])
 
+    def test_read_endpoints_validation(self):
+        good = {"type": "jev", "api_key_file": "/k", "summary_read_endpoints": [{"host": "h.example.com", "path": "/read"}]}
+        a = riskmodel.build(good, self.read)
+        self.assertEqual(a.inner._describer._read_eps, good["summary_read_endpoints"])
+        for bad in ("x", [1], [{"host": "h"}], [{"host": "https://h", "path": "/r"}], [{"host": "h", "path": "r"}],
+                    [{"host": "h", "path": "/r?x=1"}], [{"host": "h", "path": "/r", "extra": 1}]):
+            with self.assertRaises(ValueError) as cm:
+                riskmodel.build({**good, "summary_read_endpoints": bad}, self.read)
+            self.assertIn("summary.summary_read_endpoints", str(cm.exception))
+
     def test_url_validation(self):
         for k, v in (("base_url", "http://evil.example.com"), ("summary_base_url", "ftp://x"),
                      ("summary_base_url", "https://"), ("base_url", "https://h/?a=1")):

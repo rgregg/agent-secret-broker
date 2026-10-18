@@ -116,8 +116,7 @@ class MutatingStrictness(unittest.TestCase):
         ("Deploying a new release", "http", {"method": "POST", "url": "https://h/deploy"}),
         ("Running a backup script", "env", {"argv": ["sh", "-c", "backup.sh > out"]}),
         ("Retrieving a list of models from OpenAI", "http", {"method": "GET", "url": "https://h/models"}),
-        ("Searching a photo library", "http", {"method": "POST", "url": "https://h/api/search", "body": "{}"}),
-        ("Checking only the health of a server", "http", {"method": "GET", "url": "https://h/health"}),
+                ("Checking only the health of a server", "http", {"method": "GET", "url": "https://h/health"}),
         ("Unclear what this request does", "http", {"method": "DELETE", "url": "https://h/x"}),
     ]
 
@@ -136,19 +135,57 @@ class MutatingStrictness(unittest.TestCase):
         self.assertEqual((r["source"], r["reason"]), ("deterministic", "rejected"))
 
 
+class PostReads(unittest.TestCase):
+    def post(self, url, body=None):
+        return {"method": "POST", "url": url, "body": body}
+
+    def test_keyword_bypasses_rejected(self):
+        for spec in (self.post("https://h/api/list/delete"), self.post("https://h/api/search/x", "{}"),
+                     self.post("https://h/x", '{"op":"search","status":"list"}'),
+                     self.post("https://h/api/get/health", "drop it")):
+            self.assertFalse(D.consistent_with("Retrieving a list of items", "http", spec), spec)
+            self.assertTrue(D.is_mutating("http", spec))
+
+    def test_graphql_query_is_read(self):
+        q = self.post("https://h/graphql", json.dumps({"query": "query { viewer { login } }"}))
+        self.assertFalse(D.is_mutating("http", q))
+        self.assertTrue(D.consistent_with("Looking up account details", "http", q))
+        q2 = self.post("https://h/graphql", json.dumps({"query": "{ viewer { login } } # mutation"}))
+        self.assertFalse(D.is_mutating("http", q2))
+
+    def test_graphql_mutation_needs_write_description(self):
+        m = self.post("https://h/graphql", json.dumps({"query": "mutation { teamDelete(id:1) { ok } }"}))
+        self.assertTrue(D.is_mutating("http", m))
+        self.assertFalse(D.consistent_with("Looking up a team", "http", m))
+        self.assertTrue(D.consistent_with("Deleting a team", "http", m))
+
+    def test_uncertain_graphql_is_mutation(self):
+        for body in ("not json", "[1]", '{"query": 5}', '{"query":"query { a "}', '{"query":"subscription { a }"}',
+                     '{"query":"query { a } mutation { b }"}', '{"query":""}', None, '[{"query":"{a}"}]',
+                     '{"query":"hello world"}'):
+            self.assertTrue(D.is_mutating("http", self.post("https://h/graphql", body)), body)
+
+    def test_allowlist_exact_only(self):
+        eps = [{"host": "komodo.example.com", "path": "/read"}]
+        ok = self.post("https://komodo.example.com/read", "{}")
+        self.assertFalse(D.is_mutating("http", ok, eps))
+        for u in ("https://komodo.example.com/read/", "https://komodo.example.com/read/x",
+                  "https://komodo.example.com/execute", "https://evil.example.com/read",
+                  "https://komodo.example.com.evil.net/read", "https://komodo.example.com/Read"):
+            self.assertTrue(D.is_mutating("http", self.post(u, "{}"), eps), u)
+        d = D.Describer("k", read_endpoints=eps)
+        with mock.patch.object(D, "_post_json", lambda *a: reply("Listing stacks")):
+            self.assertEqual(d.describe("http", ["x"], dict(ok))["source"], "model")
+            self.assertEqual(d.describe("http", ["x"], self.post("https://komodo.example.com/execute", "{}"))["reason"],
+                             "rejected")
+
+
 class Consistency(unittest.TestCase):
     def test_read_claim_on_mutation_rejected(self):
         self.assertFalse(D.consistent_with("Reads a dashboard", "http", HTTP_DEL))
         self.assertFalse(D.consistent_with("Lists files", "env", {"argv": ["rm", "-rf", "/x"]}))
         self.assertFalse(D.consistent_with("Checks status", "env", {"argv": ["sh", "-c", "x > /etc/y"]}))
         self.assertFalse(D.consistent_with("Reads a key", "store", {}))
-
-    def test_post_query_allowed_but_post_mutation_not(self):
-        q = {"method": "POST", "url": "https://p.example.com/api/search/metadata", "body": '{"city":"x"}'}
-        self.assertTrue(D.consistent_with("Searching a photo library", "http", q))
-        m = {"method": "POST", "url": "https://p.example.com/api/search/metadata", "body": "drop table x"}
-        self.assertFalse(D.consistent_with("Searching a photo library", "http", m))
-        self.assertFalse(D.consistent_with("Checking a thing", "http", {"method": "POST", "url": "https://p/x/delete"}))
 
     def test_home_assistant_is_not_flagged(self):
         self.assertEqual(D.sanitize("Unlocking the front door in Home Assistant")[1], None)

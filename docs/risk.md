@@ -65,11 +65,17 @@ Safety measures:
   API jargon, no shouted tokens, no quote of the prompt, no safety or approval
   language (`FORBIDDEN_PHRASES`), capped at 160 characters.
 - Consistency (best effort): for a mutating request (POST/PUT/PATCH/DELETE other
-  than a POST that is clearly a query, a write-looking command, a store request
-  or ssh signing) the description must contain a write-class verb
+  than a POST whose body is a GraphQL query document, or one to an allowlisted
+  read endpoint; a write-looking command, a store request or ssh signing) the description must contain a write-class verb
   (`WRITE_VERBS`) and no minimizing language (`MINIMIZING`: nothing, without, no
   change, only, just, merely, read-only, does not ...). Read requests are not
   checked.
+- POSTs are treated as writes unless the body is certainly a read-only GraphQL
+  query (JSON with a `query` string, no mutation or subscription; uncertain
+  means mutation) or the operator lists the exact host and path in
+  `summary_read_endpoints`. There is no keyword guessing, so genuine search-style
+  POSTs (REST search, read RPCs) fall back to the technical `auto:` line unless
+  allowlisted.
 - Any rejection, timeout, error or rate cap replaces the description with the
   deterministic `auto:` line. The audit `assessed` event records
   `summary_source` (`model` or `deterministic`) and `summary_reason`

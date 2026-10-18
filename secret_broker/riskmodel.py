@@ -357,7 +357,7 @@ _KEYS = {
                    "prompt", "base_url"},
     "jev": {"type", "api_key_file", "model", "timeout", "max_content_chars", "send_content",
             "base_url", "high_threshold", "low_threshold", "summary_text", "summary_model",
-            "summary_timeout", "summary_max_per_minute", "summary_concurrency", "summary_base_url"},
+            "summary_timeout", "summary_max_per_minute", "summary_concurrency", "summary_base_url", "summary_read_endpoints"},
 }
 
 
@@ -414,6 +414,16 @@ def validate_config(sc):
             v = sc.get(k, 1)
             if isinstance(v, bool) or not isinstance(v, int) or not 1 <= v <= hi:
                 raise ValueError(f"summary.{k} must be an integer 1-{hi}")
+    if typ == "jev" and "summary_read_endpoints" in sc:
+        eps = sc["summary_read_endpoints"]
+        if not isinstance(eps, list) or len(eps) > 100:
+            raise ValueError("summary.summary_read_endpoints must be a list of {host, path} objects")
+        for i, e in enumerate(eps):
+            if (not isinstance(e, dict) or set(e) != {"host", "path"} or not isinstance(e["host"], str)
+                    or not e["host"] or "/" in e["host"] or not isinstance(e["path"], str)
+                    or not e["path"].startswith("/") or "?" in e["path"]):
+                raise ValueError(f"summary.summary_read_endpoints[{i}] must be "
+                                 '{"host": "name[:port]", "path": "/exact/path"}')
     return typ
 
 
@@ -446,7 +456,8 @@ def build(sc, read):
             key, sc.get("summary_model", "openai/gpt-5-mini"), timeout=sc.get("summary_timeout", 4.0),
             max_content_chars=sc.get("max_content_chars", 400), send_content=sc.get("send_content", True),
             base_url=sc.get("summary_base_url", DESCRIBER_DEFAULT_BASE),
-            max_per_minute=sc.get("summary_max_per_minute", 30), concurrency=sc.get("summary_concurrency", 4))
+            max_per_minute=sc.get("summary_max_per_minute", 30), concurrency=sc.get("summary_concurrency", 4),
+            read_endpoints=sc.get("summary_read_endpoints", []))
     fa = FloorAnalyzer(JevAnalyzer(
         key, sc.get("model", DEFAULT_JEV_MODEL), timeout=sc.get("timeout", 6.0),
         base_url=sc.get("base_url", DEFAULT_JEV_BASE),

@@ -21,6 +21,7 @@ import re
 import secrets
 import threading
 import time
+import urllib.parse
 import urllib.request
 
 from .riskmodel import deterministic_summary, request_fields
@@ -198,31 +199,45 @@ def _quotes_prompt(s):
     return any(" ".join(words[i:i + 5]) in prompt for i in range(len(words) - 4))
 
 
-_QUERYISH = re.compile(r"search|quer|list|read|get|find|select|look|status|check|metadata|health|"
-                       r"dataset|graphql|jmap|template|history|info", re.I)
-_MUTATEISH = re.compile(r"delet|drop|destroy|remov|mutation|truncat|updat|creat|insert|refund|revok|"
-                        r"purge|reset|execute|write|send|post|rollback|reboot|stop|start|restart|kill|"
-                        r"unlock|disarm|deploy|apply|push|merge", re.I)
+def graphql_is_query(body):
+    """True only when `body` is a JSON object with a `query` string that is
+    certainly a read-only GraphQL query document. Anything uncertain is False."""
+    try:
+        obj = json.loads(body)
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(obj, dict) or not isinstance(obj.get("query"), str):
+        return False
+    doc = obj["query"]
+    doc = re.sub(r'"""(?:.|\n)*?"""', '""', doc)
+    doc = re.sub(r'"(?:[^"\\\n]|\\.)*"', '""', doc)
+    doc = re.sub(r"#[^\n]*", " ", doc).strip()
+    if not doc or re.search(r"\b(?:mutation|subscription)\b", doc, re.I):
+        return False
+    if not re.match(r"(?:query\b|\{|fragment\b)", doc):
+        return False
+    return doc.count("{") == doc.count("}") and doc.count("{") > 0
 
 
-def _looks_like_query(spec):
-    u = str(spec.get("url") or "").split("?")[0]
-    text = u + " " + str(spec.get("body") or "")[:400]
-    return bool(_QUERYISH.search(text)) and not _MUTATEISH.search(text)
+def _read_endpoint(spec, endpoints):
+    u = urllib.parse.urlsplit(str(spec.get("url") or ""))
+    return any(u.netloc.lower() == e["host"].lower() and u.path == e["path"] for e in endpoints)
 
 
-def is_mutating(mode, spec):
+def is_mutating(mode, spec, read_endpoints=()):
+    """A POST is a read only if its body is a GraphQL query or it hits an
+    operator-allowlisted read endpoint (exact host and path). No keyword guessing."""
     if mode == "http":
         m = str(spec.get("method") or "GET").upper()
-        if m == "POST" and _looks_like_query(spec):
-            return False                     # POST used as a query (search, GraphQL, read RPC)
+        if m == "POST":
+            return not (graphql_is_query(spec.get("body")) or _read_endpoint(spec, read_endpoints))
         return m in _MUTATING_METHODS
     if mode == "env":
         return bool(_CMD_WRITE_RE.search(" ".join(spec.get("argv") or [])))
     return mode in ("store", "ssh_sign")
 
 
-def consistent_with(text, mode, spec):
+def consistent_with(text, mode, spec, read_endpoints=()):
     """Best-effort check against hard facts (false means reject).
 
     A mutating request (see is_mutating) needs a description with a write-class
@@ -231,7 +246,7 @@ def consistent_with(text, mode, spec):
     they would be misleading (not checked: GET descriptions are accepted as is)."""
     if text.lower().rstrip(".") in CANNED:
         return True
-    if not is_mutating(mode, spec):
+    if not is_mutating(mode, spec, read_endpoints):
         return True
     return bool(_WRITE_WORD.search(text)) and not _MINIMIZING_RE.search(text)
 
@@ -249,10 +264,11 @@ class Describer:
 
     def __init__(self, api_key, model="openai/gpt-5-mini", timeout=4.0, max_content_chars=400,
                  send_content=True, base_url="https://openrouter.ai/api/v1", max_per_minute=30,
-                 concurrency=4, clock=time.monotonic):
+                 concurrency=4, clock=time.monotonic, read_endpoints=()):
         self._key, self._model, self._timeout = api_key, model, timeout
         self._max, self._send, self._base = max_content_chars, send_content, base_url.rstrip("/")
         self._cap, self._clock = max_per_minute, clock
+        self._read_eps = list(read_endpoints)
         self._sem = threading.BoundedSemaphore(concurrency)
         self._stamps, self._lock = collections.deque(), threading.Lock()
         self.last_cost = None
@@ -307,7 +323,7 @@ class Describer:
         out = None
         if reason is None:
             out, _ = sanitize(text)
-            if out is not None and not consistent_with(out, mode, spec):
+            if out is not None and not consistent_with(out, mode, spec, self._read_eps):
                 out = None
             if out is None:
                 reason = "rejected"
