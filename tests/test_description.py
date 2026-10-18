@@ -124,6 +124,19 @@ class MutatingStrictness(unittest.TestCase):
         for text, mode, spec in self.CASES:
             self.assertFalse(D.consistent_with(text, mode, spec), text)
 
+    def test_noun_adjective_bypasses_rejected(self):
+        for text in ("Retrieving a list of open ports", "Listing blocked IPs", "Open ports on the router",
+                     "Checking whether a sync finished", "Sent messages in Slack", "Armed zones list",
+                     "Deleting a record after listing it", "Pulling a list of items, reading them"):
+            for method in ("POST", "DELETE", "PUT"):
+                self.assertFalse(D.consistent_with(text, "http", {"method": method, "url": "https://h/x"}),
+                                 (text, method))
+
+    def test_new_gerunds_accepted(self):
+        for text in ("Opening a garage door", "Blocking a device", "Syncing a repository",
+                     "Deleting a virtual machine in Proxmox", "Merging a pull request", "Sending a message"):
+            self.assertTrue(D.consistent_with(text, "http", {"method": "POST", "url": "https://h/x"}), text)
+
     def test_valid_pass(self):
         for text, mode, spec in self.GOOD:
             self.assertTrue(D.consistent_with(text, mode, spec), text)
@@ -192,8 +205,8 @@ class Consistency(unittest.TestCase):
 
     def test_fine_cases(self):
         self.assertTrue(D.consistent_with("Reads a dashboard", "http", HTTP_GET))
-        self.assertTrue(D.consistent_with("Deletes a dashboard", "http", HTTP_DEL))
-        self.assertTrue(D.consistent_with("Reads and deletes a thing", "http", HTTP_DEL))
+        self.assertTrue(D.consistent_with("Deleting a dashboard", "http", HTTP_DEL))
+        self.assertFalse(D.consistent_with("Deletes a dashboard", "http", HTTP_DEL))   # first word must be a gerund
         self.assertTrue(D.consistent_with("Lists files", "env", {"argv": ["ls", "-la"]}))
 
 

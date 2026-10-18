@@ -66,8 +66,9 @@ Safety measures:
   language (`FORBIDDEN_PHRASES`), capped at 160 characters.
 - Consistency (best effort): for a mutating request (POST/PUT/PATCH/DELETE other
   than a POST whose body is a GraphQL query document, or one to an allowlisted
-  read endpoint; a write-looking command, a store request or ssh signing) the description must contain a write-class verb
-  (`WRITE_VERBS`) and no minimizing language (`MINIMIZING`: nothing, without, no
+  read endpoint; a write-looking command, a store request or ssh signing) the description must START with a write-class gerund
+  (`WRITE_VERBS`: Deleting, Opening, Syncing ...), contain no read gerund
+  (`READ_GERUNDS`: retrieving, listing, checking ...) anywhere, and no minimizing language (`MINIMIZING`: nothing, without, no
   change, only, just, merely, read-only, does not ...). Read requests are not
   checked.
 - POSTs are treated as writes unless the body is certainly a read-only GraphQL

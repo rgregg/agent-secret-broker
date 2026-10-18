@@ -106,21 +106,29 @@ _EMAIL_RE = re.compile(r"\S+@\S+\.\S+")
 _HTML_RE = re.compile(r"<[^>]*>|&[a-z#0-9]+;", re.I)
 _MD_LINK_RE = re.compile(r"\[[^\]]*\]\([^)]*\)")
 _TWO_SENTENCES_RE = re.compile(r"[.!?]\s+[A-Z]")
-_READ_WORD = re.compile(r"\b(?:read\w*|fetch\w*|list\w*|quer\w*|check\w*|retriev\w*|get\w*|view\w*|"
-                        r"look\w*|inspect\w*|search\w*|show\w*|download\w*)\b", re.I)
-# Write-class action verbs (stems). A description of a MUTATING request must
-# contain one of these. One constant, edit here.
+# Write-class action gerunds. A description of a MUTATING request must START
+# with one of these (first word, or a leading "logging in"/"signing in"). Explicit
+# forms only: stems such as open, sent, arm, block, sync, pull, merge, cancel are
+# nouns or adjectives too. One constant, edit here.
 WRITE_VERBS = (
-    "creat", "add", "updat", "chang", "delet", "remov", "modif", "writ", "send", "sent", "post",
-    "push", "restart", "stop", "start", "trigger", "deploy", "submit", "upload", "revok",
-    "rotat", "replac", "overwrit", "drop", "kill", "execut", "run", "install", "disabl", "enabl",
-    "reboot", "reset", "purg", "clear", "mov", "renam", "sign", "unlock", "lock", "destroy", "wip",
-    "format", "refund", "charging", "transfer", "issu", "generat", "stor", "sav", "edit", "turn",
-    "switch", "open", "clos", "disarm", "arm", "merg", "publish", "apply", "block", "unblock",
-    "reload", "sync", "cancel", "prun", "rollback", "roll back", "pull",
-    "log in", "logging in", "logs in", "sign in", "signing in",
+    "creating", "adding", "updating", "changing", "deleting", "removing", "modifying", "writing",
+    "sending", "posting", "pushing", "restarting", "stopping", "starting", "triggering",
+    "deploying", "submitting", "uploading", "revoking", "rotating", "replacing", "overwriting",
+    "dropping", "killing", "executing", "running", "installing", "disabling", "enabling",
+    "rebooting", "resetting", "purging", "clearing", "moving", "renaming", "signing", "unlocking",
+    "locking", "destroying", "wiping", "formatting", "refunding", "charging", "transferring",
+    "issuing", "generating", "storing", "saving", "editing", "turning", "switching", "opening",
+    "closing", "disarming", "arming", "merging", "publishing", "applying", "blocking",
+    "unblocking", "reloading", "syncing", "cancelling", "canceling", "pruning", "rolling",
+    "pulling", "building", "logging", "restoring", "pausing", "resuming", "scaling", "setting",
+    "making", "granting", "assigning", "inviting", "registering", "enrolling", "paying", "pairing",
+    "committing", "tagging", "archiving", "importing", "emptying", "approving", "denying",
 )
-_WRITE_WORD = re.compile(r"\b(?:" + "|".join(WRITE_VERBS) + r")\w*\b", re.I)
+_WRITE_FIRST = re.compile(r"^(?:" + "|".join(WRITE_VERBS) + r")\b", re.I)
+# Read gerunds: never allowed anywhere in the description of a mutating request.
+READ_GERUNDS = ("retrieving", "fetching", "listing", "reading", "checking", "querying", "viewing",
+                "getting", "looking", "searching", "inspecting", "showing", "downloading")
+_READ_GERUND_RE = re.compile(r"\b(?:" + "|".join(READ_GERUNDS) + r")\b", re.I)
 # Minimizing or negating language: never acceptable for a mutating request.
 MINIMIZING = (r"nothing", r"without", r"no changes?", r"no impact", r"not \w+ed", r"not \w+ing",
               r"only", r"just", r"merely", r"simply", r"harmless", r"read[- ]?only", r"doesn'?t",
@@ -241,14 +249,15 @@ def consistent_with(text, mode, spec, read_endpoints=()):
     """Best-effort check against hard facts (false means reject).
 
     A mutating request (see is_mutating) needs a description with a write-class
-    verb (WRITE_VERBS) and no minimizing/negating language (MINIMIZING). A
+    verb gerund (WRITE_VERBS) as its first word, no read gerund (READ_GERUNDS) anywhere, and no minimizing/negating language (MINIMIZING). A
     non-mutating request is only checked for minimizing claims being absent where
     they would be misleading (not checked: GET descriptions are accepted as is)."""
     if text.lower().rstrip(".") in CANNED:
         return True
     if not is_mutating(mode, spec, read_endpoints):
         return True
-    return bool(_WRITE_WORD.search(text)) and not _MINIMIZING_RE.search(text)
+    return bool(_WRITE_FIRST.search(text.strip())) and not _READ_GERUND_RE.search(text) \
+        and not _MINIMIZING_RE.search(text)
 
 
 def _post_json(url, key, payload, timeout):
