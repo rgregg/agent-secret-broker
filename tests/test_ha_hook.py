@@ -74,26 +74,29 @@ class TickerActions(unittest.TestCase):
 
     def test_payload_shape_and_order(self):
         n, body = self.send()
-        self.assertEqual(body["actions"], [
+        self.assertNotIn("actions", body)              # top-level is Ticker's switch only
+        self.assertEqual(body["data"]["actions"], [
             {"action": f"ASB|deny|Rid_abc-123|{n.action_token}", "title": "Deny"},
             {"action": f"ASB|approve|Rid_abc-123|{n.action_token}", "title": "Approve"}])
         self.assertEqual((body["title"], body["message"]), ("T", "body"))     # text unchanged
-        for a in body["actions"]:
+        for a in body["data"]["actions"]:
             self.assertLess(len(a["action"]), 100)
             self.assertRegex(a["action"], r"^ASB\|(approve|deny)\|[A-Za-z0-9_-]+\|[A-Za-z0-9_-]+$")
 
     def test_no_actions_without_hook(self):
         n, body = self.send(enabled=False)
         self.assertNotIn("actions", body)
+        self.assertNotIn("actions", body["data"])
         self.assertIsNone(n.action_token)
 
     def test_policy_applies(self):
         pol = notify.parse_action_policy({"approve_max_risk": "low", "deny": True}, "x")
         _, body = self.send(risk="medium", policy=pol)
-        self.assertEqual([a["title"] for a in body["actions"]], ["Deny"])
+        self.assertEqual([a["title"] for a in body["data"]["actions"]], ["Deny"])
         none = notify.parse_action_policy({"approve_max_risk": "none", "deny": False}, "x")
         n, body = self.send(policy=none)
         self.assertNotIn("actions", body)
+        self.assertNotIn("actions", body["data"])
         self.assertIsNone(n.action_token)
 
     def test_unsafe_ids_drop_buttons(self):
@@ -293,6 +296,106 @@ class HookEndpoint(Hook):
     def test_channel_registry(self):
         self.assertTrue(CHANNELS["ha"].token_required)
         self.assertFalse(CHANNELS["ha"].may_create_always)
+
+
+class ActionPolicyAtDecision(Hook):
+    """The token only authorises the actions that were actually offered."""
+    policy = {"approve_max_risk": "low", "deny": True}
+    risk = "high"
+
+    def tweak(self, cfg):
+        super().tweak(cfg)
+        cfg["notify_actions"] = dict(self.policy)
+
+    def setUp(self):
+        super().setUp()
+        self.broker.summarizer = t._Stub("Reads things", self.risk)
+
+    def test_unoffered_approve_refused_on_ha_and_push_token_not_spent(self):
+        rid, n = self.asked()
+        self.assertEqual([a.id for a in n.actions], ["deny"])
+        self.assertEqual(self.broker._by_id[rid].offered, frozenset({"deny"}))
+        self.assertEqual(self.hook(self.good(rid, n, "approve"))[0], 403)
+        code, req = self.broker.decide_via("push", rid, "approve", "u", token=n.action_token)
+        self.assertEqual((code, req), (403, None))
+        self.assertEqual(self.broker._by_id[rid].status, "pending")
+        self.assertIsNotNone(self.broker._by_id[rid].action_hash)
+        self.assertEqual(self.events("decided"), [])
+        ref = self.events("decision_refused")
+        self.assertEqual([(e["channel"], e["decision"]) for e in ref],
+                         [("ha", "approve"), ("push", "approve")])
+        with open(self.audit) as f:
+            self.assertNotIn(n.action_token, f.read())
+        self.assertEqual(self.hook(self.good(rid, n, "deny"))[0], 200)       # token still works
+        self.assertEqual(self.result(rid)["status"], "denied")
+
+    def test_dashboard_approve_unaffected(self):
+        rid, n = self.asked()
+        self.assertEqual(self.broker.decide_via("dashboard", rid, "approve", "alice")[0], 200)
+        self.assertEqual(self.result(rid)["status"], "approved")
+
+    def test_offered_approve_and_deny_work(self):
+        self.broker.summarizer = t._Stub("Reads things", "low")
+        rid, n = self.asked()
+        self.assertEqual(self.broker._by_id[rid].offered, frozenset({"approve", "deny"}))
+        self.assertEqual(self.hook(self.good(rid, n, "approve"))[0], 200)
+        rid2, n2 = self.asked("/y")
+        self.assertEqual(self.broker.decide_via("push", rid2, "deny", "u", token=n2.action_token)[0], 200)
+
+    def test_no_token_means_token_channels_refused(self):
+        rid, n = self.asked()
+        self.broker._by_id[rid].offered = frozenset()
+        self.assertEqual(self.broker.decide_via("push", rid, "deny", "u", token=n.action_token)[0], 403)
+
+    def test_union_across_transports(self):
+        a = t.FakeNotifier(supports_actions=("approve", "deny"))
+        a.action_policy = {"approve_max_risk": "none", "deny": True}
+        b = t.FakeNotifier(supports_actions=("approve", "deny"))
+        b.action_policy = {"approve_max_risk": "high", "deny": False}
+        self.broker.notifier = notify.MultiNotifier([a, b])
+        rid = self.ask("/u")
+        end = time.time() + 5
+        while not a.notifications and time.time() < end:
+            time.sleep(0.05)
+        n = a.notifications[0]
+        self.assertEqual(self.broker._by_id[rid].offered, frozenset({"approve", "deny"}))
+        self.assertEqual(self.broker.decide_via("push", rid, "approve", "u", token=n.action_token)[0], 200)
+
+    def test_union_when_only_one_transport_denies(self):
+        a = t.FakeNotifier(supports_actions=("approve", "deny"))
+        a.action_policy = {"approve_max_risk": "none", "deny": True}
+        b = t.FakeNotifier(supports_actions=())
+        self.broker.notifier = notify.MultiNotifier([a, b])
+        rid = self.ask("/v")
+        end = time.time() + 5
+        while not a.notifications and time.time() < end:
+            time.sleep(0.05)
+        n = a.notifications[0]
+        self.assertEqual(self.broker._by_id[rid].offered, frozenset({"deny"}))
+        self.assertEqual(self.broker.decide_via("push", rid, "approve", "u", token=n.action_token)[0], 403)
+
+
+class RateMapBound(Hook):
+    def test_ha_rate_map_capped_and_legit_ip_limited(self):
+        b, cap = self.broker, self.broker.RATE_MAP_CAP
+        self.assertEqual(cap, 4096)
+        for i in range(10000):
+            b.ha_rate_ok(f"10.{i // 65536}.{(i // 256) % 256}.{i % 256}")
+            self.assertLessEqual(len(b._ha_rate), cap)
+        self.assertEqual(len(b._ha_rate), cap)
+        self.assertFalse(b.ha_rate_ok("192.0.2.1"))             # full of live entries: refused
+        for st in b._ha_rate.values():                          # expire them: new IPs fit again
+            st["t"] -= 120
+        self.assertTrue(b.ha_rate_ok("192.0.2.1"))
+        self.assertLessEqual(len(b._ha_rate), cap)
+        res = [b.ha_rate_ok("192.0.2.2") for _ in range(65)]
+        self.assertEqual((res[:60].count(True), res[60:].count(True)), (60, 0))
+
+    def test_rate_map_full_helper_prunes_expired_only(self):
+        now = time.time()
+        m = {i: {"t": now - (120 if i % 2 else 0)} for i in range(self.broker.RATE_MAP_CAP)}
+        self.assertFalse(self.broker.rate_map_full(m, now))
+        self.assertEqual(len(m), self.broker.RATE_MAP_CAP // 2)
 
 
 class HookEmptyDevices(Hook):

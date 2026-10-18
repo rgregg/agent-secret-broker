@@ -271,7 +271,9 @@ class TickerNotifier:
         }
         acts = self.action_list(n)
         if acts:
-            body["actions"] = acts
+            # Custom buttons go in data.actions. Ticker's top-level `actions` is
+            # only a switch (category_default|none); a list there is rejected.
+            body["data"]["actions"] = acts
         self._call("/api/services/ticker/notify", body)
         time.sleep(1.5)
         state = self._call(f"/api/states/sensor.ticker_{self._category}")

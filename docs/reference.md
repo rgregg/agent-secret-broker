@@ -236,6 +236,19 @@ An override replaces the policy as a whole (unset keys take the defaults, not th
 global values). Invalid values stop the broker at startup naming the field
 (`notify_actions.deny`, `notify[0].actions.approve_max_risk`, ...).
 
+The policy is enforced at decision time, not only in what is shown: a decision
+on a token channel (`push`, `ha`) must be one of the actions offered. The token
+is shared by all transports, so the allowed set is the union of what any
+transport offered; a valid token used for an action nobody offered is refused
+403, audited as `decision_refused` (channel and attempted decision, never the
+token), and the token is not spent. Dashboard and approval-link decisions are
+unaffected.
+
+Per-source rate-limit maps (the HA hook per IP, `/push/event` per user) are
+capped at 4096 entries. When the cap is reached, expired entries are pruned; if
+it is still full a new key is treated as rate-limited (429 / dropped) instead of
+growing the map.
+
 ### Decision channels
 
 Every decision (dashboard `/decide`, approval-link page, `/push/decide`,
@@ -291,6 +304,11 @@ Ticker action ids (Deny first, title shown on the button):
 `rid` and `token` are url-safe (about 22 chars each; the id stays under 100
 characters). The token is the same single-use per-request token as Web Push; the
 broker keeps only its hash. The notification text is unchanged.
+
+The buttons are sent inside the `data` object of the `ticker.notify` call
+(`data.actions`), which Ticker passes through unchanged. Ticker's own top-level
+`actions` field is only a switch (`category_default` or `none`); the broker never
+sets it, and a list there would be rejected by the service schema.
 
 Endpoint, on the client listener (the port agents use):
 

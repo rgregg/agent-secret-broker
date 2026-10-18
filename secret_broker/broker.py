@@ -101,6 +101,7 @@ class Request:
         self.approver = None
         self.action_hash = None   # sha256 of the push-button token; None once spent
         self.notification = None  # the Notification sent for this request
+        self.offered = frozenset()  # action ids offered on any token-carrying transport
         self.done = threading.Event()
 
 
@@ -122,7 +123,7 @@ class Broker:
         self._audit = audit if isinstance(audit, AuditLog) else AuditLog(audit)
         self.ha_hook = notify_mod.parse_ha_hook(
             config.get("ha_hook"), lambda p: open(p).read().strip())
-        self._ha_rate = {}              # source ip -> {"t", "n", "drop"}
+        self._ha_rate = {}              # source ip -> {"t", "n", "drop"}; <= RATE_MAP_CAP
         self._ha_rate_lock = threading.Lock()
         if self.ha_hook is not None and not self.ha_hook["allowed_devices"]:
             self.log("ha_hook_any_device", warning="ha_hook.allowed_devices is empty: "
@@ -692,6 +693,9 @@ class Broker:
             summary=req.summary, expires_at=req.expires, transport=self.notifier,
             default_policy=self.action_policy)
         req.notification = n
+        # The token is shared by every transport, so what it may do is the UNION
+        # of the actions offered anywhere (per-transport narrowing is not tracked).
+        req.offered = frozenset(a.id for a in n.actions) if n.action_token else frozenset()
         if n.action_token:                          # only its hash is kept
             req.action_hash = hashlib.sha256(n.action_token.encode()).digest()
         try:
@@ -764,15 +768,28 @@ class Broker:
             return False
 
     HA_LIMIT_PER_MIN = 60
+    RATE_MAP_CAP = 4096     # hard bound on every per-IP / per-user limiter map
+
+    @staticmethod
+    def rate_map_full(m, now, window=60):
+        """Prune expired entries from limiter map `m`; True if it is still at
+        RATE_MAP_CAP (the caller then treats a NEW key as rate-limited rather
+        than growing the map). Call with the map's lock held."""
+        if len(m) >= Broker.RATE_MAP_CAP:
+            for k in [k for k, v in m.items() if now - v["t"] >= window]:
+                del m[k]
+        return len(m) >= Broker.RATE_MAP_CAP
 
     def ha_rate_ok(self, ip):
         """Fixed-window limit on the Home Assistant hook, per source IP. The
         first drop in a window is audited."""
         now = time.time()
         with self._ha_rate_lock:
-            if len(self._ha_rate) > 1024:
-                self._ha_rate = {k: v for k, v in self._ha_rate.items() if now - v["t"] < 60}
-            st = self._ha_rate.setdefault(ip, {"t": now, "n": 0, "drop": 0})
+            st = self._ha_rate.get(ip)
+            if st is None:
+                if self.rate_map_full(self._ha_rate, now):
+                    return False        # map full of live entries: refuse, do not grow
+                st = self._ha_rate[ip] = {"t": now, "n": 0, "drop": 0}
             if now - st["t"] >= 60:
                 st.update(t=now, n=0, drop=0)
             st["n"] += 1
@@ -818,6 +835,7 @@ class Broker:
         check = ch.token_required or token is not None
         digest = hashlib.sha256((token or "").encode()).digest()
         stale_log, refused_log, code, req = False, False, None, None
+        unoffered = None
         with self._lock:
             self._expire_locked()
             if nonce is not None:
@@ -844,6 +862,10 @@ class Broker:
                             match = r
                     if match is None:
                         code, refused_log = (403 if cands else 410), True
+                    elif ch.token_required and decision not in match.offered:
+                        # Token is valid but this action was never offered (action
+                        # policy): refuse like a bad token and do NOT spend it.
+                        code, refused_log, unoffered = 403, True, match
                     else:
                         match.action_hash = None        # spent, whatever happens next
                         req = match
@@ -852,6 +874,10 @@ class Broker:
                 if req is not None:
                     req.status = "deciding"     # claim it: a second submit must not also act
         if req is None:
+            if unoffered is not None:
+                self.audit("decision_refused", unoffered, channel=channel, decision=decision,
+                           reason="action not offered", approver=actor, approver_peer=peer,
+                           approver_ip=client_ip)
             if refused_log:
                 self.log(f"{channel}_decide_refused", user=actor, peer=peer, client_ip=client_ip,
                          status=code)
@@ -2317,7 +2343,12 @@ def approval_handler(broker):
                 return self._json(400, {"ok": False})
             now = time.time()
             with _CE_LOCK:
-                st = self._ce_state.setdefault(user, {"t": now, "n": 0, "drop": 0})
+                st = self._ce_state.get(user)
+                if st is None:
+                    if Broker.rate_map_full(self._ce_state, now):
+                        st = {"t": now, "n": _CE_LIMIT + 1, "drop": 2}   # full: drop, untracked
+                    else:
+                        st = self._ce_state[user] = {"t": now, "n": 0, "drop": 0}
                 if now - st["t"] >= 60:
                     prev = st["drop"]
                     st.update(t=now, n=0, drop=0)
