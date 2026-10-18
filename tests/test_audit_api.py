@@ -64,8 +64,8 @@ class Redaction(unittest.TestCase):
             if ev in audit_api.HIDDEN:
                 self.assertIsNone(out, ev)
                 continue
-            if out is None:
-                self.assertEqual(ev, "client_event")         # kind not in the allowed set
+            if ev not in audit_api.WHITELIST:
+                self.assertIsNone(out, ev)                  # deny by default
                 continue
             self.assertLessEqual(set(out), ALLOWED_KEYS, ev)
             allowed = ENVELOPE | set(audit_api.WHITELIST.get(ev, {}))
@@ -77,8 +77,7 @@ class Redaction(unittest.TestCase):
                                    duration_ms=3, **POISON))
         self.assertEqual(out["upstream_status"], 200)
         self.assertEqual(set(out), ENVELOPE | {"upstream_status", "response_bytes", "duration_ms"})
-        out = audit_api.redact(rec("brand_new_event", id="r1", **POISON))
-        self.assertEqual(set(out), ENVELOPE)
+        self.assertIsNone(audit_api.redact(rec("brand_new_event", id="r1", **POISON)))
         out = audit_api.redact(rec("requested", id="r1", names=["svc"], mode="http", method="GET",
                                    url="https://h/p", source="me", peer="1.2.3.4", **POISON))
         self.assertEqual(out["names"], ["svc"])
@@ -121,29 +120,8 @@ class Redaction(unittest.TestCase):
         out = audit_api.redact(rec("http_failed", id="r1", error="[Errno 111] Connection refused"))
         self.assertEqual(out["error_class"], "connection")
         out = audit_api.redact(rec("failed", id="r1", error="could not notify: tg 500 token=abc"))
-        self.assertEqual(out["error_class"], "notify_failed")
+        self.assertEqual(out["error_class"], "other")       # a notify error would mean "a human was asked"
         self.assertNotIn("abc", json.dumps(out))
-
-    def test_decide_refused_reasons_and_channel(self):
-        out = audit_api.redact(rec("ha_decide_refused", user="ha:dev", peer="p", status=403,
-                                   reason="device not allowed"))
-        self.assertEqual((out["channel"], out["reason"]), ("ha", "device_not_allowed"))
-        self.assertNotIn("status", out)
-        for raw, cls in (("guard", "malformed"), ("action not offered", "not_offered"),
-                         ("SECRET TEXT here", "other"), (None, "other")):
-            o = audit_api.redact(rec("push_decide_refused", reason=raw, user="u"))
-            self.assertEqual(o["reason"], cls)
-        self.assertEqual(audit_api.redact(rec("push_decide_refused", status=410))["reason"],
-                         "spent_or_expired")
-        self.assertEqual(audit_api.redact(rec("ha_decide_refused", status=403))["reason"], "bad_token")
-        self.assertNotIn("user", out)
-        out = audit_api.redact(rec("decision_refused", id="r1", channel="push", decision="approve",
-                                   reason="action not offered", approver="alice"))
-        self.assertEqual(out["reason"], "not_offered")
-        self.assertEqual(out["decision"], "approve")
-        self.assertIsNone(audit_api.redact(rec("decision_refused", decision="x"))
-                          .get("decision"))
-        self.assertNotIn("approver", out)
 
     def test_catalog_loaded_gives_counts_not_names(self):
         out = audit_api.redact(rec("catalog_loaded", count=3, names=["a", "b", "c"],
@@ -158,38 +136,15 @@ class Redaction(unittest.TestCase):
                    "push_test", "csrf_refused"):
             self.assertIsNone(audit_api.redact(rec(ev, id="r1")), ev)
 
-    def test_client_event_presence_kinds_are_hidden(self):
-        for kind in ("visibility", "page_load", "poll_requested", "sw_message", "sw_registered",
-                     "sw_register_failed", "sw_status", "anything_else", "", None, 5):
-            self.assertIsNone(audit_api.redact(rec("client_event", kind=kind, ok=True)), kind)
-
-    def test_client_event_kept_kinds_have_only_fixed_fields(self):
-        raw = dict(kind="click_outcome", ok=False, v="12", ms=40, clients=2, action="approve",
-                   err="TypeError: Failed to fetch https://secret/x", note="/history?x=1",
-                   tag="secret-abc", state="visible", client_paths=["/", "/history"], visible=True,
-                   queued=3, user="alice", client_ip="1.2.3.4")
-        out = audit_api.redact(rec("client_event", id="r1", **raw))
-        self.assertEqual(out["kind"], "click_outcome")
-        self.assertEqual(set(out), ENVELOPE | {"kind", "ok", "v", "ms", "clients", "action",
-                                              "error_class"})
-        self.assertEqual((out["ok"], out["v"], out["ms"], out["clients"], out["action"]),
-                         (False, "12", 40, 2, "approve"))
-        self.assertEqual(out["error_class"], "network")
-        text = json.dumps(out)
-        for bad in ("secret", "history", "alice", "1.2.3.4", "visible"):
-            self.assertNotIn(bad, text)
-        for kind in audit_api.CE_KINDS:
-            self.assertEqual(audit_api.redact(rec("client_event", kind=kind))["kind"], kind)
-        o = audit_api.redact(rec("client_event", kind="push", v="1234", action="evil", note="503",
-                                 err="HTTP 502 bad gateway"))
-        self.assertNotIn("v", o)
-        self.assertNotIn("action", o)
-        self.assertEqual((o["outcome"], o["error_class"]), ("http_5xx", "http_5xx"))
-        self.assertEqual(audit_api.redact(rec("client_event", kind="push", action=""))["action"], "")
-        for err, cls in (("HTTP 404", "http_4xx"), ("redirect loop", "redirect"),
-                         ("NetworkError when attempting", "network"), ("boom error", "exception"),
-                         ("zzz", "other")):
-            self.assertEqual(audit_api.client_error_class(err), cls)
+    def test_unknown_events_are_dropped_and_not_counted(self):
+        self.assertIsNone(audit_api.redact(rec("never_heard_of_it", id="r1")))
+        self.assertIn("client_event", audit_api.HIDDEN)
+        for ev in ("client_event", "decision_refused", "ha_decide_refused", "push_decide_refused",
+                   "dashboard_decide_refused", "link_decide_refused", "config_warning",
+                   "request_detail_viewed"):
+            self.assertIsNone(audit_api.redact(rec(ev, id="r1", kind="show", ok=True)), ev)
+        # nothing outside WHITELIST is ever shown, so the two sets cannot overlap
+        self.assertEqual(set(audit_api.WHITELIST) & audit_api.HIDDEN, set())
 
 
 class Params(unittest.TestCase):
@@ -372,20 +327,19 @@ class Api(ApiBase):
 
     def test_response_size_cap(self):
         for i in range(30):
-            self.broker.log("client_event", user="u", peer="p", client_ip="c", kind="show",
-                            ok=True, v="7", ms=12, clients=3, action="open", note="200",
-                            err="net error")
+            self.broker.log("discovery", peer="p", host="h.example", found=["n" * 40] * 10)
+        self.broker.log("client_event", user="u", kind="show", ok=True)       # hidden: not counted
         old = audit_api.MAX_BODY_BYTES
         audit_api.MAX_BODY_BYTES = 2000
         try:
-            code, r, raw = self.get("event=client_event&limit=500")
+            code, r, raw = self.get("event=discovery&limit=500")
         finally:
             audit_api.MAX_BODY_BYTES = old
         self.assertTrue(r["truncated"])
         self.assertLess(r["count"], 30)
         self.assertIsNotNone(r["next"])
         self.assertEqual(r["next"], r["events"][-1]["seq"])
-        _, more, _ = self.get(f"event=client_event&limit=500&before={r['next']}")
+        _, more, _ = self.get(f"event=discovery&limit=500&before={r['next']}")
         self.assertGreater(more["count"], 0)
 
     def test_validation_errors_are_400_with_a_short_message(self):
@@ -425,6 +379,8 @@ class Api(ApiBase):
                         status=403, reason="guard")
         self.broker.log("client_event", user="alice", peer="p", client_ip="c", kind="page_load",
                         state="visible", note="/")
+        self.broker.log("client_event", user="alice", kind="click_outcome", ok=True, request_id=r4,
+                        id=r4)
         self.broker.log("client_event", user="alice", peer="p", client_ip="c", kind="visibility",
                         state="visible", visible=True)
         self.broker.log("client_event", user="alice", peer="p", client_ip="c", kind="show",
@@ -438,7 +394,7 @@ class Api(ApiBase):
         prevs = re.findall(r'"prev": "([0-9a-f]{64})"', raw_log)
         line_hashes = [hashlib.sha256(l.encode()).hexdigest() for l in raw_log.splitlines()]
         texts = []
-        for q in ("limit=500", "limit=500&order=asc", f"request={r1}", f"request={r2}",
+        for q in ("limit=500", "limit=500&order=asc", "after=0&limit=500", f"request={r1}", f"request={r2}",
                   f"request={r3}", f"request={r4}", "event=approved,denied,failed,expired",
                   "event=secret_read,delivered,discovery", "secret=svc", "secret=auto"):
             code, r, raw = self.get(q)
@@ -453,20 +409,17 @@ class Api(ApiBase):
         for word in ('"risk"', '"reasons"', '"summary"', '"via"', '"prev"', '"hash"', '"nonce"',
                      '"policy', '"model"', '"approval"', '"adopted"', '"token"', '"value"',
                      "model rated", "treated as high", "policy:", "LEAKTAG", "LEAKPATH", "LEAKERR",
-                     "LEAKDEV", "page_load", "visibility", "approval_viewed", "push_subscribed"):
+                     "LEAKDEV", "page_load", "visibility", "approval_viewed", "push_subscribed",
+                     "client_event", "decide_refused", "decision_refused", "device not allowed"):
             self.assertNotIn(word, blob)
         seen = set()
         for tx in texts[:-1]:
             for e in json.loads(tx)["events"]:
                 self.assertLessEqual(set(e), ALLOWED_KEYS)
                 seen.add(e["event"])
-        for ev in ("requested", "approved", "denied", "secret_read", "delivered", "ha_decide_refused",
-                   "push_decide_refused", "client_event"):
+        for ev in ("requested", "approved", "denied", "secret_read", "delivered"):
             self.assertIn(ev, seen)
         self.assertTrue(seen.isdisjoint(audit_api.HIDDEN), seen & audit_api.HIDDEN)
-        ha = json.loads(texts[0])["events"]
-        ref = next(e for e in ha if e["event"] == "ha_decide_refused")
-        self.assertEqual((ref["channel"], ref["reason"]), ("ha", "device_not_allowed"))
         dec = [e for e in json.loads(self.get(f"request={r4}")[2])["events"] if e["event"] == "approved"]
         self.assertEqual((dec[0]["channel"], dec[0]["approver"]), ("dashboard", "alice"))
 

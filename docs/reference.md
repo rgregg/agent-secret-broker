@@ -751,19 +751,29 @@ History page.
 Why redacted: what the agent can see must not reveal approval context (which secrets
 auto-approve, risk verdicts and reasons, policy), or the agent could favor credentials that
 skip the prompt. Redaction is a **whitelist**: for each event type only the fields below are
-returned; an unknown event type is returned as `seq`, `ts`, `event`, `request` only, and
-unknown fields are dropped. `startup`, `assessed`, `escalated`, `notified`, `decided`,
-`policy_changed`, `policy_change_refused`, `policy_change_failed`, `policies_viewed` and
-`ha_hook_any_device` are not returned at all (several carry policy; `notified` and `decided`
-exist only when a human was asked, so their absence would mark an auto-approved request).
-Approver presence and activity is hidden too, so the agent cannot time requests for when you
-are away: `approval_viewed`, `approval_stale`, `approval_forbidden`, `csrf_refused`,
-`dashboard_viewed`, `history_viewed`, `push_subscribed`, `push_revoked`, `push_refused`,
-`push_test`, `ha_decide_dropped`, `client_event_dropped`, and every `client_event` whose kind is
-not a service-worker delivery diagnostic (`visibility`, `page_load`, `poll_requested`,
-`sw_message`, `sw_registered`, `sw_register_failed`, `sw_status`, and anything unlisted).
-Free text that a browser or an error can supply is never returned: it is reduced to a fixed
-class or dropped.
+returned, and unknown fields are dropped. **Deny by default**: an event type that is not in
+the whitelist is not returned at all (not even as an empty envelope, which would still show
+that something happened and when), and does not count toward `count`. A test requires every
+event the broker emits to be either whitelisted or listed as hidden, so a new event forces a
+decision. Hidden on purpose:
+
+- Policy and risk: `startup`, `assessed`, `escalated`, `policy_changed`,
+  `policy_change_refused`, `policy_change_failed`, `policies_viewed`, `ha_hook_any_device`,
+  `config_warning`.
+- Policy by absence. These exist only when a human was asked or acted, so their absence on
+  a request would mark it as auto-approved: `notified`, `decided`, `decision_refused`, and
+  `dashboard_`/`push_`/`ha_`/`link_decide_refused`.
+- Approver presence and activity, so the agent cannot time requests for when you are away:
+  `approval_viewed`, `request_detail_viewed`, `approval_stale`, `approval_forbidden`,
+  `csrf_refused`, `dashboard_viewed`, `history_viewed`, `push_subscribed`, `push_revoked`,
+  `push_refused`, `push_test`, `ha_decide_dropped`.
+- Browser telemetry: every `client_event` (page loads, visibility, service-worker delivery
+  diagnostics) and `client_event_dropped`. Even the delivery diagnostics only occur when a
+  human was notified or acted, and the rest shows whether a page is open. The full
+  telemetry stays in the audit file and the SSO History page.
+
+Free text that an error can supply is reduced to a fixed class; a notification failure
+reports `other`, since "notify failed" would show that a human was to be asked.
 A request that policy approved shows `approved` with `channel` and `approver` null, the
 same shape as a human approval. Never returned: risk, model verdict, reasons, summary text,
 `via`, `always_requested`, latency on decisions, the `adopted` and catalog name lists, secret
@@ -806,24 +816,23 @@ Whitelist (output field from the recorded field; every event also has `seq`, `ts
 | `requested` | names, mode, source, peer, method, url, argv, op, field, ssh_kind, fingerprint |
 | `rejected` | names, mode, source, peer, url, reason (already returned to the client) |
 | `approved`, `denied`, `expired` | channel (dashboard, push, ha, link or null), approver (null for policy) |
-| `failed` | error_class (notify_failed, release_failed, timeout, tls, dns, connection, vault, other), channel, approver |
+| `failed` | error_class (release_failed, timeout, tls, dns, connection, vault, other), channel, approver |
 | `secret_read` | secret, vars (variable names) |
 | `delivered` | kind |
 | `http_executed` | upstream_status, response_bytes, duration_ms |
 | `http_failed` | error_class |
 | `stored` | names, op, field, duration_ms |
 | `ssh_signed` | fingerprint |
-| `decision_refused`, `<channel>_decide_refused` | channel, decision (approve or deny, `decision_refused` only), reason class (bad_token, bad_key, not_offered, device_not_allowed, spent_or_expired, malformed, other) |
 | `auth_failed` | peer, method |
 | `bad_request` | peer, error (the message the broker already returned to the agent) |
 | `discovery` | peer, host, found (names) |
 | `catalog_loaded` | count, invalid_count (not names) |
 | `backend_ready` | duration_ms |
-| `catalog_error`, `backend_error` | envelope only |
-| `client_event` (kinds `push`, `show`, `notificationclick`, `click_navigate`, `click_focus`, `click_openwindow`, `click_outcome`, `notificationclose`, `pushsubscriptionchange`, `sw_install`, `sw_activate`, `action_click`, `action_decide` only) | kind, ok, v (1-3 digits), ms, clients, action (empty, open, approve, deny), error_class (network, http_4xx, http_5xx, redirect, exception, other), outcome (http_2xx.. from a bare status in `note`); never err, note, tag, state or client_paths text |
+| `catalog_error`, `backend_error` | envelope only (no fields) |
 
 Residual signals the agent can still infer: a decision with `channel` null is a policy
-approval, and the time between `requested` and `approved` is milliseconds for one.
+approval, the time between `requested` and `approved` is milliseconds for one, and `denied`
+or `expired` mean a human was asked (the agent also learns that from its own request status).
 
 ## Threat model, honestly
 
