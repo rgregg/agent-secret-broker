@@ -57,7 +57,9 @@ MEDIUM: changes with limited blast radius that can be undone or re-done: \
 creating or updating ordinary records, toggling a device or automation, \
 restarting one service, sending a message or notification, running a script \
 or build that writes files, git commit/push to a feature branch, docker \
-compose up for a single stack, uploading a file, triggering a reload.
+compose up for a single stack, uploading a file, syncing build output to a server, (re)deploying one \
+service or stack, blocking or restarting a single network client or device, \
+triggering a reload.
 
 HIGH: destructive, irreversible or high-impact actions: deleting data or \
 resources (DELETE on real resources, rm -rf, drop, prune, volume removal), \
@@ -65,7 +67,9 @@ DNS, firewall, network, auth, user or IAM/permission changes, money movement \
 (charges, refunds, payouts, transfers), creating, rotating, revealing or \
 exfiltrating credentials, reading many or all secrets at once, shell \
 commands that pipe downloaded content into a shell or evaluate it, \
-privilege escalation (sudo, chmod 777 on system paths), force pushes, \
+privilege escalation (sudo, chmod 777 on system paths), physical-security \
+actions (unlocking doors, opening garage doors, disarming alarms, switching \
+off cameras), force pushes, \
 publishing or deploying to production, firmware or OS updates, bulk changes \
 across many records. Any SSH key signing is HIGH.
 

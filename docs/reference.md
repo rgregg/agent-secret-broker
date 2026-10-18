@@ -225,6 +225,34 @@ startup.
 Optional one-line summaries come from a cheap OpenRouter model (`summary`
 block). They are labelled unverified and never replace the raw request.
 
+### Classifier config (`summary` block)
+
+    "summary": {"api_key_file": "/run/secrets/openrouter_key", "model": "openai/gpt-5-mini"}
+
+With no `type` this is the original chat-completions classifier, unchanged.
+Set `type` to pick another:
+
+| key | applies to | default | meaning |
+|---|---|---|---|
+| `type` | both | `openrouter` | `openrouter` (chat model) or `jev` (decision model) |
+| `api_key_file` | both | required | file holding the OpenRouter key |
+| `model` | both | required for `openrouter`; `typesafe/jev-1.14` for `jev` | OpenRouter model id |
+| `timeout` | both | 4 (`openrouter`), 6 (`jev`) | seconds; a timeout is a HIGH verdict |
+| `max_content_chars` | both | 300 / 400 | body or command characters sent |
+| `send_content` | both | true | false sends only "present, not shown" |
+| `prompt` | `openrouter` | `legacy` | `legacy` (old prompt) or `rubric` (the prompt in docs/risk.md) |
+| `high_threshold` | `jev` | 0.5 | rate HIGH when P(high) >= this |
+| `low_threshold` | `jev` | 0.5 | a `low` answer with P(low) below this becomes `medium` |
+| `summary_text` | `jev` | `deterministic` | `deterministic` (one line built from the request fields, prefixed `auto:`), `chat` (a second, parallel chat call with `summary_model`) or `none` |
+| `summary_model` | `jev` | none | chat model for `summary_text: chat` |
+| `base_url` | both | OpenRouter | override the endpoint root |
+
+Config with an explicit `type` rejects unknown keys at startup, naming the field
+(`summary.<key>`); a block without `type` keeps ignoring extra keys as before.
+`ssh_sign` requests are always HIGH regardless of the model (and are never sent
+to it). Everything else uses the model's verdict only; no verdict is HIGH. See
+[risk.md](risk.md) for the rubric and the evaluation harness.
+
 ## Notification transports
 
 A transport only delivers the **link** to the approval page; approving always
