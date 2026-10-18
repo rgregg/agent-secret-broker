@@ -64,6 +64,9 @@ class Redaction(unittest.TestCase):
             if ev in audit_api.HIDDEN:
                 self.assertIsNone(out, ev)
                 continue
+            if out is None:
+                self.assertEqual(ev, "client_event")         # kind not in the allowed set
+                continue
             self.assertLessEqual(set(out), ALLOWED_KEYS, ev)
             allowed = ENVELOPE | set(audit_api.WHITELIST.get(ev, {}))
             self.assertLessEqual(set(out), allowed, ev)
@@ -124,12 +127,22 @@ class Redaction(unittest.TestCase):
     def test_decide_refused_reasons_and_channel(self):
         out = audit_api.redact(rec("ha_decide_refused", user="ha:dev", peer="p", status=403,
                                    reason="device not allowed"))
-        self.assertEqual((out["channel"], out["status"], out["reason"]),
-                         ("ha", 403, "device_not_allowed"))
+        self.assertEqual((out["channel"], out["reason"]), ("ha", "device_not_allowed"))
+        self.assertNotIn("status", out)
+        for raw, cls in (("guard", "malformed"), ("action not offered", "not_offered"),
+                         ("SECRET TEXT here", "other"), (None, "other")):
+            o = audit_api.redact(rec("push_decide_refused", reason=raw, user="u"))
+            self.assertEqual(o["reason"], cls)
+        self.assertEqual(audit_api.redact(rec("push_decide_refused", status=410))["reason"],
+                         "spent_or_expired")
+        self.assertEqual(audit_api.redact(rec("ha_decide_refused", status=403))["reason"], "bad_token")
         self.assertNotIn("user", out)
         out = audit_api.redact(rec("decision_refused", id="r1", channel="push", decision="approve",
                                    reason="action not offered", approver="alice"))
-        self.assertEqual(out["reason"], "action_not_offered")
+        self.assertEqual(out["reason"], "not_offered")
+        self.assertEqual(out["decision"], "approve")
+        self.assertIsNone(audit_api.redact(rec("decision_refused", decision="x"))
+                          .get("decision"))
         self.assertNotIn("approver", out)
 
     def test_catalog_loaded_gives_counts_not_names(self):
@@ -140,8 +153,43 @@ class Redaction(unittest.TestCase):
         self.assertNotIn("adopted", out)
 
     def test_hidden_events_are_not_returned(self):
-        for ev in ("assessed", "escalated", "notified", "decided", "startup", "policy_changed"):
+        for ev in ("assessed", "escalated", "notified", "decided", "startup", "policy_changed",
+                   "approval_viewed", "dashboard_viewed", "client_event_dropped", "push_subscribed",
+                   "push_test", "csrf_refused"):
             self.assertIsNone(audit_api.redact(rec(ev, id="r1")), ev)
+
+    def test_client_event_presence_kinds_are_hidden(self):
+        for kind in ("visibility", "page_load", "poll_requested", "sw_message", "sw_registered",
+                     "sw_register_failed", "sw_status", "anything_else", "", None, 5):
+            self.assertIsNone(audit_api.redact(rec("client_event", kind=kind, ok=True)), kind)
+
+    def test_client_event_kept_kinds_have_only_fixed_fields(self):
+        raw = dict(kind="click_outcome", ok=False, v="12", ms=40, clients=2, action="approve",
+                   err="TypeError: Failed to fetch https://secret/x", note="/history?x=1",
+                   tag="secret-abc", state="visible", client_paths=["/", "/history"], visible=True,
+                   queued=3, user="alice", client_ip="1.2.3.4")
+        out = audit_api.redact(rec("client_event", id="r1", **raw))
+        self.assertEqual(out["kind"], "click_outcome")
+        self.assertEqual(set(out), ENVELOPE | {"kind", "ok", "v", "ms", "clients", "action",
+                                              "error_class"})
+        self.assertEqual((out["ok"], out["v"], out["ms"], out["clients"], out["action"]),
+                         (False, "12", 40, 2, "approve"))
+        self.assertEqual(out["error_class"], "network")
+        text = json.dumps(out)
+        for bad in ("secret", "history", "alice", "1.2.3.4", "visible"):
+            self.assertNotIn(bad, text)
+        for kind in audit_api.CE_KINDS:
+            self.assertEqual(audit_api.redact(rec("client_event", kind=kind))["kind"], kind)
+        o = audit_api.redact(rec("client_event", kind="push", v="1234", action="evil", note="503",
+                                 err="HTTP 502 bad gateway"))
+        self.assertNotIn("v", o)
+        self.assertNotIn("action", o)
+        self.assertEqual((o["outcome"], o["error_class"]), ("http_5xx", "http_5xx"))
+        self.assertEqual(audit_api.redact(rec("client_event", kind="push", action=""))["action"], "")
+        for err, cls in (("HTTP 404", "http_4xx"), ("redirect loop", "redirect"),
+                         ("NetworkError when attempting", "network"), ("boom error", "exception"),
+                         ("zzz", "other")):
+            self.assertEqual(audit_api.client_error_class(err), cls)
 
 
 class Params(unittest.TestCase):
@@ -324,9 +372,9 @@ class Api(ApiBase):
 
     def test_response_size_cap(self):
         for i in range(30):
-            self.broker.log("client_event", user="u", peer="p", client_ip="c", kind="k",
-                            note="n" * 80, err="e" * 120, tag="t" * 40,
-                            client_paths=["/p" * 20] * 5)
+            self.broker.log("client_event", user="u", peer="p", client_ip="c", kind="show",
+                            ok=True, v="7", ms=12, clients=3, action="open", note="200",
+                            err="net error")
         old = audit_api.MAX_BODY_BYTES
         audit_api.MAX_BODY_BYTES = 2000
         try:
@@ -377,6 +425,13 @@ class Api(ApiBase):
                         status=403, reason="guard")
         self.broker.log("client_event", user="alice", peer="p", client_ip="c", kind="page_load",
                         state="visible", note="/")
+        self.broker.log("client_event", user="alice", peer="p", client_ip="c", kind="visibility",
+                        state="visible", visible=True)
+        self.broker.log("client_event", user="alice", peer="p", client_ip="c", kind="show",
+                        ok=True, v="7", ms=12, tag="secret-LEAKTAG", note="/LEAKPATH",
+                        err="LEAKERR 500", client_paths=["/LEAKPATH"])
+        self.broker.log("approval_viewed", user="alice", peer="p", request_id=r4, found=True)
+        self.broker.log("push_subscribed", user="alice", device="LEAKDEV", peer="p")
         nonces = [r.nonce for r in self.broker._by_id.values()]
         with open(self.audit) as f:
             raw_log = f.read()
@@ -397,7 +452,8 @@ class Api(ApiBase):
             self.assertNotIn(f, blob)
         for word in ('"risk"', '"reasons"', '"summary"', '"via"', '"prev"', '"hash"', '"nonce"',
                      '"policy', '"model"', '"approval"', '"adopted"', '"token"', '"value"',
-                     "model rated", "treated as high", "policy:"):
+                     "model rated", "treated as high", "policy:", "LEAKTAG", "LEAKPATH", "LEAKERR",
+                     "LEAKDEV", "page_load", "visibility", "approval_viewed", "push_subscribed"):
             self.assertNotIn(word, blob)
         seen = set()
         for tx in texts[:-1]:

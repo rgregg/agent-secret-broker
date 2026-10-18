@@ -41,6 +41,20 @@ _L = "strlist"      # list of strings, 50 items max
 _CH = "channel"     # one of CHANNELS
 _ERR = "errclass"   # free text reduced to a coarse class
 _RSN = "reason"     # free text reduced to a coarse class
+_DEC = "decision"   # approve | deny
+_V = "version"      # 1-3 digits
+_ACT = "action"     # "" | open | approve | deny
+_NOTE = "noteclass"  # a bare HTTP status reduced to its class
+_CEKIND = "cekind"  # an allowed client_event kind
+# client_event kinds that are service-worker delivery diagnostics. Everything else the
+# browser reports (page_load, visibility, poll_requested, sw_*status...) shows whether the
+# approver has a page open, so it is dropped.
+CE_KINDS = frozenset({"push", "show", "notificationclick", "click_navigate", "click_focus",
+                      "click_openwindow", "click_outcome", "notificationclose",
+                      "pushsubscriptionchange", "sw_install", "sw_activate", "action_click",
+                      "action_decide"})
+REASON_CLASSES = ("bad_token", "bad_key", "not_offered", "device_not_allowed",
+                  "spent_or_expired", "malformed", "other")
 
 # event -> {output field: (source field, kind)}
 # `request` (from id / request_id), `seq`, `ts` and `event` are always added.
@@ -66,33 +80,21 @@ WHITELIST = {
     "stored": {"names": ("names", _L), "op": ("op", _S), "field": ("field", _S),
                "duration_ms": ("duration_ms", _I)},
     "ssh_signed": {"fingerprint": ("ssh_fingerprint", _S)},
-    "decision_refused": {"channel": ("channel", _CH), "decision": ("decision", _S),
+    "decision_refused": {"channel": ("channel", _CH), "decision": ("decision", _DEC),
                          "reason": ("reason", _RSN)},
-    "approval_viewed": {"found": ("found", _B)},
-    "approval_stale": {}, "approval_forbidden": {}, "csrf_refused": {},
-    "dashboard_viewed": {}, "history_viewed": {},
-    "ha_decide_dropped": {},
     "auth_failed": {"peer": ("peer", _S), "method": ("method", _S)},
     "bad_request": {"peer": ("peer", _S), "error": ("error", _S)},
     "discovery": {"peer": ("peer", _S), "host": ("host", _S), "found": ("found", _L)},
     "catalog_loaded": {"count": ("count", _I), "invalid_count": ("invalid", "count")},
     "catalog_error": {}, "backend_error": {},
     "backend_ready": {"duration_ms": ("duration_ms", _I)},
-    "push_subscribed": {"device": ("device", _S)},
-    "push_revoked": {"device": ("device", _S), "removed": ("removed", _B)},
-    "push_refused": {"reason": ("reason", _S)},
-    "push_test": {"delivered": ("delivered", _B)},
-    "client_event": {"kind": ("kind", _S), "v": ("v", _S), "state": ("state", _S),
-                     "ok": ("ok", _B), "err": ("err", _S), "note": ("note", _S),
-                     "tag": ("tag", _S), "action": ("action", _S), "clients": ("clients", _I),
-                     "ms": ("ms", _I), "queued": ("queued", _I), "visible": ("visible", _B),
-                     "client_paths": ("client_paths", _L)},
-    "client_event_dropped": {"dropped": ("dropped", _I), "final": ("final", _B)},
+    "client_event": {"kind": ("kind", _CEKIND), "ok": ("ok", _B), "v": ("v", _V), "ms": ("ms", _I),
+                     "clients": ("clients", _I), "action": ("action", _ACT),
+                     "error_class": ("err", _ERR), "outcome": ("note", _NOTE)},
 }
 # <channel>_decide_refused are generated: channel from the event name, plus status/reason class.
 for _c in CHANNELS:
-    WHITELIST[f"{_c}_decide_refused"] = {"channel": ("@channel", _CH), "status": ("status", _I),
-                                         "reason": ("reason", _RSN)}
+    WHITELIST[f"{_c}_decide_refused"] = {"channel": ("@channel", _CH), "reason": ("reason", _RSN)}
 
 # Not returned at all. Several of these carry policy or risk outright; `notified`
 # and `decided` exist only for requests a human was asked about, so their absence
@@ -102,10 +104,43 @@ HIDDEN = frozenset({
     "startup", "assessed", "escalated", "notified", "decided",
     "policy_changed", "policy_change_refused", "policy_change_failed", "policies_viewed",
     "ha_hook_any_device",
+    # approver presence / activity: which pages are open, when, from which device
+    "approval_viewed", "approval_stale", "approval_forbidden", "csrf_refused", "dashboard_viewed",
+    "history_viewed", "client_event_dropped", "push_subscribed", "push_revoked", "push_refused",
+    "push_test", "ha_decide_dropped",
 })
 
-_REASON_CLASSES = {"action not offered": "action_not_offered", "guard": "guard",
-                   "device not allowed": "device_not_allowed"}
+_REASON_MAP = {"action not offered": "not_offered", "device not allowed": "device_not_allowed",
+               "guard": "malformed", "bad token": "bad_token", "bad key": "bad_key"}
+_STATUS_REASON = {400: "malformed", 401: "bad_key", 403: "bad_token", 404: "spent_or_expired",
+                  410: "spent_or_expired"}
+
+
+def reason_class(reason, status=None):
+    """A fixed-vocabulary class for a refusal; the raw text never leaves."""
+    if isinstance(reason, str) and reason in _REASON_MAP:
+        return _REASON_MAP[reason]
+    if isinstance(status, int) and not isinstance(status, bool) and status in _STATUS_REASON:
+        return _STATUS_REASON[status]
+    return "other"
+
+
+def client_error_class(text):
+    """Browser-reported error text -> network | http_4xx | http_5xx | redirect | exception | other."""
+    t = str(text or "").lower()
+    if not t:
+        return None
+    if re.search(r"\b5\d\d\b", t):
+        return "http_5xx"
+    if re.search(r"\b4\d\d\b", t):
+        return "http_4xx"
+    if re.search(r"\b30\d\b|redirect", t):
+        return "redirect"
+    if re.search(r"network|fetch|offline|timeout|timed out|abort|connection", t):
+        return "network"
+    if re.search(r"error|exception|invalid|denied|notallowed", t):
+        return "exception"
+    return "other"
 
 
 def error_class(text):
@@ -140,9 +175,22 @@ def _clean(val, kind, rec, event):
     if kind == _CH:
         return val if val in CHANNELS else None
     if kind == _ERR:
+        if event == "client_event":
+            return client_error_class(val) if isinstance(val, str) else None
         return error_class(val) if isinstance(val, str) else None
     if kind == _RSN:
-        return _REASON_CLASSES.get(val, "other") if isinstance(val, str) else None
+        return reason_class(val, rec.get("status")) if isinstance(val, str) or "status" in rec else None
+    if kind == _DEC:
+        return val if val in ("approve", "deny") else None
+    if kind == _V:
+        return val if isinstance(val, str) and re.fullmatch(r"[0-9]{1,3}", val) else None
+    if kind == _ACT:
+        return val if val in ("", "open", "approve", "deny") else None
+    if kind == _NOTE:
+        return (f"http_{val[0]}xx" if isinstance(val, str) and re.fullmatch(r"[1-5][0-9]{2}", val)
+                else None)
+    if kind == _CEKIND:
+        return val if val in CE_KINDS else None
     if kind == "count":
         return len(val) if isinstance(val, list) else None
     return None
@@ -165,6 +213,8 @@ def redact(rec):
     out = {"seq": seq, "ts": iso(ts), "event": event[:60],
            "request": rid if isinstance(rid, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", rid)
            else None}
+    if event == "client_event" and rec.get("kind") not in CE_KINDS:
+        return None
     spec = WHITELIST.get(event)
     if spec is None:
         return out                      # unknown event type: nothing beyond the envelope
@@ -173,6 +223,8 @@ def redact(rec):
             val = _clean(event.split("_decide_refused")[0], kind, rec, event)
         else:
             val = _clean(rec.get(src), kind, rec, event)
+            if kind == _RSN and val is None:
+                val = reason_class(None, rec.get("status"))
         if name == "approver" and isinstance(val, str) and val.startswith("policy"):
             val = None
         if val is not None or event in ("approved", "denied", "expired", "failed") and name in (

@@ -756,6 +756,14 @@ unknown fields are dropped. `startup`, `assessed`, `escalated`, `notified`, `dec
 `policy_changed`, `policy_change_refused`, `policy_change_failed`, `policies_viewed` and
 `ha_hook_any_device` are not returned at all (several carry policy; `notified` and `decided`
 exist only when a human was asked, so their absence would mark an auto-approved request).
+Approver presence and activity is hidden too, so the agent cannot time requests for when you
+are away: `approval_viewed`, `approval_stale`, `approval_forbidden`, `csrf_refused`,
+`dashboard_viewed`, `history_viewed`, `push_subscribed`, `push_revoked`, `push_refused`,
+`push_test`, `ha_decide_dropped`, `client_event_dropped`, and every `client_event` whose kind is
+not a service-worker delivery diagnostic (`visibility`, `page_load`, `poll_requested`,
+`sw_message`, `sw_registered`, `sw_register_failed`, `sw_status`, and anything unlisted).
+Free text that a browser or an error can supply is never returned: it is reduced to a fixed
+class or dropped.
 A request that policy approved shows `approved` with `channel` and `approver` null, the
 same shape as a human approval. Never returned: risk, model verdict, reasons, summary text,
 `via`, `always_requested`, latency on decisions, the `adopted` and catalog name lists, secret
@@ -805,17 +813,14 @@ Whitelist (output field from the recorded field; every event also has `seq`, `ts
 | `http_failed` | error_class |
 | `stored` | names, op, field, duration_ms |
 | `ssh_signed` | fingerprint |
-| `decision_refused`, `<channel>_decide_refused` | channel, decision/status, reason class (action_not_offered, guard, device_not_allowed, other) |
-| `approval_viewed` | found |
+| `decision_refused`, `<channel>_decide_refused` | channel, decision (approve or deny, `decision_refused` only), reason class (bad_token, bad_key, not_offered, device_not_allowed, spent_or_expired, malformed, other) |
 | `auth_failed` | peer, method |
-| `bad_request` | peer, error |
+| `bad_request` | peer, error (the message the broker already returned to the agent) |
 | `discovery` | peer, host, found (names) |
 | `catalog_loaded` | count, invalid_count (not names) |
 | `backend_ready` | duration_ms |
-| `push_subscribed`, `push_revoked`, `push_refused`, `push_test` | device, removed, reason, delivered |
-| `client_event` | kind, v, state, ok, err, note, tag, action, clients, ms, queued, visible, client_paths |
-| `client_event_dropped` | dropped, final |
-| `approval_stale`, `approval_forbidden`, `csrf_refused`, `dashboard_viewed`, `history_viewed`, `ha_decide_dropped`, `catalog_error`, `backend_error` | envelope only |
+| `catalog_error`, `backend_error` | envelope only |
+| `client_event` (kinds `push`, `show`, `notificationclick`, `click_navigate`, `click_focus`, `click_openwindow`, `click_outcome`, `notificationclose`, `pushsubscriptionchange`, `sw_install`, `sw_activate`, `action_click`, `action_decide` only) | kind, ok, v (1-3 digits), ms, clients, action (empty, open, approve, deny), error_class (network, http_4xx, http_5xx, redirect, exception, other), outcome (http_2xx.. from a bare status in `note`); never err, note, tag, state or client_paths text |
 
 Residual signals the agent can still infer: a decision with `channel` null is a policy
 approval, and the time between `requested` and `approved` is milliseconds for one.
