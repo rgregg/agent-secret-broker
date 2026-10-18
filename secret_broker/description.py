@@ -207,38 +207,35 @@ def _quotes_prompt(s):
     return any(" ".join(words[i:i + 5]) in prompt for i in range(len(words) - 4))
 
 
-def graphql_is_query(body):
-    """True only when `body` is a JSON object with a `query` string that is
-    certainly a read-only GraphQL query document. Anything uncertain is False."""
-    try:
-        obj = json.loads(body)
-    except (TypeError, ValueError):
-        return False
-    if not isinstance(obj, dict) or not isinstance(obj.get("query"), str):
-        return False
-    doc = obj["query"]
-    doc = re.sub(r'"""(?:.|\n)*?"""', '""', doc)
-    doc = re.sub(r'"(?:[^"\\\n]|\\.)*"', '""', doc)
-    doc = re.sub(r"#[^\n]*", " ", doc).strip()
-    if not doc or re.search(r"\b(?:mutation|subscription)\b", doc, re.I):
-        return False
-    if not re.match(r"(?:query\b|\{|fragment\b)", doc):
-        return False
-    return doc.count("{") == doc.count("}") and doc.count("{") > 0
+_OVERRIDE_HEADERS = {"x-http-method-override", "x-method-override", "x-http-method"}
+_BAD_URL_RE = re.compile(r"[\\\s\x00-\x1f\x7f?#]|%(?:2f|2e|5c|00)", re.I)
 
 
 def _read_endpoint(spec, endpoints):
-    u = urllib.parse.urlsplit(str(spec.get("url") or ""))
-    return any(u.netloc.lower() == e["host"].lower() and u.path == e["path"] for e in endpoints)
+    """True only for a clean POST to an exact allowlisted host and path. Anything
+    that cannot be checked unambiguously is not a read."""
+    try:
+        raw = str(spec.get("url") or "")
+        if not endpoints or _BAD_URL_RE.search(raw):
+            return False
+        if any(str(h).lower() in _OVERRIDE_HEADERS for h in (spec.get("headers") or {})):
+            return False
+        u = urllib.parse.urlsplit(raw)
+        if u.query or u.fragment or "@" in u.netloc or u.scheme not in ("http", "https"):
+            return False
+        return any(u.netloc.lower() == e["host"].lower() and u.path == e["path"] for e in endpoints)
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def is_mutating(mode, spec, read_endpoints=()):
-    """A POST is a read only if its body is a GraphQL query or it hits an
-    operator-allowlisted read endpoint (exact host and path). No keyword guessing."""
+    """Every POST/PUT/PATCH/DELETE is mutating, except a clean POST to an
+    operator-allowlisted read endpoint (exact host and path). No body parsing,
+    no keyword guessing."""
     if mode == "http":
         m = str(spec.get("method") or "GET").upper()
         if m == "POST":
-            return not (graphql_is_query(spec.get("body")) or _read_endpoint(spec, read_endpoints))
+            return not _read_endpoint(spec, read_endpoints)
         return m in _MUTATING_METHODS
     if mode == "env":
         return bool(_CMD_WRITE_RE.search(" ".join(spec.get("argv") or [])))

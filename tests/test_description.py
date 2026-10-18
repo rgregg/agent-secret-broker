@@ -159,24 +159,28 @@ class PostReads(unittest.TestCase):
             self.assertFalse(D.consistent_with("Retrieving a list of items", "http", spec), spec)
             self.assertTrue(D.is_mutating("http", spec))
 
-    def test_graphql_query_is_read(self):
+    def test_graphql_is_not_special(self):
         q = self.post("https://h/graphql", json.dumps({"query": "query { viewer { login } }"}))
-        self.assertFalse(D.is_mutating("http", q))
-        self.assertTrue(D.consistent_with("Looking up account details", "http", q))
-        q2 = self.post("https://h/graphql", json.dumps({"query": "{ viewer { login } } # mutation"}))
-        self.assertFalse(D.is_mutating("http", q2))
+        self.assertTrue(D.is_mutating("http", q))
+        self.assertFalse(D.consistent_with("Looking up account details", "http", q))
+        self.assertFalse(hasattr(D, "graphql_is_query"))
 
-    def test_graphql_mutation_needs_write_description(self):
-        m = self.post("https://h/graphql", json.dumps({"query": "mutation { teamDelete(id:1) { ok } }"}))
-        self.assertTrue(D.is_mutating("http", m))
-        self.assertFalse(D.consistent_with("Looking up a team", "http", m))
-        self.assertTrue(D.consistent_with("Deleting a team", "http", m))
-
-    def test_uncertain_graphql_is_mutation(self):
-        for body in ("not json", "[1]", '{"query": 5}', '{"query":"query { a "}', '{"query":"subscription { a }"}',
-                     '{"query":"query { a } mutation { b }"}', '{"query":""}', None, '[{"query":"{a}"}]',
-                     '{"query":"hello world"}'):
-            self.assertTrue(D.is_mutating("http", self.post("https://h/graphql", body)), body)
+    def test_allowlist_requires_clean_request(self):
+        eps = [{"host": "komodo.example.com", "path": "/read"}]
+        base = "https://komodo.example.com/read"
+        self.assertFalse(D.is_mutating("http", self.post(base, "{}"), eps))
+        self.assertFalse(D.is_mutating("http", self.post("https://KOMODO.example.com/read"), eps))
+        bad = [self.post(base + "?x=1"), self.post(base + "#f"), self.post("https://u:p@komodo.example.com/read"),
+               self.post("https://komodo.example.com./read"), self.post("https://komodo.example.com:8443/read"),
+               self.post("https://komodo.example.com/re%61d/../read"), self.post("https://komodo.example.com/%2e/read"),
+               self.post("https://komodo.example.com/read%2f"), self.post("https://komodo.example.com\\@evil.net/read"),
+               self.post(base + " "), self.post("ftp://komodo.example.com/read"),
+               {"method": "PUT", "url": base}, {"method": "DELETE", "url": base}]
+        for spec in bad:
+            self.assertTrue(D.is_mutating("http", spec, eps), spec)
+        for h in ("X-HTTP-Method-Override", "x-method-override", "X-Http-Method"):
+            spec = {**self.post(base), "headers": {h: "DELETE"}}
+            self.assertTrue(D.is_mutating("http", spec, eps), h)
 
     def test_allowlist_exact_only(self):
         eps = [{"host": "komodo.example.com", "path": "/read"}]
