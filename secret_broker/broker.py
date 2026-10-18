@@ -1042,9 +1042,10 @@ class Broker:
         if not ok:
             self.audit("grant_refused", req, reason=why, **who)
             return
-        made = [self.grants.add(n, minutes, actor, channel, req.id) for n in dict.fromkeys(req.names)]
-        self.audit("grant_created", req, grant_ids=[g["id"] for g in made], grant_minutes=minutes,
-                   expires_at=made[0]["expires_at"], created_by=actor, channel=channel,
+        g = self.grants.add(req.names, minutes, grants_mod.scope_for(req.mode, req.spec), actor,
+                            channel, req.id)
+        self.audit("grant_created", req, grant_id=g["id"], scope=g["scope"], grant_minutes=minutes,
+                   expires_at=g["expires_at"], created_by=actor, channel=channel,
                    approver_peer=who.get("approver_peer"), approver_ip=who.get("approver_ip"))
 
     def _grant_claim(self, req):
@@ -1055,31 +1056,34 @@ class Broker:
         cfg = self.grants_cfg
         if not cfg["enabled"] or req.mode not in grants_mod.ELIGIBLE_MODES:
             return False
-        level = req.risk["level"] if req.risk else "high"
+        level = req.risk["level"] if req.risk else "high"     # no verdict counts as high
         with self._lock:
-            got = self.grants.match(req.names)
-            if got is None:
+            g = self.grants.find(req.names)
+            if g is None:
                 return False
-            skipped = not risk_mod.auto_ok(level, cfg["max_risk"])
-            if not skipped:
-                if req.status != "pending":
-                    return False
+            skip = None
+            if not grants_mod.covers(g, req.mode, req.spec):
+                skip = "method"
+            elif not risk_mod.auto_ok(level, cfg["max_risk"]):
+                skip = "risk"
+            elif req.status != "pending":
+                return False
+            else:
                 req.status = "deciding"
-        ids = [g["id"] for g in got]
-        if skipped:
-            self.audit("grant_skipped", req, reason="risk", grant_ids=ids, risk_level=level,
-                       max_risk=cfg["max_risk"])
+        if skip:
+            self.audit("grant_skipped", req, reason=skip, grant_id=g["id"], scope=g["scope"],
+                       risk_level=level, max_risk=cfg["max_risk"])
             return False
-        left = min(self.grants.left_s(g) for g in got)
-        self.audit("grant_used", req, grant_ids=ids, grant_left_s=left)
+        left = self.grants.left_s(g)
+        self.audit("grant_used", req, grant_id=g["id"], scope=g["scope"], grant_left_s=left)
         try:
             result = self._release(req)
         except (BackendError, OSError, ValueError) as e:
             self._finish(req, "failed", error=f"release failed: {e}", via="policy",
-                         grant_id=ids[0], grant_ids=ids, grant_left_s=left)
+                         grant_id=g["id"], grant_left_s=left)
         else:
             self._finish(req, "approved", result=result, via="policy",
-                         grant_id=ids[0], grant_ids=ids, grant_left_s=left)
+                         grant_id=g["id"], grant_left_s=left)
         return True
 
     def revoke_grant(self, grant_id, user, peer=None, client_ip=None):
@@ -1087,8 +1091,8 @@ class Broker:
         g = self.grants.revoke(grant_id) if self.grants_cfg["enabled"] else None
         if g is None:
             return False
-        self.log("grant_revoked", grant_id=g["id"], secret=g["secret"], created_by=g["created_by"],
-                 revoked_by=user, left_s=max(0, int(g["expires_at"] - time.time())), peer=peer,
+        self.log("grant_revoked", grant_id=g["id"], secrets=g["secrets"], scope=g["scope"],
+                 created_by=g["created_by"], revoked_by=user, left_s=max(0, int(g["expires_at"] - time.time())), peer=peer,
                  client_ip=client_ip)
         return True
 
@@ -2102,9 +2106,10 @@ def _grant_menu(broker, req):
         f"<button class=btn name=decision value='approve_grant_{m}'>"
         f"Approve for {_fmt_minutes(m)}</button>" for m in mins)
     return ("<details class=more><summary>Approve for a while &#9662;</summary>" + btns
-            + f"<p><small>Further requests for {html.escape(', '.join(req.names))} that the broker "
-            "runs itself are approved without asking until the time is up. Revoke any time "
-            "under Policies.</small></p></details>")
+            + f"<p><small>Further requests for exactly {html.escape(', '.join(req.names))} that the "
+            f"broker runs itself ({'GET, HEAD and OPTIONS only' if grants_mod.scope_for(req.mode, req.spec) == 'read' else 'any method'}) "
+            "are approved without asking until the time is up. Revoke any time under "
+            "Policies.</small></p></details>")
 
 
 def _fmt_minutes(m):
@@ -2201,7 +2206,9 @@ def _detail_html(r, evs):
         + (f" {e(r['error'])}" if r["error"] else ""), True)
     if r["via"] == "policy" and r.get("grant_id"):
         left = (final or {}).get("grant_left_s")
-        add("Decided by", "time-boxed grant (auto-approved)"
+        gs = (first("grant_used") or {}).get("scope")
+        add("Decided by", "time-boxed grant"
+            + (" (reads only)" if gs == "read" else " (all requests)" if gs else "") + " (auto-approved)"
             + ((f", {left // 60} min left when used" if left >= 60 else ", under a minute left when used")
                if isinstance(left, int) else "")
             + f", grant {str(r['grant_id'])[:8]}")
@@ -2753,14 +2760,15 @@ def approval_handler(broker):
             """'Active grants' card on the Policies tab: who allowed what, time left, Revoke."""
             head = ("<h3 style='margin-top:0'>Active grants</h3><p><small class=muted>Time-boxed "
                     "approvals: until the clock runs out, requests for these secrets that the broker "
-                    "runs itself are approved without asking. Revoke to ask every time again."
+                    "runs itself are approved without asking, when the request names exactly the same secrets. Revoke to ask every time again."
                     "</small></p>")
             if not broker.grants_cfg["enabled"]:
                 return head + "<div class='card empty'>Time-boxed grants are turned off.</div>"
             rows = []
             for g in broker.active_grants():
                 rows.append(
-                    f"<tr><td data-label=Secret><b>{html.escape(g['secret'])}</b></td>"
+                    f"<tr><td data-label=Secret><b>{html.escape(', '.join(g['secrets']))}</b></td>"
+                    f"<td data-label=Covers>{'reads only' if g['scope'] == 'read' else 'all requests'}</td>"
                     f"<td data-label='Time left'><time data-gexp='{int(g['expires_at'])}'>"
                     f"{html.escape(_left(g['left_s']))}</time></td>"
                     f"<td data-label='Allowed by'>{html.escape(g['created_by'])}"
@@ -2771,7 +2779,7 @@ def approval_handler(broker):
                     "<button>Revoke</button></form></td></tr>")
             if not rows:
                 return head + "<div class='card empty'>No active grants</div>"
-            return (head + "<table class=tbl><thead><tr><th>Secret</th><th>Time left</th>"
+            return (head + "<table class=tbl><thead><tr><th>Secrets</th><th>Covers</th><th>Time left</th>"
                     "<th>Allowed by</th><th></th></tr></thead><tbody>" + "".join(rows)
                     + "</tbody></table>")
 
@@ -3019,7 +3027,7 @@ def approval_handler(broker):
                 extra = f"<p><small>Always allow {html.escape(req.always)}.</small></p>"
             if parsed[2] is not None:
                 extra += (f"<p>Further requests for <b>{html.escape(', '.join(req.names))}</b> are "
-                          f"approved for {parsed[2]} minutes. Revoke it at "
+                          f"approved for {parsed[2]} minutes (same secrets only). Revoke it at "
                           "<a href='/policies'>/policies</a>.</p>")
             _page(self, 200, "<h1>Approved</h1><p>Releasing now. You can close this page.</p>" + extra)
 

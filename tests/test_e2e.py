@@ -2686,7 +2686,7 @@ class StatusEndpoint(Harness):
         self.assertEqual(st["backend"], {"type": "file", "ok": True})
         self.assertEqual(st["notifiers"], ["ticker"])
         self.assertEqual(st["features"], {"ha_hook": True, "ssh": False, "webpush_actions": False,
-                                         "auto_approve_max": "low"})
+                                         "auto_approve_max": "low", "timed_grants": True})
 
     def test_leaks_no_names_hosts_or_config(self):
         _, body = self.status()

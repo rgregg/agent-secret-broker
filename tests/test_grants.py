@@ -80,10 +80,10 @@ class Base(Harness):
         _, b = self.api("GET", f"/v1/requests/{rid}?wait=5")
         return json.loads(b)
 
-    def http(self, names=("svc",), path="/x"):
+    def http(self, names=("svc",), path="/x", method="GET"):
         url = f"http://127.0.0.1:{self.up.server_address[1]}{path}"
         _, body = self.api("POST", "/v1/requests", {
-            "mode": "http", "names": list(names), "method": "GET", "url": url,
+            "mode": "http", "names": list(names), "method": method, "url": url,
             "headers": {**({"Authorization": "Bearer {{SVC_TOKEN}}"} if "svc" in names else {}),
                         **({"X-Other": "{{OTHER_TOKEN}}"} if "other" in names else {})}})
         return json.loads(body)["id"]
@@ -109,8 +109,8 @@ class Base(Harness):
                 return e.code
         return self.decide(rid, decision)[0]
 
-    def grant_it(self, names=("svc",), minutes=15):
-        rid = self.http(names)
+    def grant_it(self, names=("svc",), minutes=15, method="GET"):
+        rid = self.http(names, method=method)
         self.assertEqual(self.approve(rid, f"approve_grant_{minutes}"), 303)
         self.broker._by_id[rid].done.wait(10)
         return rid
@@ -126,7 +126,7 @@ class Creation(Base):
     def test_dashboard_menu_creates_grant_and_audits(self):
         rid = self.grant_it()
         g = self.broker.active_grants()
-        self.assertEqual([x["secret"] for x in g], ["svc"])
+        self.assertEqual([x["secrets"] for x in g], [["svc"]])
         self.assertEqual(g[0]["created_by"], "alice")
         self.assertEqual(g[0]["minutes"], 15)
         ev = self.events("grant_created")[0]
@@ -249,15 +249,48 @@ class Using(Base):
         self.http(("other",))
         self.assertEqual(len(self.notifier.sent), n + 1)
 
-    def test_multi_secret_needs_all(self):
+    def test_set_equality_subset_and_superset_prompt(self):
+        self.grant_it(("svc", "other"))
+        n = len(self.notifier.sent)
+        self.assertEqual(self.result(self.http(("other", "svc")))["status"], "approved")  # same set
+        self.assertEqual(len(self.notifier.sent), n)
+        self.http(("svc",))                                    # subset prompts
+        self.assertEqual(len(self.notifier.sent), n + 1)
+        self.broker.decide_via("dashboard", self.pending_id(), "approve", "alice")
+        self.grant_it(("svc",), 5)                             # a separate grant for {svc}
+        self.assertEqual(len(self.broker.active_grants()), 2)
+
+    def test_superset_prompts(self):
         self.grant_it(("svc",))
         n = len(self.notifier.sent)
         self.http(("svc", "other"))
-        self.assertEqual(len(self.notifier.sent), n + 1)       # other has none: prompts
-        self.broker.decide_via("dashboard", self.pending_id(), "approve", "alice")
-        self.grant_it(("other",), 5)
-        rid2 = self.http(("svc", "other"))
-        self.assertEqual(self.result(rid2)["status"], "approved")
+        self.assertEqual(len(self.notifier.sent), n + 1)
+
+    def test_read_grant_does_not_cover_mutating_methods(self):
+        self.grant_it(method="GET")
+        g = self.broker.active_grants()[0]
+        self.assertEqual(g["scope"], "read")
+        self.assertEqual(self.events("grant_created")[0]["scope"], "read")
+        for m in ("HEAD", "OPTIONS", "GET"):
+            self.assertEqual(self.result(self.http(method=m, path="/" + m))["status"], "approved", m)
+        n = len(self.notifier.sent)
+        rid = self.http(method="DELETE", path="/d")
+        self.assertEqual(len(self.notifier.sent), n + 1)
+        sk = self.events("grant_skipped")[0]
+        self.assertEqual((sk["id"], sk["reason"], sk["scope"]), (rid, "method", "read"))
+
+    def test_write_grant_covers_get_and_other_methods(self):
+        self.grant_it(method="POST")
+        self.assertEqual(self.broker.active_grants()[0]["scope"], "any")
+        n = len(self.notifier.sent)
+        for m in ("GET", "DELETE", "PUT"):
+            self.assertEqual(self.result(self.http(method=m, path="/" + m))["status"], "approved", m)
+        self.assertEqual(len(self.notifier.sent), n)
+
+    def test_ssh_grant_scope_is_any(self):
+        rid = self.sign()
+        self.approve(rid, "approve_grant_5")
+        self.assertEqual(self.broker.active_grants()[0]["scope"], "any")
 
     def test_env_and_store_always_ask(self):
         self.grant_it()
@@ -298,7 +331,7 @@ class Using(Base):
         self.offset += 200
         self.http(path="/mid")                          # use does not extend
         self.offset += 200
-        self.assertEqual(self.broker.grants.sweep()[0]["secret"], "svc")
+        self.assertEqual(self.broker.grants.sweep()[0]["secrets"], ["svc"])
         self.assertEqual(len(self.events("grant_expired")), 1)
 
     def test_revoke(self):
@@ -307,8 +340,8 @@ class Using(Base):
         self.assertTrue(self.broker.revoke_grant(gid, "alice", "1.2.3.4", None))
         self.assertFalse(self.broker.revoke_grant(gid, "alice"))
         ev = self.events("grant_revoked")[0]
-        self.assertEqual((ev["grant_id"], ev["secret"], ev["revoked_by"], ev["created_by"]),
-                         (gid, "svc", "alice", "alice"))
+        self.assertEqual((ev["grant_id"], ev["secrets"], ev["revoked_by"], ev["created_by"]),
+                         (gid, ["svc"], "alice", "alice"))
         n = len(self.notifier.sent)
         self.http()
         self.assertEqual(len(self.notifier.sent), n + 1)
@@ -405,7 +438,15 @@ class Persistence(Base):
         self.assertNotIn("s3cr3t", raw)
         self.assertNotIn("nonce", raw)
         b = self.reload()
-        self.assertEqual([g["secret"] for g in b.active_grants()], ["svc"])
+        self.assertEqual([g["secrets"] for g in b.active_grants()], [["svc"]])
+
+    def test_scope_and_set_persist(self):
+        self.grant_it(("svc", "other"), method="GET")
+        b = self.reload()
+        g = b.active_grants()[0]
+        self.assertEqual((g["secrets"], g["scope"]), (["other", "svc"], "read"))
+        self.assertIsNotNone(b.grants.find(["svc", "other"]))
+        self.assertIsNone(b.grants.find(["svc"]))
 
     def test_expired_dropped_on_load_and_audited(self):
         self.grant_it(minutes=5)
@@ -485,7 +526,12 @@ class Pages(Base):
         self.assertIn("data-gexp", pol)
         self.assertIn("/grants/revoke", pol)
         self.assertIn("<b>svc</b>", pol)
-        gid = self.broker.active_grants()[0]["id"]
+        self.assertIn("reads only", pol)
+        self.grant_it(("svc", "other"), 10, method="POST")
+        _, pol = self.get("/policies")
+        self.assertIn("<b>other, svc</b>", pol)
+        self.assertIn("all requests", pol)
+        gid = next(g["id"] for g in self.broker.active_grants() if g["scope"] == "read")
         form = {"grant": gid, "csrf": "bad"}
         def post(form):
             try:
@@ -495,9 +541,9 @@ class Pages(Base):
             except urllib.error.HTTPError as e:
                 return e.code
         self.assertEqual(post(form), 403)
-        self.assertEqual(len(self.broker.active_grants()), 1)
+        self.assertEqual(len(self.broker.active_grants()), 2)
         self.assertEqual(post({"grant": gid, "csrf": self.broker.csrf_token("alice")}), 200)
-        self.assertEqual(self.broker.active_grants(), [])
+        self.assertEqual([g["scope"] for g in self.broker.active_grants()], ["any"])
         self.assertEqual(self.get("/policies", "mallory")[0], 403)
 
     def test_settings_line_and_card_durations(self):
@@ -510,7 +556,7 @@ class Pages(Base):
         self.assertIn("Approve for 2 h", page)
 
     def test_creator_name_is_escaped(self):
-        self.broker.grants.add("svc", 5, "<script>x</script>", "dashboard", "r")
+        self.broker.grants.add(["svc"], 5, "any", "<script>x</script>", "dashboard", "r")
         _, pol = self.get("/policies")
         self.assertNotIn("<script>x", pol)
         self.assertIn("&lt;script&gt;", pol)

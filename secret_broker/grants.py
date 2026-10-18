@@ -1,8 +1,10 @@
 """Time-boxed grants: "approve for the next N minutes".
 
 When the human approves a request they may choose "Approve for N minutes".
-For that window, further requests for the same secret NAME in a mode where the
-value never leaves the broker (`http`, `ssh_sign`) are approved without a tap.
+For that window, further requests for exactly the same SET of secret names in a
+mode where the value never leaves the broker (`http`, `ssh_sign`) are approved
+without a tap. A grant made from a read-only http request (GET/HEAD/OPTIONS)
+covers only such methods; one made from any other method covers all.
 The grant expires at an absolute deadline (no sliding extension) and can be
 revoked early. Grants are persisted (names, times and creator only; no values,
 no tokens) so a broker restart does not drop them.
@@ -24,6 +26,21 @@ import time
 from . import risk as risk_mod
 
 ELIGIBLE_MODES = ("http", "ssh_sign")     # the value never reaches the agent
+READ_METHODS = ("GET", "HEAD", "OPTIONS")
+
+
+def scope_for(mode, spec):
+    """'read' when the approved request was a safe http method, else 'any'."""
+    if mode == "http" and str((spec or {}).get("method", "")).upper() in READ_METHODS:
+        return "read"
+    return "any"
+
+
+def covers(grant, mode, spec):
+    """True when `grant` (by scope) may approve a later request."""
+    if grant["scope"] == "any":
+        return True
+    return mode == "http" and str((spec or {}).get("method", "")).upper() in READ_METHODS
 DEFAULTS = {"enabled": True, "durations": [5, 15, 30, 60], "max_minutes": 60, "max_risk": "high"}
 MAX_DURATIONS = 6
 HARD_MAX_MINUTES = 24 * 60
@@ -76,9 +93,10 @@ def describe(cfg):
 
 
 class GrantStore:
-    """In-memory grants keyed by secret name, mirrored to a small JSON file.
-
-    One active grant per secret: granting again replaces (and so restarts) it.
+    """In-memory grants keyed by the exact SET of secret names, mirrored to a
+    small JSON file. A request is covered only by a grant whose set equals its
+    own (a subset or superset does not match). Granting again for the same set
+    replaces (and so restarts) the grant, whatever its scope was.
     `on_event(name, **fields)` receives audit records; it must not call back in.
     """
 
@@ -88,7 +106,7 @@ class GrantStore:
         self._clock = clock
         self._max_s = max_minutes * 60
         self._lock = threading.Lock()
-        self._by_secret = {}
+        self._by_set = {}       # frozenset(names) -> grant
 
     # -- persistence -------------------------------------------------------
     def load(self):
@@ -110,7 +128,10 @@ class GrantStore:
         with self._lock:
             for g in items:
                 try:
-                    g = {"id": str(g["id"])[:16], "secret": str(g["secret"])[:80],
+                    names = sorted({str(n)[:80] for n in g["secrets"]})
+                    if not names or g["scope"] not in ("read", "any"):
+                        raise ValueError("bad entry")
+                    g = {"id": str(g["id"])[:16], "secrets": names, "scope": g["scope"],
                          "minutes": int(g["minutes"]), "created_at": float(g["created_at"]),
                          "expires_at": float(g["expires_at"]), "created_by": str(g["created_by"])[:120],
                          "channel": str(g.get("channel") or "")[:20],
@@ -119,19 +140,19 @@ class GrantStore:
                     self._log("grants_file_corrupt", warning="skipped a malformed grant entry")
                     continue
                 if g["expires_at"] <= now:
-                    self._log("grant_expired", grant_id=g["id"], secret=g["secret"],
+                    self._log("grant_expired", grant_id=g["id"], secrets=g["secrets"],
                               expires_at=g["expires_at"], created_by=g["created_by"],
                               note="expired while the broker was down")
                 elif g["expires_at"] - now > self._max_s + 60:
-                    self._log("grant_dropped", grant_id=g["id"], secret=g["secret"],
+                    self._log("grant_dropped", grant_id=g["id"], secrets=g["secrets"],
                               reason="deadline is further out than max_minutes allows")
                 else:
-                    self._by_secret[g["secret"]] = g
+                    self._by_set[frozenset(g["secrets"])] = g
 
     def _save_locked(self):
         if not self._path:
             return
-        data = {"version": 1, "grants": sorted(self._by_secret.values(), key=lambda g: g["id"])}
+        data = {"version": 2, "grants": sorted(self._by_set.values(), key=lambda g: g["id"])}
         tmp = f"{self._path}.tmp"
         try:
             fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -145,10 +166,10 @@ class GrantStore:
     # -- operations --------------------------------------------------------
     def _expire_locked(self):
         now = self._clock()
-        gone = [g for g in self._by_secret.values() if g["expires_at"] <= now]
+        gone = [g for g in self._by_set.values() if g["expires_at"] <= now]
         for g in gone:
-            del self._by_secret[g["secret"]]
-            self._log("grant_expired", grant_id=g["id"], secret=g["secret"],
+            del self._by_set[frozenset(g["secrets"])]
+            self._log("grant_expired", grant_id=g["id"], secrets=g["secrets"],
                       expires_at=g["expires_at"], created_by=g["created_by"])
         if gone:
             self._save_locked()
@@ -158,38 +179,37 @@ class GrantStore:
         with self._lock:
             return self._expire_locked()
 
-    def add(self, secret, minutes, created_by, channel, request_id):
+    def add(self, names, minutes, scope, created_by, channel, request_id):
         now = self._clock()
-        g = {"id": secrets.token_hex(4), "secret": secret, "minutes": int(minutes),
-             "created_at": now, "expires_at": now + minutes * 60, "created_by": created_by,
-             "channel": channel, "request_id": request_id or ""}
+        key = frozenset(names)
+        g = {"id": secrets.token_hex(4), "secrets": sorted(key), "scope": scope,
+             "minutes": int(minutes), "created_at": now, "expires_at": now + minutes * 60,
+             "created_by": created_by, "channel": channel, "request_id": request_id or ""}
         with self._lock:
             self._expire_locked()
-            self._by_secret[secret] = g
+            self._by_set[key] = g
             self._save_locked()
         return dict(g)
 
-    def match(self, names):
-        """Active grants covering EVERY name, as a list, else None."""
+    def find(self, names):
+        """The active grant for exactly this set of names, or None."""
         with self._lock:
             self._expire_locked()
-            found = [self._by_secret.get(n) for n in dict.fromkeys(names)]
-            if not found or any(g is None for g in found):
-                return None
-            return [dict(g) for g in found]
+            g = self._by_set.get(frozenset(names))
+            return dict(g) if g else None
 
     def active(self):
         with self._lock:
             self._expire_locked()
-            return sorted((dict(g) for g in self._by_secret.values()), key=lambda g: g["expires_at"])
+            return sorted((dict(g) for g in self._by_set.values()), key=lambda g: g["expires_at"])
 
     def revoke(self, grant_id):
         """Remove a grant by id; returns it, or None when not active."""
         with self._lock:
             self._expire_locked()
-            for name, g in list(self._by_secret.items()):
+            for key, g in list(self._by_set.items()):
                 if g["id"] == grant_id:
-                    del self._by_secret[name]
+                    del self._by_set[key]
                     self._save_locked()
                     return dict(g)
         return None

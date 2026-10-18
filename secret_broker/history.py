@@ -21,7 +21,7 @@ _EV_KEYS = ("reason", "reasons", "model", "risk", "error", "via", "channel", "de
             "approver", "approver_peer", "approver_ip", "always_requested", "latency_ms",
             "duration_ms", "upstream_status", "response_bytes", "secret", "vars", "kind",
             "to_peer", "auto_max", "ssh_fingerprint", "sign_bytes", "value_bytes", "op",
-            "item", "field", "key", "hosts", "grant_id", "grant_ids", "grant_minutes",
+            "item", "field", "key", "hosts", "grant_id", "scope", "secrets", "grant_minutes",
             "grant_left_s", "expires_at", "created_by", "max_risk", "risk_level")
 _MAX_EVENTS = 60            # per request
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
