@@ -97,6 +97,16 @@ class Consistency(unittest.TestCase):
         self.assertFalse(D.consistent_with("Checks status", "env", {"argv": ["sh", "-c", "x > /etc/y"]}))
         self.assertFalse(D.consistent_with("Reads a key", "store", {}))
 
+    def test_post_query_allowed_but_post_mutation_not(self):
+        q = {"method": "POST", "url": "https://p.example.com/api/search/metadata", "body": '{"city":"x"}'}
+        self.assertTrue(D.consistent_with("Searching a photo library", "http", q))
+        m = {"method": "POST", "url": "https://p.example.com/api/search/metadata", "body": "drop table x"}
+        self.assertFalse(D.consistent_with("Searching a photo library", "http", m))
+        self.assertFalse(D.consistent_with("Checking a thing", "http", {"method": "POST", "url": "https://p/x/delete"}))
+
+    def test_home_assistant_is_not_flagged(self):
+        self.assertEqual(D.sanitize("Unlocking the front door in Home Assistant")[1], None)
+
     def test_fine_cases(self):
         self.assertTrue(D.consistent_with("Reads a dashboard", "http", HTTP_GET))
         self.assertTrue(D.consistent_with("Deletes a dashboard", "http", HTTP_DEL))
