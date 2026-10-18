@@ -1423,7 +1423,7 @@ class AlwaysAllow(Harness):
         self.create_env()
         page = self.page()
         self.assertNotIn("value=approve_always", page)
-        self.assertIn("Always allow not offered", page)
+        self.assertNotIn("Automatically approve", page)       # nothing eligible: no row at all
         status, body = self.post(f"/a/{self.nonce()}", decision="approve_always")   # forged
         self.assertEqual(status, 200)
         self.assertIn("not applied", body)

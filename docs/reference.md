@@ -508,8 +508,10 @@ An agent can add or rotate credentials, always with a fresh approval:
 
 The approval listener serves a small web app with three tabs: **Requests**,
 **Policies** and **Settings**. **Requests** (`/`) is a live list of pending
-requests, each with **Approve**, **Deny** and (where the usual rules allow it)
-an **Always allow** menu, and below it the most recent decisions as a list. A
+requests, each with **Approve** and **Deny** side by side (Deny is solid red) and, where
+the usual rules allow it, an **Automatically approve...** row of **5 min / 15 min
+/ 30 min / Always** chips (the configured durations; *Always* asks for a
+confirmation first), and below it the most recent decisions as a list. A
 history row opens a pop-over with everything recorded for that request (see
 [Request history](#request-history)); **Search and filter all history** expands
 the same list in place. It is for when the phone is out of reach: open the site, sign in
@@ -718,7 +720,9 @@ whose result the client never fetched.
 
 ## Always allow
 
-On the approval page, **Approve and always allow `NAME`** approves this request
+On the approval page, the **Always** chip in the "Automatically approve..." row
+(it opens an "Always approve `NAME`?" confirmation with a **Confirm** button that
+submits `approve_always`) approves this request
 and records `"approval": "allow"` in that secret's vault item metadata (with who
 and when), effective immediately. It is offered only
 when it would mean something:
@@ -737,9 +741,10 @@ secrets that are always allowed, with a **Revoke** button that puts one back to
 
 ## Time-boxed grants (approve for N minutes)
 
-Instead of plain Approve or Always allow, the approver can pick **Approve for N
-min** from the "Approve for a while" menu on the approval card (dashboard) or on
-the approval-link page. The request is approved as usual, and for the next N
+Instead of plain Approve or Always allow, the approver can pick a duration chip
+(**5 min**, **15 min**, ... after "Automatically approve...") on the approval card
+(dashboard) or on the approval-link page. A chip submits immediately (it expires
+by itself); a disabled **Always** chip with a tooltip shows why Always is not offered. The request is approved as usual, and for the next N
 minutes further requests for the same secret are approved without a tap. The
 grant ends by itself at an absolute deadline (using it does not extend it) and
 can be revoked early.
@@ -754,7 +759,7 @@ can be revoked early.
   POST/PUT/PATCH/DELETE falls through to a normal prompt (`grant_skipped`,
   `reason: method`). A grant made from any other method (`scope: any`) covers
   all methods. `ssh_sign` has no method: its grant (`scope: any`) covers signing
-  for that key. The card's menu text says which applies.
+  for that key. The line under the chips says which applies.
 - **Risk does not block creating one.** HIGH-rated requests (every `ssh_sign` is
   rated high) can still be approved with a grant; only `max_risk` limits use.
 - **Modes where the value never leaves the broker:** `http` and `ssh_sign`
@@ -767,10 +772,10 @@ can be revoked early.
   can never create one. A denied or already decided request creates nothing.
 - **Config** (`timed_grants`, validated at startup with the field named in the
   error): `enabled` (default `true`), `durations` (minutes offered; 1-6 distinct
-  whole numbers > 0 and <= `max_minutes`; default `[5, 15, 30, 60]`),
+  whole numbers > 0 and <= `max_minutes`; default `[5, 15, 30]`),
   `max_minutes` (cap, default 60, at most 1440) and `max_risk`
   (`none|low|medium|high`, default `high` = no ceiling). `enabled: false` hides
-  the menu, rejects grant choices and ignores any persisted grants.
+  the chips, rejects grant choices and ignores any persisted grants.
 - **Risk ceiling.** A request rated above `max_risk` ignores the grant and
   prompts normally (`grant_skipped`, `reason: risk`). A missing model verdict
   counts as high, so it only matters when the ceiling is below `high`. `none`

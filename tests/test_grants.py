@@ -1,6 +1,7 @@
 """Time-boxed grants: "Approve for N minutes"."""
 import base64
 import json
+import re
 import os
 import sys
 import threading
@@ -195,20 +196,24 @@ class Creation(Base):
         self.assertEqual(self.broker.active_grants(), [])
         self.assertEqual(self.events("grant_created"), [])
 
-    def test_dashboard_card_has_the_menu_only_for_eligible_requests(self):
+    def test_dashboard_card_has_the_chips_only_for_eligible_requests(self):
         self.http()
         _, page = self.get("/")
-        self.assertIn("Approve for 15 min", page)
-        self.assertIn("value='approve_grant_60'", page)
-        self.assertIn("Approve for a while", page)
+        self.assertIn("Automatically approve...", page)
+        for m in (5, 15, 30):
+            self.assertIn(f"name=decision value='approve_grant_{m}'", page)
+            self.assertIn(f">{m} min</button>", page)
+        self.assertNotIn("approve_grant_60", page)
+        self.assertNotIn("Approve for a while", page)
         link_nonce = next(iter(self.broker._by_nonce))
         _, lp = self.get(f"/a/{link_nonce}")
-        self.assertIn("Approve for 5 min", lp)
+        self.assertIn(">5 min</button>", lp)
 
     def test_no_menu_for_env_and_store(self):
         self.create_env()
         _, page = self.get("/")
-        self.assertNotIn("Approve for", page)
+        self.assertNotIn("Automatically approve", page)
+        self.assertNotIn("approve_grant_", page)
         rid = self.pending_id()
         self.assertEqual(self.decide(rid, "approve_grant_15")[0], 303)
         self.assertEqual(self.broker.active_grants(), [])
@@ -405,7 +410,8 @@ class Disabled(Base):
     def test_menu_hidden_and_decision_rejected(self):
         rid = self.http()
         _, page = self.get("/")
-        self.assertNotIn("Approve for", page)
+        self.assertNotIn("approve_grant_", page)
+        self.assertNotIn("Applies to exactly", page)
         self.assertEqual(self.decide(rid, "approve_grant_15")[1], "/?note=bad")
         self.assertEqual(self.status_of(rid), "pending")
         _, pol = self.get("/policies")
@@ -483,7 +489,7 @@ class Config(unittest.TestCase):
 
     def test_defaults(self):
         self.assertEqual(grants_mod.parse_config(None), {
-            "enabled": True, "durations": [5, 15, 30, 60], "max_minutes": 60, "max_risk": "high"})
+            "enabled": True, "durations": [5, 15, 30], "max_minutes": 60, "max_risk": "high"})
 
     def test_validation_names_fields(self):
         self.bad("x", "timed_grants must")
@@ -512,6 +518,99 @@ class Config(unittest.TestCase):
                 f.write("{}")
             Broker({"timed_grants": {"durations": [500]}, "secrets": {}}, FileBackend(p),
                    FakeNotifier(), None)
+
+
+class CardLayout(Base):
+    def card(self, page):
+        m = re.search(r"<article class=req.*?</article>", page, re.S)
+        self.assertTrue(m)
+        return m.group(0)
+
+    def test_approve_and_deny_share_one_row_with_a_filled_danger_deny(self):
+        self.http()
+        _, page = self.get("/")
+        card = self.card(page)
+        row = re.search(r"<div class=decide-row>(.*?)</div>", card, re.S).group(1)
+        self.assertIn("class='btn approve' name=decision value=approve>Approve", row)
+        self.assertIn("class='btn deny' name=decision value=deny>Deny", row)
+        self.assertRegex(page, r"\.btn\.deny\{background:var\(--danger\)")
+        self.assertNotRegex(page, r"\.btn\.deny\{color:var\(--bad\)\}")
+        self.assertNotIn("<details class=more", page)
+
+    def test_http_card_offers_chips_and_a_confirmed_always(self):
+        self.http()
+        _, page = self.get("/")
+        card = self.card(page)
+        self.assertLess(card.index("Approve</button>"), card.index("Automatically approve..."))
+        self.assertLess(card.index(">5 min<"), card.index(">15 min<"))
+        self.assertLess(card.index(">30 min<"), card.index(">Always</summary>"))
+        # Always is behind a confirmation: the submit button lives inside the opened <details>
+        det = re.search(r"<details class=alw>(.*?)</details>", card, re.S).group(1)
+        self.assertIn("name=decision value=approve_always>Confirm", det)
+        self.assertEqual(card.count("value=approve_always"), 1)
+        self.assertNotRegex(card.replace(det, ""), "value=approve_always")
+        self.assertIn("Applies to exactly: svc. Reads only (GET, HEAD, OPTIONS).", card)
+        self.assertNotIn(" title=", card[card.index("<div class=decide-row>"):])
+        for m in re.findall(r"<(?:button|summary|span) class=[^>]*>", card):
+            if "chip" in m:
+                self.assertIn("aria-label=", m)
+        _, lp = self.get(f"/a/{next(iter(self.broker._by_nonce))}")
+        self.assertIn("<div class=decide-row>", lp)
+        self.assertIn("Automatically approve...", lp)
+        self.assertIn("value=approve_always>Confirm", lp)
+        self.assertNotIn(" title=", self.card_link(lp))
+
+    def card_link(self, lp):
+        return lp[lp.index("<form"):lp.index("</form>")]
+
+    def test_non_read_method_says_any_method(self):
+        self.http(method="POST")
+        _, page = self.get("/")
+        self.assertIn("Applies to exactly: svc. Any method.", page)
+
+    def test_ssh_sign_has_chips_and_a_disabled_always(self):
+        self.sign()
+        _, page = self.get("/")
+        card = self.card(page)
+        self.assertIn(">5 min</button>", card)
+        self.assertNotIn("approve_always", card)
+        m = re.search(r"<span class='chip off'[^>]*>Always</span>", card)
+        self.assertTrue(m)
+        self.assertIn("data-tip='Always not offered:", m.group(0))
+        self.assertNotIn(" title=", card[card.index("<div class=decide-row>"):])
+
+    def test_env_has_no_options_row(self):
+        self.create_env()
+        _, page = self.get("/")
+        card = self.card(page)
+        self.assertIn("<div class=decide-row>", card)
+        self.assertNotIn("Automatically approve", card)
+        self.assertNotIn("chip", card)
+
+    def test_chip_values_are_the_old_contract(self):
+        rid = self.http()
+        _, page = self.get("/")
+        for m in (5, 15, 30):
+            self.assertIn(f"value='approve_grant_{m}'", page)
+        self.assertEqual(self.approve(rid, "approve_grant_30"), 303)
+        self.assertEqual(self.broker.active_grants()[0]["minutes"], 30)
+
+    def test_markup_is_deterministic_for_a_fixed_state(self):
+        self.http()
+        strip = lambda c: re.sub(r"expires in \d+s|data-exp='\d+'", "", c)
+        a = strip(self.card(self.get("/")[1]))
+        b = strip(self.card(self.get("/")[1]))
+        self.assertEqual(a, b)
+
+    def test_names_are_escaped(self):
+        self.broker.cfg["secrets"]["<b>x"] = dict(self.broker.cfg["secrets"]["svc"])
+        self.http(names=("svc",))
+        r = next(iter(self.broker._by_id.values()))
+        r.names = ["<b>x"]
+        from secret_broker.broker import _approve_actions
+        out = _approve_actions(self.broker, r)
+        self.assertNotIn("<b>x", out)
+        self.assertIn("&lt;b&gt;x", out)
 
 
 class Pages(Base):
@@ -553,7 +652,8 @@ class Pages(Base):
         self.assertIn("up to medium risk", s)
         self.http()
         _, page = self.get("/")
-        self.assertIn("Approve for 2 h", page)
+        self.assertIn(">2 hr</button>", page)
+        self.assertIn(">10 min</button>", page)
 
     def test_creator_name_is_escaped(self):
         self.broker.grants.add(["svc"], 5, "any", "<script>x</script>", "dashboard", "r")

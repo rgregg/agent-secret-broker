@@ -1355,10 +1355,10 @@ def _json(h, code, obj, headers=None):
 
 _CSS = """
 :root{color-scheme:light dark;--bg:#f6f8fa;--card:#fff;--fg:#1f2328;--muted:#656d76;--line:#d0d7de;
---accent:#2563eb;--ok:#1a7f37;--warn:#9a6700;--bad:#cf222e;--okbg:#dcfce7;--okfg:#166534;
+--accent:#2563eb;--ok:#1a7f37;--warn:#9a6700;--bad:#cf222e;--danger:#cf222e;--dangerh:#a40e26;--okbg:#dcfce7;--okfg:#166534;
 --wbg:#fef3c7;--wfg:#92400e;--badbg:#ffebe9;--hov:#f3f4f6}
 @media (prefers-color-scheme:dark){:root{--bg:#0d1117;--card:#161b22;--fg:#e6edf3;--muted:#8b949e;
---line:#30363d;--accent:#4c8dff;--ok:#3fb950;--warn:#d29922;--bad:#f85149;--okbg:#12301c;--okfg:#3fb950;
+--line:#30363d;--accent:#4c8dff;--ok:#3fb950;--warn:#d29922;--bad:#f85149;--danger:#da3633;--dangerh:#b62324;--okbg:#12301c;--okfg:#3fb950;
 --wbg:#3a2a0a;--wfg:#e3b341;--badbg:#3d1418;--hov:#1c2230}}
 *{box-sizing:border-box}
 html{-webkit-text-size-adjust:100%}
@@ -1390,21 +1390,40 @@ p,td,li{overflow-wrap:anywhere}
 white-space:nowrap}
 .pill.ok{background:var(--okbg);color:var(--okfg)}.pill.warn{background:var(--wbg);color:var(--wfg)}
 .pill.bad{background:var(--badbg);color:var(--bad)}.pill.plain{background:var(--hov);color:var(--muted)}
-.actions{display:flex;flex-wrap:wrap;align-items:center;gap:.5rem;margin:.9rem 0 .2rem}
+.decide-row{display:flex;gap:.6rem;margin:.9rem 0 .2rem}
+.decide-row .btn{flex:1 1 0;min-width:0;min-height:2.75rem}
+.auto{position:relative;display:flex;flex-wrap:wrap;align-items:center;gap:.4rem .5rem;margin:.7rem 0 0}
+.auto .lbl{font-size:.85rem;color:var(--muted)}
+.chips{display:flex;flex-wrap:wrap;align-items:center;gap:.4rem}
+.chip{display:inline-flex;align-items:center;font:inherit;font-weight:600;font-size:.82rem;min-height:2.1rem;
+padding:.2rem .8rem;border-radius:99px;border:1px solid var(--line);background:var(--card);color:var(--fg);cursor:pointer;
+list-style:none}
+.chip:hover{background:var(--hov)}
+.chip::-webkit-details-marker{display:none}
+.chip.always{border-color:var(--warn);color:var(--wfg);background:var(--wbg)}
+.chip.off{opacity:.55;cursor:help;border-style:dashed}
+.chip[data-tip]:hover::after,.chip[data-tip]:focus::after{content:attr(data-tip);position:absolute;left:0;top:100%;z-index:30;
+margin-top:.3rem;width:max-content;max-width:min(16rem,70vw);padding:.4rem .6rem;border:1px solid var(--line);
+border-radius:.4rem;background:var(--card);color:var(--fg);font:normal .8rem/1.3 system-ui,sans-serif;text-align:left;
+box-shadow:0 4px 14px #0003;font-weight:400}
+details.alw{display:inline-block}
+details.alw[open]>summary{border-style:dashed}
+details.alw[open]>summary::after{display:none!important}
+details.alw .confirm{margin-top:.4rem;max-width:100%;display:flex;flex-wrap:wrap;align-items:center;gap:.5rem;font-size:.85rem;
+padding:.5rem .6rem;border:1px solid var(--warn);border-radius:.5rem}
+.scope{flex-basis:100%;margin:.1rem 0 0}
+:is(.btn,.chip,button,summary):focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 .btn,button{font:inherit;font-weight:600;font-size:.85rem;min-height:2.25rem;padding:.35rem .95rem;
 border-radius:.5rem;border:1px solid var(--line);background:var(--card);color:var(--fg);cursor:pointer}
 .btn:hover,button:hover{background:var(--hov)}
 .btn.approve{background:var(--accent);border-color:var(--accent);color:#fff}
 .btn.approve:hover{filter:brightness(1.08)}
-.btn.deny{color:var(--bad)}
+.btn.deny{background:var(--danger);border-color:var(--danger);color:#fff}
+.btn.deny:hover{background:var(--dangerh);border-color:var(--dangerh)}
 .btn.sm,td button{min-height:1.8rem;padding:.15rem .65rem;font-size:.8rem}
 [hidden]{display:none!important}
 body:has(dialog[open]){overflow:hidden}
 button:disabled{opacity:.6;cursor:default}
-details.more{margin-left:auto;font-size:.85rem}
-details.more summary{cursor:pointer;color:var(--muted);list-style:none;padding:.35rem .2rem}
-details.more summary::-webkit-details-marker{display:none}
-details.more[open]{flex-basis:100%;margin:.2rem 0 0;border-top:1px solid var(--line);padding-top:.5rem}
 form.inline{display:inline}
 .card,.req{background:var(--card);border:1px solid var(--line);border-radius:.7rem;padding:1rem;margin:0 0 .8rem}
 .card h2{margin-bottom:.4rem}
@@ -1484,9 +1503,8 @@ overflow:hidden}
  .tbl td{border:0;padding:.2rem 0;display:flex;gap:.75rem}
  .tbl td::before{content:attr(data-label);flex:0 0 5.5rem;color:var(--muted);font-size:.8rem;padding-top:.1rem}
  .tbl td>*{min-width:0}
- .actions .btn{flex:1 1 100%;min-height:2.75rem}
- details.more{margin:0;flex-basis:100%;text-align:center}
 }
+@media (max-width:19.99rem){.decide-row{flex-direction:column}}
 """
 
 _WORKING_JS = (
@@ -2107,25 +2125,52 @@ _AUTO_LABEL = {"none": "off (every request asks a human)", "low": "up to low ris
                "high": "any risk level, including requests with no model verdict"}
 
 
-def _grant_menu(broker, req):
-    """The 'Approve for N minutes' menu (dashboard card or approval-link page);
-    empty when grants are off or this request cannot create one."""
-    ok, _ = broker.grant_eligibility(req)
-    mins = broker.grant_durations()
-    if not ok or not mins:
-        return ""
-    btns = "".join(
-        f"<button class=btn name=decision value='approve_grant_{m}'>"
-        f"Approve for {_fmt_minutes(m)}</button>" for m in mins)
-    return ("<details class=more><summary>Approve for a while &#9662;</summary>" + btns
-            + f"<p><small>Further requests for exactly {html.escape(', '.join(req.names))} that the "
-            f"broker runs itself ({'GET, HEAD and OPTIONS only' if grants_mod.scope_for(req.mode, req.spec) == 'read' else 'any method'}) "
-            "are approved without asking until the time is up. Revoke any time under "
-            "Policies.</small></p></details>")
+def _approve_actions(broker, req):
+    """The decision controls of a pending request (dashboard card and approval
+    link page): Approve and Deny side by side, then an 'Automatically approve...'
+    row of timed-grant chips and a confirmed 'Always'. Chips are offered only
+    when the request is eligible; the form values are unchanged."""
+    e = html.escape
+    names = e(", ".join(req.names))
+    row1 = ("<div class=decide-row><button class='btn approve' name=decision value=approve>"
+            "Approve</button><button class='btn deny' name=decision value=deny>Deny</button></div>")
+    ok_g, _ = broker.grant_eligibility(req)
+    mins = broker.grant_durations() if ok_g else []
+    ok_a, why = broker.always_allow_eligibility(req)
+    if not mins and not ok_a:
+        return row1
+    scope = grants_mod.scope_for(req.mode, req.spec)
+    chips = []
+    for m in mins:
+        label = _fmt_minutes(m)
+        chips.append(
+            f"<button class=chip name=decision value='approve_grant_{m}' "
+            f"aria-label='Approve this request, and approve further requests for exactly {names} "
+            f"for {label}'>{label}</button>")
+    if ok_a:
+        tip = ("Approve this request and release future calls with this secret without asking "
+               "when the request is low risk. Revoke any time under Policies.")
+        chips.append(
+            f"<details class=alw><summary class='chip always' data-tip='{e(tip)}' "
+            f"aria-label='Always approve {e(req.names[0])}: {e(tip)}'>Always</summary>"
+            f"<div class=confirm><span>Always approve {e(req.names[0])}?</span>"
+            "<button class='btn sm approve' name=decision value=approve_always>Confirm</button>"
+            "<span class=muted>Click Always again to cancel.</span></div></details>")
+    elif mins:
+        tip = f"Always not offered: {why}."
+        chips.append(f"<span class='chip off' tabindex=0 role=img data-tip='{e(tip)}' "
+                     f"aria-label='{e(tip)}'>Always</span>")
+    out = ("<div class=auto><span class=lbl>Automatically approve...</span>"
+           f"<div class=chips>{''.join(chips)}</div>")
+    if mins:
+        out += (f"<p class=scope><small class=muted>Applies to exactly: {names}. "
+                f"{'Reads only (GET, HEAD, OPTIONS)' if scope == 'read' else 'Any method'}. "
+                "Revoke any time under Policies.</small></p>")
+    return row1 + out + "</div>"
 
 
 def _fmt_minutes(m):
-    return f"{m} min" if m < 60 or m % 60 else f"{m // 60} h"
+    return f"{m} min" if m < 60 or m % 60 else f"{m // 60} hr"
 
 
 def _parse_decision(decision):
@@ -2460,17 +2505,6 @@ def approval_handler(broker):
             cards = []
             for r in reqs:
                 what, rnote = _describe(r)
-                ok, why = broker.always_allow_eligibility(r)
-                always = (
-                    "<details class=more><summary>Always allow &#9662;</summary>"
-                    "<button class=btn name=decision value=approve_always>"
-                    f"Approve and always allow {html.escape(r.names[0])}</button>"
-                    "<p><small>Future HTTP calls with this secret run without asking, except "
-                    "requests rated at or above the risk threshold. Revoke any time under "
-                    "Policies.</small></p></details>" if ok else "")
-                grant = _grant_menu(broker, r)
-                no_always = ("" if ok else
-                             f"<p><small>Always allow not offered: {html.escape(why)}.</small></p>")
                 cards.append(
                     f"<article class=req data-id='{html.escape(r.id)}'>"
                     f"<div class=reqhead><h2>{html.escape(', '.join(r.names))}</h2>"
@@ -2481,9 +2515,7 @@ def approval_handler(broker):
                     "<form method=post action='/decide' class=decide>"
                     f"<input type=hidden name=id value='{html.escape(r.id)}'>"
                     f"<input type=hidden name=csrf value='{token}'>"
-                    "<div class=actions><button class='btn approve' name=decision value=approve>"
-                    "Approve</button><button class='btn deny' name=decision value=deny>Deny</button>"
-                    f"{always}{grant}</div>{no_always}</form></article>")
+                    f"{_approve_actions(broker, r)}</form></article>")
             # the card must refresh when its assessment arrives, not only when requests come and go
             version = hashlib.sha256(
                 "|".join(f"{r.id}:{1 if r.risk else 0}" for r in reqs).encode()).hexdigest()[:16]
@@ -2836,15 +2868,6 @@ def approval_handler(broker):
                 return _page(self, 404, "<h1>Request not found or already handled</h1>")
             what, note = _describe(req)
             summary_html = _risk_html(req)
-            ok, why = broker.always_allow_eligibility(req)
-            if ok:
-                always_html = (
-                    "<p><button class=btn name=decision value=approve_always>"
-                    f"Approve and always allow {html.escape(req.names[0])}</button><br><small>"
-                    "Future HTTP calls with this secret will run without asking, except requests "
-                    "rated high risk. Revoke any time at /policies.</small></p>")
-            else:
-                always_html = f"<p><small>Always allow not offered: {html.escape(why)}.</small></p>"
             _page(self, 200, f"""
 <h1>Secret request</h1>
 <p><b>{html.escape(', '.join(req.names))}</b></p>
@@ -2853,11 +2876,7 @@ def approval_handler(broker):
 <p><small>{note}</small></p>
 <p><small>Expires in {int(req.expires - time.time())}s</small></p>
 <form method=post id=f>
-<div class=actions>
-<button class='btn approve' name=decision value=approve>Approve</button>
-<button class='btn deny' name=decision value=deny>Deny</button>
-{_grant_menu(broker, req)}</div>
-{always_html}
+{_approve_actions(broker, req)}
 </form>
 <p id=w hidden>Working...</p>""", script=_WORKING_JS)
 

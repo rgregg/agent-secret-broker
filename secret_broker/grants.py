@@ -41,7 +41,7 @@ def covers(grant, mode, spec):
     if grant["scope"] == "any":
         return True
     return mode == "http" and str((spec or {}).get("method", "")).upper() in READ_METHODS
-DEFAULTS = {"enabled": True, "durations": [5, 15, 30, 60], "max_minutes": 60, "max_risk": "high"}
+DEFAULTS = {"enabled": True, "durations": [5, 15, 30], "max_minutes": 60, "max_risk": "high"}
 MAX_DURATIONS = 6
 HARD_MAX_MINUTES = 24 * 60
 RISK_CEILINGS = risk_mod.AUTO_MAX          # none|low|medium|high
