@@ -47,6 +47,7 @@ def main():
     if not cfg:
         ap.error("no settings: set BROKER_CONFIG or pass --config")
     backend = build_backend(cfg)
+    notify.parse_action_policy(cfg.get("notify_actions"), "notify_actions")   # fail at startup
     if cfg.get("webpush") is not None:
         from .webpush import parse_actions
         parse_actions(cfg["webpush"])       # fail at startup on a bad webpush.actions

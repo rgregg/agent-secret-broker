@@ -60,6 +60,26 @@ _ITEM_RE = re.compile(r"^[^\x00-\x1f]{1,100}$")
 APPROVAL_VALUES = ("prompt", "allow")
 
 
+class Channel:
+    """How a decision may arrive. Every decision goes through Broker.decide_via;
+    the channel only says what that entry must enforce for it. The caller of
+    decide_via is responsible for the channel's own authentication (SSO header,
+    CSRF / same-origin guards, ...)."""
+
+    def __init__(self, token_required, may_create_always):
+        self.token_required = token_required        # must present the request's action token
+        self.may_create_always = may_create_always  # may create an always-allow rule
+
+
+# Registry of decision channels; the key is the `channel` audit field. Add a
+# future Home Assistant hook here, e.g. "ha": Channel(True, False).
+CHANNELS = {
+    "dashboard": Channel(token_required=False, may_create_always=True),   # POST /decide
+    "link": Channel(token_required=False, may_create_always=True),        # POST /a/<nonce>
+    "push": Channel(token_required=True, may_create_always=False),        # POST /push/decide
+}
+
+
 class Request:
     def __init__(self, mode, names, spec, source, ttl, peer=None):
         self.id = secrets.token_urlsafe(16)
@@ -79,6 +99,7 @@ class Request:
         self.always = None        # outcome of an "always allow" click, if any
         self.approver = None
         self.action_hash = None   # sha256 of the push-button token; None once spent
+        self.notification = None  # the Notification sent for this request
         self.done = threading.Event()
 
 
@@ -94,7 +115,9 @@ class Broker:
         self._cfg_lock = threading.Lock()
         self.summarizer = summarizer
         self.backend = backend
-        self.notifier = notifier
+        self.notifier = notifier            # property: adapts legacy transports
+        self.action_policy = notify_mod.parse_action_policy(
+            config.get("notify_actions"), "notify_actions")
         self._audit = audit if isinstance(audit, AuditLog) else AuditLog(audit)
         self.history = History(self._audit._path)
         self._csrf_key = secrets.token_bytes(32)    # per process: tokens die with a restart
@@ -113,6 +136,14 @@ class Broker:
             threading.Thread(target=self._initial_load, daemon=True).start()
         else:
             self._initial_load(locked=False)
+
+    @property
+    def notifier(self):
+        return self._notifier
+
+    @notifier.setter
+    def notifier(self, value):
+        self._notifier = notify_mod.adapt(value)    # signature detection happens once, here
 
     def _initial_load(self, locked=True):
         try:
@@ -578,13 +609,16 @@ class Broker:
         why = f"\nWhy: {'; '.join(req.risk['reasons'][:3])}" if req.risk and req.risk["reasons"] else ""
         msg = f"{head}{', '.join(req.names)} from {req.source}\n{what}{why}"
         title = f"Secret request [{req.risk['level'].upper()}]" if req.risk else "Secret request"
-        token = secrets.token_urlsafe(16)           # 128 bits; only its hash is kept
-        req.action_hash = hashlib.sha256(token.encode()).digest()
-        ctx = {"rid": req.id, "risk": req.risk["level"] if req.risk else None,
-               "action_token": token}
+        n = notify_mod.make_notification(
+            rid=req.id, tag=f"secret-{req.id[:8]}", title=title, text=msg, names=req.names,
+            risk=req.risk["level"] if req.risk else None, url=url, source=req.source,
+            summary=req.summary, expires_at=req.expires, transport=self.notifier,
+            default_policy=self.action_policy)
+        req.notification = n
+        if n.action_token:                          # only its hash is kept
+            req.action_hash = hashlib.sha256(n.action_token.encode()).digest()
         try:
-            notify_mod.deliver(self.notifier, title, msg, url, f"secret-{req.id[:8]}",
-                               list(req.names), ctx)
+            self.notifier.send(n)
         except BaseException:
             req.action_hash = None
             raise
@@ -595,11 +629,14 @@ class Broker:
         fn = getattr(self.notifier, "resolved", None)
         if fn is None or req.mode is None:
             return
-        tag = f"secret-{req.id[:8]}"
+        n = req.notification or notify_mod.Notification(
+            rid=req.id, tag=f"secret-{req.id[:8]}", title="", text="", names=list(req.names),
+            risk=req.risk["level"] if req.risk else None, url="", source=req.source,
+            summary=req.summary, expires_at=req.expires)
 
         def run():
             try:
-                fn(tag, status)
+                fn(n, status)
             except Exception:
                 pass
         threading.Thread(target=run, daemon=True).start()
@@ -661,33 +698,85 @@ class Broker:
             rows = [r for r in self._by_id.values() if r.status == "pending"]
         return sorted(rows, key=lambda r: r.created)
 
-    def decide(self, nonce, approve, user, peer=None, client_ip=None, always=False, channel="link"):
+    def decide_via(self, channel, rid, decision, actor, *, token=None, always=False,
+                   nonce=None, peer=None, client_ip=None, **audit_extra):
+        """The single entry for every decision. Returns (http_status, req):
+        200 decided; 403 wrong/missing token; 404 unknown; 410 already decided,
+        expired or token spent (no state change). `decision` is "approve" or
+        "deny". Enforced here and nowhere else: the single-decision claim, the
+        token check (constant time; spent on match, and it dies with any
+        decision), no always-allow rule from channels that may not create one,
+        and the audit fields. The request is found by `rid`, or by `nonce` (the
+        approval-link channel), or, for token channels with neither, by the
+        token alone. Channel authentication (SSO header, CSRF, origin guards)
+        is the caller's job. Unknown channel or decision raises ValueError."""
+        ch = CHANNELS.get(channel)
+        if ch is None:
+            raise ValueError(f"unknown decision channel {channel!r}")
+        if decision not in ("approve", "deny"):
+            raise ValueError("decision must be approve or deny")
+        approve = decision == "approve"
+        always = bool(always and approve and ch.may_create_always)
+        check = ch.token_required or token is not None
+        digest = hashlib.sha256((token or "").encode()).digest()
+        stale_log, refused_log, code, req = False, False, None, None
         with self._lock:
             self._expire_locked()
-            req = self._by_nonce.get(nonce)
-            if req is not None and req.status == "pending":
-                req.status = "deciding"      # claim it: a second submit must not also act
+            if nonce is not None:
+                cands = [r for r in [self._by_nonce.get(nonce)] if r is not None]
+                if not cands or cands[0].status != "pending":
+                    code, stale_log = 404 if not cands else 410, True
+            elif rid:
+                r = self._by_id.get(rid)
+                if r is None:
+                    code, cands = 404, []
+                elif r.status != "pending":
+                    code, cands, stale_log = 410, [], not check
+                else:
+                    cands = [r]
+            elif check:
+                cands = [r for r in self._by_id.values() if r.status == "pending"]
             else:
-                req = None
+                code, cands = 404, []
+            if code is None:
+                if check:
+                    match = None
+                    for r in cands:
+                        if r.action_hash is not None and hmac.compare_digest(r.action_hash, digest):
+                            match = r
+                    if match is None:
+                        code, refused_log = (403 if cands else 410), True
+                    else:
+                        match.action_hash = None        # spent, whatever happens next
+                        req = match
+                else:
+                    req = cands[0]
+                if req is not None:
+                    req.status = "deciding"     # claim it: a second submit must not also act
         if req is None:
-            self.log("approval_stale", user=user, peer=peer, client_ip=client_ip, approve=approve)
-            return None
-        who = {"via": "user", "approver": user, "approver_peer": peer, "approver_ip": client_ip,
+            if refused_log:
+                self.log(f"{channel}_decide_refused", user=actor, peer=peer, client_ip=client_ip,
+                         status=code)
+            elif stale_log:
+                self.log("approval_stale", user=actor, peer=peer, client_ip=client_ip,
+                         approve=approve)
+            return code, None
+        who = {"via": "user", "approver": actor, "approver_peer": peer, "approver_ip": client_ip,
                "channel": channel}
-        req.approver = user
+        who.update(audit_extra)
+        req.approver = actor
         req.action_hash = None           # a push-button token dies with the decision
         # The decision itself is recorded and announced immediately.
-        self.audit("decided", req, decision="approve" if approve else "deny",
-                   always_requested=bool(always and approve), **who)
+        self.audit("decided", req, decision=decision, always_requested=always, **who)
         if not approve:
             self._finish(req, "denied", **who)
-            return req
+            return 200, req
         if always:
             ok, why = self.always_allow_eligibility(req)
             if not ok:
                 req.always = f"not applied: {why}"
                 self.audit("policy_change_refused", req, reason=why, **who)
-            elif self.set_approval(req.names[0], "allow", user, peer, client_ip, req.id):
+            elif self.set_approval(req.names[0], "allow", actor, peer, client_ip, req.id):
                 req.always = "applied"
             else:
                 req.always = "not applied: could not write the config file"
@@ -697,40 +786,13 @@ class Broker:
         # result reaches the client through its poll, and any failure is audited
         # and surfaced to the client, never to the approver.
         threading.Thread(target=self._release_and_finish, args=(req, who), daemon=True).start()
-        return req
+        return 200, req
 
     def decide_push(self, rid, token, approve, user, peer=None, client_ip=None):
-        """Decision from a browser notification button. Returns (http_status, req).
-        403 bad token; 404 unknown; 410 already decided/expired. The token is bound
-        to its request, single use, and dies with the request. Goes through
-        decide() (never creates an always-allow rule)."""
-        digest = hashlib.sha256((token or "").encode()).digest()
-        with self._lock:
-            self._expire_locked()
-            if rid:
-                req = self._by_id.get(rid)
-                if req is None:
-                    return 404, None
-                if req.status != "pending":
-                    return 410, None
-                cands = [req]
-            else:
-                cands = [r for r in self._by_id.values() if r.status == "pending"]
-            match = None
-            for r in cands:
-                if r.action_hash is not None and hmac.compare_digest(r.action_hash, digest):
-                    match = r
-            if match is None:
-                code = 403 if cands else 410
-            else:
-                code = None
-                nonce = match.nonce
-                match.action_hash = None            # spent, whatever happens next
-        if code is not None:
-            self.log("push_decide_refused", user=user, peer=peer, client_ip=client_ip, status=code)
-            return code, None
-        done = self.decide(nonce, approve, user, peer, client_ip, always=False, channel="push")
-        return (200, done) if done is not None else (410, None)
+        """Decision from a browser notification button: decide_via on the
+        `push` channel. Returns (http_status, req)."""
+        return self.decide_via("push", rid, "approve" if approve else "deny", user,
+                               token=token or "", peer=peer, client_ip=client_ip)
 
     def _release_and_finish(self, req, who):
         try:
@@ -2150,9 +2212,10 @@ def approval_handler(broker):
                 r = broker._by_id.get(rid)
                 if decision not in ("approve", "deny", "approve_always") or r is None:
                     return self._redirect("/?note=stale")
-                done = broker.decide(r.nonce, decision != "deny", user, self.client_address[0],
-                                     self._fwd(), always=(decision == "approve_always"),
-                                     channel="dashboard")
+                code, done = broker.decide_via(
+                    "dashboard", rid, "deny" if decision == "deny" else "approve", user,
+                    always=(decision == "approve_always"),
+                    peer=self.client_address[0], client_ip=self._fwd())
                 if done is None:
                     return self._redirect("/?note=stale")
                 tag = ("denied" if decision == "deny" else
@@ -2169,8 +2232,9 @@ def approval_handler(broker):
             nonce = self._nonce()
             decision = form.get("decision", [""])[0]
             approve = decision in ("approve", "approve_always")
-            req = (broker.decide(nonce, approve, user, self.client_address[0], self._fwd(),
-                                 always=(decision == "approve_always"))
+            req = (broker.decide_via("link", None, "approve" if approve else "deny", user,
+                                     nonce=nonce, always=(decision == "approve_always"),
+                                     peer=self.client_address[0], client_ip=self._fwd())[1]
                    if nonce else None)
             if req is None:
                 return _page(self, 404, "<h1>Request not found or already handled</h1>")

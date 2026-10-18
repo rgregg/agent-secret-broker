@@ -121,8 +121,8 @@ class Contract(unittest.TestCase):
         class New:
             def send(self, title, message, url, tag, names=None):
                 got.append(("new", names))
-        notify.deliver(Old(), "t", "m", "u", "tag", ["a"])
-        notify.MultiNotifier([Old(), New()]).send("t", "m", "u", "tag", names=["a", "b"])
+        notify.adapt(Old()).send(t.N("t", "m", "u", "tag", names=["a"]))
+        notify.MultiNotifier([Old(), New()]).send(t.N("t", "m", "u", "tag", names=["a", "b"]))
         self.assertEqual(got, [("old", "t"), ("old", "t"), ("new", ["a", "b"])])
 
 
@@ -131,9 +131,9 @@ class Notifier(unittest.TestCase):
         sender = Sender()
         s = make_store(sender)
         s.add("alice", EP, P256DH, AUTH)
-        webpush.WebPushNotifier(s).send(
+        webpush.WebPushNotifier(s).send(t.N(
             "Secret request [LOW]", "svc from host\nGET https://x.example/p?token=SEKRIT",
-            "https://secrets.example/a/NONCE123", "secret-abcd1234", names=["svc", "other"])
+            "https://secrets.example/a/NONCE123", "secret-abcd1234", names=["svc", "other"]))
         data = json.loads(sender.calls[0]["data"])
         self.assertEqual(data, {"title": "Secret request [LOW]", "body": "svc, other",
                                 "tag": "secret-abcd1234"})
@@ -143,13 +143,13 @@ class Notifier(unittest.TestCase):
 
     def test_no_devices_is_a_delivery_failure(self):
         with self.assertRaises(NotifyError):
-            webpush.WebPushNotifier(make_store()).send("t", "m", "u", "tag", names=["a"])
+            webpush.WebPushNotifier(make_store()).send(t.N("t", "m", "u", "tag", names=["a"]))
 
     def test_all_pushes_refused_is_a_delivery_failure(self):
         s = make_store(Sender({EP: 500}))
         s.add("alice", EP, P256DH, AUTH)
         with self.assertRaises(NotifyError):
-            webpush.WebPushNotifier(s).send("t", "m", "u", "tag", names=["a"])
+            webpush.WebPushNotifier(s).send(t.N("t", "m", "u", "tag", names=["a"]))
 
     @unittest.skipUnless(HAVE_LIB, "pywebpush not installed")
     def test_real_encryption_roundtrip_with_library(self):
@@ -474,8 +474,9 @@ class ParseActions(unittest.TestCase):
             def send(self, title, message, url, tag, names=None, context=None):
                 got["ctx"] = context
         for n in (Old(), Names(), New()):
-            notify.deliver(n, "t", "m", "u", "g", ["a"], {"rid": "r"})
-        self.assertEqual((got["old"], got["names"], got["ctx"]), (True, ["a"], {"rid": "r"}))
+            notify.adapt(n).send(t.N("t", "m", "u", "g", names=["a"], token="tok"))
+        self.assertEqual((got["old"], got["names"], got["ctx"]),
+                         (True, ["a"], {"rid": "rid1", "risk": None, "action_token": "tok"}))
 
 
 class PushDecide(t.Dashboard):

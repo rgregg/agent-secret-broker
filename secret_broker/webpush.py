@@ -19,7 +19,8 @@ import threading
 import time
 import urllib.parse
 
-from .notify import NotifyError
+from .notify import (APPROVE_MAX_RISK, RISK_LEVELS, NotifyError, action_ids_for,  # noqa: F401
+                     parse_action_policy)
 
 # push services of the major browsers; extend with `webpush.endpoint_hosts`
 PUSH_HOSTS = ("fcm.googleapis.com", "push.services.mozilla.com", "push.apple.com",
@@ -180,59 +181,37 @@ class PushStore:
         return ok, errors
 
 
-RISK_LEVELS = ("low", "medium", "high")
-APPROVE_MAX_RISK = ("none",) + RISK_LEVELS
-
-
 def parse_actions(wp):
     """Validate `webpush.actions` -> {"approve_max_risk": str, "deny": bool}.
-    Defaults: every request gets Approve and Deny. Raises ValueError naming the field."""
-    raw = (wp or {}).get("actions")
-    if raw is None:
-        raw = {}
-    if not isinstance(raw, dict):
-        raise ValueError("webpush.actions must be an object")
-    for k in raw:
-        if k not in ("approve_max_risk", "deny"):
-            raise ValueError(f"webpush.actions.{k} is not a known option")
-    mx = raw.get("approve_max_risk", "high")
-    if mx not in APPROVE_MAX_RISK:
-        raise ValueError(f"webpush.actions.approve_max_risk must be one of {', '.join(APPROVE_MAX_RISK)}")
-    deny = raw.get("deny", True)
-    if not isinstance(deny, bool):
-        raise ValueError("webpush.actions.deny must be true or false")
-    return {"approve_max_risk": mx, "deny": deny}
+    This block is the webpush-specific override of the global `notify_actions`
+    policy (kept for backward compatibility). Raises ValueError naming the field."""
+    return parse_action_policy((wp or {}).get("actions"), "webpush.actions")
 
 
 class WebPushNotifier:
     """Notify transport. Deliberately ignores the message text and the link.
-    With an action token in `context` it also lists which buttons the worker
-    should render (Deny first, then Approve) and carries the token + request id."""
+    It renders both action buttons; which ones a request gets is decided by the
+    central policy (or this transport's `actions` override) and arrives in
+    `n.actions` together with the request id and single-use token."""
+
+    supports_actions = ("deny", "approve")
 
     def __init__(self, store, actions=None):
         self.store = store
+        self.action_policy = actions        # None: use the global notify_actions policy
         self.actions = actions or parse_actions(None)
 
     def actions_for(self, risk):
         """Buttons for a request of this risk level (unknown risk counts as high)."""
-        out = []
-        if self.actions["deny"]:
-            out.append("deny")
-        mx = self.actions["approve_max_risk"]
-        lvl = risk if risk in RISK_LEVELS else "high"
-        if mx != "none" and RISK_LEVELS.index(lvl) <= RISK_LEVELS.index(mx):
-            out.append("approve")
-        return out
+        return action_ids_for(self.actions, risk, self.supports_actions)
 
-    def send(self, title, message, url, tag, names=None, context=None):
-        body = ", ".join(names) if names else "A secret was requested"
+    def send(self, n):
+        body = ", ".join(n.names) if n.names else "A secret was requested"
         if not self.store.devices():
             raise NotifyError("no browser is subscribed for push notifications")
-        payload = {"title": title, "body": body[:200], "tag": tag}
-        ctx = context or {}
-        acts = self.actions_for(ctx.get("risk")) if ctx.get("action_token") and ctx.get("rid") else []
-        if acts:
-            payload.update(actions=acts, rid=ctx["rid"], token=ctx["action_token"])
+        payload = {"title": n.title, "body": body[:200], "tag": n.tag}
+        if n.actions and n.action_token and n.rid:
+            payload.update(actions=[a.id for a in n.actions], rid=n.rid, token=n.action_token)
         ok, errors = self.store.send_all(payload)
         if not ok:
             raise NotifyError("; ".join(errors[:3]) or "push delivery failed")

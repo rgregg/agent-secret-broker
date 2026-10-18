@@ -19,6 +19,14 @@ from secret_broker.backends import BackendError, BwBackend, FileBackend  # noqa:
 from secret_broker.broker import Broker, serve  # noqa: E402
 from secret_broker import notify as notify_mod  # noqa: E402
 from secret_broker.notify import FakeNotifier, NotifyError  # noqa: E402
+
+
+def N(title, text, url, tag, names=(), risk=None, actions=(), token=None):
+    """A Notification for tests that drive a transport directly."""
+    return notify_mod.Notification(
+        rid="rid1", tag=tag, title=title, text=text, names=list(names), risk=risk, url=url,
+        source="host", summary=None, expires_at=0,
+        actions=[notify_mod.Action(a, a.title()) for a in actions], action_token=token)
 from secret_broker.summarize import OpenRouterSummarizer  # noqa: E402
 
 SECRET = "s3cr3t-token-value"
@@ -844,7 +852,7 @@ class Transports(unittest.TestCase):
 
     def test_telegram_sends_url_button_only(self):
         n = self.tg()
-        n.send("Secret request [LOW]", "svc from host", "https://secrets.example/a/NONCE", "secret-abc")
+        n.send(N("Secret request [LOW]", "svc from host", "https://secrets.example/a/NONCE", "secret-abc"))
         path, body = FakeTelegram.calls[0]
         self.assertEqual(path, f"/bot{self.TOKEN}/sendMessage")
         self.assertEqual(body["chat_id"], "4242")
@@ -854,8 +862,9 @@ class Transports(unittest.TestCase):
 
     def test_resolved_edits_message(self):
         n = self.tg()
-        n.send("t", "m", "https://x.example/a/n", "tag1")
-        n.resolved("tag1", "approved")
+        note = N("t", "m", "https://x.example/a/n", "tag1")
+        n.send(note)
+        n.resolved(note, "approved")
         path, body = FakeTelegram.calls[-1]
         self.assertTrue(path.endswith("/editMessageText"))
         self.assertEqual(body["message_id"], 77)
@@ -864,7 +873,7 @@ class Transports(unittest.TestCase):
     def test_error_never_contains_bot_token(self):
         FakeTelegram.fail = 401
         with self.assertRaises(NotifyError) as cm:
-            self.tg().send("t", "m", "https://x.example/a/n", "tag")
+            self.tg().send(N("t", "m", "https://x.example/a/n", "tag"))
         self.assertNotIn("SECRET-BOT-TOKEN", str(cm.exception))
         self.assertIn("401", str(cm.exception))
 
@@ -874,10 +883,10 @@ class Transports(unittest.TestCase):
                 raise NotifyError("down")
         ok = FakeNotifier()
         multi = notify_mod.MultiNotifier([Boom(), ok])
-        multi.send("t", "m", "u", "tag")
+        multi.send(N("t", "m", "u", "tag"))
         self.assertEqual(len(ok.sent), 1)
         with self.assertRaises(NotifyError):
-            notify_mod.MultiNotifier([Boom(), Boom()]).send("t", "m", "u", "tag")
+            notify_mod.MultiNotifier([Boom(), Boom()]).send(N("t", "m", "u", "tag"))
 
     def test_build_from_config(self):
         files = {"ha": "hatok", "bot": self.TOKEN}

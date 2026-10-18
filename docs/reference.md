@@ -154,9 +154,74 @@ delivered if at least one succeeds.
   buttons, so nothing can be approved from inside the chat). The message is
   edited to APPROVED/DENIED/EXPIRED when settled.
 - `webpush`: browser push, described under Web Push below.
-- Add your own: implement `send(title, message, url, tag)` (raise `NotifyError`
-  on failure) and optionally `resolved(tag, status)`. A transport whose `send`
-  also accepts `names=None` is given the secret names for a short message.
+
+### Notifier contract
+
+The broker builds one `Notification` per request (in `Broker._push`, via
+`notify.make_notification`) and hands it to every transport. Fields: `rid`,
+`tag`, `title`, `text` (the full message), `names`, `risk` (`low|medium|high` or
+None), `url`, `source`, `summary` (advisory, or None), `expires_at`, `actions`
+(list of `Action(id, label)`, Deny before Approve) and `action_token` (opaque,
+None when no action is offered).
+
+A transport implements:
+
+- `send(n)`: deliver it; raise `NotifyError` on failure.
+- `resolved(n, status)` (optional, best effort): the request was
+  approved/denied/expired/failed; `n` is the same Notification (built-ins match
+  on `n.tag`).
+- `supports_actions = ("approve", "deny")` (optional, default none): the action
+  ids it can render. Each transport only receives the actions it supports, so
+  ticker and Telegram always get none. The token exists only if at least one
+  transport carries actions; the broker keeps just its SHA-256.
+- `action_policy` (optional): per-transport override, see below.
+
+Deprecated: a transport written as `send(title, message, url, tag, names=None,
+context=None)` / `resolved(tag, status)` still works. It is detected once, when
+registered (`notify.adapt`, also applied when `broker.notifier` is assigned), and
+wrapped; `context` is `{"rid", "risk", "action_token"}` and such a transport is
+assumed to render both actions unless it sets `supports_actions`. Port to
+`send(n)`.
+
+### Action policy
+
+Which buttons a request gets is decided centrally:
+
+    "notify_actions": {"approve_max_risk": "high", "deny": true}
+
+- `approve_max_risk`: `none|low|medium|high` (default `high`); Approve is offered
+  when the request risk is at or below it (no verdict counts as high).
+- `deny` (default `true`).
+
+Precedence, most specific first: the `actions` object inside a `notify` entry
+(e.g. `{"type": "webpush", "actions": {...}}`); for webpush only, the older
+`webpush.actions` block; then top-level `notify_actions`; then the defaults.
+An override replaces the policy as a whole (unset keys take the defaults, not the
+global values). Invalid values stop the broker at startup naming the field
+(`notify_actions.deny`, `notify[0].actions.approve_max_risk`, ...).
+
+### Decision channels
+
+Every decision (dashboard `/decide`, approval-link page, `/push/decide`, future
+hooks) goes through `Broker.decide_via(channel, rid, decision, actor, *,
+token=None, always=False, nonce=None, peer=None, client_ip=None, **audit_extra)`
+-> `(http_status, request)`; `decision` is `approve|deny`. It alone enforces the
+single-decision claim, the constant-time token check (spent on match; any
+decision kills it), whether `always` may create an always-allow rule, and the
+audit fields (`channel`, `approver`, `approver_peer`, `approver_ip`, plus
+`audit_extra`). Status: 200 decided, 403 bad/missing token, 404 unknown, 410
+already decided/expired/token spent. Channels are registered in
+`broker.CHANNELS` (unknown channel: `ValueError`); the caller does the channel's
+own authentication (SSO header, CSRF/origin, `X-Requested-With`):
+
+| Channel | token_required | may_create_always |
+| --- | --- | --- |
+| `dashboard` | no | yes |
+| `link` (`/a/<nonce>`) | no | yes |
+| `push` | yes | no |
+
+A Home Assistant hook would add e.g. `"ha": Channel(True, False)` there.
+
 
 Messages cross whatever service carries them and include secret names, the
 method and URL, and the approval link (single use, expires with the request,
@@ -302,6 +367,9 @@ only as many as the browser allows. The visible text stays names-only.
 ```json
 "webpush": {"actions": {"approve_max_risk": "high", "deny": true}}
 ```
+
+(This block is the webpush override of the global `notify_actions` policy; see
+Action policy above.)
 
 - `approve_max_risk`: `none` | `low` | `medium` | `high` (default `high`, so every
   request gets Approve). A request gets Approve only when its risk level is at or
