@@ -101,7 +101,7 @@ socket, and every signature ssh asks for becomes a broker request (mode
     P-256/384/521, RSA with SHA-2 or legacy SHA-1 host keys) and that the session
     id inside the userauth data being signed is the one of the **last** bind
     (the connection actually being signed for). A match against only an earlier
-    bind, is shown as
+    bind is shown as
     "Server identity not verified"; a chain that matches no bind at all (a bind
     replayed from another connection) is refused (`ssh_sign_refused`, reason
     `session_mismatch`). The card reads `Server: SHA256:... (ssh-ed25519)`, plus
