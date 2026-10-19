@@ -479,21 +479,54 @@ credentials with `"risk": {"auto_modes": ["http"]}` in the broker config.
   auto-approved, at any `auto_approve_max`: it always prompts and is audited as
   `escalated` with `reason: script_not_visible`.
 - **The broker also checks argv itself.** It does not trust the client's `scripts`
-  list to be complete: a command whose argv runs a script file (a leading
-  `env`/`sudo`/`doas`/`nohup`/`time`/`timeout`/`nice`/`ionice`/`stdbuf`/`exec`/
-  `command`/`setsid`/`chrt` wrapper is skipped; then an interpreter such as
-  bash, sh, zsh, python, node, deno, bun, ruby, perl, php, pwsh, lua, Rscript,
-  awk or `sed -f` followed by a script operand, or an argv[0] that has a script
-  extension or a path outside /bin, /usr/bin, /sbin, /usr/sbin) needs a matching
-  readable `scripts` entry (same path as given, or the same normalised path or
-  file name). A missing or mismatched entry, or an interpreter reading stdin, counts
-  as "script not visible": the request is never auto-approved, never covered by a
-  timed grant, never offered the Always or grant chips, and is audited `escalated` /
-  `grant_skipped` with `reason: script_not_visible`. Inline code (`-c`, `-e`, `-m`,
-  `eval`) and plain program names (`curl`, `git`, `docker compose up`) are not
-  flagged. **This catches clients that omit entries. It cannot stop a client that
-  lies**: one that reports a harmless script text for a different file, or runs
-  something other than the argv it states, is not detected.
+  list to be complete: a command whose argv runs a script file needs a matching
+  readable `scripts` entry (the same rules run in `client/asb`; a test asserts the
+  two copies are identical and agree on a table of examples). What is examined:
+  - Wrappers are looked through: `env` (options `-i -0 -v -u -C`, `VAR=value`, and
+    `-S`/`--split-string` in every form, whose value is split with shlex and
+    examined again, nested at most 4 deep), `sudo`, `doas`, `nohup`, `time`,
+    `timeout`, `nice`, `ionice`, `stdbuf`, `exec`, `command`, `setsid`, `chrt`,
+    `xargs`, `busybox` (the applet is the next operand), `strace`, `ltrace`,
+    `nsenter`, `unshare`, `taskset`, `flock`, `chroot`, `setpriv`, `numactl`,
+    `runuser`, `watch`, `parallel`. The `-c` shell string of `su`, `script`,
+    `flock -c` and `runuser` (without `-u`), and a single-string `watch` or
+    `parallel` command, is split at `;`, `&&`, `||`, `|`, `&` and examined command
+    by command (no `$(...)`/backtick expansion).
+  - Then an interpreter (bash, sh, zsh, python, node, deno, bun, ruby, perl, php,
+    pwsh, lua, Rscript, awk, `sed -f`) followed by a script operand, or an
+    interpreter reading stdin, is flagged.
+  - argv[0] itself is flagged when it has a script extension or a slash. The
+    exemption for `/bin/`, `/usr/bin/`, `/sbin/`, `/usr/sbin/` applies to the
+    `os.path.normpath` of an absolute path; an argv[0] containing a `..` component,
+    a NUL or a newline is always flagged (`/usr/bin/../../tmp/x.sh`).
+  - A bare program name that is not in the built-in allowlist of common non-script
+    programs (git, curl, wget, docker, kubectl, ssh, scp, rsync, make, cargo, npm,
+    ls, cat, grep, jq, tar, ffmpeg, terraform, ansible, helm, aws, gcloud, az, gh,
+    systemctl, psql, ...; see `NOT_SCRIPT_PROGRAMS`) is flagged when any operand
+    ends in a script extension or contains a slash (URLs and `-options` excepted);
+    with no file-like operand it stays unflagged, so ordinary commands do not prompt
+    forever. Allowlisted programs are never flagged.
+  - Fail closed: an `env -S` or `-c` string that cannot be split, nesting deeper than
+    4, or a wrapper chain longer than 32 counts as an unreadable script.
+  Matching: the flagged operand and an entry's `path` (or its optional `given`, the
+  path as named before symlinks) must be equal after `os.path.normpath`. A relative
+  operand is first resolved against the request's optional `cwd` (the client's
+  working directory: an absolute path of at most 300 printable characters, no
+  control characters; anything else is a 400). With no `cwd`, a relative operand
+  matches only an entry whose absolute path ends in that exact relative path at a `/`
+  boundary, never by bare file name (so `./deploy.sh` does not match
+  `/other/dir/deploy.sh` when `cwd` is given and differs). Two matching entries is
+  fine; no match means not visible. A missing or mismatched entry, or an
+  interpreter reading stdin, counts as "script not visible": the request is never
+  auto-approved, never covered by a timed grant, never offered the Always or grant
+  chips, and is audited `escalated` / `grant_skipped` with
+  `reason: script_not_visible`. Inline code (`-c`, `-e`, `-m`, `eval`) is not a
+  script file. **This catches clients that omit entries. It cannot stop a client
+  that lies**: one that reports a harmless script text for a different file, sends
+  a false `cwd`, runs something other than the argv it states, or reaches a script
+  through an allowlisted program (`make`, `git`, `find -exec`), a wrapper not listed
+  above, or a program found only on the client's PATH, is not detected. A wrapper or
+  interpreter is recognised by its base name, wherever it lives.
 - Scripts that print or send the credential are rated high by the model, so they
   auto-approve only when `auto_approve_max` is `high`.
 - What auto-approval of env means: the plaintext secret value is released to the

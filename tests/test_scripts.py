@@ -782,3 +782,213 @@ class ReadOnlyHardening(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# -- argv detection: broker and client share one table; hardening cases -------------
+SH = ["bash", "x.sh"]
+NEST5 = ["env", "-S", "env -S 'env -S \"env -S \\\"env -S \\\\\\\"bash x.sh\\\\\\\"\\\"\"'"]
+# (argv, operand paths both sides must report)
+DETECT_TABLE = (
+    # plain / existing behaviour
+    (["bash", "deploy.sh"], ["deploy.sh"]),
+    (["sudo", "-u", "x", "bash", "y.sh"], ["y.sh"]),
+    (["timeout", "5", "python3.12", "-u", "a/b.py"], ["a/b.py"]),
+    (["bash", "-c", "echo hi"], []),
+    (["python3", "-m", "http.server"], []),
+    (["bash"], ["-"]),
+    (["sed", "-f", "p.sed", "in"], ["p.sed"]),
+    (["sed", "s/a/b/"], []),
+    # env -S in every form
+    (["env", "-S", "bash x.sh"], ["x.sh"]),
+    (["env", "-Sbash x.sh"], ["x.sh"]),
+    (["env", "--split-string=bash x.sh"], ["x.sh"]),
+    (["env", "--split-string", "bash x.sh"], ["x.sh"]),
+    (["env", "--split", "bash x.sh"], ["x.sh"]),
+    (["env", "-S", "sh -c 'echo hi'"], []),
+    (["env", "-S'sh -c \"echo hi\"'"], []),
+    (["env", "-S", "A=1 B=2 bash x.sh", "extra"], ["x.sh"]),
+    (["env", "-iS", "bash x.sh"], ["x.sh"]),
+    (["env", "-S", "env -S 'bash x.sh'"], ["x.sh"]),
+    (["env", "-S", "bash 'unbalanced"], ["-"]),
+    (["env", "-S"], ["-"]),
+    (NEST5, ["-"]),
+    (["env", "-i", "-0", "-v", "--ignore-environment", "bash", "x.sh"], ["x.sh"]),
+    (["env", "-u", "FOO", "-C", "/tmp", "--unset=BAR", "--chdir", "/", "bash", "x.sh"], ["x.sh"]),
+    (["env", "-uFOO", "A=1", "bash", "x.sh"], ["x.sh"]),
+    # path prefix tricks
+    (["/usr/bin/../../tmp/x.sh"], ["/usr/bin/../../tmp/x.sh"]),
+    (["/usr/bin/./x"], []),
+    (["/usr/bin/curl", "u"], []),
+    (["/usr/bin/../bin/ls"], ["/usr/bin/../bin/ls"]),
+    (["/usr/bin/ls\n"], ["/usr/bin/ls\n"]),
+    (["/usr/bin/a\0b"], ["/usr/bin/a\0b"]),
+    (["//usr/bin/x"], ["//usr/bin/x"]),
+    (["/tmp/run"], ["/tmp/run"]),
+    (["/usr/bin/../../tmp/python3", "x.py"], ["/usr/bin/../../tmp/python3", "x.py"]),
+    # wrappers with a script operand, and with inline code
+    (["xargs", "-n", "1", "bash", "x.sh"], ["x.sh"]),
+    (["xargs", "-I", "{}", "echo", "{}"], []),
+    (["busybox", "sh", "x.sh"], ["x.sh"]),
+    (["busybox", "sed", "-f", "p.sed"], ["p.sed"]),
+    (["busybox", "sh", "-c", "echo"], []),
+    (["strace", "-o", "t.out", "-f", "bash", "x.sh"], ["x.sh"]),
+    (["strace", "-e", "trace=open", "python3", "-c", "1"], []),
+    (["ltrace", "-o", "t.out", "bash", "x.sh"], ["x.sh"]),
+    (["nsenter", "-t", "1", "-m", "bash", "x.sh"], ["x.sh"]),
+    (["nsenter", "-t", "1", "-m", "sh", "-c", "id"], []),
+    (["unshare", "-m", "--propagation", "private", "bash", "x.sh"], ["x.sh"]),
+    (["unshare", "-m", "sh", "-c", "id"], []),
+    (["taskset", "0x1", "bash", "x.sh"], ["x.sh"]),
+    (["taskset", "-c", "0-3", "bash", "x.sh"], ["x.sh"]),
+    (["taskset", "0x1", "bash", "-c", "id"], []),
+    (["flock", "/tmp/l", "bash", "x.sh"], ["x.sh"]),
+    (["flock", "-w", "5", "/tmp/l", "sh", "-c", "id"], []),
+    (["flock", "-c", "bash x.sh", "/tmp/l"], ["x.sh"]),
+    (["flock", "-c", "echo hi", "/tmp/l"], []),
+    (["su", "-c", "bash x.sh", "root"], ["x.sh"]),
+    (["su", "root", "-c", "bash x.sh"], ["x.sh"]),
+    (["su", "-c", "echo hi", "root"], []),
+    (["su", "-c", "echo hi; bash x.sh", "root"], ["x.sh"]),
+    (["su", "-c", "echo 'oops", "root"], ["-"]),
+    (["chroot", "/jail", "bash", "x.sh"], ["x.sh"]),
+    (["chroot", "--userspec", "u:g", "/jail", "sh", "-c", "id"], []),
+    (["runuser", "-u", "u", "--", "bash", "x.sh"], ["x.sh"]),
+    (["runuser", "u", "-c", "bash x.sh"], ["x.sh"]),
+    (["runuser", "-u", "u", "--", "sh", "-c", "id"], []),
+    (["setpriv", "--reuid", "1", "bash", "x.sh"], ["x.sh"]),
+    (["setpriv", "--reuid=1", "sh", "-c", "id"], []),
+    (["numactl", "--cpunodebind", "0", "bash", "x.sh"], ["x.sh"]),
+    (["numactl", "-N", "0", "sh", "-c", "id"], []),
+    (["ionice", "-c", "3", "bash", "x.sh"], ["x.sh"]),
+    (["watch", "-n", "5", "bash", "x.sh"], ["x.sh"]),
+    (["watch", "-n", "5", "bash x.sh"], ["x.sh"]),
+    (["watch", "-n", "5", "date"], []),
+    (["script", "-c", "bash x.sh", "/dev/null"], ["x.sh"]),
+    (["script", "-qc", "echo hi", "/dev/null"], []),
+    (["parallel", "-j", "2", "bash", "x.sh", "{}", ":::", "a", "b"], ["x.sh"]),
+    (["parallel", "bash x.sh {} ::: a b"], ["x.sh"]),
+    (["parallel", "echo", ":::", "a/b.sh"], []),
+    # unknown bare names
+    (["mytool", "run.sh"], ["run.sh"]),
+    (["mytool", "--cfg", "conf/a.yml"], ["conf/a.yml"]),
+    (["mytool", "--flag", "value"], []),
+    (["mytool", "https://example.com/x.sh"], []),
+    (["mytool"], []),
+    (["deploy.sh"], ["deploy.sh"]),
+    # allowlisted programs never flagged, even with file-like operands
+    (["git", "apply", "p/x.sh"], []),
+    (["curl", "-o", "/tmp/x.sh", "https://e.com/x.sh"], []),
+    (["docker", "run", "-v", "/a:/b", "img"], []),
+    (["ls", "-l", "/tmp/x.py"], []),
+    (["cat", "/etc/hosts"], []),
+    (["make", "-f", "build/Makefile"], []),
+    (["sqlite3", "db/a.db", ".tables"], []),
+)
+
+
+class ArgvDetectionShared(unittest.TestCase):
+    def test_table_broker(self):
+        for argv, want in DETECT_TABLE:
+            self.assertEqual(S.argv_runs_script(argv), want, argv)
+
+    def test_table_client_agrees(self):
+        for argv, want in DETECT_TABLE:
+            self.assertEqual(A.argv_runs_script(argv), want, argv)
+            self.assertEqual(A.argv_runs_script(argv), S.argv_runs_script(argv), argv)
+
+    def test_shared_source_identical(self):
+        def block(path):
+            with open(path, encoding="utf-8") as f:
+                t = f.read()
+            a, b = t.index("# --- shared-detection:begin"), t.index("# --- shared-detection:end ---")
+            return t[a:b]
+        self.assertEqual(block(CLI), block(os.path.join(HERE, "..", "secret_broker", "scripts.py")))
+
+    def test_allowlist_programs(self):
+        for prog in ("git curl wget docker kubectl ssh scp rsync make cargo npm ls cat grep echo printf date "
+                     "uname ps df du head tail wc jq tar gzip unzip ffmpeg terraform ansible helm aws gcloud "
+                     "az gh systemctl journalctl ping dig nslookup openssl sqlite3 psql mysql redis-cli "
+                     "mongosh").split():
+            self.assertEqual(S.argv_runs_script([prog, "a/b.sh", "c.py"]), [], prog)
+
+    def test_nesting_limit(self):
+        ok = ["env", "-S", "env -S 'env -S \"bash x.sh\"'"]               # 3 levels
+        self.assertEqual(S.argv_runs_script(ok), ["x.sh"])
+        self.assertEqual(S.argv_runs_script(NEST5), ["-"])
+
+    def test_hostile_argv0_never_exempt(self):
+        for a0 in ("/usr/bin/../../tmp/x", "/bin/../tmp/x", "/usr/bin/x/..", "../usr/bin/x"):
+            self.assertEqual(S.argv_runs_script([a0]), [a0], a0)
+
+    def test_non_list_input(self):
+        self.assertEqual(S.argv_runs_script("bash x.sh"), [])
+        self.assertEqual(S.argv_runs_script([]), [])
+
+
+class PathMatching(unittest.TestCase):
+    def e(self, path, **kw):
+        return {"path": path, "size": 1, "sha256": "a" * 64, "text": "x", "truncated": False, **kw}
+
+    def test_absolute_equal_after_normalisation(self):
+        sc = [self.e("/home/u/deploy.sh")]
+        self.assertFalse(S.script_not_visible(["bash", "/home/u/deploy.sh"], sc))
+        self.assertFalse(S.script_not_visible(["bash", "/home/u/./d/../deploy.sh"], sc))
+        self.assertTrue(S.script_not_visible(["bash", "/other/deploy.sh"], sc))
+
+    def test_basename_collision_rejected_with_cwd(self):
+        sc = [self.e("/other/dir/deploy.sh")]
+        self.assertTrue(S.script_not_visible(["./deploy.sh"], sc, "/home/u"))
+        self.assertTrue(S.script_not_visible(["bash", "deploy.sh"], sc, "/home/u"))
+        self.assertFalse(S.script_not_visible(["./deploy.sh"], sc, "/other/dir"))
+        self.assertFalse(S.script_not_visible(["bash", "../dir/deploy.sh"], sc, "/other/x"))
+
+    def test_relative_without_cwd_needs_path_boundary(self):
+        sc = [self.e("/other/dir/deploy.sh")]
+        self.assertFalse(S.script_not_visible(["bash", "dir/deploy.sh"], sc))
+        self.assertFalse(S.script_not_visible(["bash", "deploy.sh"], sc))      # whole trailing component
+        self.assertTrue(S.script_not_visible(["bash", "ir/deploy.sh"], sc))    # not at a boundary
+        self.assertTrue(S.script_not_visible(["bash", "eploy.sh"], sc))
+        self.assertTrue(S.script_not_visible(["bash", "../dir/deploy.sh"], sc))
+
+    def test_ambiguity_is_fine_and_no_match_is_not_visible(self):
+        sc = [self.e("/a/deploy.sh"), self.e("/b/deploy.sh")]
+        self.assertFalse(S.script_not_visible(["bash", "deploy.sh"], sc))
+        self.assertTrue(S.script_not_visible(["bash", "deploy.sh"], [self.e("/a/other.sh")]))
+
+    def test_given_path_counts(self):
+        sc = [self.e("/real/target.sh", given="/home/u/link.sh")]
+        self.assertFalse(S.script_not_visible(["bash", "/home/u/link.sh"], sc))
+        self.assertFalse(S.script_not_visible(["bash", "link.sh"], sc, "/home/u"))
+        self.assertTrue(S.script_not_visible(["bash", "link.sh"], sc, "/elsewhere"))
+
+    def test_cwd_validation(self):
+        self.assertIsNone(S.validate_cwd(None))
+        self.assertEqual(S.validate_cwd("/home/u"), "/home/u")
+        for bad in ("home/u", "", "/a\0b", "/a\nb", "/" + "x" * 300, 5, ["/a"]):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                S.validate_cwd(bad)
+
+    def test_given_validated(self):
+        out = S.validate([self.e("/a/b.sh", given="/c/d.sh")])
+        self.assertEqual(out[0]["given"], "/c/d.sh")
+        with self.assertRaises(ValueError):
+            S.validate([{"stdin": True, "given": "/x"}])
+        with self.assertRaises(ValueError):
+            S.validate([self.e("/a/b.sh", given="a\x00b")])
+
+
+class HonestClientStaysVisible(Files):
+    def test_entry_from_client_matches_broker(self):
+        os.mkdir(os.path.join(self.d, "sub"))
+        self.write("sub/run.sh", b"#!/bin/sh\necho hi\n")
+        os.symlink(os.path.join(self.d, "sub", "run.sh"), os.path.join(self.d, "link.sh"))
+        for argv in (["bash", "sub/run.sh"], ["./sub/run.sh"], ["bash", "link.sh"], ["bash", "./sub/../sub/run.sh"],
+                     ["env", "-S", "bash sub/run.sh"], ["xargs", "bash", os.path.join(self.d, "link.sh")],
+                     ["mytool", "sub/run.sh"]):
+            entries = A.find_scripts(argv)
+            self.assertTrue(entries, argv)
+            self.assertFalse(S.script_not_visible(argv, S.validate(entries), self.d), argv)
+            self.assertFalse(S.script_not_visible(argv, S.validate(entries)), argv)
+            # an entry for a different file does not satisfy it
+            other = [{**entries[0], "path": "/elsewhere/run.sh", **({"given": "/elsewhere/l.sh"} if "given" in entries[0] else {})}]
+            self.assertTrue(S.script_not_visible(argv, S.validate(other), self.d), argv)

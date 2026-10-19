@@ -478,13 +478,37 @@ class ArgvRunsScript(unittest.TestCase):
 class OmittedScripts(EnvAutoBase):
     risk_cfg = {"auto_approve_max": "high"}
 
-    def post(self, argv, scripts=None):
+    def post(self, argv, scripts=None, cwd=None):
         body = {"mode": "env", "names": ["svc"], "argv": argv}
         if scripts is not None:
             body["scripts"] = scripts
+        if cwd is not None:
+            body["cwd"] = cwd
         code, b = self.api("POST", "/v1/requests", body)
         self.assertEqual(code, 202, b)
         return json.loads(b)["id"]
+
+    def test_cwd_resolves_relative_operand(self):
+        ent = [{**VISIBLE, "path": "/other/dir/deploy.sh"}]
+        self.post(["bash", "deploy.sh"], ent, cwd="/home/u")          # basename collision: prompts
+        self.assertPrompts()
+        self.notifier.sent.clear()
+        rid = self.post(["bash", "deploy.sh"], ent, cwd="/other/dir")
+        self.assertAuto(rid)
+
+    def test_bad_cwd_is_a_400(self):
+        for bad in ("relative", "/a\u0000b", "/" + "x" * 400, 7):
+            code, b = self.api("POST", "/v1/requests", {"mode": "env", "names": ["svc"],
+                                                        "argv": ["echo"], "cwd": bad})
+            self.assertEqual(code, 400, bad)
+
+    def test_env_S_and_traversal_and_new_wrappers_prompt(self):
+        for argv in (["env", "-S", "bash x.sh"], ["/usr/bin/../../tmp/x"], ["xargs", "bash", "x.sh"],
+                     ["su", "-c", "bash x.sh", "root"], ["env", "-S", "bash 'oops"]):
+            self.notifier.sent.clear()
+            self.broker._by_id.clear()
+            self.post(argv)
+            self.assertEqual(len(self.notifier.sent), 1, argv)
 
     def test_omitted_list_prompts_even_at_high_with_allow(self):
         for argv in FLAGGED[:5]:

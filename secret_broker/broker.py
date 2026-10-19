@@ -595,7 +595,8 @@ class Broker(sshrules_mod.SshRulesMixin):
         """An env request whose script text the classifier and approver cannot see
         (unreadable, read from stdin, or cut off) is never auto-approved."""
         return mode == "env" and scripts_mod.script_not_visible((spec or {}).get("argv"),
-                                                                (spec or {}).get("scripts"))
+                                                                (spec or {}).get("scripts"),
+                                                                (spec or {}).get("cwd"))
 
     def auto_approve_max(self):
         """Highest risk level at which an auto-eligible request is released
@@ -781,6 +782,7 @@ class Broker(sshrules_mod.SshRulesMixin):
             secrets_cfg = self.cfg["secrets"]
             if mode == "env":
                 spec["scripts"] = scripts_mod.validate(spec.get("scripts"))
+                spec["cwd"] = scripts_mod.validate_cwd(spec.get("cwd"))
             elif spec.get("scripts") is not None:
                 raise ValueError("scripts are only allowed for env requests")
             if mode == "store":
@@ -3088,7 +3090,7 @@ def client_handler(broker, client_key):
                             "body_b64": body.get("body_b64")}
                 elif mode == "env":
                     spec = {"argv": [str(a) for a in body.get("argv") or []],
-                            "scripts": body.get("scripts")}
+                            "scripts": body.get("scripts"), "cwd": body.get("cwd")}
                 elif mode == "store":
                     spec = {"op": body.get("op"), "value": body.get("value"),
                             "field": body.get("field"), "item": body.get("item"),

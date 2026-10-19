@@ -80,12 +80,23 @@ Check it:
 - **Scripts are shown to you.** For `NAME -- command`, `asb` looks for the script
   file the command runs and sends its text with the request, so the approval card
   and the risk check see what the script does, not just `bash deploy.sh`. It skips
-  leading wrappers (`env VAR=..`, `sudo`, `nohup`, `time`, `timeout N`, `nice`,
-  `stdbuf`, `exec`, `command`), then takes either an interpreter's script file
+  leading wrappers (`env VAR=..` including `env -S "cmd"`, `sudo`, `doas`, `nohup`,
+  `time`, `timeout N`, `nice`, `ionice`, `stdbuf`, `exec`, `command`, `setsid`,
+  `chrt`, `xargs`, `busybox`, `strace`, `ltrace`, `nsenter`, `unshare`, `taskset`,
+  `flock`, `chroot`, `setpriv`, `numactl`, `runuser`, `watch`, `parallel`, and the
+  `-c` string of `su`, `script`, `flock`, `runuser`), then takes either an interpreter's script file
   (`bash`, `sh`, `zsh`, `python3`, `node`, `deno`, `bun`, `ruby`, `perl`, `php`,
   `pwsh`, `awk -f`, `sed -f`: the first operand that is a file) or the command
   itself when it is an executable text script (a bare name must be found on PATH and
-  start with `#!`). Inline code (`-c`, `-e`, `-m`) is already in the command and
+  start with `#!`), or, for a bare program name that is not a well-known tool (git,
+  curl, docker, ls, make, ...), any operand that ends in a script extension or
+  contains a slash. The same rules run in the broker on the argv it receives, so a
+  script run is flagged even if `asb` is replaced by a client that sends no `scripts`
+  list; a string that cannot be split (`env -S 'unbalanced`) or nests deeper than 4
+  levels counts as unreadable (fails closed). `asb` also sends its working
+  directory as `cwd`, and each entry's `path` is absolute (symlinks resolved, with
+  `given` holding the path as named when it differs): the broker matches the
+  operand to an entry by full normalised path, never by file name alone. Inline code (`-c`, `-e`, `-m`) is already in the command and
   reads no file. Limits: at most 3 files, 32 KB of text each (larger files send only
   the head and say so; the hash is of the whole file), text only (a binary, missing,
   unreadable, oversized or protected file is reported as such, never read), one

@@ -23,6 +23,7 @@ store (request_details.py), cut to request_details.max_script_bytes.
 import html
 import os
 import re
+import shlex
 import time
 
 MAX_SCRIPTS = 3
@@ -287,7 +288,11 @@ def validate(raw):
     for i, e in enumerate(raw):
         if not isinstance(e, dict):
             raise ValueError(f"scripts[{i}] must be an object")
+        e = dict(e)
+        given = e.pop("given", None)        # optional: the path as named, before symlinks were resolved
         keys = set(e)
+        if given is not None and "path" not in keys:
+            raise ValueError(f"scripts[{i}].given needs a path")
         if keys == _KEYS_STDIN:
             if e["stdin"] is not True:
                 raise ValueError(f"scripts[{i}].stdin must be true")
@@ -296,6 +301,8 @@ def validate(raw):
             if e["unreadable"] not in UNREADABLE:
                 raise ValueError(f"scripts[{i}].unreadable must be one of {', '.join(UNREADABLE)}")
             out.append({"path": _path(e["path"], i), "unreadable": e["unreadable"]})
+            if given is not None:
+                out[-1]["given"] = _path(given, i)
         elif keys == _KEYS_TEXT:
             size = e["size"]
             if isinstance(size, bool) or not isinstance(size, int) or not 0 <= size <= MAX_SIZE:
@@ -309,6 +316,8 @@ def validate(raw):
                 raise ValueError(f"scripts[{i}].text must be a string of at most {MAX_TEXT} characters")
             out.append({"path": _path(e["path"], i), "size": size, "sha256": e["sha256"].lower(),
                         "text": scrub(clean_text(text)), "truncated": e["truncated"]})
+            if given is not None:
+                out[-1]["given"] = _path(given, i)
         else:
             raise ValueError(f"scripts[{i}] has unexpected or missing keys")
     return out
@@ -630,9 +639,23 @@ CSS = (".scripts{margin-top:.5rem}.scripts summary{cursor:pointer;color:var(--mu
 # script run look like a plain command. This mirrors the client's detection (kept in
 # step with client/asb by hand) so the broker can notice the omission. It catches
 # clients that omit entries; it cannot stop a client that reports false contents.
+# --- shared-detection:begin (identical in client/asb; tests/test_scripts.py compares them) ---
+MAX_SPLIT_DEPTH = 4         # nested `env -S` / `su -c` strings examined before failing closed
+MAX_HOPS = 32               # wrapper commands skipped before failing closed
+_SYSTEM_BIN = ("/bin/", "/usr/bin/", "/sbin/", "/usr/sbin/")
+_SCRIPT_EXT = (".sh", ".py", ".js", ".rb", ".pl", ".php", ".ps1", ".lua", ".R")
+# A bare program name in this set is never treated as a script, whatever its operands
+# look like. Any other bare name is flagged only when an operand ends in a script
+# extension or contains a slash (a file-like operand); with none it stays unflagged.
+NOT_SCRIPT_PROGRAMS = frozenset((
+    "git curl wget docker kubectl ssh scp rsync make cargo npm npx yarn pnpm pip pip3 go rustc mvn gradle "
+    "java dotnet brew apt apt-get dpkg rpm yum dnf ls cat grep rg find echo printf date uname ps df du head "
+    "tail wc jq tar gzip gunzip zip unzip ffmpeg terraform ansible helm aws gcloud az gh systemctl "
+    "journalctl ping dig nslookup openssl sqlite3 psql mysql redis-cli mongosh sort uniq cut tr mkdir cp mv "
+    "rm touch chmod chown cd pwd which whoami id hostname sleep true false test tee less more diff stat file "
+    "ln readlink basename dirname nc ip ss").split())
 # wrapper -> (options that take a value, number of positional args to skip)
 SCRIPT_WRAPPERS = {
-    "env": ({"-u", "--unset", "-C", "--chdir", "-S", "--split-string"}, 0),
     "sudo": ({"-u", "-g", "-h", "-p", "-C", "-D", "-r", "-t", "-T", "-U", "-R", "--user", "--group"}, 0),
     "doas": ({"-u", "-C"}, 0),
     "nohup": (set(), 0),
@@ -645,7 +668,34 @@ SCRIPT_WRAPPERS = {
     "command": (set(), 0),
     "setsid": (set(), 0),
     "chrt": (set(), 1),
+    "xargs": ({"-a", "-d", "-E", "-I", "-L", "-n", "-P", "-s", "-R", "-S", "--arg-file", "--delimiter",
+               "--max-args", "--max-procs", "--max-lines", "--max-chars"}, 0),
+    "busybox": (set(), 0),                    # the applet name is the next operand
+    "strace": ({"-a", "-b", "-e", "-E", "-I", "-o", "-O", "-p", "-P", "-s", "-S", "-u", "-U", "-X", "-D"}, 0),
+    "ltrace": ({"-a", "-A", "-e", "-F", "-l", "-n", "-o", "-p", "-s", "-u", "-w"}, 0),
+    "nsenter": ({"-t", "--target", "-S", "--setuid", "-G", "--setgid", "-w", "--wd", "--root"}, 0),
+    "unshare": ({"-S", "-G", "-w", "--wd", "-R", "--root", "--propagation", "--setgroups", "--map-user",
+                 "--map-group", "--map-users", "--map-groups"}, 0),
+    "taskset": ({"-c", "--cpu-list"}, 1),     # the mask operand is absent when -c is given
+    "flock": ({"-w", "--timeout", "-E", "--conflict-exit-code"}, 1),
+    "chroot": ({"--userspec", "--groups"}, 1),
+    "setpriv": ({"--reuid", "--regid", "--ruid", "--euid", "--rgid", "--egid", "--groups", "--inh-caps",
+                 "--bounding-set", "--ambient-caps", "--securebits", "--pdeathsig", "--selinux-label",
+                 "--apparmor-profile", "--landlock-access"}, 0),
+    "numactl": ({"-C", "-N", "-m", "-i", "-p", "--physcpubind", "--cpunodebind", "--cpubind", "--membind",
+                 "--interleave", "--preferred"}, 0),
+    "watch": ({"-n", "--interval"}, 0),
+    "runuser": ({"-u", "--user", "-g", "--group", "-G", "--supp-group", "-s", "--shell"}, 0),
+    "parallel": ({"-j", "--jobs", "-n", "-N", "-S", "--sshlogin", "-a", "--arg-file", "--colsep", "-C", "-d",
+                  "--delimiter", "--results", "--joblog", "-I", "-L", "-l", "--timeout", "--retries",
+                  "--sshloginfile", "--wd", "--workdir", "--tmpdir", "-E", "--eof", "--delay", "--load",
+                  "--memfree"}, 0),
 }
+_SKIP_POSITIONAL_UNLESS = {"taskset": {"-c", "--cpu-list"}}
+# wrappers that take a shell string with -c (the string is examined like a command line)
+_INLINE_WRAPPERS = ("su", "script")
+_ENV_LONG = ("--ignore-environment", "--null", "--unset", "--chdir", "--split-string", "--debug", "--argv0",
+             "--block-signal", "--default-signal", "--ignore-signal", "--list-signal-handling")
 # interpreter name pattern -> (kind, flags that take the next arg, inline-code flags, stdin flags)
 _SHELLS = r"(?:ba|z|da|k|a|c|tc)?sh|fish"
 SCRIPT_INTERPRETERS = (
@@ -666,28 +716,132 @@ _AWK_LIKE = re.compile(r"^(?:awk|gawk|mawk|sed)$")
 _RUNNERS = re.compile(r"^(?:deno|bun)$")
 
 
-def _strip_wrappers(argv):
-    """argv without leading wrapper commands (env VAR=.., sudo, timeout 5, ...)."""
-    i = 0
-    while i < len(argv):
-        w = os.path.basename(argv[i])
-        if w not in SCRIPT_WRAPPERS:
+def _env_long(name):
+    """Canonical GNU env long option for `name` (unique abbreviations allowed), else None."""
+    if name in _ENV_LONG:
+        return name
+    hits = [o for o in _ENV_LONG if len(name) > 2 and o.startswith(name)]
+    return hits[0] if len(hits) == 1 else None
+
+
+def _skip_options(name, args):
+    valued, positional = SCRIPT_WRAPPERS[name]
+    i, seen = 0, set()
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            i += 1
             break
-        valued, positional = SCRIPT_WRAPPERS[w]
-        i += 1
-        while i < len(argv):
-            a = argv[i]
-            if a == "--":
-                i += 1
-                break
-            if w == "env" and "=" in a and not a.startswith("-"):
-                i += 1
-            elif a.startswith("-") and len(a) > 1:
-                i += 2 if a in valued else 1
-            else:
-                break
+        if a.startswith("-") and len(a) > 1:
+            seen.add(a)
+            i += 2 if a in valued else 1
+        else:
+            break
+    if not (seen & _SKIP_POSITIONAL_UNLESS.get(name, set())):
         i += positional
-    return argv[i:]
+    return args[i:]
+
+
+def _env_unwrap(args, splits):
+    """env's options and VAR=value words skipped -> (command argv, splits used), or
+    (None, splits) when an -S/--split-string value cannot be split (fail closed)."""
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            i += 1
+            break
+        piece = None
+        if a.startswith("--"):
+            nm, eq, val = a.partition("=")
+            canon = _env_long(nm)
+            if canon == "--split-string":
+                if eq:
+                    piece, i = val, i + 1
+                elif i + 1 < len(args):
+                    piece, i = args[i + 1], i + 2
+                else:
+                    return None, splits
+            elif canon in ("--unset", "--chdir", "--argv0"):
+                i += 1 if eq else 2
+            else:
+                i += 1
+        elif a.startswith("-") and len(a) > 1:
+            j, i = 1, i + 1
+            while j < len(a):
+                c = a[j]
+                if c in "uCaS":
+                    rest = a[j + 1:]
+                    if not rest:
+                        if i >= len(args):
+                            return (None, splits) if c == "S" else (args[i:], splits)
+                        rest, i = args[i], i + 1
+                    if c == "S":
+                        piece = rest
+                    break
+                j += 1
+        elif "=" in a:
+            i += 1
+        else:
+            break
+        if piece is not None:
+            splits += 1
+            try:
+                pieces = shlex.split(piece)
+            except ValueError:
+                return None, splits
+            # the pieces take the place of the option; parsing carries on over them
+            args = pieces + args[i:]
+            i = 0
+    return args[i:], splits
+
+
+def _shell_segments(s):
+    """The commands (argv lists) in a shell string, split at ; && || | & and parentheses;
+    redirection targets dropped. None when it cannot be tokenised."""
+    try:
+        lex = shlex.shlex(s, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        toks = list(lex)
+    except ValueError:
+        return None
+    segs, skip = [[]], False
+    for t in toks:
+        if skip:
+            skip = False
+        elif t and all(c in "();<>|&" for c in t):
+            if "<" in t or ">" in t:
+                skip = True
+            else:
+                segs.append([])
+        else:
+            segs[-1].append(t)
+    return [x for x in segs if x]
+
+
+def _inline_string(args):
+    """(found, value) for a -c / --command shell string among a wrapper's arguments."""
+    for i, a in enumerate(args):
+        if a in ("-c", "--command"):
+            return True, (args[i + 1] if i + 1 < len(args) else None)
+        if a.startswith("--command="):
+            return True, a.split("=", 1)[1]
+        if re.match(r"^-c.", a) and not a.startswith("--"):
+            return True, a[2:]
+    return False, None
+
+
+def _bad_path(p):
+    return "\0" in p or "\n" in p or ".." in p.split("/")
+
+
+def _in_system_bin(p):
+    return not _bad_path(p) and os.path.isabs(p) and os.path.normpath(p).startswith(_SYSTEM_BIN)
+
+
+def _file_like(a):
+    return (not a.startswith("-") and not re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", a)
+            and (a.endswith(_SCRIPT_EXT) or "/" in a))
 
 
 def _script_args(name, args):
@@ -769,48 +923,149 @@ def _script_args(name, args):
         i += 1
     return ("none", None)
 
-_SYSTEM_BIN = ("/bin/", "/usr/bin/", "/sbin/", "/usr/sbin/")
-_SCRIPT_EXT = (".sh", ".py", ".js", ".rb", ".pl", ".php", ".ps1", ".lua", ".R")
+
+def _runs(argv, depth=0, trace=None):
+    """[(path, strict)] for the script files `argv` appears to execute. `strict` marks
+    argv[0] itself being the script (so a client may skip a compiled program); "-"
+    stands for code read from stdin or for anything that could not be examined (fail
+    closed). See argv_runs_script."""
+    out = []
+
+    def add(p, strict=False):
+        if (p, strict) not in out:
+            out.append((p, strict))
+
+    def closed():
+        add("-")
+        return out
+    cmd, hops, splits = list(argv), 0, 0
+    while cmd:
+        hops += 1
+        if hops > MAX_HOPS or depth + splits > MAX_SPLIT_DEPTH:
+            return closed()
+        a0, args = cmd[0], cmd[1:]
+        if _bad_path(a0):
+            add(a0, True)                       # `..`, NUL or newline in the program path
+        name = os.path.basename(a0)
+        if name == "env":
+            nxt, splits = _env_unwrap(args, splits)
+            if nxt is None or depth + splits > MAX_SPLIT_DEPTH:
+                return closed()
+            cmd = nxt
+            continue
+        if name in _INLINE_WRAPPERS or (name == "runuser" and not any(
+                a in ("-u", "--user") or a.startswith("--user=") for a in args)) or (
+                name == "flock" and _inline_string(args)[0]):
+            found, value = _inline_string(args)
+            if not found or value is None:
+                return out                      # su/script with no command: an interactive shell
+            segs = _shell_segments(value)
+            if segs is None:
+                return closed()
+            for seg in segs:
+                for item in _runs(seg, depth + 1):
+                    add(*item)
+            return out
+        if name == "watch" or name == "parallel":
+            rest = _skip_options(name, args)
+            if name == "parallel":
+                for k, a in enumerate(rest):
+                    if a in (":::", "::::", ":::+", "::::+"):
+                        rest = rest[:k]
+                        break
+            if len(rest) == 1 and re.search(r"\s", rest[0]):
+                segs = _shell_segments(rest[0])
+                if segs is None:
+                    return closed()
+                for seg in segs:
+                    for item in _runs(seg, depth + 1):
+                        add(*item)
+                return out
+            cmd = rest
+            continue
+        if name in SCRIPT_WRAPPERS:
+            cmd = _skip_options(name, args)
+            continue
+        break
+    else:
+        return out
+    if trace is not None:
+        trace["cmd"] = cmd
+    found = _script_args(name, args)
+    if found is not None:
+        kind, paths = found
+        if kind == "stdin" or (kind == "none" and not name.startswith(("sed", "awk", "gawk", "mawk"))):
+            add("-")
+        elif kind == "file":
+            for p in paths:
+                add(p)
+        return out
+    if a0.endswith(_SCRIPT_EXT):
+        add(a0, True)
+    elif "/" in a0:
+        if not _in_system_bin(a0):
+            add(a0, True)
+    elif a0 not in NOT_SCRIPT_PROGRAMS:
+        for a in args:
+            if _file_like(a):
+                add(a)
+    return out
 
 
 def argv_runs_script(argv):
     """Operand paths of the script files `argv` appears to execute ([] when it runs
-    none): an interpreter's script operand, or argv[0] itself when it contains a
-    slash (outside the standard system bin directories) or ends in a script
-    extension. "-" stands for code read from standard input. Inline code (-c, -e,
-    -m, eval) is not a script file. A bare program name (curl, git) is not flagged."""
+    none). Looked through: wrapper commands (env, sudo, xargs, busybox, strace,
+    flock, ...), env -S/--split-string and -c shell strings (su, script, flock,
+    runuser), then an interpreter's script operand, argv[0] itself when it has a
+    script extension or a slash outside /bin, /usr/bin, /sbin, /usr/sbin (compared
+    after normpath; a `..`, NUL or newline in it is always flagged), or, for a bare
+    program name outside NOT_SCRIPT_PROGRAMS, its file-like operands. "-" stands for
+    code read from stdin or anything that could not be examined (fail closed).
+    Inline code (-c, -e, -m, eval) is not a script file."""
     if not isinstance(argv, list) or not all(isinstance(a, str) for a in argv):
         return []
-    cmd = _strip_wrappers(argv)
-    if not cmd:
-        return []
-    name = os.path.basename(cmd[0])
-    found = _script_args(name, cmd[1:])
-    if found is not None:
-        kind, paths = found
-        if kind == "stdin" or (kind == "none" and not name.startswith(("sed", "awk", "gawk", "mawk"))):
-            return ["-"]
-        return list(paths) if kind == "file" else []
-    if cmd[0].endswith(_SCRIPT_EXT):
-        return [cmd[0]]
-    if "/" in cmd[0] and not cmd[0].startswith(_SYSTEM_BIN):
-        return [cmd[0]]
-    return []
+    return [p for p, _ in _runs(argv)]
+# --- shared-detection:end ---
 
 
-def _same_path(a, b):
-    return (a == b or os.path.normpath(a) == os.path.normpath(b)
-            or os.path.basename(a.rstrip("/")) == os.path.basename(b.rstrip("/")))
+def _norm(p):
+    return os.path.normpath(p)
 
 
-def script_not_visible(argv, scripts):
+def _same_path(p, cand, cwd=None):
+    """Does operand `p` (as written in argv) name the file the client reported as
+    `cand`? Full normalised paths only, never a bare file name: an absolute operand
+    must equal it; a relative one is resolved against `cwd` when given, else must be
+    a whole trailing path (at a `/` boundary) of an absolute `cand`."""
+    if not isinstance(cand, str) or "\0" in p or "\0" in cand:
+        return False
+    c = _norm(cand)
+    if os.path.isabs(p):
+        return _norm(p) == c
+    if cwd:
+        return _norm(os.path.join(cwd, p)) == c
+    r = _norm(p)
+    return r == c or (os.path.isabs(c) and c.endswith("/" + r) and not r.startswith(("..", "/")))
+
+
+def validate_cwd(raw):
+    """The client's working directory (absolute, at most MAX_PATH characters, no
+    control characters) or None when not sent. Raises ValueError otherwise."""
+    if raw is None:
+        return None
+    if not isinstance(raw, str) or not raw.startswith("/") or not _PATH_RE.match(raw):
+        raise ValueError(f"cwd must be an absolute path of at most {MAX_PATH} printable characters")
+    return raw
+
+
+def script_not_visible(argv, scripts, cwd=None):
     """True when the script text for this command is not fully visible: an entry is
-    unreadable, from stdin or cut off, or `argv` runs a script file that has no
-    matching readable entry in `scripts`."""
+    unreadable, from stdin or cut off, or `argv` runs a script file (or could not be
+    examined) that has no matching readable entry in `scripts`."""
     scripts = scripts or []
     if has_blind_spot(scripts):
         return True
     for p in argv_runs_script(argv):
-        if p == "-" or not any("path" in s and _same_path(p, s["path"]) for s in scripts):
+        if p == "-" or not any(_same_path(p, s[k], cwd) for s in scripts for k in ("path", "given") if k in s):
             return True
     return False
