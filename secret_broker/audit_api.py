@@ -96,6 +96,7 @@ HIDDEN = frozenset({
     # time-boxed grants are approval policy context: a grant-approved request shows as plain "approved"
     "grant_created", "grant_refused", "grant_used", "grant_skipped", "grant_revoked", "grant_expired",
     "grant_dropped", "grants_file_corrupt", "grants_file_write_failed", "client_event",
+    "request_details_store_error",
     # exist only when a human was asked to decide (policy / presence by absence)
     "decision_refused", "dashboard_decide_refused", "push_decide_refused", "ha_decide_refused",
     "link_decide_refused",

@@ -45,7 +45,7 @@ def _clean(v, depth=0):
 
 def _scripts(rec):
     """[{path, size, sha}] from a `requested` record: path, size and hash only (the
-    text is not in the audit log; keeping it for history is a separate store)."""
+    text is not in the audit log; it is kept in the request-details store)."""
     paths = rec.get("script_paths")
     if not isinstance(paths, list):
         return []

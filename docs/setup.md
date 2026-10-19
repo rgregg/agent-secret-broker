@@ -76,7 +76,10 @@ and fails open when the analysis model is down; see the reference),
 unverified), `ttl_seconds` (how long a request waits, default 300),
 `audit_log`, `timed_grants` ("Automatically approve... 5/15/30 min" chips on the approval
 card; on by default, tune or turn off with `{"enabled": false}`, see the
-reference). All keys are in `deploy/config.example.json`.
+reference), `request_details` (headers and body shown on the approval card, kept 7 days for
+the history pop-over in a separate file next to the audit log; credential-like headers
+that are not `{{PLACEHOLDERS}}` are masked; see the reference). All keys are in
+`deploy/config.example.json`.
 
 Leave `serve: true` in the `backend` block: the broker then keeps one long-lived
 vault session and cannot trip the vault's login rate limit.

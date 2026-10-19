@@ -40,6 +40,7 @@ from . import grants as grants_mod
 from . import guidance as guidance_mod
 from . import sshhosts as sshhosts_mod
 from . import risk as risk_mod
+from . import request_details as details_mod
 from . import scripts as scripts_mod
 from . import sshkey
 from . import structured
@@ -156,6 +157,13 @@ class Broker:
             self.log("ha_hook_any_device", warning="ha_hook.allowed_devices is empty: "
                      "any device id is accepted (it is recorded, not verified)")
         self.history = History(self._audit._path)
+        self.details_cfg = details_mod.parse_config(config.get("request_details"))
+        self.details = None             # retained headers/bodies for history; see request_details.py
+        if self.details_cfg["enabled"] and self._audit._path:
+            self.details = details_mod.DetailsStore(
+                os.path.join(os.path.dirname(os.path.abspath(self._audit._path)), "request_details.db"),
+                self.details_cfg, self.log)
+            self.details.start()
         self._csrf_key = secrets.token_bytes(32)    # per process: tokens die with a restart
         self._lock = threading.Lock()
         self._by_id = {}
@@ -772,6 +780,7 @@ class Broker:
             self.log("rejected", reason=err, names=names, mode=mode, source=source, peer=peer)
             raise PermissionError(err)
         self.audit("requested", req)
+        self._retain_details(req)
         if self.cfg.get("backend", {}).get("prewarm", True):
             # unlock while the human is reaching for their phone
             self.warm_backend()
@@ -808,6 +817,32 @@ class Broker:
         except (NotifyError, OSError) as e:
             self._finish(req, "failed", error=f"could not notify: {e}")
         return req
+
+    def details_view(self, req):
+        """The masked headers/body view of an http request, built once from the spec that
+        will be executed (None when the feature is off or the request has no http spec)."""
+        if not self.details_cfg["enabled"] or req.mode != "http":
+            return None
+        if not hasattr(req, "_details_view"):
+            req._details_view = details_mod.build_view(req.spec, self.details_cfg["max_body_bytes"])
+        return req._details_view
+
+    def _retain_details(self, req):
+        """Keep what the approver saw for the history pop-over (separate small store,
+        never the audit log). Masking happened when the view was built."""
+        if self.details is None:
+            return
+        try:
+            if req.mode == "http":
+                rec = self.details_view(req)
+            elif req.mode == "env" and req.spec.get("scripts"):
+                rec = {"scripts": details_mod.scripts_view(req.spec["scripts"],
+                                                           self.details_cfg["max_script_bytes"])}
+            else:
+                return
+            self.details.put(req.id, rec)
+        except Exception as e:  # noqa: BLE001 -- retention must never break a request
+            self.log("request_details_store_error", op="retain", error=type(e).__name__)
 
     def _validate_store(self, names, spec):
         """Validate (and fill defaults for) a request to create/update a credential."""
@@ -1867,6 +1902,17 @@ def sanitize_client_event(obj):
     return out
 
 
+# Open/closed state of the collapsible parts of a card ("Request details", "Script contents").
+# The card markup is replaced when its version changes (for example when the risk assessment
+# arrives); the keys below (request id, kind, position) let the poll put open ones back.
+_KEEP_JS = r'''
+function asbDetailKeys(root,fn){root.querySelectorAll('article[data-id]').forEach(function(a){
+  a.querySelectorAll('details.reqdetails,details.scripts').forEach(function(d,i){
+    fn(d,a.getAttribute('data-id')+'|'+d.className+'|'+i);});});}
+function asbOpenKeys(root){var o=[];asbDetailKeys(root,function(d,k){if(d.open)o.push(k);});return o;}
+function asbReopen(root,keys){asbDetailKeys(root,function(d,k){if(keys.indexOf(k)>=0)d.open=true;});}
+'''
+
 _DASH_JS = r'''
 (function(){
   var lastRep={};
@@ -2065,7 +2111,8 @@ _DASH_JS = r'''
       .then(function(r){if(!r.ok)throw 0;return r.text();})
       .then(function(h){var d=parse(h),c=d.getElementById('cards'),nl=d.getElementById('hlist');
         if(c&&c.getAttribute('data-version')!==last){
-          last=c.getAttribute('data-version');cards.innerHTML=c.innerHTML;bind();
+          last=c.getAttribute('data-version');var wasopen=asbOpenKeys(cards);
+          cards.innerHTML=c.innerHTML;asbReopen(cards,wasopen);bind();
           track(ids(c));}
         if(hl&&nl&&seq===hseq&&nl.innerHTML!==hl.innerHTML)hl.innerHTML=nl.innerHTML;
         off.hidden=true;secs();title();})
@@ -2137,6 +2184,7 @@ _DASH_JS = r'''
       +new Date().toLocaleTimeString()+'.');});
 })();
 '''
+_DASH_JS = _KEEP_JS + _DASH_JS
 
 # Single source of truth for the worker version: rendered into the worker, the
 # X-SW-Version header on /sw.js, and the Settings page ("expected" version).
@@ -2338,7 +2386,7 @@ def _page(h, code, body, wide=False, nav=True, script=None, tab=None, badge=0, u
            "<meta name=viewport content='width=device-width,initial-scale=1'>"
            "<meta name=color-scheme content='light dark'><title>Agent Secret Broker</title>"
            f"<link rel=icon href=\"{_ICON}\">"
-           f"<style>{_CSS}{scripts_mod.CSS}</style><body>{_chrome(tab, badge, user) if nav else ''}"
+           f"<style>{_CSS}{scripts_mod.CSS}{details_mod.CSS}</style><body>{_chrome(tab, badge, user) if nav else ''}"
            f"<main class='{'wide' if wide else 'narrow'}'>{body}</main>{scr}</body></html>").encode()
     h.send_response(code)
     h.send_header("Content-Type", "text/html; charset=utf-8")
@@ -2498,7 +2546,7 @@ def _ev_val(v):
     return str(v)
 
 
-def _detail_html(r, evs):
+def _detail_html(r, evs, retained=""):
     """Server-escaped detail of one finished request: the history row plus its
     audit events (whitelisted fields only; see history._EV_KEYS)."""
     e = html.escape
@@ -2531,7 +2579,7 @@ def _detail_html(r, evs):
     elif r["mode"] == "env":
         add("Command", "<code>" + e(" ".join(r["argv"] or [])) + "</code>", True)
         if r.get("scripts"):
-            # path, size and short hash only: the text is not in the audit log (separate store, issue #9)
+            # path, size and short hash only here; the text is in the retained request-details store
             add("Scripts", "<br>".join(
                 f"<code>{e(str(x['path']))}</code> "
                 f"({e(str(x['size']))} bytes, sha256 <code>{e(x['sha'])}</code>)" for x in r["scripts"]), True)
@@ -2611,7 +2659,7 @@ def _detail_html(r, evs):
                   + (f"<span class=ev>{e(extra)}</span>" if extra else "") + "</li>")
     return (f"<div class=dtitle><b>{e(', '.join(r['names']))}</b>"
             f"<span class='pill {kind}'>{e(label)}</span></div>"
-            f"<dl class=kv>{''.join(rows)}</dl><h3>Timeline</h3><ol class=tl>{''.join(tl)}</ol>")
+            f"<dl class=kv>{''.join(rows)}</dl>{retained}<h3>Timeline</h3><ol class=tl>{''.join(tl)}</ol>")
 
 
 def client_handler(broker, client_key):
@@ -2816,6 +2864,7 @@ def approval_handler(broker):
                     f"<time data-exp='{int(r.expires)}'>expires in "
                     f"{max(0, int(r.expires - time.time()))}s</time></div>{_risk_html(r)}"
                     f"<div class=box>From: {html.escape(r.source)}<br>{what}</div>"
+                    f"{details_mod.html(broker.details_view(r))}"
                     f"<p><small>{rnote}</small></p>"
                     "<form method=post action='/decide' class=decide>"
                     f"<input type=hidden name=id value='{html.escape(r.id)}'>"
@@ -2949,11 +2998,30 @@ def approval_handler(broker):
                              badge=len(broker.pending()), user=user)
             broker.log("request_detail_viewed", peer=self.client_address[0],
                        client_ip=self._fwd(), request_id=rid)
-            body = _detail_html(row, evs)
+            body = _detail_html(row, evs, self._retained_html(row))
             if fragment:
                 return self._fragment(200, body)
             _page(self, 200, "<h1>Request</h1><div class=card>" + body + "</div>",
                   tab="requests", badge=len(broker.pending()), user=user)
+
+        def _retained_html(self, row):
+            """Request details kept for a finished request (headers/body for http, script
+            text for env), or a short note when they are gone. Read by the approver pages only."""
+            if broker.details is None or not (row["mode"] == "http" or (row["mode"] == "env" and row["scripts"])):
+                return ""
+            days = broker.details_cfg["retention_days"]
+            rec, state = broker.details.get(row["id"])
+            if state == "missing" and time.time() > row["ts"] + days * 86400:
+                state = "expired"
+            if state == "ok":
+                try:
+                    return (details_mod.html(rec) if row["mode"] == "http"
+                            else scripts_mod.card_html(rec.get("scripts")))
+                except Exception:  # noqa: BLE001 -- a malformed record is just "not available"
+                    state = "error"
+            msg = (f"Details are kept for {days} day{'' if days == 1 else 's'} and have expired."
+                   if state == "expired" else "Request details are not available for this request.")
+            return f"<p class=muted><small>{html.escape(msg)}</small></p>"
 
         def _fragment(self, code, body):
             raw = body.encode()
@@ -3180,6 +3248,7 @@ def approval_handler(broker):
 <p><b>{html.escape(', '.join(req.names))}</b></p>
 {summary_html}
 <div class=box>From: {html.escape(req.source)}<br>{what}</div>
+{details_mod.html(broker.details_view(req))}
 <p><small>{note}</small></p>
 <p><small>Expires in {int(req.expires - time.time())}s</small></p>
 <form method=post id=f>

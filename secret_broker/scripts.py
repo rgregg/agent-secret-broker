@@ -16,9 +16,9 @@ Entry shapes (exactly one of):
 
 Script text is untrusted data. It is held in memory with the request (spec) and
 shown on the approval card; it is never put in notifications or in the audit
-log. The audit log gets paths, sizes, hashes and marker classes only. Keeping
-text for the request history is a separate store (issue #9); until then the
-history pop-over shows path, size and hash only.
+log. The audit log gets paths, sizes, hashes and marker classes only. The
+history pop-over shows the text from the separate, short-lived request-details
+store (request_details.py), cut to request_details.max_script_bytes.
 """
 import html
 import os

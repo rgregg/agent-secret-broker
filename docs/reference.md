@@ -38,8 +38,10 @@ How the broker works, in detail. For installing and configuring it see
     the audit log. The audit `requested` event gets only `script_paths`,
     `script_sha256`, `script_sizes` and `script_markers` (marker classes), which the
     audit API returns because they describe the agent's own request. The history
-    pop-over shows path, size and short hash only; keeping the text for history is
-    the separate issue #9 store. All of this is advisory: the client chooses what to
+    pop-over shows path, size and short hash, and the (already scrubbed) text from the
+    separate, short-lived request-details store (see
+    [Request details](#request-details-headers-and-body)), cut to
+    `request_details.max_script_bytes`. All of this is advisory: the client chooses what to
     send. The client re-hashes the scripts before running them and exits 6 if one
     changed.
 
@@ -853,7 +855,9 @@ outcome, who decided and through which channel (dashboard, push, ha, link,
 policy), the approver, timestamps and durations (requested, decided, released,
 delivered), upstream HTTP status and response size, and a timeline of every
 audit event for that request id with its recorded fields. Only a fixed list
-of fields is shown; urls, bodies and anything unlisted are not. A pending
+of audit fields is shown; urls, bodies and anything unlisted are not. A
+collapsed **Request details** section adds the headers and body kept in the separate
+request-details store (below). A pending
 request has no detail (409; it has a card), an unknown or malformed id is 404,
 and the nonce and action tokens are never shown. All text is HTML-escaped on
 the server.
@@ -864,6 +868,70 @@ most the most recent 5000 requests kept in memory; a detail view reads that
 index, not the file. No values, header values or bodies are ever shown (the log
 does not contain them). "(not collected)" in the pop-over marks an approval
 whose result the client never fetched.
+
+## Request details: headers and body
+
+Every pending `http` request card (dashboard and `/a/<nonce>` page) has a
+collapsed **Request details** section: the headers, one `name: value` per line, and
+the body in a monospace block with its size. It is closed by default; the live poll
+keeps a section you opened open when it redraws the card (open ones are noted by
+request id before the markup is replaced, and restored after), and with scripting
+off it is a plain `<details>`. It is built from the request spec that will be
+executed, so what is shown is what is sent; `{{VAR}}` placeholders are shown as typed,
+never substituted. Omitted when the request has no headers and no body. `store`,
+`ssh_sign` and `env` requests keep their own descriptions (env shows its scripts).
+
+- **Body.** Shown as text only when it is valid UTF-8 and the content type is text-like
+  (JSON, XML, form data, plain text, GraphQL, and so on; with no content type, when it
+  contains no control characters). Cut at `request_details.max_body_bytes` (default
+  2048) with a "truncated, N bytes total" note. JSON that parses (and is at most 64 KB)
+  is pretty-printed for the view only, labelled "formatted for display"; the bytes sent
+  are unchanged. Binary or non-text content shows only the content type and length.
+  Obvious secret-looking literals in the text are removed with the script scrubber
+  (`scripts.scrub`); if it fails or withholds, the body shows
+  `[body withheld: could not be scrubbed safely]`.
+- **Headers.** At most 40 are shown and each value at most 500 characters, with a note
+  when something was cut. Control characters are replaced.
+- **Masking.** The value of a credential-like header is shown only when it consists of
+  `{{VAR}}` placeholders (optionally behind a scheme such as `Bearer`, joined by
+  `:` `;` `,`); anything else, i.e. a literal credential pasted by the agent, is
+  replaced by `[masked]`. Credential-like means `Authorization`, `Proxy-Authorization`,
+  `Cookie`, `Set-Cookie`, `X-Api-Key`, `X-Api-Secret`, `X-Auth-Token`, `X-Access-Token`,
+  or any header whose name contains `token`, `secret`, `key`, `password`, `auth` or
+  `credential` (case-insensitive). Masking happens before display and before storage;
+  there is no reveal. Other headers are shown in full. The URL display is unchanged.
+- **Escaping.** All of it is server-escaped text in `<pre>`; the CSP is unchanged and a
+  body is never rendered as HTML.
+
+**History.** The pop-over shows the same section for a finished request, from a separate
+small store, never the audit log (which stays free of headers and bodies):
+`request_details.db` (SQLite, mode 0600, `secure_delete`) next to the audit log, keyed by
+request id with `created_at` and `expires_at`. It is written when the request is created,
+from the masked view: headers and a text body (cut at `max_body_bytes`); a binary or
+non-text body keeps only its content type and length. For env requests with scripts it
+keeps the already-scrubbed script text, up to `max_script_bytes` per script, so the
+pop-over shows the same **Script contents** section as the card. Retention is
+`retention_days` (default 7): a sweep at startup and then hourly (daemon thread) removes
+expired entries, and an expired entry is never shown ("Details are kept for 7 days and
+have expired."; the normal audit record stays). A total size cap `max_store_mb` evicts the
+oldest entries first. A missing or corrupt file just means "not available" in the pop-over
+and an audit warning `request_details_store_error` (operation and exception class only); a
+file SQLite cannot read is set aside as `request_details.db.corrupt` and a fresh one started.
+
+```json
+"request_details": {"enabled": true, "retention_days": 7, "max_body_bytes": 2048,
+                    "max_script_bytes": 4096, "max_store_mb": 20}
+```
+
+Validated at startup naming the field: `retention_days` 1-90, `max_body_bytes` 0-65536,
+`max_script_bytes` 0-32768, `max_store_mb` 1-1024, `enabled` boolean, no unknown keys.
+`enabled: false` shows and stores nothing. With no `audit_log` configured nothing is
+retained (the cards still show the section).
+
+**Never in:** notifications (push, Telegram, ticker, Home Assistant), the audit log,
+`GET /v1/audit`, discovery, `/v1/status`, request results. The store is read only by the
+approver pages (the SSO listener), never by an agent-facing endpoint; the
+`request_details_store_error` event is hidden from the audit API.
 
 ## Always allow
 
@@ -984,7 +1052,8 @@ the requesting client, never to the approver.
 ## Audit
 
 JSONL, hash-chained, mode 0600, on the broker host. Never contains secret
-values, header values or bodies.
+values, header values or bodies (those live in the separate, short-lived
+[request-details store](#request-details-headers-and-body)).
 
 Events: `startup` (policies in force), `requested`, `assessed`, `notified`,
 `secret_read`, `approved`/`denied`/`expired`/`failed` (with `via` user or
