@@ -85,7 +85,8 @@ class Detection(Files):
 
     def test_inline_code_reads_no_file(self):
         self.write("deploy.sh", "#!/bin/sh\n")
-        for argv in (["bash", "-c", "./deploy.sh"], ["sh", "-ec", "deploy.sh"], ["python3", "-c", "import x"],
+        self.assertEqual(self.paths(["bash", "-c", "./deploy.sh"]), [os.path.join(self.d, "deploy.sh")])  # a shell string
+        for argv in (["python3", "-c", "import x"],
                      ["python3", "-m", "http.server"], ["python3", "-m", "mod", "deploy.sh"],
                      ["node", "-e", "1"], ["node", "--eval", "1"], ["ruby", "-e", "1"], ["perl", "-e", "1"],
                      ["perl", "-ne", "print"], ["php", "-r", "1;"], ["deno", "eval", "1"],

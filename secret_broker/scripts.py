@@ -651,9 +651,9 @@ _SYSTEM_BIN = ("/bin/", "/usr/bin/", "/sbin/", "/usr/sbin/")
 _SCRIPT_EXT = (".sh", ".py", ".js", ".rb", ".pl", ".php", ".ps1", ".lua", ".R")
 _NO_SPEC = {"short": "", "valued": {}, "long": frozenset(), "longv": {}, "exact": frozenset(), "digits": False,
             "max_operands": None, "operand": None}
-_NUM = r"^\d+(?:\.\d+)?$"
-_URL = r"^https?://[^\s@]+$"
-_HOST = r"^[A-Za-z0-9._:@+=-]+$"
+_PLAIN_NUM = r"^\d+(?:\.\d+)?$"
+_PLAIN_URL = r"^https?://[^\s@]+$"
+_PLAIN_HOST = r"^[A-Za-z0-9._:@+=-]+$"
 
 
 def _plain(**kw):
@@ -674,10 +674,10 @@ def _jq_filter_ok(operands):
 PLAIN_PROGRAMS = {
     "cat": _plain(short="nbsvAET"),
     "ls": _plain(short="lahtr1AFRSdisL"),
-    "head": _plain(short="qv", valued={"n": _NUM, "c": _NUM}, digits=True),
+    "head": _plain(short="qv", valued={"n": _PLAIN_NUM, "c": _PLAIN_NUM}, digits=True),
     "tail": _plain(short="qvfF", valued={"n": r"^[+]?\d+$", "c": r"^[+]?\d+$"}, digits=True),
     "wc": _plain(short="lwcmL"),
-    **{n: _plain(short="invcEFwxrRHhlLqsoaI", valued={"e": None, "m": _NUM, "A": _NUM, "B": _NUM, "C": _NUM})
+    **{n: _plain(short="invcEFwxrRHhlLqsoaI", valued={"e": None, "m": _PLAIN_NUM, "A": _PLAIN_NUM, "B": _PLAIN_NUM, "C": _PLAIN_NUM})
        for n in ("grep", "egrep", "fgrep")},
     "echo": _plain(short="neE"),
     "printf": _plain(),
@@ -697,11 +697,11 @@ PLAIN_PROGRAMS = {
     "jq": _plain(short="rcesnSCMajR", long=("--raw-output", "--compact-output", "--exit-status", "--slurp",
                                          "--null-input", "--sort-keys", "--tab", "--join-output"),
                  operand=_jq_filter_ok),
-    "ping": _plain(short="n46q", valued={"c": r"^\d+$", "W": _NUM, "w": r"^\d+$", "i": _NUM},
-                   max_operands=1, operand=lambda ops: all(re.match(_HOST, o) for o in ops)),
+    "ping": _plain(short="n46q", valued={"c": r"^\d+$", "W": _PLAIN_NUM, "w": r"^\d+$", "i": _PLAIN_NUM},
+                   max_operands=1, operand=lambda ops: all(re.match(_PLAIN_HOST, o) for o in ops)),
     "dig": _plain(short="46x", valued={"t": r"^[A-Za-z]+$", "p": r"^\d+$"},
-                  operand=lambda ops: all(re.match(_HOST, o) for o in ops)),
-    "nslookup": _plain(operand=lambda ops: all(re.match(_HOST, o) for o in ops)),
+                  operand=lambda ops: all(re.match(_PLAIN_HOST, o) for o in ops)),
+    "nslookup": _plain(operand=lambda ops: all(re.match(_PLAIN_HOST, o) for o in ops)),
     "sha256sum": _plain(short="bt"),
     "md5sum": _plain(short="bt"),
     "sort": _plain(short="nrubdfghMVsc", valued={"k": r"^[\d.,nrb]+$", "t": r"^.$"}),
@@ -712,9 +712,9 @@ PLAIN_PROGRAMS = {
     "false": _plain(max_operands=0),
     "curl": _plain(short="sSfLI", valued={"H": r"^[^\n\r@]+$", "X": r"^(?:GET|HEAD)$"},
                    long=("--silent", "--show-error", "--fail", "--location", "--head"),
-                   longv={"--max-time": _NUM, "--connect-timeout": _NUM, "--retry": r"^\d+$",
+                   longv={"--max-time": _PLAIN_NUM, "--connect-timeout": _PLAIN_NUM, "--retry": r"^\d+$",
                           "--header": r"^[^\n\r@]+$", "--request": r"^(?:GET|HEAD)$"},
-                   operand=lambda ops: all(re.match(_URL, o) for o in ops)),
+                   operand=lambda ops: all(re.match(_PLAIN_URL, o) for o in ops)),
 }
 def _val_ok(rx, v):
     return "\0" not in v and (rx is None or bool(re.match(rx, v)))
@@ -832,14 +832,14 @@ _AWK_LIKE = re.compile(r"^(?:awk|gawk|mawk|sed)$")
 _RUNNERS = re.compile(r"^(?:deno|bun)$")
 
 
-def _script_args(name, args):
+def _script_args(name, args, loaders=True):
     """-> ("file", [candidate paths]) | ("inline", None) | ("stdin", None) | ("none", None)
     for the arguments of a recognised interpreter."""
     spec = next((x for x in SCRIPT_INTERPRETERS if x[0].match(name)), None)
     is_awk = bool(_AWK_LIKE.match(name))
     if spec is None and not is_awk and not _RUNNERS.match(name):
         return None
-    lo = _loader_opts(name)
+    lo = _loader_opts(name) if loaders else set()
     if _RUNNERS.match(name):
         # deno run [opts] file | deno eval ... | bun [run] file
         sub = args[0] if args else ""
@@ -1179,6 +1179,10 @@ def _analyze(argv, depth=0, trace=None):
             found2, good = _shell_string(payload, depth + 1)
             merge(found2)
             return out, good
+        if kind == "unknown":                               # still report the script file(s), if any
+            again = _script_args(name, args, False)
+            if again and again[0] == "file":
+                merge((q, False) for q in again[1])
         return out, False                                   # other inline code, unknown options, bare sed/awk
     if a0.endswith(_SCRIPT_EXT) or ("/" in a0 and not _in_system_bin(a0)):
         add(a0, True)                                       # the command is itself a script file

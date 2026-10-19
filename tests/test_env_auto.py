@@ -445,7 +445,7 @@ class EnvGrants(tg.Base):
 from secret_broker import scripts as scripts_mod  # noqa: E402
 
 FLAGGED = (["bash", "deploy.sh"], ["python3", "x.py"], ["./run.sh"], ["sudo", "-u", "x", "bash", "y.sh"],
-           ["env", "A=1", "node", "app.js"], ["/opt/tools/run"], ["deploy.sh"], ["bash"])
+           ["env", "LANG=C", "node", "app.js"], ["/opt/tools/run"], ["deploy.sh"], ["bash"])
 NOT_FLAGGED = (["bash", "-c", "echo hi"], ["python3", "-c", "print(1)"], ["python3", "-m", "http.server"],
                ["curl", "-s", "https://example.com"], ["git", "status"], ["docker", "compose", "up"],
                ["/usr/bin/curl", "x"], ["echo", "hi"], ["sed", "s/a/b/"])
@@ -472,7 +472,7 @@ class ArgvRunsScript(unittest.TestCase):
         self.assertTrue(scripts_mod.script_not_visible(["bash", "other.sh"], ok))
         self.assertTrue(scripts_mod.script_not_visible(["bash", "deploy.sh"], []))
         self.assertTrue(scripts_mod.script_not_visible(["bash", "deploy.sh"], None))
-        self.assertFalse(scripts_mod.script_not_visible(["curl", "x"], None))
+        self.assertFalse(scripts_mod.script_not_visible(["cat", "x"], None))
 
 
 class OmittedScripts(EnvAutoBase):
