@@ -107,6 +107,8 @@ HIDDEN = frozenset({
     "push_test", "ha_decide_dropped",
     # server-identity policy (a key's allowed_hosts) is approval context
     "ssh_sign_refused",
+    # notification holding while the approver has a page open: presence is approval context
+    "notify_held", "notify_released", "notify_dropped",
 })
 
 def error_class(text):

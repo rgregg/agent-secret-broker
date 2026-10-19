@@ -224,10 +224,33 @@ def parse_ha_hook(raw, read_secret):
     return {"key": key, "allowed_devices": list(devs)}
 
 
+TRANSPORT_TYPE_ATTR = "type_name"        # a transport's config `type`; see transport_type()
+
+
+def transport_type(transport):
+    """The config `type` of a transport ("ticker", "telegram", "webpush"), or None."""
+    return getattr(getattr(transport, "wrapped", transport), TRANSPORT_TYPE_ATTR, None)
+
+
+def send_to(transports, n):
+    """Deliver `n` to just these (leaf) transports, with MultiNotifier's rule:
+    NotifyError if none of them succeeded."""
+    errors, ok = [], 0
+    for t in transports:
+        try:
+            t.send(n.for_transport(t))
+            ok += 1
+        except (NotifyError, OSError) as e:
+            errors.append(f"{type(getattr(t, 'wrapped', t)).__name__}: {e}")
+    if not ok:
+        raise NotifyError("; ".join(errors) or "no transports configured")
+
+
 class TickerNotifier:
     """ticker.notify. With `actions_enabled` (the broker has an `ha_hook`) it
     can render Approve/Deny buttons whose action id is
     `ASB|<decision>|<rid>|<token>`; without a hook it supports no actions."""
+    type_name = "ticker"
 
     def __init__(self, ha_url, ha_token, category="general", timeout=15, actions_enabled=False):
         self.supports_actions = ("approve", "deny") if actions_enabled else ()
@@ -289,6 +312,7 @@ class TelegramNotifier:
     bypass the SSO-gated page. Error text never includes the bot token (it is
     part of the API URL).
     """
+    type_name = "telegram"
 
     def __init__(self, bot_token, chat_id, api_base="https://api.telegram.org", timeout=15):
         self._base = f"{api_base.rstrip('/')}/bot{bot_token}"
@@ -400,12 +424,13 @@ def build(cfg, read_secret, push_store=None):
 class FakeNotifier:
     """Test double: records sends, optionally auto-decides via a callback."""
 
-    def __init__(self, on_send=None, supports_actions=()):
+    def __init__(self, on_send=None, supports_actions=(), type_name=None):
         self.sent = []
         self.notifications = []         # the Notification objects, parallel to `sent`
         self.resolutions = []           # (tag, status)
         self.resolved_notifications = []
         self.supports_actions = tuple(supports_actions)
+        self.type_name = type_name      # which `type` this double stands in for (presence hold)
         self._on_send = on_send
 
     def send(self, n):

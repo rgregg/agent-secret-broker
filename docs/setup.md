@@ -108,6 +108,10 @@ Add transports under `notify`; a request counts as delivered if any one works.
   (needs the Ticker integration).
 - **Telegram**: `{"type": "telegram", "bot_token_file": "...", "chat_id": "..."}`.
 
+While you have an approval page open and visible, notifications are held back and sent only
+if you leave or after 60 s (`notify_presence`; see the reference). To always send immediately
+set `"notify_presence": {"enabled": false}`; to never send as a fallback set `"fallback_s": null`.
+
 Use Web Push *and* a phone transport if you can: a browser that is fully quit
 cannot receive a push until it starts again.
 

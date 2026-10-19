@@ -21,6 +21,7 @@ import http.client
 import ipaddress
 import json
 import os
+import queue
 import re
 import secrets
 import ssl
@@ -35,6 +36,7 @@ from .audit import AuditLog
 from .backends import BackendError
 from . import audit_api
 from . import notify as notify_mod
+from . import presence as presence_mod
 from .notify import NotifyError
 from . import grants as grants_mod
 from . import guidance as guidance_mod
@@ -125,6 +127,9 @@ class Request:
         self.approver = None
         self.action_hash = None   # sha256 of the push-button token; None once spent
         self.notification = None  # the Notification sent for this request
+        self._notify_state = "none"   # none|queued|sending|done: the send job (see _notify_job)
+        self._resolve_after = None    # status to announce when the in-flight send finishes
+        self._sent_to = None      # leaf transports that sent it; None = all (presence hold)
         self.offered = frozenset()  # action ids offered on any token-carrying transport
         self.done = threading.Event()
 
@@ -164,6 +169,20 @@ class Broker:
                 os.path.join(os.path.dirname(os.path.abspath(self._audit._path)), "request_details.db"),
                 self.details_cfg, self.log)
             self.details.start()
+        self.presence_cfg = presence_mod.parse_config(config.get("notify_presence"))
+        self.presence_clock = time.time         # injectable (tests)
+        self.presence = presence_mod.Presence(self.presence_cfg["ttl_s"],
+                                              clock=lambda: self.presence_clock())
+        self.presence_tick_s = 2.0
+        self._presence_autostart = True         # tests drive presence_tick() themselves
+        self._held = {}                         # rid -> held notification; in memory only
+        self._held_lock = threading.Lock()
+        self._presence_thread = None
+        self._nq = queue.Queue()                # notification sends, run off the request thread
+        self._nq_cv = threading.Condition()
+        self._nq_pending = 0
+        self._nq_threads = 0
+        self._presence_rate = {}                # user -> {"t","n"}; <= RATE_MAP_CAP
         self._csrf_key = secrets.token_bytes(32)    # per process: tokens die with a restart
         self._lock = threading.Lock()
         self._by_id = {}
@@ -1075,15 +1094,221 @@ class Broker:
         req.offered = frozenset(a.id for a in n.actions) if n.action_token else frozenset()
         if n.action_token:                          # only its hash is kept
             req.action_hash = hashlib.sha256(n.action_token.encode()).digest()
+        # Sends never run on the request thread: the agent's create call returns at the same
+        # speed whether anything is held, sent at once, or slow (see _notify_job).
+        held = self._presence_hold_set(req)
+        if held:
+            self._hold(req, n, held)
+        else:
+            req._notify_state = "queued"
+            self._notify_submit(lambda: self._notify_job(req, n, None))
+
+    # -- asynchronous dispatch ------------------------------------------------
+    NOTIFY_WORKERS = 8
+
+    def _notify_submit(self, job):
+        with self._nq_cv:
+            self._nq_pending += 1
+            start = self._nq_threads < self.NOTIFY_WORKERS
+            if start:
+                self._nq_threads += 1
+        self._nq.put(job)
+        if start:
+            threading.Thread(target=self._notify_worker, daemon=True).start()
+
+    def _notify_worker(self):
+        while True:
+            job = self._nq.get()
+            try:
+                job()
+            except Exception:           # noqa: BLE001 -- never raises
+                pass
+            finally:
+                with self._nq_cv:
+                    self._nq_pending -= 1
+                    self._nq_cv.notify_all()
+
+    def flush_notifications(self, timeout=10.0):
+        """Wait until every queued notification send has finished (tests, shutdown).
+        True if the queue drained within `timeout`."""
+        end = time.time() + timeout
+        with self._nq_cv:
+            while self._nq_pending:
+                left = end - time.time()
+                if left <= 0:
+                    return False
+                self._nq_cv.wait(left)
+        return True
+
+    def _notify_job(self, req, n, rest):
+        """Send `n` now: to every transport (rest None) or just `rest` (the others are held).
+        Runs on a worker. Nothing is sent for a request that settled while queued."""
         try:
-            self.notifier.send(n)
-        except BaseException:
+            with self._held_lock:
+                if req.status != "pending":
+                    req._notify_state = "done"
+                    req._resolve_after = None   # never sent: nothing to resolve
+                    return
+                req._notify_state = "sending"
+            ok = True
+            try:
+                if rest is None:
+                    self.notifier.send(n)
+                else:
+                    notify_mod.send_to(rest, n)
+            except Exception as e:      # noqa: BLE001
+                ok, err = False, e
+            if ok:
+                self.audit("notified", req)
+            elif rest is None:          # nothing delivered and nothing held: fail like a sync send
+                self._fail_notify(req, err)
+        finally:
+            with self._held_lock:
+                req._notify_state = "done"
+                later = req._resolve_after
+                req._resolve_after = None
+            if later:                   # settled while the send was in flight
+                self._call_resolved(req, later)
+
+    def _fail_notify(self, req, err):
+        with self._lock:                # same claim a decision makes: one of the two wins
+            if req.status != "pending":
+                return
+            req.status = "deciding"
             req.action_hash = None
-            raise
-        self.audit("notified", req)
+        self._finish(req, "failed", error=f"could not notify: {err}")
+
+    # -- presence: hold phone notifications while an approval page is open ----
+    # Every request is treated alike (SSH signing and high risk included): while
+    # the approver is looking at the page, a buzz adds nothing. A held
+    # notification is released when presence lapses or `fallback_s` after the
+    # request was created, so an unattended open tab cannot swallow a request.
+    def _presence_hold_set(self, req):
+        """The leaf transports to hold for this request ([] = send everything now)."""
+        pc = self.presence_cfg
+        if not pc["enabled"] or not pc["transports"]:
+            return []
+        fb = pc["fallback_s"]
+        if fb is not None and req.expires - self.presence_clock() < fb + presence_mod.MIN_LIFE_MARGIN_S:
+            return []           # would expire (nearly) before the fallback could fire
+        if not self.presence.present(self.cfg.get("allowed_user")):
+            return []
+        return [t for t in notify_mod.leaves(self.notifier)
+                if notify_mod.transport_type(t) in pc["transports"]]
+
+    def _hold(self, req, n, held):
+        rest = [t for t in notify_mod.leaves(self.notifier) if all(t is not h for h in held)]
+        req._sent_to = list(rest)
+        with self._held_lock:
+            self._held[req.id] = {"req": req, "n": n, "leaves": list(held),
+                                  "created": req.created}
+        self.audit("notify_held", req, transports=sorted(
+            {notify_mod.transport_type(t) or "?" for t in held}), reason="presence")
+        self._presence_start()
+        if rest:
+            req._notify_state = "queued"
+            self._notify_submit(lambda: self._notify_job(req, n, rest))
+
+    def _presence_start(self):
+        if not self._presence_autostart or self._presence_thread is not None:
+            return
+        with self._held_lock:
+            if self._presence_thread is not None:
+                return
+            self._presence_thread = threading.Thread(target=self._presence_loop, daemon=True)
+        self._presence_thread.start()
+
+    def _presence_loop(self):
+        while True:
+            time.sleep(self.presence_tick_s)
+            self.presence_tick()
+
+    def presence_tick(self):
+        """Release or drop held notifications. Never raises."""
+        try:
+            with self._held_lock:
+                items = list(self._held.values())
+            if not items:
+                return
+            now = self.presence_clock()
+            present = self.presence.present(self.cfg.get("allowed_user"))
+            fb = self.presence_cfg["fallback_s"]
+            for h in items:
+                try:
+                    req = h["req"]
+                    if req.status == "deciding":
+                        continue
+                    if req.status != "pending" or now > req.expires:
+                        self._drop_held(req, req.status if req.status != "pending" else "expired")
+                    elif not present:
+                        self._release_held(req, "presence_lapsed")
+                    elif fb is not None and now - h["created"] >= fb:
+                        self._release_held(req, "fallback")
+                except Exception:       # noqa: BLE001 -- one request must not stop the others
+                    pass
+        except Exception:               # noqa: BLE001
+            pass
+
+    def _drop_held(self, req, outcome):
+        """The request settled while held: forget the notification, never send it late."""
+        with self._held_lock:
+            h = self._held.pop(req.id, None)
+        if h is not None:
+            self.audit("notify_dropped", req, outcome=outcome)
+
+    def _release_held(self, req, reason):
+        with self._held_lock:
+            h = self._held.pop(req.id, None)
+        if h is None:
+            return
+        leaves = h["leaves"]
+        req._sent_to = list(getattr(req, "_sent_to", None) or []) + leaves
+        self.audit("notify_released", req, reason=reason, transports=sorted(
+            {notify_mod.transport_type(t) or "?" for t in leaves}))
+        try:
+            notify_mod.send_to(leaves, h["n"])
+        except (NotifyError, OSError) as e:
+            if not req._sent_to[:-len(leaves)]:         # nothing was ever delivered
+                self._finish(req, "failed", error=f"could not notify: {e}")
+        else:
+            self.audit("notified", req)
+        if req.status not in ("pending", "deciding"):   # settled while sending
+            for t in leaves:
+                fn = getattr(t, "resolved", None)
+                if fn:
+                    try:
+                        fn(h["n"], req.status)
+                    except Exception:   # noqa: BLE001
+                        pass
+
+    def presence_beat(self, user, visible, tab, peer=None):
+        """Record a heartbeat from the approval page. False: rate limited."""
+        now = time.time()
+        with self._held_lock:
+            st = self._presence_rate.get(user)
+            if st is None:
+                self.rate_map_make_room(self._presence_rate, now)
+                st = self._presence_rate[user] = {"t": now, "n": 0}
+            if now - st["t"] >= 60:
+                st.update(t=now, n=0)
+            st["n"] += 1
+            if st["n"] > self.PRESENCE_LIMIT_PER_MIN:
+                return False
+        self.presence.beat(user, visible, tab)
+        return True
+
+    PRESENCE_LIMIT_PER_MIN = 120
 
     def _resolved(self, req, status):
         """Tell the transport the request is settled (e.g. edit the chat message)."""
+        self._drop_held(req, status)
+        with self._held_lock:
+            if req._notify_state in ("queued", "sending"):
+                req._resolve_after = status     # the send job calls resolved once it is done
+                return
+        self._call_resolved(req, status)
+
+    def _call_resolved(self, req, status):
         fn = getattr(self.notifier, "resolved", None)
         if fn is None or req.mode is None:
             return
@@ -1092,11 +1317,22 @@ class Broker:
             risk=req.risk["level"] if req.risk else None, url="", source=req.source,
             summary=req.summary, expires_at=req.expires)
 
+        sent_to = getattr(req, "_sent_to", None)    # None: every transport got it
+
         def run():
-            try:
-                fn(n, status)
-            except Exception:
-                pass
+            if sent_to is None:
+                try:
+                    fn(n, status)
+                except Exception:
+                    pass
+                return
+            for t in sent_to:                       # never tell a transport that did not send
+                one = getattr(t, "resolved", None)
+                if one:
+                    try:
+                        one(n, status)
+                    except Exception:
+                        pass
         threading.Thread(target=run, daemon=True).start()
 
     def _expire_locked(self):
@@ -1914,6 +2150,28 @@ function asbOpenKeys(root){var o=[];asbDetailKeys(root,function(d,k){if(d.open)o
 function asbReopen(root,keys){asbDetailKeys(root,function(d,k){if(keys.indexOf(k)>=0)d.open=true;});}
 '''
 
+# Presence heartbeat: POST /presence while this tab is visible (and focused, when the broker
+# is configured with require_focus). The config object is prepended by _page().
+_PRESENCE_JS = r'''
+(function(){
+  var cfg=window.ASB_PRESENCE||{}, every=cfg.every||10000, dead=false, was=false, timer=null,
+      tab=(Math.random().toString(36).slice(2,10)+Date.now().toString(36)).slice(0,24);
+  function vis(){try{return document.visibilityState==='visible'&&(!cfg.focus||document.hasFocus());}
+    catch(e){return false;}}
+  function beat(v){if(dead)return;try{
+    fetch('/presence',{method:'POST',credentials:'same-origin',keepalive:true,redirect:'manual',
+      headers:{'Content-Type':'application/json','X-Requested-With':'asb'},
+      body:JSON.stringify({v:v,tab:tab})}).then(function(r){
+        if(r&&r.status===404)dead=true;}).catch(function(){});}catch(x){}}
+  function sync(){var v=vis();if(v){beat(true);was=true;}else if(was){beat(false);was=false;}}
+  function tick(){if(vis()){beat(true);was=true;}}
+  document.addEventListener('visibilitychange',sync);
+  window.addEventListener('focus',sync);window.addEventListener('blur',sync);
+  window.addEventListener('pagehide',function(){if(was){beat(false);was=false;}});
+  sync();timer=setInterval(function(){if(dead)clearInterval(timer);else tick();},every);
+})();
+'''
+
 _DASH_JS = r'''
 (function(){
   var lastRep={};
@@ -2381,6 +2639,9 @@ def _chrome(tab, badge, user):
 def _page(h, code, body, wide=False, nav=True, script=None, tab=None, badge=0, user=""):
     nonce = secrets.token_urlsafe(16)
     scr = f"<script nonce='{nonce}'>{script}</script>" if script else ""
+    pcfg = getattr(h, "presence_page_cfg", None) if nav else None
+    if pcfg:            # enabled: every approval page sends the presence heartbeat
+        scr += (f"<script nonce='{nonce}'>window.ASB_PRESENCE={json.dumps(pcfg)};{_PRESENCE_JS}</script>")
     csp = ("default-src 'none'; style-src 'unsafe-inline'; img-src data:; form-action 'self'; connect-src 'self'; "
            f"base-uri 'none'; frame-ancestors 'none'; worker-src 'self'; script-src 'nonce-{nonce}'")
     raw = ("<!doctype html><html lang=en><meta charset=utf-8>"
@@ -2809,6 +3070,11 @@ def approval_handler(broker):
         def log_message(self, *a):
             pass
 
+        @property
+        def presence_page_cfg(self):
+            pc = broker.presence_cfg
+            return {"every": 10000, "focus": pc["require_focus"]} if pc["enabled"] else None
+
         def _fwd(self):
             """Client IP as reported by the proxy chain. Informational: it is
             only as trustworthy as the proxies in front of this listener."""
@@ -3052,6 +3318,8 @@ def approval_handler(broker):
                   f"{html.escape(auto[0].upper() + auto[1:])}."
                   " Applies only to secrets set to always allow; set in the broker config "
                   "(risk.auto_approve_max).</small></div></div>"
+                  "<div class=srow><div class=t><b>Notifications</b><small class=muted>"
+                  f"{html.escape(presence_mod.describe(broker.presence_cfg))}</small></div></div>"
                   "<div class=srow><div class=t><b>Time-boxed grants</b><small class=muted>"
                   f"{html.escape(grants_mod.describe(broker.grants_cfg))}. "
                   "Set in the broker config (timed_grants).</small></div></div></section>"
@@ -3336,6 +3604,39 @@ def approval_handler(broker):
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
 
+        def _presence(self, user):
+            """POST /presence {"v": bool, "tab": "<id>"}: the page is (not) visible. Same guard
+            as /push/event; only this SSO listener can reach it, never the client API."""
+            try:
+                n = int(self.headers.get("Content-Length", 0))
+            except ValueError:
+                n = -1
+            ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            if (self.headers.get("X-Requested-With") != "asb" or ctype != "application/json"
+                    or not self._same_origin()):
+                self.close_connection = True
+                return self._json(403, {"ok": False})
+            if n < 0 or n > 256:
+                self.close_connection = True
+                return self._json(413, {"ok": False})
+            try:
+                body = json.loads(self.rfile.read(n).decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                body = None
+            tab = body.get("tab", "") if isinstance(body, dict) else None
+            if (not isinstance(body, dict) or not isinstance(body.get("v"), bool)
+                    or not isinstance(tab, str) or (tab and not presence_mod.TAB_RE.match(tab))):
+                return self._json(400, {"ok": False})
+            if not broker.presence_cfg["enabled"]:
+                self.send_response(204)         # nothing is held: accept and ignore
+                self.send_header("Cache-Control", "no-store")
+                return self.end_headers()
+            if not broker.presence_beat(user, body["v"], tab, self.client_address[0]):
+                return self._json(429, {"ok": False})
+            self.send_response(204)
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+
         def _push_decide(self, user):
             ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
             try:
@@ -3372,6 +3673,8 @@ def approval_handler(broker):
                 return
             if self.path.split("?")[0].rstrip("/") == "/push/event":
                 return self._client_event(user)
+            if self.path.split("?")[0].rstrip("/") == "/presence":
+                return self._presence(user)
             if self.path.split("?")[0].rstrip("/") == "/push/decide":
                 return self._push_decide(user)
             path = self.path.split("?")[0].rstrip("/")
