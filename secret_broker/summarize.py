@@ -14,6 +14,8 @@ import json
 import urllib.parse
 import urllib.request
 
+from . import guidance as guidance_mod
+
 SYSTEM = (
     "You label API requests for a human approver. Reply with ONLY a JSON "
     'object: {"summary": "<=12 words saying what the request does", '
@@ -61,13 +63,14 @@ class OpenRouterSummarizer:
         self._key, self._model, self._timeout = api_key, model, timeout
         self._max, self._send, self._base = max_content_chars, send_content, base_url.rstrip("/")
 
-    def analyze(self, mode, names, spec):
+    def analyze(self, mode, names, spec, guidance=None):
         """Return {"summary": str|None, "risk": "low|medium|high"|None, "summary_model": str}, or None
         on any failure. A non-JSON reply is treated as a bare summary."""
+        extra = guidance_mod.prompt_sections(guidance)
         payload = {
             "model": self._model,
             "messages": [
-                {"role": "system", "content": SYSTEM},
+                {"role": "system", "content": SYSTEM + ("\n\n" + extra if extra else "")},
                 {"role": "user", "content": describe(mode, names, spec, self._max, self._send)},
             ],
             "max_tokens": 200,

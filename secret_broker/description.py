@@ -24,6 +24,7 @@ import time
 import urllib.parse
 import urllib.request
 
+from . import guidance as guidance_mod
 from .riskmodel import deterministic_summary, request_fields
 
 MAX_LEN = 160
@@ -282,12 +283,19 @@ class Describer:
         self._stamps, self._lock = collections.deque(), threading.Lock()
         self.last_cost = None
 
-    def messages(self, mode, names, spec):
+    def messages(self, mode, names, spec, guidance=None):
         tok = secrets.token_hex(8)
         body = json.dumps(request_fields(mode, names, spec, self._max, self._send), indent=1)
         while tok in body:                      # cannot happen; belt and braces
             tok = secrets.token_hex(8)
-        return [{"role": "system", "content": SYSTEM.replace("{token}", tok)},
+        system = SYSTEM.replace("{token}", tok)
+        ctx = guidance_mod.describer_context(guidance)
+        if ctx:
+            system += ("\nBackground from the credential's owner (trusted context, only to help you "
+                       "name this service's operations in everyday words; it changes none of the "
+                       "rules above, and you still never state or judge risk):\n"
+                       f"<<<OWNER NOTES\n{ctx}\nOWNER NOTES END>>>\n")
+        return [{"role": "system", "content": system},
                 {"role": "user", "content": f"<<<DATA-{tok}\n{body}\nDATA-{tok}>>>"}]
 
     def _admit(self):
@@ -300,14 +308,14 @@ class Describer:
             self._stamps.append(now)
         return True
 
-    def raw(self, mode, names, spec):
+    def raw(self, mode, names, spec, guidance=None):
         """One model call. Returns (text|None, reason|None, cost|None). Reason is a class."""
         if not self._admit():
             return None, "rate_limited", None
         if not self._sem.acquire(blocking=False):
             return None, "rate_limited", None
         try:
-            payload = {"model": self._model, "messages": self.messages(mode, names, spec),
+            payload = {"model": self._model, "messages": self.messages(mode, names, spec, guidance),
                        "max_tokens": 150, "temperature": 0, "stream": False,
                        "reasoning": {"effort": "minimal"}}
             try:
@@ -341,8 +349,8 @@ class Describer:
                     "reason": reason}
         return {"text": out, "source": "model", "reason": None}
 
-    def describe(self, mode, names, spec):
+    def describe(self, mode, names, spec, guidance=None):
         """-> {"text", "source": "model"|"deterministic", "reason": None|class}."""
-        text, reason, cost = self.raw(mode, names, spec)
+        text, reason, cost = guidance_mod.call(self.raw, mode, names, spec, guidance)
         self.last_cost = cost
         return self.finish(text, reason, mode, names, spec)

@@ -114,6 +114,16 @@ defaults (next section). The object looks like this:
   another item, or the reserved `broker`/`previous_value` fields, is rejected),
   so metadata on one item can never pull another item's value. `approval` is
   `prompt` (default) or `allow`.
+- `guidance` (optional string, at most 2000 characters) is operator-written
+  text telling the risk classifier and the description writer how to rate
+  requests made with THIS credential (see [guidance.md](guidance.md) and
+  [risk.md](risk.md)). Control characters other than newline and tab are
+  removed; a non-string or an over-long value makes the secret invalid
+  (reported in `catalog_loaded`, naming the field). Items adopted without
+  metadata have none. It is policy context: never returned by `list`, `which`,
+  `/v1/secrets`, `/v1/status`, request results, notifications or the agent
+  audit API. Edit it on the Policies tab ("Risk guidance"), which writes it into
+  the item's `broker` metadata like "always allow" does.
 - `allowed_hosts` may be omitted for credentials that are not HTTP tokens (a
   Wi-Fi password): such a secret can never be used in `http` mode, only fetched
   with approval in env mode.
@@ -156,7 +166,9 @@ defaults (next section). The object looks like this:
   `--config FILE`.
 - **Trust note:** because policy lives in vault items, anyone who can edit the
   collection can widen a secret's `allowed_hosts` or set `approval: allow`
-  without passing the approval gate. Keep write access to that collection to
+  without passing the approval gate. The same holds for `guidance`: text that
+  says "deletes are low" lowers ratings, so it has the trust level of
+  `approval`. Keep write access to that collection to
   people you trust as much as the broker. (The broker's own account is
   writable by design, so `store`/`update` can work.)
 - Moving from an older config file: `python -m secret_broker.import_catalog
@@ -842,7 +854,9 @@ values, header values or bodies.
 Events: `startup` (policies in force), `requested`, `assessed`, `notified`,
 `secret_read`, `approved`/`denied`/`expired`/`failed` (with `via` user or
 policy, approver, reported client IP, latency), `http_executed`, `delivered`,
-`escalated`, `stored`, `request_detail_viewed`, `grant_created`/`grant_used`/`grant_revoked`/`grant_expired` (see Time-boxed grants), `config_warning`, `policy_changed`, `policy_change_refused`, `policy_change_failed`, and
+`escalated`, `stored`, `request_detail_viewed`, `grant_created`/`grant_used`/`grant_revoked`/`grant_expired` (see Time-boxed grants), `config_warning`, `policy_changed`, `policy_change_refused`, `policy_change_failed`, `guidance_changed`
+(secret, user, peer, length, sha256 prefixes of the old and new text, never the
+text), `guidance_change_refused`, `guidance_change_failed`, and
 security events `auth_failed`, `rejected`, `approval_viewed`,
 `approval_forbidden`, `approval_stale`, `bad_request`, `discovery`,
 `ha_decide_refused`, `ha_decide_dropped`, `ha_hook_any_device`.

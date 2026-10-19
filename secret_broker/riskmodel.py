@@ -28,6 +28,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from . import guidance as guidance_mod
 from . import summarize
 
 LEVELS = ("low", "medium", "high")
@@ -221,7 +222,9 @@ class JevAnalyzer:
         self._summary_mode, self._describer = summary_mode, describer
         self.last_cost = None
 
-    def payload(self, mode, names, spec):
+    def payload(self, mode, names, spec, guidance=None):
+        extra = guidance_mod.prompt_sections(guidance)
+        extra = extra + "\n\n" if extra else ""
         return {
             "model": self._model,
             "state": {
@@ -231,17 +234,17 @@ class JevAnalyzer:
             },
             "questions": {"risk": {
                 "type": "choice",
-                "instructions": RUBRIC + "\nQuestion: which level (low, medium or high) fits the "
+                "instructions": RUBRIC + "\n" + extra + "Question: which level (low, medium or high) fits the "
                                 "request in the state?",
                 "criteria": CRITERIA,
             }},
         }
 
-    def classify(self, mode, names, spec):
+    def classify(self, mode, names, spec, guidance=None):
         """Return (level|None, cost|None). Never raises."""
         try:
             resp = _post_json(f"{self._base}/alpha/decisions", self._key,
-                              self.payload(mode, names, spec), self._timeout)
+                              self.payload(mode, names, spec, guidance), self._timeout)
         except Exception:  # noqa: BLE001  (HTTP error, timeout, bad JSON, ...)
             return None, None
         cost = None
@@ -254,18 +257,18 @@ class JevAnalyzer:
         except Exception:  # noqa: BLE001
             return None, cost
 
-    def analyze(self, mode, names, spec):
+    def analyze(self, mode, names, spec, guidance=None):
         """The level comes from classify() alone. The description (display only)
         is produced independently and can never change it."""
         src = reason = None
         if self._summary_mode == "chat" and self._describer is not None:
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-                fut = ex.submit(self._describe, mode, names, spec)
-                level, cost = self.classify(mode, names, spec)
+                fut = ex.submit(self._describe, mode, names, spec, guidance)
+                level, cost = self.classify(mode, names, spec, guidance)
                 d = fut.result()
             summary, src, reason = d["text"], d["source"], d["reason"]
         else:
-            level, cost = self.classify(mode, names, spec)
+            level, cost = self.classify(mode, names, spec, guidance)
             if self._summary_mode == "none":
                 summary = None
             else:
@@ -276,9 +279,9 @@ class JevAnalyzer:
                 "summary_model": (getattr(self._describer, "_model", None)
                                   if src == "model" else None)}
 
-    def _describe(self, mode, names, spec):
+    def _describe(self, mode, names, spec, guidance=None):
         try:
-            return self._describer.describe(mode, names, spec)
+            return guidance_mod.call(self._describer.describe, mode, names, spec, guidance)
         except Exception:  # noqa: BLE001
             return {"text": deterministic_summary(mode, names, spec), "source": "deterministic",
                     "reason": "error"}
@@ -297,17 +300,19 @@ class ChatAnalyzer(summarize.OpenRouterSummarizer):
         self._prompt = prompt
         self.last_cost = None
 
-    def _messages(self, mode, names, spec):
+    def _messages(self, mode, names, spec, guidance=None):
+        extra = guidance_mod.prompt_sections(guidance)
+        extra = extra + "\n\n" if extra else ""
         if self._prompt == "rubric":
-            system = (RUBRIC + '\nReply with ONLY a JSON object: {"summary": "<=12 words saying what '
+            system = (RUBRIC + "\n" + extra + 'Reply with ONLY a JSON object: {"summary": "<=12 words saying what '
                       'the request does", "risk": "low|medium|high"}.')
             return [{"role": "system", "content": system},
                     {"role": "user", "content": chat_user_text(mode, names, spec, self._max, self._send)}]
-        return [{"role": "system", "content": summarize.SYSTEM},
+        return [{"role": "system", "content": summarize.SYSTEM + (" " + extra.rstrip() if extra else "")},
                 {"role": "user", "content": summarize.describe(mode, names, spec, self._max, self._send)}]
 
-    def analyze(self, mode, names, spec):
-        payload = {"model": self._model, "messages": self._messages(mode, names, spec),
+    def analyze(self, mode, names, spec, guidance=None):
+        payload = {"model": self._model, "messages": self._messages(mode, names, spec, guidance),
                    "max_tokens": 200, "temperature": 0, "reasoning": {"effort": "minimal"}}
         try:
             resp = _post_json(f"{self._base}/chat/completions", self._key, payload, self._timeout)
@@ -341,11 +346,11 @@ class FloorAnalyzer:
     def __init__(self, inner):
         self.inner = inner
 
-    def analyze(self, mode, names, spec):
+    def analyze(self, mode, names, spec, guidance=None):
         if mode == "ssh_sign":
             return {"summary": deterministic_summary(mode, names, spec), "risk": "high",
                     "cost": None, "summary_source": "deterministic", "summary_reason": None}
-        return self.inner.analyze(mode, names, spec)
+        return guidance_mod.call(self.inner.analyze, mode, names, spec, guidance)
 
     def summarize(self, mode, names, spec):
         return (self.analyze(mode, names, spec) or {}).get("summary")

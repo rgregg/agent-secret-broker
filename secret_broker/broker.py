@@ -37,6 +37,7 @@ from . import audit_api
 from . import notify as notify_mod
 from .notify import NotifyError
 from . import grants as grants_mod
+from . import guidance as guidance_mod
 from . import risk as risk_mod
 from . import sshkey
 from . import structured
@@ -251,9 +252,14 @@ class Broker:
             vars_[var] = {"item": item, "field": field}
             if ref.get("key"):
                 vars_[var]["key"] = str(ref["key"])
-        return name, {**meta, "vars": vars_, "allowed_hosts": [h.lower() for h in hosts],
-                      "approval": approval, "_item": item, "_meta": meta,
-                      "_tls": {"fingerprint": fp, "verify": verify}}
+        note = guidance_mod.from_meta(meta)      # policy context, never shown to agents
+        entry = {**meta, "vars": vars_, "allowed_hosts": [h.lower() for h in hosts],
+                 "approval": approval, "_item": item, "_meta": meta,
+                 "_tls": {"fingerprint": fp, "verify": verify}}
+        entry.pop("guidance", None)
+        if note:
+            entry["guidance"] = note
+        return name, entry
 
     @staticmethod
     def _auto_meta(item, info):
@@ -506,6 +512,51 @@ class Broker:
                  client_ip=client_ip, request_id=request_id)
         return True
 
+    def _persist_guidance(self, name, text, user):
+        """Write the guidance into the item's broker metadata in the vault (the same
+        path as _persist_approval); empty text removes the key."""
+        sc = self.cfg["secrets"][name]
+        meta = {**sc["_meta"],
+                "guidance_changed": {"by": user, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}}
+        if text:
+            meta["guidance"] = text
+        else:
+            meta.pop("guidance", None)
+        self.backend.set_meta(sc["_item"], meta)
+        sc["_meta"] = meta
+
+    def set_guidance(self, name, text, user, peer=None, client_ip=None):
+        """Set (or, when empty, remove) a secret's risk guidance: vault first, then
+        memory. Returns True/False; raises ValueError for an unknown secret. The
+        audit events carry the length and hashes, never the text."""
+        if name not in self.cfg["secrets"]:
+            raise ValueError("bad guidance change")
+        who = dict(secret=name, user=user, peer=peer, client_ip=client_ip)
+        try:
+            if not isinstance(text, str) or len(text) > guidance_mod.MAX_LEN:
+                raise ValueError(f"guidance must be at most {guidance_mod.MAX_LEN} characters")
+            new = guidance_mod.clean(text)
+        except ValueError as e:
+            self.log("guidance_change_refused", reason=str(e)[:120], **who)
+            return False
+        with self._cfg_lock:
+            sc = self.cfg["secrets"][name]
+            old = sc.get("guidance") or ""
+            if old == new:
+                return True
+            try:
+                self._persist_guidance(name, new, user)
+            except (OSError, ValueError, KeyError, BackendError) as e:
+                self.log("guidance_change_failed", error=str(e)[:200], **who)
+                return False
+            if new:
+                sc["guidance"] = new
+            else:
+                sc.pop("guidance", None)
+        self.log("guidance_changed", length=len(new), old_sha256=guidance_mod.digest(old),
+                 new_sha256=guidance_mod.digest(new), **who)
+        return True
+
     # -- discovery (no approval, no push, no values) ----------------------
     def available(self, host=None):
         """Secrets usable for `host` in http mode. Names and placeholder
@@ -577,7 +628,9 @@ class Broker:
         if self.cfg.get("backend", {}).get("prewarm", True):
             # unlock while the human is reaching for their phone
             self.warm_backend()
-        a = risk_mod.assess(mode, names, spec, self.summarizer)
+        # ssh_sign never reaches a model, so it carries no guidance either
+        notes = {} if mode == "ssh_sign" else guidance_mod.for_names(self.cfg["secrets"], names)
+        a = risk_mod.assess(mode, names, spec, self.summarizer, guidance=notes or None)
         req.summary, req.risk = a["summary"], {k: a[k] for k in ("level", "model", "reasons")}
         req.summary_model = a.get("summary_model") if a.get("summary_source") != "deterministic" else None
         req.summary_source = a.get("summary_source")
@@ -2799,8 +2852,9 @@ def approval_handler(broker):
                   "<h3>Always allowed</h3>"
                   "<p><small class=muted>These secrets are released without asking when the request's "
                   f"risk is within the auto-approve limit ({_AUTO_LABEL[broker.auto_approve_max()]}). "
-                  "Revoke to ask every time again.</small></p>" + table,
-                  script=_GRANTS_JS, tab="policies", badge=len(broker.pending()), user=user)
+                  "Revoke to ask every time again.</small></p>" + table
+                  + guidance_mod.policies_section(cfg["secrets"], broker.csrf_token(user)),
+                  script=_GRANTS_JS + guidance_mod.JS, tab="policies", badge=len(broker.pending()), user=user)
 
         def _grants_section(self, user):
             """'Active grants' card on the Policies tab: who allowed what, time left, Revoke."""
@@ -2997,11 +3051,15 @@ def approval_handler(broker):
                 return self._client_event(user)
             if self.path.split("?")[0].rstrip("/") == "/push/decide":
                 return self._push_decide(user)
-            form = urllib.parse.parse_qs(
-                self.rfile.read(min(int(self.headers.get("Content-Length", 0)), 8192)).decode())
             path = self.path.split("?")[0].rstrip("/")
-            if path in ("/decide", "/policies", "/grants/revoke", "/push/subscribe", "/push/revoke",
-                        "/push/test") and not self._csrf_ok(user, form.get("csrf", [""])[0]):
+            # a guidance form can hold 2000 characters of percent-encoded text
+            limit = 40000 if path == "/policies/guidance" else 8192
+            if int(self.headers.get("Content-Length", 0)) > limit and path == "/policies/guidance":
+                return _page(self, 413, "<h1>Too large</h1>")
+            form = urllib.parse.parse_qs(
+                self.rfile.read(min(int(self.headers.get("Content-Length", 0)), limit)).decode())
+            if path in ("/decide", "/policies", "/policies/guidance", "/grants/revoke", "/push/subscribe",
+                        "/push/revoke", "/push/test") and not self._csrf_ok(user, form.get("csrf", [""])[0]):
                 broker.log("csrf_refused", path=path, peer=self.client_address[0],
                            client_ip=self._fwd(), origin=(self.headers.get("Origin") or "")[:80],
                            fetch_site=self.headers.get("Sec-Fetch-Site"))
@@ -3029,6 +3087,15 @@ def approval_handler(broker):
                 done = broker.revoke_grant(gid, user, self.client_address[0], self._fwd())
                 return self._policies_page(
                     user, f"<p>{'Grant revoked' if done else 'That grant is no longer active'}.</p>")
+            if path == "/policies/guidance":
+                name = form.get("name", [""])[0]
+                if name not in cfg["secrets"]:
+                    return _page(self, 400, "<h1>Bad request</h1>")
+                done = broker.set_guidance(name, form.get("guidance", [""])[0], user,
+                                           self.client_address[0], self._fwd())
+                return self._policies_page(
+                    user, f"<p>{'Guidance saved' if done else 'Could not save guidance'}: "
+                          f"{html.escape(name)}</p>")
             if self.path.split("?")[0].rstrip("/") == "/policies":
                 name = form.get("name", [""])[0]
                 # this page can only *tighten*: granting happens in the context of a request
