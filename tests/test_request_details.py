@@ -184,6 +184,66 @@ class CardTests(Base):
         self.assertNotIn("ghp_a", json.dumps(v))
 
 
+class JsonDisplay(unittest.TestCase):
+    WARN = "This JSON has duplicate keys or numbers that would change when formatted, so it is shown exactly as sent."
+
+    def view(self, body):
+        return D.build_view(spec({"Content-Type": "application/json"}, body=body))["body"]
+
+    def test_hazards_show_raw_with_warning(self):
+        cases = {
+            '{"op":"read","op":"delete"}': "duplicate keys",
+            '{"a":{"x":1,"y":2,"x":3}}': "duplicate keys",
+            '[{"k":1},{"k":1,"k":2}]': "duplicate keys",
+            '{"n":1.0000000000000001}': "unusual numbers",
+            '{"n":1e400}': "unusual numbers",
+            '{"n":123456789012345678901234567890}': "unusual numbers",
+            '{"n":NaN}': "unusual numbers",
+            '[-Infinity]': "unusual numbers",
+            '[Infinity]': "unusual numbers",
+        }
+        for raw, what in cases.items():
+            b = self.view(raw)
+            self.assertEqual(b["text"], raw, raw)
+            self.assertFalse(b["formatted"], raw)
+            self.assertIn(what, b["warn"], raw)
+            self.assertNotIn("raw", b)
+            page = D.html({"headers": [], "body": b, "ctype": "application/json"})
+            self.assertIn(self.WARN, page)
+            self.assertIn(what, page)
+            self.assertNotIn("formatted for display", page)
+            self.assertNotIn("Show as sent", page)
+
+    def test_both_warnings_named(self):
+        self.assertEqual(self.view('{"a":1,"a":2,"b":1e999}')["warn"], ["duplicate keys", "unusual numbers"])
+
+    def test_deep_nesting_falls_back_to_raw(self):
+        raw = "[" * 100000 + "]" * 100000
+        b = self.view(raw)       # too deep: must not raise
+        self.assertEqual(b["kind"], "text")
+        self.assertFalse(b["formatted"])
+        self.assertTrue(b["text"].startswith("[[[["))
+        self.assertNotIn("warn", b)
+
+    def test_clean_json_is_formatted_with_as_sent_toggle(self):
+        raw = '{"a":1,"b":[1.5,2],"c":0.1,"d":"x"}'
+        b = self.view(raw)
+        self.assertTrue(b["formatted"])
+        self.assertEqual(b["raw"], raw)
+        self.assertIn('  "a": 1', b["text"])
+        page = D.html({"headers": [], "body": b, "ctype": "application/json"})
+        self.assertIn("formatted for display", page)
+        self.assertIn("<details class=asent><summary>Show as sent</summary>", page)
+        self.assertNotIn("<details class=asent open", page)
+        self.assertNotIn(self.WARN, page)
+
+    def test_raw_is_capped_and_scrubbed_too(self):
+        b = self.view('{"password":"hunter2hunter2","k":"' + "v" * 5000 + '"}')
+        self.assertNotIn("hunter2hunter2", json.dumps(b))
+        self.assertLessEqual(len(b["raw"].encode()), 2048)
+        self.assertLessEqual(len(b["text"].encode()), 2048)
+
+
 class Masking(unittest.TestCase):
     def test_listed_headers_masked_unless_placeholders(self):
         names = ["Authorization", "Proxy-Authorization", "Cookie", "Set-Cookie", "X-Api-Key", "X-Api-Secret",

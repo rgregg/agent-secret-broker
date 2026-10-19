@@ -22,6 +22,7 @@ Rules, all enforced here and nowhere else:
 Everything is untrusted, attacker-influenced text: `html()` escapes it all.
 """
 import base64
+from decimal import Decimal
 import html as _html
 import json
 import os
@@ -168,25 +169,76 @@ def _body_view(spec, ctype, limit):
         return {"kind": "binary", "total": total}
     if not ctype and not _plain_text(text):
         return {"kind": "binary", "total": total}
-    formatted = False
-    if 0 < total <= _PARSE_MAX and (not ctype or "json" in ctype.lower() or text.lstrip()[:1] in "{["):
+    def shown(t):
+        """Scrubbed, capped text of `t`; None when the scrubber withholds it."""
+        encoded = t.encode("utf-8")
+        window = encoded[:limit + _SCRUB_MARGIN].decode("utf-8", "ignore")
         try:
-            pretty = json.dumps(json.loads(text), indent=2, ensure_ascii=False)
-            if pretty != text:
-                text, formatted = pretty, True
-        except (ValueError, RecursionError):
-            pass
-    encoded = text.encode("utf-8")
-    window = encoded[:limit + _SCRUB_MARGIN].decode("utf-8", "ignore")
-    try:
-        scrubbed = scripts_mod.scrub(scripts_mod.clean_text(window))
-    except Exception:  # noqa: BLE001 -- fail closed
-        scrubbed = scripts_mod.WITHHELD
-    if scrubbed == scripts_mod.WITHHELD:
+            scrubbed = scripts_mod.scrub(scripts_mod.clean_text(window))
+        except Exception:  # noqa: BLE001 -- fail closed
+            return None
+        if scrubbed == scripts_mod.WITHHELD:
+            return None
+        return scrubbed.encode("utf-8")[:limit].decode("utf-8", "ignore"), len(encoded) > limit
+
+    pretty, warn = None, []
+    if 0 < total <= _PARSE_MAX and (not ctype or "json" in ctype.lower() or text.lstrip()[:1] in "{["):
+        pretty, warn = _format_json(text)
+    view = {"kind": "text", "total": total, "formatted": False}
+    raw = shown(text)
+    if raw is None:
         return {"kind": "withheld", "total": total}
-    shown = scrubbed.encode("utf-8")[:limit].decode("utf-8", "ignore")
-    return {"kind": "text", "text": shown, "total": total,
-            "truncated": total > limit or len(encoded) > limit, "formatted": formatted}
+    view["text"], view["truncated"] = raw[0], total > limit or raw[1]
+    if warn:
+        view["warn"] = warn             # shown exactly as sent: formatting would hide or change something
+    elif pretty is not None and pretty != text:
+        fmt = shown(pretty)
+        if fmt is None:
+            return {"kind": "withheld", "total": total}
+        view.update(raw=raw[0], text=fmt[0], formatted=True, truncated=total > limit or fmt[1])
+    return view
+
+
+def _format_json(text):
+    """(pretty text or None, warnings). Warns when formatting would hide something: duplicate
+    keys at any depth, numbers that do not survive a round trip exactly, NaN/Infinity. Input
+    that does not parse (or nests too deeply) gives (None, [])."""
+    flags = set()
+
+    def pairs(items):
+        keys = [k for k, _ in items]
+        if len(set(keys)) != len(keys):
+            flags.add("duplicate keys")
+        return dict(items)
+
+    def num(lit):
+        try:
+            f = float(lit)
+            if f in (float("inf"), float("-inf")) or Decimal(repr(f)) != Decimal(lit):
+                flags.add("unusual numbers")
+        except (ValueError, ArithmeticError):
+            flags.add("unusual numbers")
+        return float(lit) if lit else 0.0
+
+    def integer(lit):
+        n = int(lit)
+        if abs(n) > 2 ** 53 or lit.startswith("-0"):
+            flags.add("unusual numbers")
+        return n
+
+    def const(name):
+        flags.add("unusual numbers")
+        return 0
+
+    try:
+        obj = json.loads(text, object_pairs_hook=pairs, parse_float=num, parse_int=integer,
+                         parse_constant=const)
+        pretty = json.dumps(obj, indent=2, ensure_ascii=False)
+    except (ValueError, RecursionError):
+        return None, []
+    if flags:
+        return None, [w for w in ("duplicate keys", "unusual numbers") if w in flags]
+    return pretty, []
 
 
 def build_view(spec, max_body_bytes=2048):
@@ -248,8 +300,15 @@ def html(view):
                 bits.append(f"truncated, {b['total']} bytes total")
             if b["formatted"]:
                 bits.append("formatted for display; the bytes sent are unchanged")
-            parts.append(f"<p class=note>Body ({'; '.join(bits)})</p>"
-                         f"<pre class=reqtext tabindex=0>{e(b['text'])}</pre>")
+            parts.append(f"<p class=note>Body ({'; '.join(bits)})</p>")
+            if b.get("warn"):
+                parts.append("<p class=note><b>This JSON has duplicate keys or numbers that would change when "
+                             "formatted, so it is shown exactly as sent.</b> "
+                             f"Found: {e(', '.join(b['warn']))}.</p>")
+            parts.append(f"<pre class=reqtext tabindex=0>{e(b['text'])}</pre>")
+            if b.get("raw") is not None:
+                parts.append("<details class=asent><summary>Show as sent</summary>"
+                             f"<pre class=reqtext tabindex=0>{e(b['raw'])}</pre></details>")
         elif b["kind"] == "withheld":
             parts.append(f"<p class=note>Body ({ct}{_n(b['total'])})</p>"
                          f"<p class=note><i>{e(BODY_WITHHELD)}</i></p>")

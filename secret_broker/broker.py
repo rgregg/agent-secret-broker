@@ -1907,7 +1907,7 @@ def sanitize_client_event(obj):
 # arrives); the keys below (request id, kind, position) let the poll put open ones back.
 _KEEP_JS = r'''
 function asbDetailKeys(root,fn){root.querySelectorAll('article[data-id]').forEach(function(a){
-  a.querySelectorAll('details.reqdetails,details.scripts').forEach(function(d,i){
+  a.querySelectorAll('details.reqdetails,details.asent,details.scripts').forEach(function(d,i){
     fn(d,a.getAttribute('data-id')+'|'+d.className+'|'+i);});});}
 function asbOpenKeys(root){var o=[];asbDetailKeys(root,function(d,k){if(d.open)o.push(k);});return o;}
 function asbReopen(root,keys){asbDetailKeys(root,function(d,k){if(keys.indexOf(k)>=0)d.open=true;});}

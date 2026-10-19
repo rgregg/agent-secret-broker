@@ -885,8 +885,14 @@ never substituted. Omitted when the request has no headers and no body. `store`,
   (JSON, XML, form data, plain text, GraphQL, and so on; with no content type, when it
   contains no control characters). Cut at `request_details.max_body_bytes` (default
   2048) with a "truncated, N bytes total" note. JSON that parses (and is at most 64 KB)
-  is pretty-printed for the view only, labelled "formatted for display"; the bytes sent
-  are unchanged. Binary or non-text content shows only the content type and length.
+  is pretty-printed for the view only, labelled "formatted for display", with a nested
+  **Show as sent** toggle holding the original text; the bytes sent are unchanged. If the
+  JSON has duplicate keys at any depth, or numbers that would not round-trip exactly
+  (precision loss, overflow, integers beyond 2^53, NaN/Infinity), it is NOT formatted: the
+  raw text is shown with a warning ("This JSON has duplicate keys or numbers that would
+  change when formatted, so it is shown exactly as sent.") naming what was found. Input
+  that does not parse or nests too deeply is shown raw. The retained copy follows the same
+  logic. Binary or non-text content shows only the content type and length.
   Obvious secret-looking literals in the text are removed with the script scrubber
   (`scripts.scrub`); if it fails or withholds, the body shows
   `[body withheld: could not be scrubbed safely]`.
