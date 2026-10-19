@@ -501,13 +501,7 @@ credentials with `"risk": {"auto_modes": ["http"]}` in the broker config.
     `--alt-svc`, `--trace*`, `--stderr`, `--libcurl`, ...) is not understood. wget and
     openssl are not on the list. The name must be bare or under
     /bin, /usr/bin, /sbin, /usr/sbin (after `os.path.normpath`; an argv[0] with
-    a `..` component, glob character, NUL or newline is never understood). A
-    leading `NAME=value` (an env assignment or a `VAR=x cmd` prefix) is allowed only
-    for LANG, LANGUAGE, LC_*, TZ, TERM, COLUMNS, LINES, NO_COLOR, CLICOLOR,
-    FORCE_COLOR, CI, DEBUG, VERBOSE, TERM_PROGRAM, PYTHONUNBUFFERED,
-    PYTHONDONTWRITEBYTECODE, PYTHONIOENCODING, NODE_NO_WARNINGS, with a value that
-    has no `$`, backslash, backtick or newline (no `*_PROXY`, PATH, LD_*, BASH_ENV,
-    ZDOTDIR, ...); any other name is not understood. `env -u NAME` is fine.
+    a `..` component, glob character, NUL or newline is never understood).
   - (b) an interpreter (sh bash zsh dash ksh ash fish python node deno bun ruby
     perl php pwsh lua Rscript, `sed -f`, `awk -f`) running a script file
     operand, **which needs a matching readable `scripts` entry**, or running
@@ -519,27 +513,28 @@ credentials with `"risk": {"auto_modes": ["http"]}` in the broker config.
     understood. A script run directly (`./run.sh`, a script extension, a path
     outside the system bin dirs) also needs an entry; a program on stdin (`bash -s`,
     `python -`) is never visible;
-  - (c) a known wrapper whose wrapped command is understood under (a), (b) or
-    (c) (nesting at most 4, at most 32 wrappers). A wrapper left with no command
-    (`nice`, `sudo -n`, `env -S ''`, `xargs`) is not understood; only a bare `env`
-    (plain options, no assignments) that prints the environment is: env (including
-    `-S`/`--split-string`, refused when the value has a backslash, `$`, `#` or
-    newline; `-C/--chdir` refused), sudo, doas, nohup, time, timeout, nice, ionice,
-    stdbuf, exec, command, setsid, chrt, taskset, flock (including `-c`),
-    su and runuser (`-c` string, clustered options like `-lc`, `-s` only with
-    a standard shell), setpriv, busybox (the applet is the next operand), strace,
-    ltrace, unshare (without mount/root/chdir options), numactl, watch (without
-    `-x` the arguments are joined with spaces and parsed as a shell string),
-    script (`-c`). xargs and parallel take extra arguments from stdin or `:::`, so
-    their target must be one of cat, ls, head, tail, wc, echo, stat, sha256sum,
-    md5sum, du, df, true, false (never env, nice, sh, ...). Every wrapper's options are an explicit
-    list: **an option the parser does not recognise makes the command not
-    understood**, never "an interactive shell" and never unflagged. nsenter, chroot
-    and options that change the directory or root (sudo `-D/-R`, env `-C`) are
-    not understood, because the files the client read would not be the ones that
-    run.
-  Restricted shell strings (every `-c`, `su -c`, `watch`, `parallel`, `flock -c`,
-  `script -c`): the string must contain no newline, `#`, backtick, `$`, backslash,
+  - (c) one of a deliberately short list of wrappers whose wrapped command is
+    understood under (a), (b) or (c) (nesting at most 32): `env` (only `-i`, `-0`,
+    `-u NAME` and their long forms, then `NAME=value` words), `sudo` (`-u USER`,
+    `-n`, `-H`; not `-E`, `-s`, `-i`, `-e`, chdir/chroot options), `doas` (`-u`,
+    `-n`), `nohup`, `time`, `timeout` (`DURATION`, `-s`, `-k`, `--preserve-status`,
+    `--foreground`), `nice` (`-n N`), `stdbuf` (`-i/-o/-e MODE`), `exec` and
+    `command` (no options). An option that is not listed makes the command not
+    understood, and a wrapper left with no command (`nice`, `sudo -n`, `env LANG=C`)
+    is not understood; only a bare `env` (or `env -i`) that prints the environment
+    is. **Every other launcher is not understood and prompts**: xargs, parallel,
+    watch, script, flock, su, runuser, setsid, setpriv, nsenter, unshare, chroot,
+    numactl, busybox, strace, ltrace, taskset, ionice, chrt, `env -S`, `env -C`, ...
+    (they feed arguments to other commands, take templates or change the
+    environment the command runs in).
+  - `NAME=value` as an argv word is understood only as an `env` argument (`env
+    LANG=C cmd`) or as a prefix inside a shell string, where the shell performs it:
+    NAME must be one of LANG, LANGUAGE, LC_*, TZ, TERM, COLUMNS, LINES, NO_COLOR,
+    CLICOLOR, FORCE_COLOR, CI, DEBUG, VERBOSE, TERM_PROGRAM, PYTHONUNBUFFERED,
+    PYTHONDONTWRITEBYTECODE, PYTHONIOENCODING, NODE_NO_WARNINGS and the value may
+    not contain `/`, `$`, backslash, backtick, whitespace or newline. An
+    assignment-shaped argv[0], or one after `sudo`/`nice`/..., is not understood.
+  Restricted shell strings (every `sh -c`): the string must contain no newline, `#`, backtick, `$`, backslash,
   here-document, process substitution, braces, parentheses, `&` (background) or
   redirection other than a lone `2>&1`; it is split on unquoted `&&`, `||`, `;`
   and `|`, no segment may start with a reserved word (`if`, `for`, `while`, `{`,

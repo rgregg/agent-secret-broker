@@ -716,10 +716,6 @@ PLAIN_PROGRAMS = {
                           "--header": r"^[^\n\r@]+$", "--request": r"^(?:GET|HEAD)$"},
                    operand=lambda ops: all(re.match(_URL, o) for o in ops)),
 }
-# programs xargs / parallel may launch: no options that run commands or take file names
-XARGS_TARGETS = frozenset("cat ls head tail wc echo stat sha256sum md5sum du df true false".split())
-
-
 def _val_ok(rx, v):
     return "\0" not in v and (rx is None or bool(re.match(rx, v)))
 
@@ -789,70 +785,17 @@ def _w(s="", sv="", so="", l=(), lv=(), pos=0, pos_unless=(), digits=False, dash
 # attached value (rest of the cluster), l/lv: long flags / long options with a value.
 # An option not listed means the command is not understood.
 SCRIPT_WRAPPERS = {
-    "sudo": _w("AbEHnPSB", "ughpCDrtTUR", l=("--askpass", "--background", "--preserve-env", "--set-home",
-                                             "--non-interactive", "--stdin", "--bell"),
-               lv=("--user", "--group", "--host", "--prompt", "--close-from", "--chdir", "--role", "--type",
-                   "--command-timeout", "--other-user", "--chroot"), chdir=("-D", "--chdir", "-R", "--chroot")),
-    "doas": _w("n", "uC"),
+    "sudo": _w("nH", "u", l=("--non-interactive", "--set-home"), lv=("--user",)),
+    "doas": _w("n", "u"),
     "nohup": _w(),
-    "time": _w("apqvV", "fo", l=("--append", "--portability", "--quiet", "--verbose"), lv=("--format", "--output")),
-    "timeout": _w("v", "sk", l=("--foreground", "--preserve-status", "--verbose"),
-                  lv=("--signal", "--kill-after"), pos=1),
-    "nice": _w("", "n", lv=("--adjustment",), digits=True),
-    "ionice": _w("t", "cnpPu", l=("--ignore",), lv=("--class", "--classdata", "--pid", "--pgid", "--uid")),
+    "time": _w(),
+    "timeout": _w("", "sk", l=("--preserve-status", "--foreground"), lv=("--signal", "--kill-after"), pos=1),
+    "nice": _w("", "n", lv=("--adjustment",)),
     "stdbuf": _w("", "ioe", lv=("--input", "--output", "--error")),
-    "exec": _w("cl", "a"),
-    "command": _w("p"),
-    "setsid": _w("cfw", l=("--ctty", "--fork", "--wait")),
-    "chrt": _w("bfimoRrvd", l=("--batch", "--fifo", "--idle", "--other", "--rr", "--reset-on-fork",
-                               "--verbose", "--deadline"), pos=1),
-    "xargs": _w("0oprtx", "adEILnPsS", so="ile", l=("--null", "--interactive", "--no-run-if-empty", "--verbose",
-                                                    "--exit", "--open-tty", "--show-limits", "--max-lines",
-                                                    "--replace", "--eof"),
-                lv=("--arg-file", "--delimiter", "--max-args", "--max-procs", "--max-chars")),
-    "busybox": _w(),
-    "strace": _w("cCdfFhiqrtTvVxyYzDw", "abeEIoOpPsSuUX", l=("--follow-forks", "--summary", "--summary-only")),
-    "ltrace": _w("cCfiSrtTV", "aAeFlnopswu"),
-    "nsenter": _w("FZ", "tSG", so="muinpCUTrw", l=("--no-fork", "--preserve-credentials", "--follow-context",
-                                                   "--mount", "--uts", "--ipc", "--net", "--pid", "--cgroup",
-                                                   "--user", "--time", "--root", "--wd"),
-                  lv=("--target", "--setuid", "--setgid"), chdir=("*",)),
-    "unshare": _w("frc", "SGRw", so="muinpCUT", l=("--fork", "--kill-child", "--mount-proc", "--map-root-user",
-                                                      "--map-current-user", "--map-auto", "--mount", "--uts",
-                                                      "--ipc", "--net", "--pid", "--user", "--cgroup", "--time",
-                                                      "--keep-caps"),
-                  lv=("--propagation", "--setgroups", "--map-user", "--map-group", "--map-users", "--map-groups",
-                      "--root", "--wd"), chdir=("-m", "--mount", "-R", "--root", "-w", "--wd", "--mount-proc")),
-    "taskset": _w("a", "c", l=("--all-tasks",), lv=("--cpu-list",), pos=1, pos_unless=("-c", "--cpu-list")),
-    "chroot": _w("", "", l=("--skip-chdir",), lv=("--userspec", "--groups"), pos=1, chdir=("*",)),
-    "setpriv": _w("", "", l=("--clear-groups", "--init-groups", "--keep-groups", "--no-new-privs", "--reset-env"),
-                  lv=("--reuid", "--regid", "--ruid", "--euid", "--rgid", "--egid", "--groups", "--inh-caps",
-                      "--bounding-set", "--ambient-caps", "--securebits", "--pdeathsig", "--selinux-label",
-                      "--apparmor-profile", "--landlock-access")),
-    "numactl": _w("ltHs", "CNmip", l=("--localalloc", "--touch", "--hardware", "--show", "--all"),
-                  lv=("--physcpubind", "--cpunodebind", "--cpubind", "--membind", "--interleave", "--preferred",
-                      "--preferred-many", "--weighted-interleave")),
+    "exec": _w(),
+    "command": _w(),
 }
-# wrappers that take their own parsing (a command string with -c, or watch/parallel)
-_SU_OPTS = _w("lmpfP", "cgGsuw", dash=True, l=("--login", "--preserve-environment", "--fast", "--pty"),
-              lv=("--command", "--group", "--supp-group", "--shell", "--session-command", "--user",
-                  "--whitelist-environment"))
-_SCRIPT_OPTS = _w("aefq", "cEBIOTmo", l=("--append", "--return", "--flush", "--quiet", "--force"),
-                  lv=("--command", "--echo", "--log-in", "--log-out", "--log-io", "--log-timing",
-                      "--logging-format", "--output-limit"))
-_FLOCK_OPTS = _w("sxenuoFv", "wEc", l=("--shared", "--exclusive", "--nonblock", "--nb", "--unlock", "--no-fork",
-                                      "--close", "--verbose"), lv=("--timeout", "--wait", "--conflict-exit-code",
-                                                                    "--command"))
-_WATCH_OPTS = _w("bectgqrxp", "n", so="d", l=("--beep", "--errexit", "--color", "--no-color", "--no-title",
-                                              "--chgexit", "--exec", "--precise", "--no-wrap", "--differences"),
-                 lv=("--interval",))
-_PARALLEL_OPTS = _w("kvqXm0", "jnNSaCdILlE", l=("--keep-order", "--verbose", "--quote", "--null", "--tag", "--bar",
-                                                "--will-cite", "--no-notice"),
-                    lv=("--jobs", "--sshlogin", "--arg-file", "--colsep", "--delimiter", "--results", "--joblog",
-                        "--timeout", "--retries", "--sshloginfile", "--wd", "--workdir", "--tmpdir", "--eof",
-                        "--delay", "--load", "--memfree"))
-_ENV_OPTS = _w("i0v", "uCaS", l=("--ignore-environment", "--null", "--debug"),
-               lv=("--unset", "--chdir", "--argv0", "--split-string"), dash=True, chdir=("-C", "--chdir"))
+_ENV_OPTS = _w("i0", "u", l=("--ignore-environment", "--null"), lv=("--unset",))
 _ENV_NAMES = re.compile(r"^(?:LANG|LANGUAGE|LC_[A-Z_]+|TZ|TERM|COLUMNS|LINES|NO_COLOR|CLICOLOR|FORCE_COLOR|CI|"
                         r"DEBUG|VERBOSE|TERM_PROGRAM|PYTHONUNBUFFERED|PYTHONDONTWRITEBYTECODE|PYTHONIOENCODING|"
                         r"NODE_NO_WARNINGS)$")
@@ -864,10 +807,9 @@ def _assignment(word):
     m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", word, re.S)
     if not m:
         return None
-    return bool(_ENV_NAMES.match(m.group(1))) and not re.search(r"[$\\`\n\r\0]", m.group(2))
+    return bool(_ENV_NAMES.match(m.group(1))) and not re.search(r"[$\\`\n\r\0/ \t]", m.group(2))
 
 
-_SAFE_SHELLS = frozenset("sh bash dash zsh ksh ash".split())
 _SHELL_RESERVED = frozenset("if then else elif fi for while until do done case esac function select time { } ! [[ "
                       "coproc in".split())
 # interpreter name pattern -> (kind, flags that take the next arg, inline-code flags, stdin flags)
@@ -1150,6 +1092,10 @@ def _shell_string(s, depth):
         segs[-1].append("".join(word))
     out, ok = [], True
     for seg in segs:
+        while seg and _assignment(seg[0]) is not None:      # the shell performs VAR=value prefixes
+            if not _assignment(seg[0]):
+                return out, False
+            seg = seg[1:]
         if not seg or seg[0] in _SHELL_RESERVED:
             return out, False
         found, good = _analyze(seg, depth + 1)
@@ -1191,11 +1137,8 @@ def _analyze(argv, depth=0, trace=None):
         a0, args = cmd[0], cmd[1:]
         if _bad_path(a0):
             return out, False
-        if _assignment(a0) is not None:                     # VAR=value prefix of a command
-            if not _assignment(a0):
-                return out, False
-            cmd = args
-            continue
+        if _assignment(a0) is not None:                     # only env and shell strings may assign
+            return out, False
         name = os.path.basename(a0)
         simple = "/" not in a0 or _in_system_bin(a0)        # bare name or a standard system path
         if simple and name == "env":
@@ -1207,86 +1150,16 @@ def _analyze(argv, depth=0, trace=None):
                 return out, hops == 1 and depth == 0 and splits == 0 and not any("=" in a for a in args)
             cmd = nxt
             continue
-        if simple and name in ("su", "runuser", "script", "flock", "watch", "parallel"):
-            spec = {"su": _SU_OPTS, "runuser": _SU_OPTS, "script": _SCRIPT_OPTS, "flock": _FLOCK_OPTS,
-                    "watch": _WATCH_OPTS, "parallel": _PARALLEL_OPTS}[name]
-            parsed = _parse_opts(args, spec)
-            if parsed is None:
-                return out, False
-            rest, seen, vals = parsed
-            if name in ("su", "runuser", "flock") and rest:
-                if name != "flock" and not ("-u" in seen or "--user" in seen):
-                    # su [options] user [options]: options may follow the user name
-                    p2 = _parse_opts(rest[1:], spec)
-                    if p2 is None:
-                        return out, False
-                    rest, seen2, vals2 = p2
-                    seen, vals = seen | seen2, vals + vals2
-            for k, v in vals:
-                if k in ("-s", "--shell") and not (os.path.basename(v) in _SAFE_SHELLS and (
-                        "/" not in v or _in_system_bin(v))):
-                    return out, False
-            strings = [v for k, v in vals if k in ("-c", "--command", "--session-command")]
-            if name == "runuser" and ("-u" in seen or "--user" in seen):
-                if strings:
-                    return out, False
-                cmd = rest
-                continue
-            if name == "flock" and not strings:
-                cmd = rest[1:]                              # the lock file/fd, then the command
-                if not rest:
-                    return out, False
-                continue
-            if name in ("su", "runuser", "script", "flock"):
-                if not strings:
-                    return out, False                       # an interactive shell: nothing to see
-                for st in strings:
-                    found, good = _shell_string(st, depth + 1)
-                    merge(found)
-                    if not good:
-                        return out, False
-                return out, True
-            if name == "watch":
-                if "-x" in seen or "--exec" in seen:
-                    cmd = rest
-                    continue
-            else:                                           # parallel: cut at ::: / ::::
-                for k, a in enumerate(rest):
-                    if a in (":::", "::::", ":::+", "::::+"):
-                        rest = rest[:k]
-                        break
-            if not rest:
-                return out, False
-            joined = " ".join(rest)
-            if name == "parallel" and (re.search(r"[&|;<>]", joined) or
-                                       os.path.basename(joined.split()[0]) not in XARGS_TARGETS):
-                return out, False                           # extra arguments come from stdin / :::
-            found, good = _shell_string(joined, depth + 1)
-            merge(found)
-            return out, good
         if simple and name in SCRIPT_WRAPPERS:
-            if name == "command" and args[:1] in (["-v"], ["-V"]):
-                return out, True                            # only prints where a command is
             parsed = _parse_opts(args, SCRIPT_WRAPPERS[name])
             if parsed is None:
                 return out, False
             rest, seen, _ = parsed
             spec = SCRIPT_WRAPPERS[name]
-            if name == "taskset" and "-p" in seen:
-                return out, False
             if not (seen & spec["pos_unless"]):
                 if len(rest) < spec["pos"]:
                     return out, False
                 rest = rest[spec["pos"]:]
-            if name == "chroot" and not rest:
-                return out, False
-            if name == "busybox" and not rest:
-                return out, False
-            if name == "xargs":
-                # stdin supplies extra arguments: only commands with nothing dangerous to inject
-                t = os.path.basename(rest[0]) if rest else ""
-                return out, bool(rest) and ("/" not in rest[0] or _in_system_bin(rest[0])) and \
-                    t in XARGS_TARGETS and _plain_ok(t, rest[1:])
             cmd = rest
             continue
         break

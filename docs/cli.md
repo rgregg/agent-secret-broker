@@ -80,11 +80,10 @@ Check it:
 - **Scripts are shown to you.** For `NAME -- command`, `asb` looks for the script
   file the command runs and sends its text with the request, so the approval card
   and the risk check see what the script does, not just `bash deploy.sh`. It skips
-  leading wrappers (`env VAR=..` and `env -S`, `sudo`, `doas`, `nohup`, `time`,
-  `timeout N`, `nice`, `ionice`, `stdbuf`, `exec`, `command`, `setsid`, `chrt`,
-  `taskset`, `flock`, `su`/`runuser` (`-c`), `setpriv`, `busybox`, `strace`,
-  `ltrace`, `unshare`, `numactl`, `watch`, `script -c`; `xargs`/`parallel` only around cat, ls, wc and the like), then
-  takes either an interpreter's script file
+  leading wrappers (`env VAR=..`, `sudo`, `doas`, `nohup`, `time`, `timeout N`,
+  `nice`, `stdbuf`, `exec`, `command`; the broker understands only this short list,
+  anything launched through xargs, parallel, watch, su, flock, setsid, strace and the
+  like prompts), then takes either an interpreter's script file
   (`bash`, `sh`, `zsh`, `python3`, `node`, `deno`, `bun`, `ruby`, `perl`, `php`,
   `pwsh`, `awk -f`, `sed -f`: the first operand that is a file) or the command
   itself when it is an executable text script (a bare name must be found on PATH and
