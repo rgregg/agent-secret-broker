@@ -259,6 +259,14 @@ def request_fields(mode, names, spec, max_content_chars=400, send_content=True,
             f["usable_for_hosts"] = list(spec["allowed_hosts"])
     elif mode == "ssh_sign":
         f["operation"] = "sign data with an SSH key: " + str((spec.get("ssh") or {}).get("text", ""))
+        host = spec.get("host") or {}
+        if host:
+            f["server"] = ((", ".join(host.get("names") or []) or host.get("fp"))
+                           if host.get("fp") else "not verified")
+            if host.get("claimed"):
+                f["destination"] = str(host["claimed"])
+            if host.get("forwarding"):
+                f["forwarding"] = True
     else:
         cmd = " ".join(spec.get("argv") or [])
         f["command"] = cmd[:max_content_chars] if send_content else "<not shown>"
@@ -279,10 +287,16 @@ def deterministic_summary(mode, names, spec):
             s = f"{f['operation']} ({f['vault_item']})"
         elif mode == "ssh_sign":
             s = f["operation"]
+            if "server" in f:
+                s += f"; server {f['server']}"
+            if f.get("destination"):
+                s += f"; destination (claimed) {f['destination']}"
+            if f.get("forwarding"):
+                s += "; agent forwarding"
         else:
             s = "run " + f["command"]
         s = "".join(c if 32 <= ord(c) < 127 else "?" for c in " ".join(s.split()))   # display-safe
-        return ("auto: " + s)[:100]
+        return ("auto: " + s)[:(240 if mode == "ssh_sign" else 100)]
     except Exception:  # noqa: BLE001
         return None
 

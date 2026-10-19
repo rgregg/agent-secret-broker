@@ -51,7 +51,7 @@ def assess(mode, names, spec, analyzer=None, guidance=None):
                 "reasons": ["adds a new credential (a human approves every store)"]}
     if mode == "ssh_sign":
         # a signature authenticates as the user to a server: high whatever the model says
-        return {"level": "high", "model": model_risk, "summary": summary, "summary_model": summary_model,
+        return {"level": "high", "model": model_risk, **out,
                 "reasons": ["an SSH signature authenticates as you; always high"]}
     if model_risk is None:
         return {"level": "high", "model": None, **out,
