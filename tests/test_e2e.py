@@ -1410,12 +1410,14 @@ class AlwaysAllow(Harness):
         self.assertIn("Always allow saved", body)
         self.finish()
         d = self.disk()
-        self.assertEqual(d["secrets"]["svc"]["approval"], "allow")        # written to the vault item
-        self.assertEqual(d["secrets"]["svc"]["approval_changed"]["by"], "alice")
+        self.assertEqual(d["secrets"]["svc"].get("approval", "prompt"), "prompt")   # narrow, not credential-wide
+        st = d["secrets"]["svc"]["standing"]                             # written to the vault item
+        self.assertEqual([(e["mode"], e["scope"], e["created_by"], e["expires_at"]) for e in st],
+                         [("http", "read", "alice", None)])             # a GET: reads only
         self.assertEqual(d["secrets"]["svc"]["allowed_hosts"], ["127.0.0.1"])   # rest untouched
-        self.assertEqual(self.broker.cfg["secrets"]["svc"]["approval"], "allow")
-        ch = self.events("policy_changed")[0]
-        self.assertEqual((ch["secret"], ch["from"], ch["to"], ch["user"]), ("svc", "prompt", "allow", "alice"))
+        self.assertEqual(self.events("policy_changed"), [])
+        ch = self.events("grant_created")[0]
+        self.assertEqual((ch["kind"], ch["scope"], ch["expires_at"], ch["created_by"]), ("always", "read", None, "alice"))
         self.assertTrue(self.events("decided")[0]["always_requested"])
         pushes = len(self.notifier.sent)
         _, b = self.http_req()                                       # next call: no prompt
@@ -1423,6 +1425,9 @@ class AlwaysAllow(Harness):
         _, r = self.api("GET", f"/v1/requests/{json.loads(b)['id']}?wait=3")
         self.assertEqual(json.loads(r)["http"]["status"], 200)
         self.assertEqual(self.events("approved")[-1]["via"], "policy")
+        self.http_req("DELETE")                                      # a reads-only Always never covers this
+        self.assertEqual(len(self.notifier.sent), pushes + 1)
+        self.assertEqual(self.events("grant_skipped")[-1]["reason"], "method")
 
     def test_env_mode_is_offered_the_stronger_confirm_and_applies(self):
         self.create_env()
@@ -1433,7 +1438,8 @@ class AlwaysAllow(Harness):
         self.assertEqual(status, 200)
         self.assertIn("Always allow saved", body)
         self.finish()
-        self.assertEqual(self.disk()["secrets"]["svc"]["approval"], "allow")
+        self.assertEqual([(e["mode"], e["scope"]) for e in self.disk()["secrets"]["svc"]["standing"]],
+                         [("env", "any")])
 
     def test_high_risk_request_cannot_establish_standing_allow(self):
         self.broker.summarizer = _Stub("Deletes things", "high")
@@ -1446,18 +1452,19 @@ class AlwaysAllow(Harness):
 
     def test_write_failure_leaves_policy_unchanged_but_approves(self):
         self.http_req()
-        orig = self.broker._persist_approval
+        orig = self.broker._persist_standing
 
         def boom(*a, **k):
             raise OSError("disk full")
-        self.broker._persist_approval = boom
+        self.broker._persist_standing = boom
         status, body = self.post(f"/a/{self.nonce()}", decision="approve_always")
-        self.broker._persist_approval = orig
+        self.broker._persist_standing = orig
         self.assertEqual(status, 200)
         self.assertIn("could not write", body)
         self.finish()
         self.assertEqual(self.broker.cfg["secrets"]["svc"].get("approval", "prompt"), "prompt")
-        self.assertEqual(len(self.events("policy_change_failed")), 1)
+        self.assertEqual(len(self.events("standing_change_failed")), 1)
+        self.assertNotIn("standing", self.broker.cfg["secrets"]["svc"])
         self.assertEqual(len(self.events("approved")), 1)
 
     def test_policies_page_can_only_tighten(self):
@@ -2362,8 +2369,10 @@ class Dashboard(Harness):
         rid = self.ask()
         self.assertIn("approve_always", self.get()[1])
         self.assertEqual(self.decide(rid, "approve_always")[1], "/?note=always")
-        self.assertEqual(self.broker.cfg["secrets"]["svc"]["approval"], "allow")
-        self.assertEqual(self.disk()["secrets"]["svc"]["approval"], "allow")
+        self.assertEqual(self.broker.cfg["secrets"]["svc"].get("approval", "prompt"), "prompt")
+        self.assertEqual([(e["mode"], e["scope"]) for e in self.broker.cfg["secrets"]["svc"]["standing"]],
+                         [("http", "read")])
+        self.assertEqual(len(self.disk()["secrets"]["svc"]["standing"]), 1)
 
     def test_fragment_version_changes_when_the_queue_changes(self):
         def version():

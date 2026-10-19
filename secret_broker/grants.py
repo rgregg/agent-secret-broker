@@ -11,6 +11,10 @@ The grant expires at an absolute deadline (no sliding extension) and can be
 revoked early. Grants are persisted (names, times and creator only; no values,
 no tokens) so a broker restart does not drop them.
 
+A timed grant has no risk ceiling (the human chose it explicitly for a short
+time); the no-expiry kind, "Always", lives in the credential's vault metadata
+and is checked against risk.auto_approve_max (see standing.py).
+
 This module holds the store, config validation and persistence. The decision
 hooks live in broker.py (`Broker.create`, `Broker.decide_via`).
 
@@ -47,7 +51,8 @@ def covers(grant, mode, spec):
     if grant["scope"] == "any":
         return True
     return mode == "http" and str((spec or {}).get("method", "")).upper() in READ_METHODS
-DEFAULTS = {"enabled": True, "durations": [5, 15, 30], "max_minutes": 60, "max_risk": "high"}
+DEFAULTS = {"enabled": True, "durations": [5, 15, 30], "max_minutes": 60}
+IGNORED = ("max_risk",)      # accepted for old configs; timed grants have no risk ceiling
 MAX_DURATIONS = 6
 HARD_MAX_MINUTES = 24 * 60
 RISK_CEILINGS = risk_mod.AUTO_MAX          # none|low|medium|high
@@ -60,11 +65,11 @@ def parse_config(raw, field="timed_grants"):
         raw = {}
     if not isinstance(raw, dict):
         raise ValueError(f"{field} must be an object")
-    unknown = sorted(set(raw) - set(DEFAULTS))
+    unknown = sorted(set(raw) - set(DEFAULTS) - set(IGNORED))
     if unknown:
         raise ValueError(f"{field}.{unknown[0]} is not a known setting")
     out = dict(DEFAULTS)
-    out.update(raw)
+    out.update({k: v for k, v in raw.items() if k in DEFAULTS})
     if not isinstance(out["enabled"], bool):
         raise ValueError(f"{field}.enabled must be true or false")
 
@@ -83,19 +88,18 @@ def parse_config(raw, field="timed_grants"):
     if len(set(d)) != len(d):
         raise ValueError(f"{field}.durations must not repeat a value")
     out["durations"] = sorted(d)
-    if out["max_risk"] not in RISK_CEILINGS:
+    if "max_risk" in raw and raw["max_risk"] not in RISK_CEILINGS:
         raise ValueError(f"{field}.max_risk must be one of {', '.join(RISK_CEILINGS)}")
     return out
 
 
-def describe(cfg):
+def describe(cfg, auto_max="low"):
     """One line for the Settings page."""
-    if not cfg["enabled"]:
-        return "Off"
-    ceil = cfg["max_risk"]
-    return ("On: " + ", ".join(f"{m} min" for m in cfg["durations"])
-            + "; " + ("no risk ceiling" if ceil == "high" else
-                      "never used" if ceil == "none" else f"used up to {ceil} risk"))
+    timed = (("timed grants (no ceiling) " + "/".join(str(m) for m in cfg["durations"]) + " min")
+             if cfg["enabled"] else "timed grants off")
+    always = ("Always off (risk.auto_approve_max none)" if auto_max == "none"
+              else f"Always up to {auto_max} risk")
+    return f"Standing approvals: {timed}; {always}"
 
 
 class GrantStore:

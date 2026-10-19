@@ -226,15 +226,15 @@ class AlwaysChip(EnvAutoBase):
         self.env()
         page, r = self.page()
         self.assertIn("value=approve_always", page)
-        self.assertIn("web and run-with-secret requests", page)
-        self.assertIn("The secret value will be released to the requesting machine without asking "
+        self.assertIn("Always approve run-with-secret requests for svc? The secret value will be "
+                      "released to the requesting machine without asking "
                       "again when the request is rated medium or lower.", page)
         body = self.post_decision(r, "approve_always")
         self.assertIn("Always allow saved", body)
         r.done.wait(10)
         sc = self.broker.cfg["secrets"]["svc"]
-        self.assertEqual(sc["approval"], "allow")
-        self.assertNotIn("auto_modes", sc)
+        self.assertEqual(sc["approval"], "prompt")           # narrow: not credential-wide
+        self.assertEqual([(e["mode"], e["scope"]) for e in sc["standing"]], [("env", "any")])
         self.assertEqual(self.events("approved")[0]["via"], "user")
         n = len(self.notifier.sent)
         self.assertEqual(self.result(self.env())["env"], {"SVC_TOKEN": SECRET})
@@ -283,7 +283,7 @@ class PoliciesList(EnvAutoBase):
         self.broker.cfg["secrets"]["svc"]["auto_modes"] = ["http"]
         page = self.policies()
         self.assertNotIn("run-with-secret</td>", page)
-        self.assertIn("Auto-approved for", page)
+        self.assertIn("whole credential, any method, any covered mode", page)
 
 
 # -- time-boxed grants for env requests ---------------------------------------
@@ -421,24 +421,23 @@ class EnvGrants(tg.Base):
         self.grant_env()
         self.grant_it(("other",))
         page = self.get("/policies")[1]
-        self.assertIn("run-with-secret: all requests", page)
-        self.assertIn("web: reads only", page)
+        self.assertIn("<td data-label=Covers>run-with-secret</td>", page)
+        self.assertIn("<td data-label=Covers>web reads only</td>", page)
 
     def test_history_wording(self):
         self.grant_env()
         rid = self.env()
         self.result(rid)
         _, frag = self.get(f"/request/{rid}?fragment=1")
-        self.assertIn("time-boxed grant (all requests), run-with-secret (auto-approved)", frag)
+        self.assertIn("standing approval (15 min, run-with-secret) (auto-approved)", frag)
 
-    def test_ceiling_skip(self):
+    def test_no_risk_ceiling_for_timed_env_grants(self):
         self.grant_env()
-        self.broker.grants_cfg["max_risk"] = "low"
-        self.broker.summarizer = _Stub("x", "medium")
+        self.broker.summarizer = _Stub("x", "high")
         n = len(self.notifier.sent)
-        self.env()
-        self.assertEqual(len(self.notifier.sent), n + 1)
-        self.assertEqual(self.events("grant_skipped")[-1]["reason"], "risk")
+        self.assertEqual(self.result(self.env())["status"], "approved")
+        self.assertEqual(len(self.notifier.sent), n)
+        self.assertEqual(self.events("grant_skipped"), [])
 
 
 # -- the broker checks argv itself: an omitted `scripts` entry is "not visible" ----

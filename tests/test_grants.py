@@ -242,7 +242,7 @@ class Using(Base):
         self.assertEqual(row["outcome"], "auto-approved")
         self.assertTrue(row["grant_id"])
         _, frag = self.get(f"/request/{rid}?fragment=1")
-        self.assertIn("time-boxed grant", frag)
+        self.assertIn("standing approval (15 min, reads only)", frag)
         self.assertIn("min left when used", frag)
         first = [r for r in self.broker.history.rows() if r["outcome"] == "approved"][-1]
         _, frag2 = self.get(f"/request/{first['id']}?fragment=1")
@@ -362,46 +362,23 @@ class Using(Base):
         self.assertEqual(len(self.notifier.sent), n)
 
 
-class RiskCeiling(Base):
-    risk = "medium"
-    grants_cfg = {"max_risk": "low"}
-
-    def test_above_ceiling_prompts_and_audits_skip(self):
-        self.grant_it()
-        n = len(self.notifier.sent)
-        rid = self.http()
-        self.assertEqual(len(self.notifier.sent), n + 1)
-        sk = self.events("grant_skipped")[0]
-        self.assertEqual((sk["id"], sk["reason"], sk["max_risk"]), (rid, "risk", "low"))
-        self.assertEqual(self.events("grant_used"), [])
-
-    def test_within_ceiling_and_missing_verdict(self):
-        self.grant_it()
-        self.broker.summarizer = _Stub("x", "low")
-        self.assertEqual(self.result(self.http())["status"], "approved")
-        self.broker.summarizer = None                    # no verdict counts as high
-        n = len(self.notifier.sent)
-        self.http()
-        self.assertEqual(len(self.notifier.sent), n + 1)
-
-
-class NoCeilingByDefault(Base):
-    risk = None
-
-    def test_missing_verdict_is_fine_with_default_ceiling(self):
-        self.grant_it()
-        self.broker.summarizer = None
-        self.assertEqual(self.result(self.http())["status"], "approved")
-
-
-class CeilingNone(Base):
+class NoRiskCeiling(Base):
+    """Timed grants have no ceiling; `max_risk` is accepted but ignored."""
+    risk = "high"
     grants_cfg = {"max_risk": "none"}
 
-    def test_none_never_uses(self):
+    def test_high_risk_and_missing_verdict_are_released(self):
         self.grant_it()
         n = len(self.notifier.sent)
-        self.http()
-        self.assertEqual(len(self.notifier.sent), n + 1)
+        self.assertEqual(self.result(self.http())["status"], "approved")
+        self.broker.summarizer = None                    # no verdict: still released
+        self.assertEqual(self.result(self.http(path="/y"))["status"], "approved")
+        self.assertEqual(len(self.notifier.sent), n)
+        self.assertEqual(self.events("grant_skipped"), [])
+
+    def test_max_risk_logs_a_config_warning(self):
+        warns = [e["warning"] for e in self.events("config_warning")]
+        self.assertTrue(any("timed_grants.max_risk is ignored" in w for w in warns), warns)
 
 
 class Disabled(Base):
@@ -489,7 +466,7 @@ class Config(unittest.TestCase):
 
     def test_defaults(self):
         self.assertEqual(grants_mod.parse_config(None), {
-            "enabled": True, "durations": [5, 15, 30], "max_minutes": 60, "max_risk": "high"})
+            "enabled": True, "durations": [5, 15, 30], "max_minutes": 60})
 
     def test_validation_names_fields(self):
         self.bad("x", "timed_grants must")
@@ -615,22 +592,25 @@ class CardLayout(Base):
 
 
 class Pages(Base):
-    grants_cfg = {"durations": [10, 60, 120], "max_minutes": 120, "max_risk": "medium"}
+    grants_cfg = {"durations": [10, 60, 120], "max_minutes": 120}
 
     def test_policies_empty_then_listed_with_revoke(self):
         _, pol = self.get("/policies")
-        self.assertIn("No active grants", pol)
-        self.assertLess(pol.index("Active grants"), pol.index("Always allowed"))
+        self.assertIn("No standing approvals", pol)
+        self.assertIn("Standing approvals", pol)
+        self.assertNotIn("Active grants", pol)
+        self.assertNotIn("Always allowed", pol)
         self.grant_it(minutes=60)
         _, pol = self.get("/policies")
         self.assertIn("data-gexp", pol)
         self.assertIn("/grants/revoke", pol)
         self.assertIn("<b>svc</b>", pol)
-        self.assertIn("reads only", pol)
+        self.assertIn("web reads only", pol)
+        self.assertRegex(pol, r"<time data-gexp='\d+'>in (59|60) min</time>")
         self.grant_it(("svc", "other"), 10, method="POST")
         _, pol = self.get("/policies")
         self.assertIn("<b>other, svc</b>", pol)
-        self.assertIn("all requests", pol)
+        self.assertIn("web any method", pol)
         gid = next(g["id"] for g in self.broker.active_grants() if g["scope"] == "read")
         form = {"grant": gid, "csrf": "bad"}
         def post(form):
@@ -648,9 +628,7 @@ class Pages(Base):
 
     def test_settings_line_and_card_durations(self):
         _, s = self.get("/settings")
-        self.assertIn("Time-boxed grants", s)
-        self.assertIn("10 min, 60 min, 120 min", s)
-        self.assertIn("up to medium risk", s)
+        self.assertIn("Standing approvals: timed grants (no ceiling) 10/60/120 min; Always up to low risk", s)
         self.http()
         _, page = self.get("/")
         self.assertIn(">2 hr</button>", page)

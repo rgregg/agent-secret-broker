@@ -213,7 +213,7 @@ socket, and every signature ssh asks for becomes a broker request (mode
   requests are rated HIGH, so this only releases a signature when
   `auto_approve_max` is `high`. Host-level refusals (`ssh_hosts.allowed_hosts`,
   unverified or forwarded connections) still apply first. The credential-level
-  "always allow" button is never offered for an SSH key; set `approval` in the
+  "Always" button is never offered for an SSH key; set `approval` in the
   vault item yourself. To allow ONE server without that, use a standing host rule
   (next).
 
@@ -269,7 +269,7 @@ assessment, `create()` checks a matching rule *before* auto-approval, grants and
 the prompt. A matching rule releases the signature without a notification at
 ANY `risk.auto_approve_max` (including `none`) and regardless of the HIGH rating
 SSH requests carry: it is explicit human policy for exactly one server, like a
-time-boxed grant, and is audited as such (`approved` with `via: policy`,
+timed standing approval, and is audited as such (`approved` with `via: policy`,
 `rule_id`, `decision_source: rule`; `ssh_rule_used`). If a grant, `approval:
 allow` or a rule would each release a request, the audit shows the rule.
 Everything else (other servers, other accounts, other keys) still prompts or is
@@ -382,7 +382,7 @@ defaults (next section). The object looks like this:
   metadata have none. It is policy context: never returned by `list`, `which`,
   `/v1/secrets`, `/v1/status`, request results, notifications or the agent
   audit API. Edit it on the Policies tab ("Risk guidance"), which writes it into
-  the item's `broker` metadata like "always allow" does.
+  the item's `broker` metadata like standing approvals do.
 - `allowed_hosts` may be omitted for credentials that are not HTTP tokens (a
   Wi-Fi password): such a secret can never be used in `http` mode, only fetched
   with approval in env mode.
@@ -417,8 +417,9 @@ defaults (next section). The object looks like this:
   Entries that fail validation are skipped and listed in the `catalog_loaded`
   audit event (fail closed).
 - `store` creates the item, its value and this metadata in one write, so there
-  is nothing to keep in sync and nothing to roll back. "Always allow" and
-  revoking it edit `approval` on the item, with who and when.
+  is nothing to keep in sync and nothing to roll back. Always standing approvals
+  edit `standing` on the item, and revoking the legacy `approval: allow` edits
+  `approval`, with who and when.
 - The settings that remain (vault URL, notify transports, risk threshold,
   ports) are wiring, not a catalog. They come from the `BROKER_CONFIG`
   environment variable (a JSON object, see `deploy/config.example.json`) and/or
@@ -488,7 +489,7 @@ credentials with `"risk": {"auto_modes": ["http"]}` in the broker config.
   readable `scripts` entry (same path as given, or the same normalised path or
   file name). A missing or mismatched entry, or an interpreter reading stdin, counts
   as "script not visible": the request is never auto-approved, never covered by a
-  timed grant, never offered the Always or grant chips, and is audited `escalated` /
+  standing approval, never offered the Always or grant chips, and is audited `escalated` /
   `grant_skipped` with `reason: script_not_visible`. Inline code (`-c`, `-e`, `-m`,
   `eval`) and plain program names (`curl`, `git`, `docker compose up`) are not
   flagged. **This catches clients that omit entries. It cannot stop a client that
@@ -502,8 +503,9 @@ credentials with `"risk": {"auto_modes": ["http"]}` in the broker config.
   risk rating and the script text are hints, not enforcement. Opt a credential
   out with `auto_modes: ["http"]` when it should never be handed out unattended.
 - Store requests, the SSH floor and SSH host rules are unchanged.
-- The Policies tab's "Always allowed" list shows, per credential, the modes that
-  are auto-eligible (for example `web, run-with-secret`).
+- The Policies tab's "Standing approvals" table lists each `approval: allow`
+  credential with the modes that are auto-eligible (for example `web,
+  run-with-secret`); see "Standing approvals".
 
 ### Auto-approve level: `risk.auto_approve_max`
 
@@ -667,7 +669,7 @@ Every decision (dashboard `/decide`, approval-link page, `/push/decide`,
 token=None, always=False, nonce=None, peer=None, client_ip=None, grant_minutes=None, ssh_rule=None, **audit_extra)`
 -> `(http_status, request)`; `decision` is `approve|deny`. It alone enforces the
 single-decision claim, the constant-time token check (spent on match; any
-decision kills it), whether `always` may create an always-allow rule and `grant_minutes` a time-boxed grant (400 for a duration that is not on offer, nothing claimed), and the
+decision kills it), whether `always` may create an Always standing approval and `grant_minutes` a timed one (400 for a duration that is not on offer, nothing claimed), and the
 audit fields (`channel`, `approver`, `approver_peer`, `approver_ip`, plus
 `audit_extra`). Status: 200 decided, 403 bad/missing token, 404 unknown, 410
 already decided/expired/token spent. Channels are registered in
@@ -734,7 +736,7 @@ configured); 410 already decided, expired or token spent; 413 oversize; 429 more
 than 60 calls/min from one source IP (first drop per window audited as
 `ha_decide_dropped`). Responses never include request details. Decisions run
 through `decide_via("ha", ...)`: audit `channel: ha`, approver `ha:<device>`,
-never an always-allow rule.
+never a standing approval.
 
 Security: anyone who controls Home Assistant, or holds the hook key plus a
 pending request's token, can approve that request. The token is single-use and
@@ -817,7 +819,7 @@ An agent can add or rotate credentials, always with a fresh approval:
   anything that exists, and the new secret still prompts on every use). It is
   recorded as `policy:auto-create`; set `"store": {"create": "prompt"}` to ask
   instead. **Update always needs a human**, regardless of a secret's `approval`
-  policy, and is never eligible for "always allow".
+  policy, and is never eligible for Always.
 - **No half-finished state:** if the config cannot be written after a create, the
   new vault item is removed again.
 - Needs a vault account that can edit the target collection, and (when the
@@ -840,7 +842,7 @@ title shows how many are waiting, and with scripting disabled the same forms
 still work as ordinary page loads.
 
 It uses the same decision path as the push link (atomic claim, identity check,
-always-allow eligibility, audit), recorded with `channel: dashboard`. Because
+standing-approval eligibility, audit), recorded with `channel: dashboard`. Because
 one signed-in session can now decide many requests, decisions are additionally
 protected against cross-site requests:
 
@@ -964,7 +966,7 @@ role. Body (max 2 KB): `{"rid": "...", "token": "...", "decision": "approve"|"de
 Responses never contain request details, URLs or values. The decision runs
 through the same code as the dashboard `/decide` (same single-decision claim,
 checks and audit events) with `channel: push` and the approver taken from the SSO
-header. A notification never creates an always-allow rule. Audit:
+header. A notification never creates a standing approval. Audit:
 `decided` and `approved`/`denied` carry `channel: "push"`; refused attempts log
 `push_decide_refused`. The worker also reports `action_click` and `action_decide`
 (`ok`, `note: "http 200"` / `"network"`, `err`) through `/push/event`. On success
@@ -1176,116 +1178,182 @@ retained (the cards still show the section).
 approver pages (the SSO listener), never by an agent-facing endpoint; the
 `request_details_store_error` event is hidden from the audit API.
 
-## Always allow
+## Standing approvals (Always and time-boxed)
 
-On the approval page, the **Always** chip in the "Automatically approve..." row
-(it opens an "Always approve `NAME`?" confirmation with a **Confirm** button that
-submits `approve_always`) approves this request
-and records `"approval": "allow"` in that secret's vault item metadata (with who
-and when), effective immediately. It is offered only
-when it would mean something:
+A **standing approval** lets later requests for a secret through without a tap.
+"Always" and the **5 min / 15 min / 30 min** chips are one feature: both create
+a grant `{id, secrets, mode, scope, expires_at, created_by, created_at}`, and
+`expires_at: null` is what makes it **Always**. The chips are on the approval
+card (dashboard) and the approval-link page, in the "Automatically approve..."
+row; a disabled **Always** chip with a tooltip says why Always is not offered.
+Choosing one approves the current request as usual and creates the grant. Form
+values are `approve_grant_<minutes>` and `approve_always`.
 
-- Web (`http`) and run-with-secret (`env`) requests only. From an env request it
-  sets `approval: allow` and leaves `auto_modes` alone; the confirmation says the
-  secret value will be released to the requesting machine without asking again
-  when the request is rated at or below `risk.auto_approve_max`. It applies to the
-  modes in `auto_modes`. Not offered when an env request's script text is not
-  visible.
-- One secret per request.
-- Not from a request rated high, or one the current `risk.auto_approve_max` would not auto-approve (the rule would not take effect for such a request).
+### What a standing approval covers
 
-The rules are enforced on the server, so a forged form field is refused and
-audited (`policy_change_refused`). Changes are audited as `policy_changed`
-(`policy_change_failed` if the file could not be written; the in-memory policy
-is then left unchanged). The **Policies** tab (`/policies`, same SSO-gated listener) lists only the
-secrets that are always allowed, with a **Revoke** button that puts one back to
-"prompt"; it can only tighten.
+- **Exact secret set.** A grant covers a later request only when its set of
+  secret names *equals* the granted set (order does not matter); a subset or
+  superset prompts. Always is offered only for single-secret requests; timed
+  grants can cover a set.
+- **Mode.** `http` (web), `env` (run-with-secret) or `ssh_sign` (timed only; see
+  below). A grant never crosses modes: a web grant never covers env, and an env
+  grant never covers web. Both can exist for the same secret.
+- **Scope.** `read` (a request made with GET, HEAD or OPTIONS: covers only those
+  methods later; a mutating method falls through and is audited `grant_skipped`
+  with `reason: method`) or `any` (every method). A grant takes the scope of the
+  request it was made from: a GET makes a reads-only grant, any other method an
+  any-method grant. `env` and `ssh_sign` are always `any`. Always is *narrow*
+  (this secret, this mode, this method class); it never turns on `approval: allow`
+  for the whole credential.
+- **`store`** (create or update a credential) always asks; a standing choice on it is
+  refused and audited (`grant_refused`).
+- **env safeguard.** An env request whose script text is not visible
+  (`unreadable`/`stdin` markers, or cut off) is never covered, by either kind: it
+  prompts and is audited `grant_skipped` with `reason: script_not_visible`, and
+  no grant can be created from such a request. A changed script is still caught
+  by the client's sha256 check (exit code 6). An env approval releases the
+  plaintext value to the requesting machine; the chip help and the Always
+  confirmation say so.
+- **SSH.** `ssh_sign` has timed grants only (scope `any`: signing for that key).
+  SSH keeps its own per-host rules (see "Standing SSH rules"); the SSH card has no
+  Always chip. A standing approval can never release anything an `ssh_hosts`
+  refusal blocks (those run before a request exists).
 
-## Time-boxed grants (approve for N minutes)
+### The two kinds and their ceilings
 
-Instead of plain Approve or Always allow, the approver can pick a duration chip
-(**5 min**, **15 min**, ... after "Automatically approve...") on the approval card
-(dashboard) or on the approval-link page. A chip submits immediately (it expires
-by itself); a disabled **Always** chip with a tooltip shows why Always is not offered. The request is approved as usual, and for the next N
-minutes further requests for the same secret are approved without a tap. The
-grant ends by itself at an absolute deadline (using it does not extend it) and
-can be revoked early.
+| | Always | Timed |
+| --- | --- | --- |
+| Expires | never (until revoked) | at an absolute deadline (using it does not extend it) |
+| Risk ceiling | `risk.auto_approve_max` | none |
+| Stored in | the credential's vault metadata (`standing`) | `grants.json` beside the audit log |
 
-- **Bound to the exact set of secrets.** A grant belongs to the set of secret
-  names the human approved. A later request is covered only when its set of
-  names *equals* a granted set (order does not matter); a request for a subset or
-  a superset prompts. Granting again for the same set replaces that grant
-  (restarting the clock).
-- **Scoped by method class.** A grant made from an `http` request with method
-  GET, HEAD or OPTIONS (`scope: read`) covers only those methods later; a later
-  POST/PUT/PATCH/DELETE falls through to a normal prompt (`grant_skipped`,
-  `reason: method`). A grant made from any other method (`scope: any`) covers
-  all methods. `ssh_sign` has no method: its grant (`scope: any`) covers signing
-  for that key. The line under the chips says which applies.
-- **Risk does not block creating one.** HIGH-rated requests (every `ssh_sign` is
-  rated high) can still be approved with a grant; only `max_risk` limits use.
-- **Modes:** `http`, `ssh_sign` and `env` (run-with-secret). A grant belongs to
-  the mode it was approved in (an `env` grant for a set never covers web requests
-  for it, and a web grant never covers env); both can exist for the same set.
-  `scope` for env is `any` (no method). An env grant releases the plaintext value
-  to the requesting machine for its whole window without asking; the chip help
-  and the line under the chips say so. `store` (create or update) always asks;
-  a grant picked on it is refused and audited (`grant_refused`).
-- **env safeguards.** An env request whose script text is not visible
-  (`unreadable`/`stdin` markers, or cut off) is never covered by a grant: it
-  prompts and is audited `grant_skipped` with `reason: script_not_visible`; a
-  grant cannot be created from such a request either. `timed_grants.max_risk`
-  applies as for every mode. A changed script is still caught by the client's
-  sha256 check (exit code 6). Grants saved before modes were recorded cover web
-  and ssh only, never env.
-- **Only an explicit human choice creates a grant**, on the dashboard card or
-  the approval-link page, with the same SSO, CSRF and same-origin checks as the
-  other buttons. Notification buttons (`push`, `ha`) stay plain Approve/Deny and
-  can never create one. A denied or already decided request creates nothing.
-- **Config** (`timed_grants`, validated at startup with the field named in the
-  error): `enabled` (default `true`), `durations` (minutes offered; 1-6 distinct
-  whole numbers > 0 and <= `max_minutes`; default `[5, 15, 30]`),
-  `max_minutes` (cap, default 60, at most 1440) and `max_risk`
-  (`none|low|medium|high`, default `high` = no ceiling). `enabled: false` hides
-  the chips, rejects grant choices and ignores any persisted grants.
-- **Risk ceiling.** A request rated above `max_risk` ignores the grant and
-  prompts normally (`grant_skipped`, `reason: risk`). A missing model verdict
-  counts as high, so it only matters when the ceiling is below `high`. `none`
-  means grants are never used. A grant is checked only for requests no
-  `approval: allow` policy already approved; a request that policy escalated
-  because of risk can still be approved by a grant when the ceiling allows.
-- **Persistence.** Active grants live in `grants.json` next to the audit log
-  (atomic write, mode 0600; secret names, scope, times, grant id and creator only). It
-  is reloaded on start, so a redeploy does not drop them. Expired entries and
-  entries whose deadline is further out than `max_minutes` are dropped on load;
-  a corrupt file fails closed (no grants, `grants_file_corrupt` audit warning).
-- **Revoking.** The **Policies** tab has an "Active grants" card above "Always
-  allowed": all secrets in the set, the mode covered (web, run-with-secret, ssh) and reads only / all requests, live time left, who allowed it, and a **Revoke** button
-  (`POST /grants/revoke`, CSRF-checked). Programmatic: `Broker.revoke_grant`.
-- **Settings** shows the config line (on/off, durations, ceiling).
-  `GET /v1/status` reports only `features.timed_grants` (a bool). Which secrets
-  currently have a grant is approval context and is not returned by any
-  agent-facing endpoint (discovery, request results, status).
+- **Always** is checked against `risk.auto_approve_max`. A request rated above
+  it prompts as usual and is audited `grant_skipped` (`kind: always`,
+  `reason: risk`, `risk_level`, `max_risk`). A missing model verdict counts as
+  high for this check only. With `auto_approve_max` `none` an Always is never used.
+  The Always chip is not offered for a request already rated above the ceiling or
+  rated high.
+- **Timed grants have no risk ceiling.** The human chose one explicitly for a
+  short time, so it releases at any risk level, including HIGH (every `ssh_sign`
+  is rated high) and with no model verdict. `timed_grants.max_risk` is still
+  accepted in the config for older files but ignored; the broker logs a
+  `config_warning` saying so.
 
-Audit events (all but the last three carry the request `id`):
+### Evaluation order
+
+For each new request, after assessment and after an SSH host rule claim:
+
+1. The legacy credential-wide `approval: allow` policy (see
+   "What `approval: allow` covers"): `auto_modes` / `risk.auto_modes`, with the
+   `auto_approve_max` ceiling and the script safeguard, exactly as before.
+2. An Always standing approval (mode, exact set and scope; `auto_approve_max`
+   ceiling; script safeguard for env). One that does not apply is audited
+   `grant_skipped` and evaluation continues.
+3. A timed grant (mode, exact set and scope; script safeguard; no ceiling).
+4. Otherwise the request prompts (or escalates) as before.
+
+A request that step 1 escalated because of risk can still be released by step 2
+or 3. Checks run under the decision lock, so a human decision and a standing
+approval never both act. A request released by a standing approval ends
+`approved` with `via: policy` and a `grant_id`.
+
+### Creating and revoking
+
+- **Only an explicit human choice creates one**, on the dashboard card or the
+  approval-link page, with the same SSO, CSRF and same-origin checks as the other
+  buttons. Notification buttons (`push`, `ha`) stay plain Approve/Deny and never
+  create one. A denied or already decided request creates nothing.
+- **Duplicates are a no-op that still approves.** Choosing Always when a covering
+  Always exists approves and changes nothing. A broader Always (any method)
+  replaces a narrower one (reads only) for the same secret and mode. A timed
+  grant for the same set and mode replaces (and restarts) the old one.
+- **Cap:** 50 Always approvals per credential (`grant_refused`, `reason: cap`; the
+  request is still approved).
+- **Revoking.** The **Policies** tab has one "Standing approvals" table with
+  every timed grant, Always approval and legacy always-allowed credential:
+  Secrets, Covers (web reads only / web any method / run-with-secret / ssh),
+  Expires ("never" or a live countdown, "in 12 min"), who created it and when,
+  and **Revoke**. Timed and Always rows `POST /grants/revoke` (CSRF-checked); a
+  legacy `approval: allow` row (marked "whole credential, any method, any covered
+  mode") posts to `/policies` and sets the policy back to `prompt`, as before.
+  Programmatic: `Broker.revoke_grant(id, user)` returns True, False (not found) or
+  None (an Always could not be removed from the vault). The SSH host rules section
+  is separate.
+
+### Storage
+
+- **Always** approvals live in the credential's vault item, in its `broker`
+  metadata field `standing` (written through the same path as `approval` and
+  `guidance`), so they survive restarts, redeploys and vault rebuilds, and the live
+  catalog entry is updated immediately. Format (a list, at most 50 entries per
+  credential; the validator names `standing[i].field`; unknown keys are refused and
+  an invalid list makes the credential invalid, like `ssh_rules`):
+
+  ```json
+  "standing": [{"id": "9f2c41aa", "secrets": ["svc"], "mode": "http", "scope": "read",
+                "expires_at": null, "created_by": "alice", "created_at": "2026-10-19T12:00:00Z"}]
+  ```
+
+  `secrets` (if present) must be exactly the credential's own name; `mode` is
+  `http` or `env`; `scope` is `read` or `any` (`any` for env); `expires_at` must be
+  null. Writing also records `standing_changed` ({by, at}). A failed write leaves
+  the live state unchanged, the request is still approved, and
+  `standing_change_failed` is audited.
+- **Timed** grants live in `grants.json` next to the audit log (atomic write,
+  mode 0600; names, mode, scope, times, id and creator only; format version 3,
+  unchanged). Reloaded on start; expired entries and entries further out than
+  `max_minutes` are dropped on load; a corrupt file fails closed
+  (`grants_file_corrupt`). Grants saved before modes were recorded cover web and
+  ssh only, never env.
+- **Config** (`timed_grants`, validated at startup naming the field): `enabled`
+  (default `true`), `durations` (minutes offered; 1-6 distinct whole numbers > 0
+  and <= `max_minutes`; default `[5, 15, 30]`), `max_minutes` (cap, default 60, at
+  most 1440), and the ignored `max_risk`. `enabled: false` hides the timed chips,
+  rejects timed choices and ignores persisted timed grants; Always is unaffected.
+  Settings shows "Standing approvals: timed grants (no ceiling) 5/15/30 min; Always
+  up to low risk".
+
+### Legacy `approval: allow`
+
+A credential with `approval: allow` in its metadata (set by hand in the vault, or by
+older versions' Always chip) keeps working unchanged: it covers the whole
+credential, every method, and every mode in its `auto_modes`, up to the
+`auto_approve_max` ceiling. It appears in the same table and Revoke sets it back to
+`prompt` (`policy_changed`). No migration is needed. The new Always chip is not
+offered for such a credential ("already always-allowed").
+
+### What the agent can and cannot see
+
+Nothing about standing approvals reaches the agent: discovery, `GET /v1/status`
+(only `features.timed_grants`, a bool), request results, notifications and the
+audit API show a standing-approved request as a plain `approved`. The Policies
+page, approval cards and history are approver-only.
+
+### Audit events
+
+All but the last few carry the request `id`; all are hidden from the agent audit API.
 
 | Event | Fields |
 | --- | --- |
-| `decided` / `approved` | `grant_minutes` when the approver chose a grant (`via: user`, `channel`) |
-| `grant_created` | `mode`, `grant_id`, `scope`, `grant_minutes`, `expires_at`, `created_by`, `channel`, `approver_peer`, `approver_ip` |
-| `grant_refused` | `reason` (ineligible mode); the approver's usual `channel`/`approver` fields |
-| `grant_used` | `grant_id`, `scope`, `grant_left_s` |
+| `decided` / `approved` | `grant_minutes` for a timed choice, `always_requested` for Always (`via: user`, `channel`) |
+| `grant_created` | `kind` (`always`/`timed`), `grant_id`, `scope`, `grant_mode` (Always) or `mode`, `grant_minutes` (timed), `expires_at` (null for Always), `created_by`, `channel`, `approver_peer`, `approver_ip` |
+| `grant_refused` | `kind`, `reason` (ineligible mode, `cap`, `backend`) |
+| `policy_change_refused` | `reason` when an Always was requested but is not eligible |
+| `grant_used` | `kind`, `grant_id`, `scope`, `grant_minutes`, `grant_left_s` (timed) |
 | `approved` (auto) | `via: policy`, `grant_id`, `grant_left_s` |
-| `grant_skipped` | `reason: risk`, `method` or `script_not_visible`, `grant_mode`, `grant_id`, `scope`, `risk_level`, `max_risk` |
-| `grant_revoked` | `mode`, `grant_id`, `secrets`, `scope`, `created_by`, `revoked_by`, `left_s`, `peer`, `client_ip` |
-| `grant_expired` | `mode`, `grant_id`, `secrets`, `expires_at`, `created_by` (recorded lazily on the next check, by a 15 s sweep, or on load) |
+| `grant_skipped` | `kind`, `reason: risk` (Always only), `method` or `script_not_visible`, `grant_mode`, `grant_id`, `scope`, `risk_level`, `max_risk` |
+| `grant_revoked` | `kind`, `mode`, `grant_id`, `secrets`, `scope`, `created_by`, `revoked_by`, `left_s`, `peer`, `client_ip` |
+| `grant_expired` | `mode`, `grant_id`, `secrets`, `expires_at`, `created_by` (timed; lazily, by a 15 s sweep, or on load) |
+| `standing_change_failed` | `op` (`create`/`revoke`), `error` |
 | `grants_file_corrupt`, `grant_dropped`, `grants_file_write_failed` | `warning` / `reason`, `error` |
+| `config_warning` | `timed_grants.max_risk is ignored` |
+| `policy_changed` | legacy `approval` changes only (`from`, `to`, `user`) |
 
 For any API that exposes audit events outside the approver UI: treat `grant_*`
-events and the `grant_id`, `scope`, `grant_left_s` fields as policy context
-and show a grant-approved request as a plain `approved`. The history rows and
-pop-over show "Decided by: time-boxed grant (auto-approved), 12 min left when
-used".
+events and the `grant_id`, `kind`, `scope`, `grant_left_s` fields as policy
+context. The history rows and pop-over say "Decided by: standing approval
+(always, reads only) (auto-approved), grant 9f2c41aa" or "standing approval (15
+min, any method) (auto-approved), 12 min left when used".
 
 ## Vault session lifetime
 
@@ -1315,7 +1383,7 @@ values, header values or bodies (those live in the separate, short-lived
 Events: `startup` (policies in force), `requested`, `assessed`, `notified`,
 `secret_read`, `approved`/`denied`/`expired`/`failed` (with `via` user or
 policy, approver, reported client IP, latency), `http_executed`, `delivered`,
-`escalated`, `stored`, `request_detail_viewed`, `grant_created`/`grant_used`/`grant_revoked`/`grant_expired` (see Time-boxed grants), `config_warning`, `policy_changed`, `policy_change_refused`, `policy_change_failed`, `guidance_changed`
+`escalated`, `stored`, `request_detail_viewed`, `grant_created`/`grant_used`/`grant_revoked`/`grant_expired` (see Standing approvals), `standing_change_failed`, `config_warning`, `policy_changed`, `policy_change_refused`, `policy_change_failed`, `guidance_changed`
 (secret, user, peer, length, sha256 prefixes of the old and new text, never the
 text), `guidance_change_refused`, `guidance_change_failed`, and
 security events `auth_failed`, `rejected`, `approval_viewed`,
@@ -1442,7 +1510,7 @@ or `expired` mean a human was asked (the agent also learns that from its own req
 - **env mode is advisory** (see above). Prefer `http` mode. With `approval: allow`
   (default `auto_modes` includes `env`), an env request that is rated within
   `risk.auto_approve_max` and has visible scripts is released to the requesting
-  machine without a prompt; a timed grant does the same for its window.
+  machine without a prompt; an Always or timed env standing approval does the same.
 - Output masking is exact-match; a program that transforms a secret before
   printing it (base64, splitting) defeats it.
 
