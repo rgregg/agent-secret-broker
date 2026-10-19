@@ -2264,6 +2264,21 @@ class Dashboard(Harness):
         return urllib.request.urlopen(urllib.request.Request(
             self.abase + path, headers={"X-authentik-username": "alice"})).headers
 
+    def test_card_says_assessing_until_the_rating_arrives_and_then_refreshes(self):
+        import re
+        rid = self.ask("/api/health")
+        r = self.broker._by_id[rid]
+        keep, r.risk = r.risk, None                      # drawn before the assessment landed
+        _, body = self.get("/?fragment=1")
+        self.assertIn("ASSESSING", body)
+        self.assertNotIn("MEDIUM RISK", body)
+        v1 = re.search(r"data-version='([0-9a-f]+)'", body).group(1)
+        r.risk = keep                                    # the assessment arrives
+        _, body = self.get("/?fragment=1")
+        self.assertNotIn("ASSESSING", body)
+        v2 = re.search(r"data-version='([0-9a-f]+)'", body).group(1)
+        self.assertNotEqual(v1, v2)                      # so the page swaps the card in
+
     def test_notification_toggle_is_present_and_text_is_names_only(self):
         self.ask("/secret-looking-path?token=abc123")
         code, body = self.get()
