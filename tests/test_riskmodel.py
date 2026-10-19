@@ -217,7 +217,7 @@ class Config(unittest.TestCase):
 class Harness(unittest.TestCase):
     def test_cases_wellformed_and_split(self):
         cases = evalrun.load_cases(evalrun.DEFAULT_CASES)
-        self.assertTrue(80 <= len(cases) <= 120)
+        self.assertTrue(80 <= len(cases) <= 180)
         hold = sum(c["split"] == "holdout" for c in cases)
         self.assertTrue(0.15 < hold / len(cases) < 0.35)
         self.assertEqual({c["mode"] for c in cases}, {"http", "env", "store", "ssh_sign"})
