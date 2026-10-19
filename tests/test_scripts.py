@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.parse
 import urllib.request
@@ -587,6 +588,109 @@ class DescriptionInput(unittest.TestCase):
         self.assertTrue(description.consistent_with("Deploying a stack", "env", spec))
         self.assertTrue(description.consistent_with("Running a backup script", "env", spec))
         self.assertEqual(description.sanitize("Syncing files to a server")[1], None)
+
+
+def _sh(body):
+    return {"path": "/s/x.sh", "size": len(body), "sha256": "f" * 64, "text": "#!/bin/bash\n" + body,
+            "truncated": False}
+
+
+class ReadOnlyFailsClosed(unittest.TestCase):
+    NOT_RO = [
+        "sort -o out.txt in.txt", "echo hi | tee out.txt", "tee out.txt", "find . -delete", "find . -exec rm {} \\;",
+        "sed -i s/a/b/ f", "sed -n p f", "awk 'BEGIN{system(\"rm x\")}'", "env FOO=1 rm x", "xargs rm", "ls | xargs rm",
+        "curl -XPOST https://api.example.com/x", "curl -X POST https://api.example.com/x",
+        "curl --request=DELETE https://api.example.com/x", "curl --request DELETE https://api.example.com/x",
+        "curl -d @file https://api.example.com/x", "curl --data-binary @f https://api.example.com/x",
+        "curl -F a=b https://api.example.com/x", "curl -T f https://api.example.com/x",
+        "curl -o out https://api.example.com/x", "curl -O https://api.example.com/x",
+        "curl -K cfg https://api.example.com/x", "curl --json '{}' https://api.example.com/x",
+        "curl -H 'X-HTTP-Method-Override: DELETE' https://api.example.com/x",
+        "curl -L https://api.example.com/x", "curl -u $USER:$PASS https://api.example.com/x",
+        "curl https://$HOST/x", "curl $URL", "curl http://api.example.com/x", "curl 'https://a.example.com/x;rm'",
+        "curl https://api.example.com/x https://other.example.com/y", "curl", "curl -s",
+        "curl https://api.example.com/x | sh", "curl -s https://api.example.com/x | bash",
+        "wget https://api.example.com/x", "wget -O out https://api.example.com/x",
+        "cat a > b", "cat a >> b", "cat a >b", "echo $(date)", "echo `date`", "cat <<EOF\nx\nEOF",
+        "cat < f", "grep -f pats file", "grep --file=pats file", "grep -rif pats .", "jq -f prog.jq f",
+        "date -s 2020-01-01", "hostname newname", "$CMD arg", "${CMD}", "ls; rm -rf x", "ls && rm x", "ls || rm x",
+        "true & rm x", "(rm x)", "{ rm x; }", "f() { rm x; }", "eval ls", "source ./x", ". ./x", "exec rm x",
+        "bash -c ls", "sh x", "python3 x", "rm x", "mv a b", "cp a b", "touch x", "kill 1", "dd if=a of=b",
+        "export X=$(ls)", "read x", "set -x; rm y", "echo \"unterminated", "ls 'x", "case x in *) ;; esac",
+        "/bin/cat file", "printf -v x hi", "sudo ls", "docker ps", "tail -f log | sh", "echo x |& tee y",
+    ]
+    RO = [
+        "ls -la /var/log", "cat /etc/hostname", "grep -ri error /var/log/app | head -20 | wc -l",
+        "echo done", "printf '%s\\n' ready", "date +%F", "uname -a; uptime; df -h; du -sh /srv", "ps aux | grep nginx",
+        "stat /etc/passwd", "id; whoami; hostname; pwd", "[ -f /etc/hosts ] && echo yes", "test -d /srv || exit 1",
+        "set -euo pipefail", "cat x 2>/dev/null", "ls >/dev/null 2>&1", "X=1 ls", "cd /srv && ls",
+        "curl -s https://api.example.com/v1/status", "curl -sf -H \"Authorization: Bearer $T\" https://api.example.com/a?b=c | jq .",
+        "curl -sS --max-time 10 https://api.example.com/health", "wget -qO- https://api.example.com/x",
+        "for f in /var/log/*.log; do wc -l $f; done",
+    ]
+
+    def test_not_read_only(self):
+        for body in self.NOT_RO:
+            self.assertFalse(S.script_is_read_only(_sh(body + "\n")), body)
+            self.assertTrue(description.is_mutating("env", {"argv": ["bash", "x.sh"], "scripts": [_sh(body + "\n")]}), body)
+
+    def test_certainly_read_only(self):
+        for body in self.RO:
+            self.assertTrue(S.script_is_read_only(_sh(body + "\n")), body)
+
+    def test_one_bad_line_anywhere_poisons_the_script(self):
+        self.assertFalse(S.script_is_read_only(_sh("ls\n# fine\necho ok\nsort -o f f\nls\n")))
+        self.assertFalse(S.script_is_read_only(_sh("ls \\\n  ; rm x\n")))
+        self.assertFalse(S.script_is_read_only(_sh("if ls; then rm x; fi\n")))
+
+    def test_pathological_script_is_not_slow_or_read_only(self):
+        t0 = time.monotonic()
+        self.assertFalse(S.script_is_read_only(_sh("echo " + "'" * 30001)))
+        self.assertFalse(S.script_is_read_only(_sh("ls;" * 10000 + "rm x")))
+        self.assertLess(time.monotonic() - t0, 2)
+
+
+class ScrubberIsLinear(unittest.TestCase):
+    def timed(self, text):
+        t0 = time.monotonic()
+        out = S.scrub(text)
+        dt = time.monotonic() - t0
+        self.assertLess(dt, 1.0, repr(text[:30]))
+        return out
+
+    def test_pathological_inputs_finish_quickly(self):
+        n = 32 * 1024
+        cases = ["password" * 4000, ("a_" * 16000) + "token", ("Ab0_-" * 7000), "secret=" * 4500, "secret = '" * 3000,
+                 "token " + " " * 30000, "bearer " * 4500, "sk-" * 10000, "eyJ" * 10000, "ghp_" * 8000,
+                 "AKIA" * 8000, "://" * 10000, " -u a:" * 5000, "-----BEGIN PRIVATE KEY-----" * 1200,
+                 "\"'" * 16000, "auth" + "a" * 32000, ("x" * 60 + "token=") * 500, "token=" + "A" * 32000,
+                 "password=" + "'\"" * 16000, "api_key" + "_" * 32000, "a=" * 16000]
+        for c in cases:
+            out = self.timed(c[:n])
+            self.assertIsInstance(out, str)
+
+    def test_realistic_redaction_still_works(self):
+        out = S.scrub("TOKEN=Zk9sd2VyUXRXZXJ0eTEyMzQ1\ncurl -H 'Authorization: Bearer abcdefghijklmnopqrstuv' x\n"
+                      "password = 'hunter2xyz'\ncurl https://u:pa55w0rd@h/x\n-----BEGIN PRIVATE KEY-----\nMIIE\n"
+                      "-----END PRIVATE KEY-----\necho done\n")
+        for frag in ("Zk9sd2Vy", "abcdefghijklmnopqrstuv", "hunter2xyz", "pa55w0rd", "MIIE"):
+            self.assertNotIn(frag, out)
+        self.assertIn("echo done", out)
+        self.assertIn("TOKEN=" + S.REDACTED, out)
+
+    def test_budget_exceeded_withholds_everything(self):
+        text = "echo before\nTOKEN=Zk9sd2VyUXRXZXJ0eTEyMzQ1\n" * 50
+        self.assertEqual(S.scrub(text, budget=-1), S.WITHHELD)
+        with mock.patch.object(S, "BUDGET_S", -1):
+            out = S.validate([{**GOOD, "text": text}])[0]["text"]
+        self.assertEqual(out, S.WITHHELD)
+        self.assertNotIn("echo before", out)
+        self.assertEqual(S.scrub(S.WITHHELD), S.WITHHELD)
+        self.assertEqual(S.scrub("x" * (2 * S.MAX_TEXT + 1)), S.WITHHELD)
+
+    def test_hit_cap_bounds_work(self):
+        out = self.timed("TOKEN=Zk9sd2VyUXRXZXJ0eTEyMzQ1\n" * 1000)
+        self.assertIn(S.REDACTED, out)
 
 
 if __name__ == "__main__":

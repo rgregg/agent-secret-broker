@@ -49,7 +49,9 @@ script that is unreadable, binary or read from stdin, and `text_truncated` when
 text was cut. The text for all scripts together is capped at 6000 characters so
 the call stays small. Obvious secrets (`token=...`, `Bearer ...`, `password=...`,
 AWS/GitHub/Slack key patterns, private key blocks) are replaced by `[redacted]`
-before anything is sent to a model or shown. `send_content: false` withholds the text.
+before anything is sent to a model or shown. The scrubber is linear-time (bounded
+windows, capped hits) and has a 50 ms budget; if that runs out the whole text is
+withheld (`[scrub budget exceeded; text withheld]`), never sent half-scrubbed. `send_content: false` withholds the text.
 
 The `SCRIPT_RUBRIC` constant in `riskmodel.py` is appended to the instructions
 only when the request has scripts. It rates what the script would do with the
@@ -68,11 +70,16 @@ raise the rating one level.
 For the description, the model sees the first 1000 characters of each script and
 may describe the script's job ("Running a backup script"). All sanitizer rules
 stay. An env request with scripts counts as mutating (a write verb is required)
-unless every script is certainly read-only: complete (not cut off), a plain
-shell script, made only of read-like commands (`echo`, `cat`, `grep`, `jq`,
-`curl` without a body, method or output file, and the like), with no command
-substitution, heredoc or redirection other than to /dev/null. When unsure it is
-mutating. The legacy `openrouter` classifier gets the same excerpt (JSON-quoted)
+unless every script is certainly read-only. That check fails closed: the script
+must be complete (not cut off) and a plain shell script made only of a short list of
+read-only commands (`cat`, `ls`, `head`, `tail`, `grep` without `-f`, `wc`, `stat`,
+`date`, `uname`, `uptime`, `df`, `du`, `ps`, `hostname`, `whoami`, `id`, `pwd`,
+`test`, `echo`, `printf`, `jq`), with no redirection to a file, command substitution,
+backticks, here-document, subshell, background job or variable in command position;
+`sort`, `tee`, `xargs`, `find`, `sed`, `awk`, `env` and the like are not on the list.
+`curl`/`wget` count only as a plain GET of one literal https URL (no `-X`, `-d`, `-F`,
+`-T`, `-o`, `-O`, `-K`, `-u`, `--json`, `-L` or method-override header). Anything
+unparseable is not read-only. When unsure it is mutating. The legacy `openrouter` classifier gets the same excerpt (JSON-quoted)
 capped by `max_content_chars`.
 
 ## The AI description (display only)

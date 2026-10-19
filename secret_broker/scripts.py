@@ -23,6 +23,7 @@ history pop-over shows path, size and hash only.
 import html
 import os
 import re
+import time
 
 MAX_SCRIPTS = 3
 MAX_TEXT = 32 * 1024            # characters of text per script
@@ -39,40 +40,174 @@ MAX_SIZE = 1 << 40
 # -- scrubbing ----------------------------------------------------------------
 # Best effort, applied to script text as soon as it arrives and again before it
 # goes to a model. Replaces obvious secret-looking values, not variable names.
+# Linear time by construction: fixed-prefix patterns have bounded quantifiers,
+# keyword rules look only at a bounded window after each keyword hit (hits are
+# capped), and a wall-clock budget makes the scrubber fail closed: when it runs
+# out of time the WHOLE text is withheld, never sent half-scrubbed.
 REDACTED = "[redacted]"
-_NOT_VAR = r"(?![\$\{\(<\[%/~.])"        # a value that is not a variable, placeholder or path
-_SCRUBS = (
-    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)", re.S),
-     "-----BEGIN PRIVATE KEY----- " + REDACTED),
-    (re.compile(r"\b(AKIA|ASIA)[0-9A-Z]{16}\b"), REDACTED),
-    (re.compile(r"\bgh[pousr]_[A-Za-z0-9]{30,}\b"), REDACTED),
-    (re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"), REDACTED),
-    (re.compile(r"\bglpat-[A-Za-z0-9_-]{16,}\b"), REDACTED),
-    (re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}\b"), REDACTED),
-    (re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"), REDACTED),
-    (re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}\b"), REDACTED),
-    (re.compile(r"(?i)\b(bearer|basic|token)(\s+)" + _NOT_VAR + r"[A-Za-z0-9._~+/=-]{16,}"),
-     lambda m: m.group(1) + m.group(2) + REDACTED),
-    (re.compile(r"(?i)(://[^/\s:@]+:)[^/\s@]{3,}(@)"), lambda m: m.group(1) + REDACTED + m.group(2)),
-    (re.compile(r"(?i)(\s-u\s+['\"]?[^\s:'\"]+:)" + _NOT_VAR + r"[^\s'\"]{3,}"),
-     lambda m: m.group(1) + REDACTED),
-    (re.compile(r"(?i)\b(x-api-key|api-key|x-auth-token|x-token)(\s*:\s*['\"]?)" + _NOT_VAR + r"[A-Za-z0-9._~+/=-]{8,}"),
-     lambda m: m.group(1) + m.group(2) + REDACTED),
-    # NAME=value / name: "value" where the name says it is a secret
-    (re.compile(r"(?i)(\b[A-Za-z0-9_-]*(?:password|passwd|pwd|passphrase)[A-Za-z0-9_-]*['\"]?\s*[:=]\s*['\"]?)"
-                + _NOT_VAR + r"[^\s'\"`;&|)]{4,}"), lambda m: m.group(1) + REDACTED),
-    (re.compile(r"(?i)(\b[A-Za-z0-9_-]*(?:token|secret|api[_-]?key|apikey|access[_-]?key|private[_-]?key|"
-                r"auth|credential)[A-Za-z0-9_-]*['\"]?\s*[:=]\s*['\"]?)" + _NOT_VAR
-                + r"[A-Za-z0-9+/=_.:@!#%^&*~-]{8,}"), lambda m: m.group(1) + REDACTED),
+WITHHELD = "[scrub budget exceeded; text withheld]"
+BUDGET_S = 0.05
+MAX_HITS = 200
+MAX_SCRUB_CHARS = 2 * MAX_TEXT
+_ID_AFTER = 64          # identifier characters examined after a keyword
+_VALUE_MAX = 200        # value characters examined after the separator
+
+_FIXED = (
+    (re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"), REDACTED),
+    (re.compile(r"\bgh[pousr]_[A-Za-z0-9]{30,100}"), REDACTED),
+    (re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,100}"), REDACTED),
+    (re.compile(r"\bglpat-[A-Za-z0-9_-]{16,100}"), REDACTED),
+    (re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,100}"), REDACTED),
+    (re.compile(r"\bsk-[A-Za-z0-9_-]{20,200}"), REDACTED),
+    (re.compile(r"\beyJ[A-Za-z0-9_-]{8,200}\.[A-Za-z0-9_-]{8,200}\.[A-Za-z0-9_-]{4,200}"), REDACTED),
 )
+_KEYWORDS = re.compile(
+    r"password|passwd|pwd|passphrase|token|secret|api[_-]?key|access[_-]?key|private[_-]?key|auth|"
+    r"credential|bearer|basic", re.I)
+_PASSWORDISH = re.compile(r"password|passwd|pwd|passphrase", re.I)
+_IDCH = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")
+_TOKCH = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._~+/=-")
+_VALCH = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+/=_.:@!#%^&*~-")
+_NOT_VALUE_START = frozenset("$({<[%/~.")
 
 
-def scrub(text):
-    """Replace obvious secret-looking values with [redacted]. Idempotent."""
+class _Budget(Exception):
+    pass
+
+
+def _run(s, i, chars, limit):
+    """End index of the run of `chars` starting at i, looking at most `limit` characters."""
+    j, stop = i, min(len(s), i + limit)
+    while j < stop and s[j] in chars:
+        j += 1
+    return j
+
+
+def _keyword_spans(text, deadline):
+    spans, hits, last = [], 0, 0
+    for m in _KEYWORDS.finditer(text):
+        if m.start() < last:
+            continue
+        hits += 1
+        if hits > MAX_HITS:
+            break
+        if hits % 32 == 0 and time.monotonic() > deadline:
+            raise _Budget
+        kw = m.group(0).lower()
+        i = _run(text, m.end(), _IDCH, _ID_AFTER)           # rest of the identifier
+        j = i
+        if j < len(text) and text[j] in "\"'":
+            j += 1
+        k = j
+        while k < len(text) and k - j < 8 and text[k] in " \t":
+            k += 1
+        if k < len(text) and text[k] in ":=" and k > j - 1:
+            k += 1
+            while k < len(text) and k - j < 16 and text[k] in " \t":
+                k += 1
+            if k < len(text) and text[k] in "\"'":
+                k += 1
+            end = _run(text, k, _VALCH, _VALUE_MAX)
+            need = 4 if _PASSWORDISH.fullmatch(kw) or _PASSWORDISH.search(text[m.start():i]) else 8
+            if end - k >= need and text[k] not in _NOT_VALUE_START:
+                spans.append((k, end))
+                last = end
+            continue
+        if kw in ("bearer", "basic", "token") and i == m.end() and k > j and k - j <= 8:
+            end = _run(text, k, _TOKCH, _VALUE_MAX)
+            if end - k >= 16 and text[k] not in _NOT_VALUE_START:
+                spans.append((k, end))
+                last = end
+    return spans
+
+
+def _userinfo_spans(text, deadline):
+    spans, pos, hits = [], 0, 0
+    while hits < MAX_HITS:
+        a = text.find("://", pos)
+        if a < 0:
+            break
+        hits += 1
+        pos = a + 3
+        u = _run(text, pos, _TOKCH - {"/"}, 100)
+        if u < len(text) and text[u] == ":":
+            p = u + 1
+            q = p
+            stop = min(len(text), p + 100)
+            while q < stop and text[q] not in "/@ \t\r\n'\"":
+                q += 1
+            if q < len(text) and text[q] == "@" and q - p >= 3:
+                spans.append((p, q))
+    pos, hits = 0, 0
+    while hits < MAX_HITS:
+        a = text.find(" -u ", pos)
+        if a < 0:
+            break
+        hits += 1
+        pos = a + 4
+        p = pos
+        if p < len(text) and text[p] in "\"'":
+            p += 1
+        u = _run(text, p, _TOKCH - {":"}, 100)
+        if u < len(text) and text[u] == ":":
+            q = _run(text, u + 1, frozenset(c for c in map(chr, range(33, 127)) if c not in "'\""), 100)
+            if q - (u + 1) >= 3 and text[u + 1] not in _NOT_VALUE_START:
+                spans.append((u + 1, q))
+    return spans
+
+
+def _private_key_spans(text):
+    spans, pos, hits = [], 0, 0
+    while hits < 20:
+        a = text.find("-----BEGIN ", pos)
+        if a < 0:
+            break
+        hits += 1
+        head_end = text.find("-----", a + 11, a + 80)
+        if head_end < 0 or "PRIVATE KEY" not in text[a:head_end]:
+            pos = a + 11
+            continue
+        e = text.find("-----END ", head_end, head_end + 16384)
+        end = len(text) if e < 0 else (text.find("-----", e + 9, e + 80) + 5 or e + 9)
+        end = min(end, head_end + 16384)
+        spans.append((head_end + 5, end))
+        pos = max(end, a + 11)
+    return spans
+
+
+def _apply(text, spans):
+    out, cur = [], 0
+    for a, b in sorted(spans):
+        if a < cur:
+            continue
+        out.append(text[cur:a])
+        out.append(REDACTED)
+        cur = b
+    out.append(text[cur:])
+    return "".join(out)
+
+
+def scrub(text, budget=None):
+    """Replace obvious secret-looking values with [redacted]. Idempotent. Linear time;
+    if the time budget runs out the whole text is replaced by WITHHELD."""
     if not isinstance(text, str):
         return ""
-    for rx, rep in _SCRUBS:
-        text = rx.sub(rep, text)
+    if len(text) > MAX_SCRUB_CHARS:
+        return WITHHELD
+    deadline = time.monotonic() + (BUDGET_S if budget is None else budget)
+    try:
+        for rx, rep in _FIXED:
+            text = rx.sub(rep, text)
+            if time.monotonic() > deadline:
+                raise _Budget
+        spans = _private_key_spans(text)
+        text = _apply(text, spans)
+        text = _apply(text, _userinfo_spans(text, deadline))
+        text = _apply(text, _keyword_spans(text, deadline))
+        if time.monotonic() > deadline:
+            raise _Budget
+    except _Budget:
+        return WITHHELD
     return text
 
 
@@ -184,59 +319,144 @@ def has_blind_spot(scripts):
 
 
 # -- the classifier-independent "certainly only reads" heuristic ----------------
-
+# Fails closed: only a short list of plainly read-only commands, in a plain shell
+# script, with no redirection to files, no substitution and no tricks, counts. A
+# curl/wget counts only as a plain GET of one literal https URL. Anything unusual
+# or unparseable is "not read-only", which makes the description need a write verb.
 _SHELL_SHEBANG = re.compile(r"^#!\s*(?:/usr/bin/env\s+(?:-S\s+)?)?\S*?(?:ba|z|da|k)?sh\b")
 READ_CMDS = frozenset((
-    "echo", "printf", "cat", "ls", "grep", "egrep", "fgrep", "head", "tail", "wc", "date", "sort", "uniq",
-    "jq", "cut", "tr", "basename", "dirname", "pwd", "true", "false", "test", "[", "[[", "set",
-    "export", "cd", "exit", "return", "read", "local", "declare", "uname", "hostname", "whoami", "id",
-    "uptime", "df", "du", "free", "ps", "stat", "file", "which", "type", "sleep", "curl", ":",
+    "cat", "ls", "head", "tail", "grep", "egrep", "fgrep", "wc", "stat", "date", "uname", "uptime", "df",
+    "du", "ps", "hostname", "whoami", "id", "pwd", "true", "false", "test", "[", "[[", "echo", "printf",
+    "jq", "cd", "exit", "set", ":", "curl", "wget",
 ))
-_CTRL_WORDS = frozenset(("if", "then", "else", "elif", "fi", "do", "done", "while", "until", "!", "{", "}",
-                         "for", "esac"))
-_CURL_WRITE = re.compile(r"(?:^|\s)(?:-X|--request|-d|--data\S*|-F|--form\S*|-T|--upload-file|-o|-O|--output|"
-                         r"-K|--config|--json|-w|--post\S*|--remote-name\S*|-J)(?:\s|=|$)|\s-[A-Za-z]*[dFToOXK]\b")
+_CTRL_WORDS = frozenset(("if", "then", "else", "elif", "fi", "do", "done", "while", "until", "!"))
+_SEPS = frozenset((";", "&&", "||", "|", "\n"))
+_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_URL = re.compile(r"^https://[A-Za-z0-9.-]+(?::\d{1,5})?(?:/[A-Za-z0-9._~/%?&=+,:@-]*)?$")
+_METHOD_HDR = re.compile(r"^\s*x-(?:http-)?method(?:-override)?\s*:", re.I)
+_SET_OK = re.compile(r"^[-+][euo]+$|^pipefail$")
+_CURL_FLAGS = re.compile(r"^-[sSf]+$")
+_CURL_LONG = frozenset(("--silent", "--show-error", "--fail", "--fail-with-body", "--compressed"))
+_CURL_VALUED = frozenset(("--max-time", "-m", "--connect-timeout", "--retry"))
+_ALLOWED_REDIR = re.compile(r"(?<![0-9A-Za-z_])\d?>&\d\b|\d?>>?\s*/dev/null|&>\s*/dev/null")
+
+
+def _curl_ok(toks):
+    urls, i = 0, 0
+    while i < len(toks):
+        t = toks[i]
+        if t in ("-H", "--header") and i + 1 < len(toks):
+            if _METHOD_HDR.match(toks[i + 1]):
+                return False
+            i += 2
+        elif t in _CURL_VALUED and i + 1 < len(toks) and re.match(r"^\d{1,4}$", toks[i + 1]):
+            i += 2
+        elif _CURL_FLAGS.match(t) or t in _CURL_LONG:
+            i += 1
+        elif t.startswith("-"):
+            return False                        # -X, -d, -o, -u, -L, -K, -T, --json, ... anything else
+        else:
+            if not _URL.match(t):
+                return False                    # not a literal https URL (variable, quote trick, http://)
+            urls += 1
+            i += 1
+    return urls == 1
+
+
+def _wget_ok(toks):
+    urls, i = 0, 0
+    while i < len(toks):
+        t = toks[i]
+        if t in ("-qO-", "-O-", "-q", "--quiet", "-nv"):
+            i += 1
+        elif t == "-O" and i + 1 < len(toks) and toks[i + 1] == "-":
+            i += 2
+        elif t.startswith("-"):
+            return False
+        else:
+            if not _URL.match(t):
+                return False
+            urls += 1
+            i += 1
+    return urls == 1 and ("-qO-" in toks or "-O-" in toks or "-O" in toks)
+
+
+def _segment_ok(toks):
+    while toks and (toks[0] in _CTRL_WORDS or _ASSIGN.match(toks[0])):
+        toks = toks[1:]
+    if not toks:
+        return True
+    if toks[0] == "for":                        # for x in a b c  (the body is separate segments)
+        return len(toks) >= 4 and toks[2] == "in" and re.match(r"^[A-Za-z_]\w*$", toks[1]) is not None
+    cmd, args = toks[0], toks[1:]
+    if cmd not in READ_CMDS:
+        return False
+    short = [a for a in args if a.startswith("-")]
+    if cmd in ("grep", "egrep", "fgrep"):
+        return not any(a.startswith("--file") or (not a.startswith("--") and "f" in a[1:]) for a in short)
+    if cmd == "jq":
+        return not any(a.startswith("--from-file") or (not a.startswith("--") and "f" in a[1:]) for a in short)
+    if cmd == "date":
+        return not any(a in ("-s", "--set") or a.startswith("--set=") or a.startswith("-s") for a in args)
+    if cmd == "hostname":
+        return all(a.startswith("-") and a not in ("-F", "--file", "-b") for a in args)
+    if cmd == "printf":
+        return "-v" not in args
+    if cmd == "set":
+        return all(_SET_OK.match(a) for a in args) and bool(args)
+    if cmd == "curl":
+        return _curl_ok(args)
+    if cmd == "wget":
+        return _wget_ok(args)
+    if cmd in ("tail", "head", "cat", "ls", "wc", "stat", "du", "df", "ps"):
+        return not any(a.startswith(("--output", "--file")) for a in args)
+    return True
 
 
 def script_is_read_only(s):
     """True only when the whole script is certainly a plain shell script made of
-    read-like commands. Anything unusual (other languages, substitutions,
-    redirections other than to /dev/null, pipes into non-read commands, heredocs,
-    functions, unknown commands, cut text) is NOT certain, so False."""
+    plainly read-only commands. Everything else is False (see the module comment)."""
     if s.get("stdin") or s.get("unreadable") or s.get("truncated") or "text" not in s:
         return False
     text = s["text"]
+    if len(text) > MAX_TEXT:
+        return False
     first = text.split("\n", 1)[0]
     if first.startswith("#!"):
         if not _SHELL_SHEBANG.match(first):
             return False
     elif not str(s.get("path", "")).endswith((".sh", ".bash")):
         return False
+    import shlex
     text = text.replace("\\\n", " ")
     for line in text.split("\n"):
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        if re.search(r"[`]|\$\(|<<|<\(|>\(|\beval\b|\bsource\b|^\.\s", line):
+        if "`" in line or "$(" in line or "<" in line or "\x00" in line:
             return False
-        probe = re.sub(r"\d?>\s*&\d|\d?>>?\s*/dev/null|&>\s*/dev/null", "", line)
-        if ">" in probe or "<" in probe:
+        probe = _ALLOWED_REDIR.sub(" ", line)
+        if ">" in probe:
             return False
-        for seg in re.split(r"&&|\|\||[;|&]|\n", probe):
-            toks = seg.split()
-            while toks and (toks[0] in _CTRL_WORDS or re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", toks[0])):
-                if toks[0] == "for":
-                    toks = []
-                    break
-                toks = toks[1:]
-            if not toks:
-                continue
-            cmd = toks[0]
-            if cmd not in READ_CMDS:
-                return False
-            rest = " ".join(toks[1:])
-            if cmd == "curl" and _CURL_WRITE.search(" " + rest):
-                return False
+        try:
+            lex = shlex.shlex(probe, posix=True, punctuation_chars=True)
+            lex.whitespace_split = True
+            lex.commenters = ""
+            toks = list(lex)
+        except ValueError:
+            return False
+        seg = []
+        for t in toks:
+            if t in _SEPS:
+                if not _segment_ok(seg):
+                    return False
+                seg = []
+            elif t and set(t) <= set("();&|") or t == "{" or t == "}":
+                return False                    # subshells, background jobs, groups, stray operators
+            else:
+                seg.append(t)
+        if not _segment_ok(seg):
+            return False
     return True
 
 
