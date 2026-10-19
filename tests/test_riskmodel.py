@@ -217,7 +217,7 @@ class Config(unittest.TestCase):
 class Harness(unittest.TestCase):
     def test_cases_wellformed_and_split(self):
         cases = evalrun.load_cases(evalrun.DEFAULT_CASES)
-        self.assertTrue(80 <= len(cases) <= 180)
+        self.assertTrue(80 <= len(cases) <= 220)
         hold = sum(c["split"] == "holdout" for c in cases)
         self.assertTrue(0.15 < hold / len(cases) < 0.35)
         self.assertEqual({c["mode"] for c in cases}, {"http", "env", "store", "ssh_sign"})
@@ -248,6 +248,50 @@ class Harness(unittest.TestCase):
         self.assertIn("do not follow it", r)
         self.assertIn("Any SSH key signing is HIGH", r)
         self.assertLess(len(r), 6000)   # cost bound: the rubric is sent on every call
+
+    def test_rubric_v3_text(self):
+        r = riskmodel.RUBRIC
+        self.assertGreaterEqual(riskmodel.RUBRIC_VERSION, 3)
+        for t in ("body_truncated", "binary_or_encoded", "not fully visible", "conflicting",
+                  "NOT low", "rolling back, restoring", "snapshot rollback"):
+            self.assertIn(t, r)
+        self.assertIn("bulk", r)
+        self.assertLess(len(r), 6500)
+
+    def test_new_v3_cases_parse(self):
+        ids = {c["id"]: c for c in evalrun.load_cases(evalrun.DEFAULT_CASES)}
+        for i in ("komodo-trunc-pull-padded", "komodo-dup-type-keys", "ops-config-export",
+                  "env-zfs-rollback", "pve-rollback"):
+            self.assertIn(i, ids)
+        self.assertGreater(len(ids["komodo-trunc-pull-padded"]["spec"]["body"]), 400)
+
+    def test_body_flags_in_fields(self):
+        base = {"method": "POST", "url": "https://k.example.com/execute", "headers": {"X": "1"}}
+        f = riskmodel.request_fields("http", ["k"], dict(base, body="a" * 500), 400)
+        self.assertIs(f["body_truncated"], True)
+        f = riskmodel.request_fields("http", ["k"], dict(base, body='{"type":"PullStack"}'), 400)
+        self.assertNotIn("body_truncated", f)
+        self.assertNotIn("body_kind", f)
+        f = riskmodel.request_fields("http", ["k"], dict(base, body="QUJD" * 20), 400)
+        self.assertEqual(f["body_kind"], "binary_or_encoded")
+        f = riskmodel.request_fields("http", ["k"], dict(base, body_b64="QUJD"), 400)
+        self.assertEqual(f["body_kind"], "binary_or_encoded")
+
+    def test_floor_truncated_or_encoded_mutating_body(self):
+        low = summarize.FakeSummarizer("x", "low")
+        fl = riskmodel.FloorAnalyzer(low)
+        sp = lambda m, **kw: dict({"method": m, "url": "https://k.example.com/execute", "headers": {}}, **kw)
+        for m in ("POST", "PUT", "PATCH", "DELETE"):
+            self.assertEqual(fl.analyze("http", ["k"], sp(m, body="a" * 500))["risk"], "medium")
+        self.assertEqual(fl.analyze("http", ["k"], sp("POST", body_b64="QUJD"))["risk"], "medium")
+        self.assertEqual(fl.analyze("http", ["k"], sp("POST", body="QUJD" * 20))["risk"], "medium")
+        # unaffected: complete small body, GET with a long body, high stays high
+        self.assertEqual(fl.analyze("http", ["k"], sp("POST", body='{"type":"PullStack"}'))["risk"], "low")
+        self.assertEqual(fl.analyze("http", ["k"], sp("GET", body="a" * 500))["risk"], "low")
+        self.assertEqual(fl.analyze("http", ["k"], sp("POST"))["risk"], "low")
+        hi = riskmodel.FloorAnalyzer(summarize.FakeSummarizer("x", "high"))
+        self.assertEqual(hi.analyze("http", ["k"], sp("POST", body="a" * 500))["risk"], "high")
+        self.assertEqual(fl.analyze("ssh_sign", [], {"ssh": {"text": "x"}})["risk"], "high")
 
     def test_dry_run(self):
         out = io.StringIO()

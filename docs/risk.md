@@ -25,6 +25,15 @@ deploy, restart, stop, start and build/job runs are MEDIUM; destroy, prune and
 deleting resources are HIGH; list/get/log operations are LOW. A path that
 says delete wins over a safe-sounding body type.
 
+Rubric version 3 adds: a body type that conflicts with the path verb, or
+duplicate/conflicting type/action/operation keys, is HIGH; reads of
+environment, secret, token, credential, config, backup or export endpoints are
+not LOW; rolling back, restoring or reverting over current state is HIGH; and
+`body_truncated: true` / `body_kind: "binary_or_encoded"` in the request data
+mean the operation is not fully visible. `request_fields` sets them when the
+body excerpt was cut at `max_content_chars` or the body is binary or
+base64-looking.
+
 Most requests should be low or medium. The classifier rates the action, not the
 sensitivity of the service.
 
@@ -102,6 +111,11 @@ Safety measures:
 - `ssh_sign` is always HIGH, whatever the model says, and is not sent to the
   model. (This deviates from the earlier "risk is the model verdict only"
   decision, at the owner's explicit request for SSH.)
+- Body-visibility floor (`FloorAnalyzer`): a POST/PUT/PATCH/DELETE whose body
+  was truncated at `max_content_chars` or is binary/encoded (`body_b64`, control
+  characters, a long base64-looking blob) is at least MEDIUM, whatever the model
+  says. A complete small body (an ordinary `/execute` PullStack) and every GET
+  are not floored; a HIGH verdict is never lowered.
 - Creating a new credential (`store` create) is low (existing rule in `risk.py`).
 - Failure, timeout, malformed reply or an unknown option: HIGH.
 
