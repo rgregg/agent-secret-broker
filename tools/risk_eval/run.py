@@ -342,7 +342,6 @@ def main(argv=None, out=sys.stdout):
     cases = [] if args.only_scripts else load_cases(args.cases)
     if args.scripts or args.only_scripts:
         cases += load_cases(SCRIPT_CASES)
-    cases = load_cases(args.cases)
     gmap = load_guidance_file(args.guidance) if args.guidance else {}
     analyzer = make_analyzer(args, key)
     if args.split != "all":

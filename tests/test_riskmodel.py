@@ -353,6 +353,19 @@ class Harness(unittest.TestCase):
         for s in ("accuracy", "OVER-FLAG", "UNDER-FLAG", "latency p50", "confusion", "misses"):
             self.assertIn(s, text)
 
+    def test_scripts_flag_adds_the_script_cases(self):
+        import re
+        base, scr = io.StringIO(), io.StringIO()
+        evalrun.main(["--dry-run"], out=base)
+        evalrun.main(["--dry-run", "--scripts"], out=scr)
+        n = lambda o: int(re.search(r"cases: (\d+)", o.getvalue()).group(1))
+        extra = len(evalrun.load_cases(evalrun.SCRIPT_CASES))
+        self.assertGreater(extra, 0)
+        self.assertEqual(n(scr), n(base) + extra)          # --scripts adds them, it does not replace
+        only = io.StringIO()
+        evalrun.main(["--dry-run", "--only-scripts"], out=only)
+        self.assertEqual(n(only), extra)
+
     def test_never_prints_key(self):
         env = {"OPENROUTER_TOKEN": "sk-or-v1-TOPSECRET"}
         out = io.StringIO()
