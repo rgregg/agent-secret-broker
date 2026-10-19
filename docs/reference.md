@@ -208,8 +208,13 @@ socket, and every signature ssh asks for becomes a broker request (mode
   `ssh_hosts_change_refused` (`reason`: `invalid`, `needs_confirmation`, `lockout`,
   `not_ssh_key`) and `ssh_hosts_change_failed`. The vault item also gets
   `ssh_hosts_changed: {by, at}`. All three events are hidden from the agent audit API.
-- `approval: allow` only auto-approves signing if `auto_modes` includes
-  `ssh_sign`; "always allow" is never offered for it.
+- `approval: allow` on an SSH key auto-approves signing (its default `auto_modes`
+  is `ssh_sign`), subject to `risk.auto_approve_max` like every other mode. SSH
+  requests are rated HIGH, so this only releases a signature when
+  `auto_approve_max` is `high`. Host-level refusals (`ssh_hosts.allowed_hosts`,
+  unverified or forwarded connections) still apply first. The credential-level
+  "always allow" button is never offered for an SSH key; set `approval` in the
+  vault item yourself.
 
 ### Vault access: `backend.serve`
 

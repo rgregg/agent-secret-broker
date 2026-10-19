@@ -260,6 +260,43 @@ class BrokerSsh(Harness):
         self.assertEqual(asb.agent_reply(bytes([99])), bytes([asb.AGENT_FAILURE]))
 
 
+class BrokerSshAutoApprove(BrokerSsh):
+    """`approval: allow` on an SSH key auto-approves signing, but only up to
+    risk.auto_approve_max; SSH is rated HIGH, so only `high` lets it through."""
+    auto_max = "high"
+    approval = "allow"
+    # the inherited test expects a notification, which an auto-approved signature does not send
+    test_approved_sign_returns_a_valid_signature_and_no_key = None
+
+    def tweak(self, cfg):
+        super().tweak(cfg)
+        cfg["secrets"]["deploy"]["approval"] = self.approval
+        cfg["risk"] = {"auto_approve_max": self.auto_max}
+
+    def test_allow_key_signs_without_a_prompt_at_high(self):
+        code, body = self.sign(userauth_blob())
+        self.assertEqual(code, 202)
+        _, b = self.api("GET", f"/v1/requests/{json.loads(body)['id']}?wait=5")
+        self.assertEqual(json.loads(b)["status"], "approved")
+        self.assertEqual(self.notifier.sent, [])             # nobody was asked
+
+
+class BrokerSshAutoApproveBelowHigh(BrokerSshAutoApprove):
+    auto_max = "medium"
+
+    def test_allow_key_signs_without_a_prompt_at_high(self):
+        self.sign(userauth_blob())                            # HIGH > medium: a human is asked
+        self.assertTrue(self.notifier.sent)
+
+
+class BrokerSshPromptKeyAtHigh(BrokerSshAutoApprove):
+    approval = "prompt"
+
+    def test_allow_key_signs_without_a_prompt_at_high(self):
+        self.sign(userauth_blob())                            # not an `allow` key: still asks
+        self.assertTrue(self.notifier.sent)
+
+
 class BrokerSshDenied(BrokerSsh):
     decision = "deny"
 

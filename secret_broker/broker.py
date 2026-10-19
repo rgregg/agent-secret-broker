@@ -515,7 +515,8 @@ class Broker:
     def _auto_modes(sc):
         if sc.get("approval", "prompt") != "allow":
             return []
-        return list(sc.get("auto_modes", ["http"]))
+        # an SSH key can only ever be used to sign, so that is its default mode
+        return list(sc.get("auto_modes", ["ssh_sign"] if sc.get("ssh") else ["http"]))
 
     def _auto_allowed(self, mode, names, spec=None):
         if mode == "store":
