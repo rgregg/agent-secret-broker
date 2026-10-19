@@ -400,7 +400,8 @@ class AutoAllowHttp(Harness):
         self.assertEqual(self.events("http_executed")[0]["upstream_status"], 200)
         self.assertEqual(self.events("secret_read")[0]["secret"], "svc")
 
-    def test_env_mode_still_prompts_by_default(self):
+    def test_env_mode_prompts_when_the_credential_opts_out(self):
+        self.broker.cfg["secrets"]["svc"]["auto_modes"] = ["http"]    # env is auto by default now
         self.create_env()
         self.assertEqual(len(self.notifier.sent), 1)
         self.assertEqual(self.events("approved"), [])
@@ -867,8 +868,9 @@ class AutoApproveMax(Harness):
         self.broker.cfg["secrets"]["svc"]["approval"] = "prompt"
         self.http()
         self.assertEqual(len(self.notifier.sent), 1)
-        # an allow secret is only auto for http unless auto_modes adds more
+        # an allow secret is auto for env too by default; auto_modes ["http"] opts out
         self.broker.cfg["secrets"]["svc"]["approval"] = "allow"
+        self.broker.cfg["secrets"]["svc"]["auto_modes"] = ["http"]
         self.api("POST", "/v1/requests", {"mode": "env", "names": ["svc"], "argv": ["true"]})
         self.assertEqual(len(self.notifier.sent), 2)
         self.assertEqual(len(self.events("approved")), 1)
@@ -1422,18 +1424,16 @@ class AlwaysAllow(Harness):
         self.assertEqual(json.loads(r)["http"]["status"], 200)
         self.assertEqual(self.events("approved")[-1]["via"], "policy")
 
-    def test_not_offered_and_refused_for_env_mode(self):
+    def test_env_mode_is_offered_the_stronger_confirm_and_applies(self):
         self.create_env()
         page = self.page()
-        self.assertNotIn("value=approve_always", page)
-        self.assertNotIn("Automatically approve", page)       # nothing eligible: no row at all
-        status, body = self.post(f"/a/{self.nonce()}", decision="approve_always")   # forged
+        self.assertIn("value=approve_always", page)
+        self.assertIn("released to the requesting machine without asking again", page)
+        status, body = self.post(f"/a/{self.nonce()}", decision="approve_always")
         self.assertEqual(status, 200)
-        self.assertIn("not applied", body)
+        self.assertIn("Always allow saved", body)
         self.finish()
-        self.assertEqual(self.disk()["secrets"]["svc"].get("approval", "prompt"), "prompt")
-        self.assertEqual(len(self.events("policy_change_refused")), 1)
-        self.assertEqual(self.events("approved")[0]["via"], "user")   # this request still approved
+        self.assertEqual(self.disk()["secrets"]["svc"]["approval"], "allow")
 
     def test_high_risk_request_cannot_establish_standing_allow(self):
         self.broker.summarizer = _Stub("Deletes things", "high")

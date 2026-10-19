@@ -72,6 +72,9 @@ Useful optional keys: `risk.auto_approve_max` (`low`, the default, is
 recommended: an always-allowed secret is released unprompted only for low-risk
 requests; `none` turns auto-approval off, `high` lets every risk level through
 and fails open when the analysis model is down; see the reference),
+`risk.auto_modes` (default `["http", "env"]`: which request types an
+`approval: allow` secret auto-approves; `["http"]` keeps run-with-secret
+(`NAME -- command`) prompting),
 `summary` (a one-line AI summary of each request via OpenRouter, marked
 unverified), `ttl_seconds` (how long a request waits, default 300),
 `audit_log`, `timed_grants` ("Automatically approve... 5/15/30 min" chips on the approval

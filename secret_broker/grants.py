@@ -1,9 +1,11 @@
 """Time-boxed grants: "approve for the next N minutes".
 
 When the human approves a request they may choose "Approve for N minutes".
-For that window, further requests for exactly the same SET of secret names in a
-mode where the value never leaves the broker (`http`, `ssh_sign`) are approved
-without a tap. A grant made from a read-only http request (GET/HEAD/OPTIONS)
+For that window, further requests for exactly the same SET of secret names in
+the same mode (`http`, `ssh_sign` or `env`) are approved without a tap. An env
+grant releases the value to the requesting machine; it never covers a request
+whose script text is not visible, and a grant made in one mode never covers
+another. A grant made from a read-only http request (GET/HEAD/OPTIONS)
 covers only such methods; one made from any other method covers all.
 The grant expires at an absolute deadline (no sliding extension) and can be
 revoked early. Grants are persisted (names, times and creator only; no values,
@@ -25,7 +27,9 @@ import time
 
 from . import risk as risk_mod
 
-ELIGIBLE_MODES = ("http", "ssh_sign")     # the value never reaches the agent
+ELIGIBLE_MODES = ("http", "ssh_sign", "env")
+LEGACY = "legacy"           # grants saved before they recorded a mode: http and ssh_sign only
+MODE_LABEL = {"http": "web", "env": "run-with-secret", "ssh_sign": "ssh", LEGACY: "web, ssh"}
 READ_METHODS = ("GET", "HEAD", "OPTIONS")
 
 
@@ -38,6 +42,8 @@ def scope_for(mode, spec):
 
 def covers(grant, mode, spec):
     """True when `grant` (by scope) may approve a later request."""
+    if mode == "env" and grant.get("mode") != "env":
+        return False
     if grant["scope"] == "any":
         return True
     return mode == "http" and str((spec or {}).get("method", "")).upper() in READ_METHODS
@@ -106,7 +112,7 @@ class GrantStore:
         self._clock = clock
         self._max_s = max_minutes * 60
         self._lock = threading.Lock()
-        self._by_set = {}       # frozenset(names) -> grant
+        self._by_set = {}       # (frozenset(names), mode) -> grant
 
     # -- persistence -------------------------------------------------------
     def load(self):
@@ -135,7 +141,8 @@ class GrantStore:
                          "minutes": int(g["minutes"]), "created_at": float(g["created_at"]),
                          "expires_at": float(g["expires_at"]), "created_by": str(g["created_by"])[:120],
                          "channel": str(g.get("channel") or "")[:20],
-                         "request_id": str(g.get("request_id") or "")[:64]}
+                         "request_id": str(g.get("request_id") or "")[:64],
+                         "mode": g.get("mode") if g.get("mode") in ELIGIBLE_MODES else LEGACY}
                 except (KeyError, TypeError, ValueError):
                     self._log("grants_file_corrupt", warning="skipped a malformed grant entry")
                     continue
@@ -147,12 +154,12 @@ class GrantStore:
                     self._log("grant_dropped", grant_id=g["id"], secrets=g["secrets"],
                               reason="deadline is further out than max_minutes allows")
                 else:
-                    self._by_set[frozenset(g["secrets"])] = g
+                    self._by_set[(frozenset(g["secrets"]), g["mode"])] = g
 
     def _save_locked(self):
         if not self._path:
             return
-        data = {"version": 2, "grants": sorted(self._by_set.values(), key=lambda g: g["id"])}
+        data = {"version": 3, "grants": sorted(self._by_set.values(), key=lambda g: g["id"])}
         tmp = f"{self._path}.tmp"
         try:
             fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -168,8 +175,8 @@ class GrantStore:
         now = self._clock()
         gone = [g for g in self._by_set.values() if g["expires_at"] <= now]
         for g in gone:
-            del self._by_set[frozenset(g["secrets"])]
-            self._log("grant_expired", grant_id=g["id"], secrets=g["secrets"],
+            del self._by_set[(frozenset(g["secrets"]), g["mode"])]
+            self._log("grant_expired", grant_id=g["id"], secrets=g["secrets"], mode=g["mode"],
                       expires_at=g["expires_at"], created_by=g["created_by"])
         if gone:
             self._save_locked()
@@ -179,10 +186,10 @@ class GrantStore:
         with self._lock:
             return self._expire_locked()
 
-    def add(self, names, minutes, scope, created_by, channel, request_id):
+    def add(self, names, minutes, scope, created_by, channel, request_id, mode=None):
         now = self._clock()
-        key = frozenset(names)
-        g = {"id": secrets.token_hex(4), "secrets": sorted(key), "scope": scope,
+        key = (frozenset(names), mode or LEGACY)
+        g = {"id": secrets.token_hex(4), "secrets": sorted(key[0]), "scope": scope, "mode": key[1],
              "minutes": int(minutes), "created_at": now, "expires_at": now + minutes * 60,
              "created_by": created_by, "channel": channel, "request_id": request_id or ""}
         with self._lock:
@@ -191,11 +198,17 @@ class GrantStore:
             self._save_locked()
         return dict(g)
 
-    def find(self, names):
-        """The active grant for exactly this set of names, or None."""
+    def find(self, names, mode=None):
+        """The active grant for exactly this set of names and mode, or None.
+        With no mode, any grant for the set (a legacy grant has no mode)."""
         with self._lock:
             self._expire_locked()
-            g = self._by_set.get(frozenset(names))
+            if mode is None:
+                g = next((g for (k, _), g in self._by_set.items() if k == frozenset(names)), None)
+            else:
+                g = self._by_set.get((frozenset(names), mode))
+                if g is None and mode in ("http", "ssh_sign"):
+                    g = self._by_set.get((frozenset(names), LEGACY))
             return dict(g) if g else None
 
     def active(self):

@@ -9,7 +9,8 @@ client, which gets an opaque request id to poll with.
 Per-secret policy (`approval` in config):
   prompt  every use needs a phone approval (default)
   allow   released without a prompt, but only for modes in `auto_modes`
-          (default ["http"]: the broker makes the call, the value never leaves)
+          (default `risk.auto_modes`, ["http", "env"]; an SSH key defaults to
+          ["ssh_sign"]). An env request whose script text is not visible always prompts.
 Everything, including auto-approved use and rejected attempts, is audited.
 """
 import base64
@@ -197,6 +198,7 @@ class Broker(sshrules_mod.SshRulesMixin):
         self._auto_max, warn = risk_mod.parse_auto_approve_max(config.get("risk"), "risk")
         if warn:
             self.log("config_warning", warning=warn)
+        self._default_auto_modes = risk_mod.parse_auto_modes(config.get("risk"), "risk")
         self._init_grants(config)
         self._init_ssh_rules()
         if background_load:
@@ -543,12 +545,11 @@ class Broker(sshrules_mod.SshRulesMixin):
                 "host_lines": sshkey.host_lines(host)}
 
     # -- policy -----------------------------------------------------------
-    @staticmethod
-    def _auto_modes(sc):
+    def _auto_modes(self, sc):
         if sc.get("approval", "prompt") != "allow":
             return []
         # an SSH key can only ever be used to sign, so that is its default mode
-        return list(sc.get("auto_modes", ["ssh_sign"] if sc.get("ssh") else ["http"]))
+        return list(sc.get("auto_modes", ["ssh_sign"] if sc.get("ssh") else self._default_auto_modes))
 
     def _auto_allowed(self, mode, names, spec=None):
         if mode == "store":
@@ -566,12 +567,13 @@ class Broker(sshrules_mod.SshRulesMixin):
 
         A standing allow is only meaningful (and only offered) when it would
         actually take effect, and it is never established from a request that is
-        itself high risk or that releases the value to the requesting host.
+        itself high risk. It applies to the modes in `auto_modes` (web and
+        run-with-secret by default).
         """
         if req.mode == "store":
             return False, "storing a credential always needs a fresh approval"
-        if req.mode != "http":
-            return False, "env-mode requests release the value to the requesting host"
+        if req.mode not in ("http", "env"):
+            return False, "only web and run-with-secret requests can be always-allowed"
         if len(req.names) != 1:
             return False, "this request involves several secrets"
         name = req.names[0]
@@ -584,7 +586,15 @@ class Broker(sshrules_mod.SshRulesMixin):
             lvl = req.risk["level"]
             if lvl == "high" or not risk_mod.auto_ok(lvl, self._auto_max):
                 return False, f"this request is rated {lvl}; such requests always prompt"
+        if req.mode == "env" and scripts_mod.has_blind_spot(req.spec.get("scripts")):
+            return False, "the script text is not visible, so env requests like this always prompt"
         return True, ""
+
+    @staticmethod
+    def _script_not_visible(mode, spec):
+        """An env request whose script text the classifier and approver cannot see
+        (unreadable, read from stdin, or cut off) is never auto-approved."""
+        return mode == "env" and scripts_mod.has_blind_spot((spec or {}).get("scripts"))
 
     def auto_approve_max(self):
         """Highest risk level at which an auto-eligible request is released
@@ -831,7 +841,10 @@ class Broker(sshrules_mod.SshRulesMixin):
         auto_max = self._auto_max
         if not auto and self._grant_claim(req):
             return req
-        if auto and not risk_mod.auto_ok(a["level"], auto_max):
+        if auto and self._script_not_visible(mode, spec):
+            self.audit("escalated", req, auto_max=auto_max, reason="script_not_visible")
+            auto = False
+        elif auto and not risk_mod.auto_ok(a["level"], auto_max):
             why = ("auto-approve is off (risk.auto_approve_max none)" if auto_max == "none" else
                    f"risk {a['level']} is above auto_approve_max {auto_max}")
             self.audit("escalated", req, auto_max=auto_max, reason=f"{why}; policy allow overridden")
@@ -1626,8 +1639,9 @@ class Broker(sshrules_mod.SshRulesMixin):
         if not self.grants_cfg["enabled"]:
             return False, "time-boxed grants are off"
         if req.mode not in grants_mod.ELIGIBLE_MODES:
-            return False, ("env-mode requests release the value to the requesting host"
-                           if req.mode == "env" else "storing a credential always needs a fresh approval")
+            return False, "storing a credential always needs a fresh approval"
+        if self._script_not_visible(req.mode, req.spec):
+            return False, "the script text is not visible, so env requests like this always prompt"
         return True, ""
 
     def active_grants(self):
@@ -1642,7 +1656,7 @@ class Broker(sshrules_mod.SshRulesMixin):
             self.audit("grant_refused", req, reason=why, **who)
             return
         g = self.grants.add(req.names, minutes, grants_mod.scope_for(req.mode, req.spec), actor,
-                            channel, req.id)
+                            channel, req.id, mode=req.mode)
         self.audit("grant_created", req, grant_id=g["id"], scope=g["scope"], grant_minutes=minutes,
                    expires_at=g["expires_at"], created_by=actor, channel=channel,
                    approver_peer=who.get("approver_peer"), approver_ip=who.get("approver_ip"))
@@ -1657,11 +1671,13 @@ class Broker(sshrules_mod.SshRulesMixin):
             return False
         level = req.risk["level"] if req.risk else "high"     # no verdict counts as high
         with self._lock:
-            g = self.grants.find(req.names)
+            g = self.grants.find(req.names, req.mode)
             if g is None:
                 return False
             skip = None
-            if not grants_mod.covers(g, req.mode, req.spec):
+            if self._script_not_visible(req.mode, req.spec):
+                skip = "script_not_visible"
+            elif not grants_mod.covers(g, req.mode, req.spec):
                 skip = "method"
             elif not risk_mod.auto_ok(level, cfg["max_risk"]):
                 skip = "risk"
@@ -1671,6 +1687,7 @@ class Broker(sshrules_mod.SshRulesMixin):
                 req.status = "deciding"
         if skip:
             self.audit("grant_skipped", req, reason=skip, grant_id=g["id"], scope=g["scope"],
+                       grant_mode=g.get("mode"),
                        risk_level=level, max_risk=cfg["max_risk"])
             return False
         left = self.grants.left_s(g)
@@ -1690,7 +1707,7 @@ class Broker(sshrules_mod.SshRulesMixin):
         g = self.grants.revoke(grant_id) if self.grants_cfg["enabled"] else None
         if g is None:
             return False
-        self.log("grant_revoked", grant_id=g["id"], secrets=g["secrets"], scope=g["scope"],
+        self.log("grant_revoked", grant_id=g["id"], secrets=g["secrets"], scope=g["scope"], mode=g["mode"],
                  created_by=g["created_by"], revoked_by=user, left_s=max(0, int(g["expires_at"] - time.time())), peer=peer,
                  client_ip=client_ip)
         return True
@@ -2758,6 +2775,7 @@ def _iso(t):
 
 _CHANNEL_LABEL = {"dashboard": "web dashboard", "push": "browser push notification",
                   "ha": "Home Assistant", "link": "approval link"}
+_MODE_LABEL = {"http": "web", "env": "run-with-secret", "ssh_sign": "ssh signing"}
 _AUTO_LABEL = {"none": "off (every request asks a human)", "low": "up to low risk",
                "medium": "up to medium risk",
                "high": "any risk level, including requests with no model verdict"}
@@ -2780,19 +2798,28 @@ def _approve_actions(broker, req):
         return row1
     scope = grants_mod.scope_for(req.mode, req.spec)
     chips = []
+    env_note = (", releasing the secret value to the requesting machine without asking"
+                if req.mode == "env" else "")
     for m in mins:
         label = _fmt_minutes(m)
         chips.append(
             f"<button class=chip name=decision value='approve_grant_{m}' "
             f"aria-label='Approve this request, and approve further requests for exactly {names} "
-            f"for {label}'>{label}</button>")
+            f"for {label}{env_note}'>{label}</button>")
     if ok_a:
-        tip = ("Approve this request and release future calls with this secret without asking "
-               "when the request is low risk. Revoke any time under Policies.")
+        tip = ("Approve this request and release future web and run-with-secret requests with "
+               "this secret without asking, as configured (auto_modes), when the request is low "
+               "risk. Revoke any time under Policies.")
+        if req.mode == "env":
+            ask = (f"Always approve {req.names[0]}? The secret value will be released to the "
+                   "requesting machine without asking again when the request is rated "
+                   f"{broker.auto_approve_max()} or lower.")
+        else:
+            ask = f"Always approve {req.names[0]}?"
         chips.append(
             f"<details class=alw><summary class='chip always' data-tip='{e(tip)}' "
             f"aria-label='Always approve {e(req.names[0])}: {e(tip)}'>Always</summary>"
-            f"<div class=confirm><span>Always approve {e(req.names[0])}?</span>"
+            f"<div class=confirm><span>{e(ask)}</span>"
             "<button class='btn sm approve' name=decision value=approve_always>Confirm</button>"
             "<span class=muted>Click Always again to cancel.</span></div></details>")
     elif mins:
@@ -2803,7 +2830,12 @@ def _approve_actions(broker, req):
         chips.append(sshrules_mod.chip_html(*rule_chip))
     out = ("<div class=auto><span class=lbl>Automatically approve...</span>"
            f"<div class=chips>{''.join(chips)}</div>")
-    if mins:
+    if mins and req.mode == "env":
+        out += (f"<p class=scope><small class=muted>Applies to exactly: {names}, run-with-secret "
+                "requests only. The secret value will be released to the requesting machine for "
+                "the chosen time without asking. Requests whose script text is not visible "
+                "still ask. Revoke any time under Policies.</small></p>")
+    elif mins:
         out += (f"<p class=scope><small class=muted>Applies to exactly: {names}. "
                 f"{'Reads only (GET, HEAD, OPTIONS)' if scope == 'read' else 'Any method'}. "
                 "Revoke any time under Policies.</small></p>")
@@ -2920,7 +2952,8 @@ def _detail_html(r, evs, retained=""):
         left = (final or {}).get("grant_left_s")
         gs = (first("grant_used") or {}).get("scope")
         add("Decided by", "time-boxed grant"
-            + (" (reads only)" if gs == "read" else " (all requests)" if gs else "") + " (auto-approved)"
+            + (" (reads only)" if gs == "read" else " (all requests)" if gs else "")
+            + (", run-with-secret" if r.get("mode") == "env" else "") + " (auto-approved)"
             + ((f", {left // 60} min left when used" if left >= 60 else ", under a minute left when used")
                if isinstance(left, int) else "")
             + f", grant {str(r['grant_id'])[:8]}")
@@ -3475,14 +3508,16 @@ def approval_handler(broker):
                 if sc.get("approval", "prompt") != "allow":
                     continue
                 by = (sc.get("approval_changed") or {}).get("by")
+                modes = ", ".join(_MODE_LABEL.get(m, m) for m in broker._auto_modes(sc)) or "none"
                 rows.append(
                     f"<tr><td data-label=Secret><b>{html.escape(name)}</b></td>"
+                    f"<td data-label='Auto-approved for'>{html.escape(modes)}</td>"
                     f"<td data-label='Allowed by'>{html.escape(by or '')}</td>"
                     "<td><form method=post class=inline>"
                     f"<input type=hidden name=csrf value='{broker.csrf_token(user)}'>"
                     f"<input type=hidden name=name value='{html.escape(name)}'>"
                     "<button name=approval value=prompt>Revoke</button></form></td></tr>")
-            table = ("<table class=tbl><thead><tr><th>Secret</th><th>Allowed by</th><th></th></tr></thead>"
+            table = ("<table class=tbl><thead><tr><th>Secret</th><th>Auto-approved for</th><th>Allowed by</th><th></th></tr></thead>"
                      "<tbody>" + "".join(rows) + "</tbody></table>" if rows else
                      "<div class='card empty'>Nothing is always allowed. Every use asks you first.</div>")
             _page(self, status, f"<h1>Policies</h1>{note}{self._grants_section(user)}"
@@ -3508,7 +3543,8 @@ def approval_handler(broker):
             for g in broker.active_grants():
                 rows.append(
                     f"<tr><td data-label=Secret><b>{html.escape(', '.join(g['secrets']))}</b></td>"
-                    f"<td data-label=Covers>{'reads only' if g['scope'] == 'read' else 'all requests'}</td>"
+                    f"<td data-label=Covers>{html.escape(grants_mod.MODE_LABEL.get(g.get('mode'), ''))}: "
+                    f"{'reads only' if g['scope'] == 'read' else 'all requests'}</td>"
                     f"<td data-label='Time left'><time data-gexp='{int(g['expires_at'])}'>"
                     f"{html.escape(_left(g['left_s']))}</time></td>"
                     f"<td data-label='Allowed by'>{html.escape(g['created_by'])}"

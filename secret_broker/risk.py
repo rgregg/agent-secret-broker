@@ -86,6 +86,25 @@ def parse_auto_approve_max(raw, field="risk"):
     return "low", None
 
 
+AUTO_MODES = ("http", "env")        # values of risk.auto_modes
+
+
+def parse_auto_modes(raw, field="risk"):
+    """Validate `risk.auto_modes` -> list of modes an `approval: allow` credential
+    is auto-eligible for when it has no `auto_modes` of its own. Default
+    ["http", "env"]; [] makes nothing auto-eligible by default."""
+    raw = raw or {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"{field} must be an object")
+    modes = raw.get("auto_modes")
+    if modes is None:
+        return list(AUTO_MODES)
+    if (not isinstance(modes, list) or not all(isinstance(m, str) and m in AUTO_MODES for m in modes)
+            or len(set(modes)) != len(modes)):
+        raise ValueError(f"{field}.auto_modes must be a list of {' and/or '.join(AUTO_MODES)}")
+    return list(modes)
+
+
 def auto_ok(level, auto_max):
     """True when a request rated `level` may be auto-approved under `auto_max`.
     A missing or unrecognised level counts as high."""

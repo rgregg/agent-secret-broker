@@ -46,6 +46,7 @@ def main():
     if not cfg:
         ap.error("no settings: set BROKER_CONFIG or pass --config")
     risk.parse_auto_approve_max(cfg.get("risk"), "risk")    # fail at startup, naming the field
+    risk.parse_auto_modes(cfg.get("risk"), "risk")          # fail at startup, naming the field
     grants.parse_config(cfg.get("timed_grants"))            # fail at startup, naming the field
     request_details.parse_config(cfg.get("request_details"))    # fail at startup, naming the field
     backend = build_backend(cfg)

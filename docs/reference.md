@@ -445,7 +445,7 @@ chooses.
 Per secret in the broker config:
 
     "approval": "prompt"        # default: every use needs a phone approval
-    "approval": "allow"         # no prompt (http mode only unless auto_modes adds env)
+    "approval": "allow"         # no prompt for web and run-with-secret (env) requests; see auto_modes
     "allowed_hosts": ["api.example.com"]
 
 Every request is rated low/medium/high by the analysis model (the `summary`
@@ -457,12 +457,44 @@ in the audit log (`assessed`). Because the model reads attacker-influenced
 text, treat it as a hint for a human who also sees the raw request; where it
 carries weight is `allow` secrets, through `risk.auto_approve_max`.
 
+### What `approval: allow` covers: `auto_modes`
+
+**Change (env auto-approval):** `approval: allow` used to auto-approve only `http`
+(web) requests. It now also auto-approves `env` (run-with-secret) requests, under
+exactly the same rules as web requests. **This widens the policy of every
+existing `approval: allow` credential.** To keep the old behaviour either set
+`"auto_modes": ["http"]` in that credential's metadata, or set it for all
+credentials with `"risk": {"auto_modes": ["http"]}` in the broker config.
+
+- The credential must be `approval: allow` (an explicit per-credential opt-in).
+- Its modes are the credential's own `auto_modes` list if it has one, else the
+  global `risk.auto_modes` (list of `"http"` and/or `"env"`, default
+  `["http", "env"]`, `[]` allowed; validated at startup naming
+  `risk.auto_modes`). An SSH key defaults to `["ssh_sign"]` and is unaffected.
+- The request's model risk level must be at or below `risk.auto_approve_max`
+  (below). A missing model verdict counts as high.
+- **Safeguard: the script must be visible.** An env request whose script text
+  the classifier and approver cannot see (any `scripts` entry marked
+  `unreadable` or `stdin`, or text that was cut off, `truncated`) is **never**
+  auto-approved, at any `auto_approve_max`: it always prompts and is audited as
+  `escalated` with `reason: script_not_visible`.
+- Scripts that print or send the credential are rated high by the model, so they
+  auto-approve only when `auto_approve_max` is `high`.
+- What auto-approval of env means: the plaintext secret value is released to the
+  requesting machine without a human looking at the request. env mode remains
+  advisory (the client chooses what it says it will run, and can lie), so the
+  risk rating and the script text are hints, not enforcement. Opt a credential
+  out with `auto_modes: ["http"]` when it should never be handed out unattended.
+- Store requests, the SSH floor and SSH host rules are unchanged.
+- The Policies tab's "Always allowed" list shows, per credential, the modes that
+  are auto-eligible (for example `web, run-with-secret`).
+
 ### Auto-approve level: `risk.auto_approve_max`
 
     "risk": {"auto_approve_max": "low"}      # none | low | medium | high, default low
 
 An *auto-eligible* request (an `approval: allow` secret, in the modes it is
-allowed for: http unless `auto_modes` adds more; plus creating a new credential
+allowed for: `auto_modes`, by default http and env; plus creating a new credential
 unless `store.create` is `prompt`) is released without a prompt only when its
 model risk level is **at or below** this setting. Otherwise a human is asked
 and an `escalated` event is audited.
@@ -1137,8 +1169,12 @@ and records `"approval": "allow"` in that secret's vault item metadata (with who
 and when), effective immediately. It is offered only
 when it would mean something:
 
-- HTTP mode only: the broker makes the call, so the value never leaves it. Never
-  offered for env mode.
+- Web (`http`) and run-with-secret (`env`) requests only. From an env request it
+  sets `approval: allow` and leaves `auto_modes` alone; the confirmation says the
+  secret value will be released to the requesting machine without asking again
+  when the request is rated at or below `risk.auto_approve_max`. It applies to the
+  modes in `auto_modes`. Not offered when an env request's script text is not
+  visible.
 - One secret per request.
 - Not from a request rated high, or one the current `risk.auto_approve_max` would not auto-approve (the rule would not take effect for such a request).
 
@@ -1172,10 +1208,20 @@ can be revoked early.
   for that key. The line under the chips says which applies.
 - **Risk does not block creating one.** HIGH-rated requests (every `ssh_sign` is
   rated high) can still be approved with a grant; only `max_risk` limits use.
-- **Modes where the value never leaves the broker:** `http` and `ssh_sign`
-  (a deploy session needs many logins). `env` and `store` (create or update)
-  always ask: the value reaches the agent, or credentials change. A grant picked
-  on such a request is refused and audited (`grant_refused`).
+- **Modes:** `http`, `ssh_sign` and `env` (run-with-secret). A grant belongs to
+  the mode it was approved in (an `env` grant for a set never covers web requests
+  for it, and a web grant never covers env); both can exist for the same set.
+  `scope` for env is `any` (no method). An env grant releases the plaintext value
+  to the requesting machine for its whole window without asking; the chip help
+  and the line under the chips say so. `store` (create or update) always asks;
+  a grant picked on it is refused and audited (`grant_refused`).
+- **env safeguards.** An env request whose script text is not visible
+  (`unreadable`/`stdin` markers, or cut off) is never covered by a grant: it
+  prompts and is audited `grant_skipped` with `reason: script_not_visible`; a
+  grant cannot be created from such a request either. `timed_grants.max_risk`
+  applies as for every mode. A changed script is still caught by the client's
+  sha256 check (exit code 6). Grants saved before modes were recorded cover web
+  and ssh only, never env.
 - **Only an explicit human choice creates a grant**, on the dashboard card or
   the approval-link page, with the same SSO, CSRF and same-origin checks as the
   other buttons. Notification buttons (`push`, `ha`) stay plain Approve/Deny and
@@ -1198,7 +1244,7 @@ can be revoked early.
   entries whose deadline is further out than `max_minutes` are dropped on load;
   a corrupt file fails closed (no grants, `grants_file_corrupt` audit warning).
 - **Revoking.** The **Policies** tab has an "Active grants" card above "Always
-  allowed": all secrets in the set, reads only / all requests, live time left, who allowed it, and a **Revoke** button
+  allowed": all secrets in the set, the mode covered (web, run-with-secret, ssh) and reads only / all requests, live time left, who allowed it, and a **Revoke** button
   (`POST /grants/revoke`, CSRF-checked). Programmatic: `Broker.revoke_grant`.
 - **Settings** shows the config line (on/off, durations, ceiling).
   `GET /v1/status` reports only `features.timed_grants` (a bool). Which secrets
@@ -1210,13 +1256,13 @@ Audit events (all but the last three carry the request `id`):
 | Event | Fields |
 | --- | --- |
 | `decided` / `approved` | `grant_minutes` when the approver chose a grant (`via: user`, `channel`) |
-| `grant_created` | `grant_id`, `scope`, `grant_minutes`, `expires_at`, `created_by`, `channel`, `approver_peer`, `approver_ip` |
+| `grant_created` | `mode`, `grant_id`, `scope`, `grant_minutes`, `expires_at`, `created_by`, `channel`, `approver_peer`, `approver_ip` |
 | `grant_refused` | `reason` (ineligible mode); the approver's usual `channel`/`approver` fields |
 | `grant_used` | `grant_id`, `scope`, `grant_left_s` |
 | `approved` (auto) | `via: policy`, `grant_id`, `grant_left_s` |
-| `grant_skipped` | `reason: risk` or `method`, `grant_id`, `scope`, `risk_level`, `max_risk` |
-| `grant_revoked` | `grant_id`, `secrets`, `scope`, `created_by`, `revoked_by`, `left_s`, `peer`, `client_ip` |
-| `grant_expired` | `grant_id`, `secrets`, `expires_at`, `created_by` (recorded lazily on the next check, by a 15 s sweep, or on load) |
+| `grant_skipped` | `reason: risk`, `method` or `script_not_visible`, `grant_mode`, `grant_id`, `scope`, `risk_level`, `max_risk` |
+| `grant_revoked` | `mode`, `grant_id`, `secrets`, `scope`, `created_by`, `revoked_by`, `left_s`, `peer`, `client_ip` |
+| `grant_expired` | `mode`, `grant_id`, `secrets`, `expires_at`, `created_by` (recorded lazily on the next check, by a 15 s sweep, or on load) |
 | `grants_file_corrupt`, `grant_dropped`, `grants_file_write_failed` | `warning` / `reason`, `error` |
 
 For any API that exposes audit events outside the approver UI: treat `grant_*`
@@ -1377,7 +1423,10 @@ or `expired` mean a human was asked (the agent also learns that from its own req
 - **Does not protect against** an agent that already has other credentials to
   your SSO provider, vault, or notification service (e.g. an admin API token in
   its home directory): those bypass the gate. Move them behind the broker.
-- **env mode is advisory** (see above). Prefer `http` mode.
+- **env mode is advisory** (see above). Prefer `http` mode. With `approval: allow`
+  (default `auto_modes` includes `env`), an env request that is rated within
+  `risk.auto_approve_max` and has visible scripts is released to the requesting
+  machine without a prompt; a timed grant does the same for its window.
 - Output masking is exact-match; a program that transforms a secret before
   printing it (base64, splitting) defeats it.
 

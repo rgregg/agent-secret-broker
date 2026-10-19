@@ -209,15 +209,15 @@ class Creation(Base):
         _, lp = self.get(f"/a/{link_nonce}")
         self.assertIn(">5 min</button>", lp)
 
-    def test_no_menu_for_env_and_store(self):
-        self.create_env()
+    def test_no_menu_for_store(self):
+        self.api("POST", "/v1/requests", {"mode": "store", "names": ["svc"], "op": "update", "value": "v"})
         _, page = self.get("/")
         self.assertNotIn("Automatically approve", page)
         self.assertNotIn("approve_grant_", page)
         rid = self.pending_id()
         self.assertEqual(self.decide(rid, "approve_grant_15")[0], 303)
         self.assertEqual(self.broker.active_grants(), [])
-        self.assertEqual(self.events("grant_refused")[0]["reason"].startswith("env-mode"), True)
+        self.assertTrue(self.events("grant_refused")[0]["reason"].startswith("storing"))
 
 
 class Using(Base):
@@ -579,13 +579,14 @@ class CardLayout(Base):
         self.assertIn("data-tip='Always not offered:", m.group(0))
         self.assertNotIn(" title=", card[card.index("<div class=decide-row>"):])
 
-    def test_env_has_no_options_row(self):
+    def test_env_has_grant_chips_with_release_wording(self):
         self.create_env()
         _, page = self.get("/")
         card = self.card(page)
         self.assertIn("<div class=decide-row>", card)
-        self.assertNotIn("Automatically approve", card)
-        self.assertNotIn("chip", card)
+        self.assertIn("Automatically approve", card)
+        self.assertIn("approve_grant_5", card)
+        self.assertIn("released to the requesting machine for the chosen time", card)
 
     def test_chip_values_are_the_old_contract(self):
         rid = self.http()
