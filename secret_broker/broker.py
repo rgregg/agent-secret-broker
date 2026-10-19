@@ -40,6 +40,7 @@ from . import notify as notify_mod
 from . import presence as presence_mod
 from .notify import NotifyError
 from . import grants as grants_mod
+from . import standing as standing_mod
 from . import guidance as guidance_mod
 from . import sshhosts as sshhosts_mod
 from . import sshrules as sshrules_mod
@@ -310,6 +311,9 @@ class Broker(sshrules_mod.SshRulesMixin):
             vars_[var] = {"item": item, "field": field}
             if ref.get("key"):
                 vars_[var]["key"] = str(ref["key"])
+        standing = None
+        if meta.get("standing") is not None:
+            standing = standing_mod.parse(meta["standing"], name)
         note = guidance_mod.from_meta(meta)      # policy context, never shown to agents
         entry = {**meta, "vars": vars_, "allowed_hosts": [h.lower() for h in hosts],
                  "approval": approval, "_item": item, "_meta": meta,
@@ -317,6 +321,9 @@ class Broker(sshrules_mod.SshRulesMixin):
         entry.pop("guidance", None)
         entry.pop("ssh_hosts", None)
         entry.pop("ssh_rules", None)
+        entry.pop("standing", None)
+        if standing:
+            entry["standing"] = standing        # parsed; policy context, never in discovery/status output
         if ssh_rules:
             entry["ssh_rules"] = ssh_rules      # parsed; policy context, never in discovery/status output
         if ssh_hosts and (ssh_hosts["known"] or ssh_hosts["allowed"] or ssh_hosts["allow_forwarded"]):
@@ -545,11 +552,15 @@ class Broker(sshrules_mod.SshRulesMixin):
                 "host_lines": sshkey.host_lines(host)}
 
     # -- policy -----------------------------------------------------------
+    def _effective_auto_modes(self, sc):
+        """The credential's own `auto_modes`, else `risk.auto_modes` (an SSH key can
+        only ever be used to sign, so that is its default mode)."""
+        return list(sc.get("auto_modes", ["ssh_sign"] if sc.get("ssh") else self._default_auto_modes))
+
     def _auto_modes(self, sc):
         if sc.get("approval", "prompt") != "allow":
             return []
-        # an SSH key can only ever be used to sign, so that is its default mode
-        return list(sc.get("auto_modes", ["ssh_sign"] if sc.get("ssh") else self._default_auto_modes))
+        return self._effective_auto_modes(sc)
 
     def _auto_allowed(self, mode, names, spec=None):
         if mode == "store":
@@ -565,10 +576,11 @@ class Broker(sshrules_mod.SshRulesMixin):
     def always_allow_eligibility(self, req):
         """(ok, reason). `reason` is shown to the approver when not ok.
 
-        A standing allow is only meaningful (and only offered) when it would
-        actually take effect, and it is never established from a request that is
-        itself high risk. It applies to the modes in `auto_modes` (web and
-        run-with-secret by default).
+        An Always standing approval is only meaningful (and only offered) when it
+        would actually take effect, and it is never established from a request that
+        is itself high risk. It is narrow: this secret, this mode, and for web the
+        request's method class (reads only, or any method). Duplicates are not
+        refused here; `_always_create` treats them as a no-op.
         """
         if req.mode == "store":
             return False, "storing a credential always needs a fresh approval"
@@ -580,6 +592,9 @@ class Broker(sshrules_mod.SshRulesMixin):
         sc = self.cfg["secrets"][name]
         if sc.get("approval", "prompt") == "allow":
             return False, "already always-allowed"
+        if req.mode not in self._effective_auto_modes(sc):
+            return False, (f"{_MODE_LABEL.get(req.mode, req.mode)} requests are not enabled "
+                           "for auto-approval (auto_modes)")
         if not hasattr(self.backend, "set_meta"):
             return False, "the vault backend cannot record this"
         if req.risk:
@@ -628,7 +643,7 @@ class Broker(sshrules_mod.SshRulesMixin):
                          request_id=request_id, error=str(e)[:200])
                 return False
             sc["approval"] = value
-            sc["approval_changed"] = {"by": user}
+            sc["approval_changed"] = {"by": user, "at": standing_mod.iso(time.time())}
         self.log("policy_changed", secret=name, **{"from": old, "to": value}, user=user, peer=peer,
                  client_ip=client_ip, request_id=request_id)
         return True
@@ -842,8 +857,6 @@ class Broker(sshrules_mod.SshRulesMixin):
             return req
         auto = self._auto_allowed(mode, names, spec)
         auto_max = self._auto_max
-        if not auto and self._grant_claim(req):
-            return req
         if auto and self._script_not_visible(mode, spec):
             self.audit("escalated", req, auto_max=auto_max, reason="script_not_visible")
             auto = False
@@ -862,6 +875,8 @@ class Broker(sshrules_mod.SshRulesMixin):
                              auto_max=auto_max)
             else:
                 self._finish(req, "approved", result=result, via="policy", auto_max=auto_max)
+            return req
+        if self._standing_claim(req):       # Always (auto_approve_max ceiling), then timed (none)
             return req
         try:
             self._push(req)
@@ -1589,14 +1604,7 @@ class Broker(sshrules_mod.SshRulesMixin):
             self._finish(req, "denied", **who)
             return 200, req
         if always:
-            ok, why = self.always_allow_eligibility(req)
-            if not ok:
-                req.always = f"not applied: {why}"
-                self.audit("policy_change_refused", req, reason=why, **who)
-            elif self.set_approval(req.names[0], "allow", actor, peer, client_ip, req.id):
-                req.always = "applied"
-            else:
-                req.always = "not applied: could not write the config file"
+            self._always_create(req, actor, channel, who)
         if grant_minutes is not None:
             self._grant_create(req, grant_minutes, actor, channel, who)
         if ssh_rule is not None:
@@ -1648,72 +1656,217 @@ class Broker(sshrules_mod.SshRulesMixin):
         return True, ""
 
     def active_grants(self):
-        """Active grants (with seconds left) for the Policies page."""
+        """Active timed grants (with seconds left)."""
         if not self.grants_cfg["enabled"]:
             return []
         return [{**g, "left_s": self.grants.left_s(g)} for g in self.grants.active()]
 
+    def standing_rows(self):
+        """Every standing approval for the Policies page, soonest-expiring first, then
+        Always, then legacy whole-credential allows. Each row: kind (timed|always|
+        legacy), id, name (legacy), secrets, mode, scope, covers, expires_at (None =
+        never), left_s, created_by, created_at (text), modes (legacy)."""
+        rows = []
+        for g in self.active_grants():
+            rows.append({"kind": "timed", "id": g["id"], "secrets": g["secrets"], "mode": g["mode"],
+                         "scope": g["scope"], "covers": standing_mod.covers_label(g["mode"], g["scope"]),
+                         "expires_at": g["expires_at"], "left_s": g["left_s"],
+                         "created_by": g["created_by"], "created_at": _utc(g["created_at"]),
+                         "minutes": g["minutes"]})
+        with self._cfg_lock:
+            secrets_now = sorted(self.cfg["secrets"].items())
+        for name, sc in secrets_now:
+            for e in sc.get("standing") or []:
+                off = e["mode"] not in self._effective_auto_modes(sc)
+                rows.append({"kind": "always", "id": e["id"], "secrets": [name], "mode": e["mode"],
+                             "scope": e["scope"], "covers": standing_mod.covers_label(e["mode"], e["scope"])
+                             + (" (not active: mode not enabled)" if off else ""),
+                             "expires_at": None, "left_s": None, "created_by": e["created_by"],
+                             "created_at": e["created_at"].replace("T", " ").replace("Z", " UTC")})
+        for name, sc in secrets_now:
+            if sc.get("approval", "prompt") != "allow":
+                continue
+            ch = sc.get("approval_changed") or {}
+            at = ch.get("at") or ""
+            modes = ", ".join(_MODE_LABEL.get(m, m) for m in self._auto_modes(sc)) or "none"
+            rows.append({"kind": "legacy", "id": "", "name": name, "secrets": [name], "mode": None,
+                         "scope": "any", "covers": f"whole credential, any method, any covered mode ({modes})",
+                         "expires_at": None, "left_s": None, "created_by": ch.get("by") or "",
+                         "created_at": at.replace("T", " ").replace("Z", " UTC")})
+        rows.sort(key=lambda r: (r["kind"] != "timed", r["expires_at"] or 0))
+        return rows
+
+    def _persist_standing(self, name, entries, user):
+        """Write the Always list into the credential's broker metadata in the vault
+        (the same path as _persist_approval); an empty list removes the field. The
+        live catalog entry is updated at the same time."""
+        sc = self.cfg["secrets"][name]
+        meta = {**sc["_meta"], "standing_changed": {"by": user, "at": standing_mod.iso(time.time())}}
+        if entries:
+            meta["standing"] = [dict(e) for e in entries]
+        else:
+            meta.pop("standing", None)
+        self.backend.set_meta(sc["_item"], meta)
+        sc["_meta"] = meta
+        if entries:
+            sc["standing"] = [dict(e) for e in entries]
+        else:
+            sc.pop("standing", None)
+
+    def _add_always(self, name, mode, scope, by):
+        """Create (or find) an Always approval. Returns (status, entry): created |
+        exists | cap | backend | failed. One entry per (credential, mode): a broader
+        scope replaces a narrower one; a narrower one is already covered."""
+        with self._cfg_lock:
+            sc = self.cfg["secrets"][name]
+            entries = [dict(e) for e in sc.get("standing") or []]
+            for e in entries:
+                if e["mode"] == mode and (e["scope"] == "any" or e["scope"] == scope):
+                    return "exists", e
+            kept = [e for e in entries if e["mode"] != mode]
+            if len(kept) >= standing_mod.MAX_STANDING:
+                return "cap", None
+            if not hasattr(self.backend, "set_meta"):
+                return "backend", None
+            taken = {e["id"] for e in kept} | {g["id"] for g in self.grants.active()}
+            sid = secrets.token_hex(4)
+            while sid in taken:
+                sid = secrets.token_hex(4)
+            entry = {"id": sid, "secrets": [name], "mode": mode, "scope": scope, "expires_at": None,
+                     "created_by": by, "created_at": standing_mod.iso(time.time())}
+            try:
+                self._persist_standing(name, kept + [entry], by)
+            except (OSError, ValueError, KeyError, BackendError):
+                return "failed", None
+        return "created", entry
+
+    def _always_create(self, req, actor, channel, who):
+        """Create the Always approval a human asked for on this request's card. Never
+        raises; sets req.always: applied | exists | not applied: <why>. The request
+        itself is approved whatever happens here."""
+        ok, why = self.always_allow_eligibility(req)
+        if not ok:
+            req.always = f"not applied: {why}"
+            self.audit("policy_change_refused", req, reason=why, **who)
+            return
+        scope = grants_mod.scope_for(req.mode, req.spec)
+        status, e = self._add_always(req.names[0], req.mode, scope, actor)
+        if status == "created":
+            req.always = "applied"
+            self.audit("grant_created", req, kind="always", grant_id=e["id"], scope=scope,
+                       grant_mode=req.mode, expires_at=None, created_by=actor, channel=channel,
+                       approver_peer=who.get("approver_peer"), approver_ip=who.get("approver_ip"))
+        elif status == "exists":
+            req.always = "exists"
+        elif status == "failed":
+            req.always = "not applied: could not write the config file"
+            self.audit("standing_change_failed", req, op="create", error="could not write the vault metadata",
+                       **who)
+        else:
+            req.always = ("not applied: this credential has the maximum number of standing approvals"
+                          if status == "cap" else "not applied: the vault backend cannot record this")
+            self.audit("grant_refused", req, kind="always", reason=status, **who)
+
     def _grant_create(self, req, minutes, actor, channel, who):
         ok, why = self.grant_eligibility(req)
         if not ok:
-            self.audit("grant_refused", req, reason=why, **who)
+            self.audit("grant_refused", req, kind="timed", reason=why, **who)
             return
         g = self.grants.add(req.names, minutes, grants_mod.scope_for(req.mode, req.spec), actor,
                             channel, req.id, mode=req.mode)
-        self.audit("grant_created", req, grant_id=g["id"], scope=g["scope"], grant_minutes=minutes,
-                   expires_at=g["expires_at"], created_by=actor, channel=channel,
+        self.audit("grant_created", req, kind="timed", grant_id=g["id"], scope=g["scope"],
+                   grant_minutes=minutes, expires_at=g["expires_at"], created_by=actor, channel=channel,
                    approver_peer=who.get("approver_peer"), approver_ip=who.get("approver_ip"))
 
-    def _grant_claim(self, req):
-        """Approve `req` from active grants when every secret has one. Called from
-        create() for requests no policy already approved. Returns True when the
-        request was claimed and finished here. Checked and claimed under the
-        decision lock, so a human decision and a grant never both act."""
-        cfg = self.grants_cfg
-        if not cfg["enabled"] or req.mode not in grants_mod.ELIGIBLE_MODES:
+    def _standing_claim(self, req):
+        """Approve `req` from a standing approval, in this order: an Always approval
+        (checked against risk.auto_approve_max; a missing verdict counts as high),
+        then a timed grant (no risk ceiling). Called from create() for requests no
+        credential-wide policy already approved. Returns True when the request was
+        claimed and finished here. Checked and claimed under the decision lock, so a
+        human decision and a standing approval never both act. An approval that does
+        not apply is audited (grant_skipped) and the next kind is tried."""
+        if req.mode not in grants_mod.ELIGIBLE_MODES:
             return False
-        level = req.risk["level"] if req.risk else "high"     # no verdict counts as high
-        with self._lock:
-            g = self.grants.find(req.names, req.mode)
+        level = req.risk["level"] if req.risk else "high"
+        hidden = self._script_not_visible(req.mode, req.spec)
+        for kind in ("always", "timed"):
+            ceiling = self._auto_max if kind == "always" else self.grants_cfg["max_risk"]
+            g = self._standing_find(req, kind)
             if g is None:
-                return False
+                continue
             skip = None
-            if self._script_not_visible(req.mode, req.spec):
-                skip = "script_not_visible"
-            elif not grants_mod.covers(g, req.mode, req.spec):
-                skip = "method"
-            elif not risk_mod.auto_ok(level, cfg["max_risk"]):
-                skip = "risk"
-            elif req.status != "pending":
-                return False
+            with self._lock:
+                if hidden:
+                    skip = "script_not_visible"
+                elif kind == "always" and req.mode not in self._effective_auto_modes(
+                        self.cfg["secrets"][req.names[0]]):
+                    skip = "auto_modes"
+                elif not grants_mod.covers(g, req.mode, req.spec):
+                    skip = "method"
+                elif not risk_mod.auto_ok(level, ceiling):
+                    skip = "risk"
+                elif req.status != "pending":
+                    return False
+                else:
+                    req.status = "deciding"
+            if skip:
+                extra = {"max_risk": ceiling} if skip == "risk" else {}
+                self.audit("grant_skipped", req, kind=kind, reason=skip, grant_id=g["id"], scope=g["scope"],
+                           grant_mode=g.get("mode"), risk_level=level, **extra)
+                continue
+            left = self.grants.left_s(g) if kind == "timed" else None
+            self.audit("grant_used", req, kind=kind, grant_id=g["id"], scope=g["scope"],
+                       grant_minutes=g.get("minutes") if kind == "timed" else None, grant_left_s=left)
+            try:
+                result = self._release(req)
+            except (BackendError, OSError, ValueError) as e:
+                self._finish(req, "failed", error=f"release failed: {e}", via="policy",
+                             grant_id=g["id"], grant_left_s=left)
             else:
-                req.status = "deciding"
-        if skip:
-            self.audit("grant_skipped", req, reason=skip, grant_id=g["id"], scope=g["scope"],
-                       grant_mode=g.get("mode"),
-                       risk_level=level, max_risk=cfg["max_risk"])
-            return False
-        left = self.grants.left_s(g)
-        self.audit("grant_used", req, grant_id=g["id"], scope=g["scope"], grant_left_s=left)
-        try:
-            result = self._release(req)
-        except (BackendError, OSError, ValueError) as e:
-            self._finish(req, "failed", error=f"release failed: {e}", via="policy",
-                         grant_id=g["id"], grant_left_s=left)
-        else:
-            self._finish(req, "approved", result=result, via="policy",
-                         grant_id=g["id"], grant_left_s=left)
-        return True
+                self._finish(req, "approved", result=result, via="policy",
+                             grant_id=g["id"], grant_left_s=left)
+            return True
+        return False
+
+    def _standing_find(self, req, kind):
+        """The standing approval of `kind` for exactly this request's secrets and
+        mode, preferring one that covers it by scope; None when there is none."""
+        if kind == "timed":
+            return self.grants.find(req.names, req.mode) if self.grants_cfg["enabled"] else None
+        if len(req.names) != 1 or req.mode not in standing_mod.ALWAYS_MODES:
+            return None
+        sc = self.cfg["secrets"].get(req.names[0]) or {}
+        mine = [e for e in sc.get("standing") or [] if e["mode"] == req.mode]
+        return next((e for e in mine if grants_mod.covers(e, req.mode, req.spec)), mine[0] if mine else None)
 
     def revoke_grant(self, grant_id, user, peer=None, client_ip=None):
-        """End a grant early. Returns True when it was active."""
+        """End a standing approval early (timed, or Always: removed from the vault
+        metadata). Returns True when it was active, False when it was not, None when
+        an Always could not be removed."""
         g = self.grants.revoke(grant_id) if self.grants_cfg["enabled"] else None
-        if g is None:
-            return False
-        self.log("grant_revoked", grant_id=g["id"], secrets=g["secrets"], scope=g["scope"], mode=g["mode"],
-                 created_by=g["created_by"], revoked_by=user, left_s=max(0, int(g["expires_at"] - time.time())), peer=peer,
-                 client_ip=client_ip)
-        return True
+        if g is not None:
+            self.log("grant_revoked", kind="timed", grant_id=g["id"], secrets=g["secrets"], scope=g["scope"],
+                     mode=g["mode"], created_by=g["created_by"], revoked_by=user,
+                     left_s=max(0, int(g["expires_at"] - time.time())), peer=peer, client_ip=client_ip)
+            return True
+        with self._cfg_lock:
+            for name, sc in self.cfg["secrets"].items():
+                entries = sc.get("standing") or []
+                e = next((x for x in entries if x["id"] == grant_id), None)
+                if e is None:
+                    continue
+                try:
+                    self._persist_standing(name, [x for x in entries if x is not e], user)
+                except (OSError, ValueError, KeyError, BackendError) as err:
+                    self.log("standing_change_failed", op="revoke", grant_id=e["id"], secrets=[name],
+                             user=user, error=str(err)[:200])
+                    return None
+                self.log("grant_revoked", kind="always", grant_id=e["id"], secrets=[name], scope=e["scope"],
+                         mode=e["mode"], created_by=e["created_by"], revoked_by=user, left_s=None,
+                         peer=peer, client_ip=client_ip)
+                return True
+        return False
 
     def decide_push(self, rid, token, approve, user, peer=None, client_ip=None):
         """Decision from a browser notification button: decide_via on the
@@ -2130,7 +2283,7 @@ _WORKING_JS = (
 
 _GRANTS_JS = r'''
 (function(){
-  function fmt(s){var m=Math.floor(s/60);return m+'m '+('0'+(s%60)).slice(-2)+'s';}
+  function fmt(s){return s>=60?'in '+Math.ceil(s/60)+' min':'in under a minute';}
   function tick(){var any=false;document.querySelectorAll('time[data-gexp]').forEach(function(t){
     var s=Math.floor(t.getAttribute('data-gexp')-Date.now()/1000);
     if(s<=0){t.textContent='expired';any=true;return;}t.textContent=fmt(s);});
@@ -2810,15 +2963,11 @@ def _approve_actions(broker, req):
             f"aria-label='Approve this request, and approve further requests for exactly {names} "
             f"for {label}{env_note}'>{label}</button>")
     if ok_a:
-        tip = ("Approve this request and release future web and run-with-secret requests with "
-               "this secret without asking, as configured (auto_modes), when the request is low "
-               "risk. Revoke any time under Policies.")
-        if req.mode == "env":
-            ask = (f"Always approve {req.names[0]}? The secret value will be released to the "
-                   "requesting machine without asking again when the request is rated "
-                   f"{broker.auto_approve_max()} or lower.")
-        else:
-            ask = f"Always approve {req.names[0]}?"
+        what = standing_mod.scope_phrase(req.mode, scope)
+        tip = (f"Approve this request and approve future requests for this secret without asking: "
+               f"{what}, when the request is rated {broker.auto_approve_max()} or lower. "
+               "Revoke any time under Policies.")
+        ask = standing_mod.confirm_text(req.names[0], req.mode, scope, broker.auto_approve_max())
         chips.append(
             f"<details class=alw><summary class='chip always' data-tip='{e(tip)}' "
             f"aria-label='Always approve {e(req.names[0])}: {e(tip)}'>Always</summary>"
@@ -2860,8 +3009,10 @@ def _parse_decision(decision):
     return None
 
 
-def _left(s):
-    return f"{s // 60}m {s % 60:02d}s"
+def _in_min(s):
+    """'in 12 min' for a countdown (rounded up); 'in under a minute' near the end."""
+    s = int(s or 0)
+    return f"in {-(-s // 60)} min" if s >= 60 else "in under a minute"
 
 
 def _utc(t):
@@ -2953,10 +3104,10 @@ def _detail_html(r, evs, retained=""):
             f", rule {str(r['rule_id'])[:16]}")
     elif r["via"] == "policy" and r.get("grant_id"):
         left = (final or {}).get("grant_left_s")
-        gs = (first("grant_used") or {}).get("scope")
-        add("Decided by", "time-boxed grant"
-            + (" (reads only)" if gs == "read" else " (all requests)" if gs else "")
-            + (", run-with-secret" if r.get("mode") == "env" else "") + " (auto-approved)"
+        used = first("grant_used") or {}
+        add("Decided by", standing_mod.decided_by(used.get("kind") or "timed", used.get("grant_minutes"),
+                                                  r.get("mode"), used.get("scope"))
+            + " (auto-approved)"
             + ((f", {left // 60} min left when used" if left >= 60 else ", under a minute left when used")
                if isinstance(left, int) else "")
             + f", grant {str(r['grant_id'])[:8]}")
@@ -3194,7 +3345,7 @@ def approval_handler(broker):
 
         def _dashboard(self, user, fragment=False, note="", q=None):
             notes = {"approved": "Approved. Releasing now.", "denied": "Denied.",
-                     "always": "Approved, and always allowed from now on.",
+                     "always": "Approved, and always approved from now on (this kind of request only).",
                      "grant": "Approved, and further requests are approved for a while.",
                      "sshrule": "Approved, and this key is always approved for that account on that server.",
                      "norule": "No standing rule was created; the request is still waiting.",
@@ -3400,13 +3551,13 @@ def approval_handler(broker):
                   "<section class=card><h2>Broker</h2><div class=srow><div class=t>"
                   "<b>Auto-approve</b><small class=muted>"
                   f"{html.escape(auto[0].upper() + auto[1:])}."
-                  " Applies only to secrets set to always allow; set in the broker config "
-                  "(risk.auto_approve_max).</small></div></div>"
+                  " The ceiling for Always approvals and secrets set to always allow; set in the "
+                  "broker config (risk.auto_approve_max).</small></div></div>"
                   "<div class=srow><div class=t><b>Notifications</b><small class=muted>"
                   f"{html.escape(presence_mod.describe(broker.presence_cfg))}</small></div></div>"
-                  "<div class=srow><div class=t><b>Time-boxed grants</b><small class=muted>"
-                  f"{html.escape(grants_mod.describe(broker.grants_cfg))}. "
-                  "Set in the broker config (timed_grants).</small></div></div></section>"
+                  "<div class=srow><div class=t><b>Standing approvals</b><small class=muted>"
+                  f"{html.escape(grants_mod.describe(broker.grants_cfg, broker.auto_approve_max()))}. "
+                  "Durations are set in the broker config (timed_grants).</small></div></div></section>"
                   "<section class=card><h2>This browser</h2>"
                   "<div class=srow><div class=t><b>Notifications while this page is open</b>"
                   "<small id=notify-state class=muted></small></div>"
@@ -3506,61 +3657,54 @@ def approval_handler(broker):
             return parts[1] if len(parts) == 2 and parts[0] == "a" else None
 
         def _policies_page(self, user, note="", status=200, ssh_state=None, rule_state=None):
-            rows = []
-            for name, sc in sorted(cfg["secrets"].items()):
-                if sc.get("approval", "prompt") != "allow":
-                    continue
-                by = (sc.get("approval_changed") or {}).get("by")
-                modes = ", ".join(_MODE_LABEL.get(m, m) for m in broker._auto_modes(sc)) or "none"
-                rows.append(
-                    f"<tr><td data-label=Secret><b>{html.escape(name)}</b></td>"
-                    f"<td data-label='Auto-approved for'>{html.escape(modes)}</td>"
-                    f"<td data-label='Allowed by'>{html.escape(by or '')}</td>"
-                    "<td><form method=post class=inline>"
-                    f"<input type=hidden name=csrf value='{broker.csrf_token(user)}'>"
-                    f"<input type=hidden name=name value='{html.escape(name)}'>"
-                    "<button name=approval value=prompt>Revoke</button></form></td></tr>")
-            table = ("<table class=tbl><thead><tr><th>Secret</th><th>Auto-approved for</th><th>Allowed by</th><th></th></tr></thead>"
-                     "<tbody>" + "".join(rows) + "</tbody></table>" if rows else
-                     "<div class='card empty'>Nothing is always allowed. Every use asks you first.</div>")
-            _page(self, status, f"<h1>Policies</h1>{note}{self._grants_section(user)}"
-                  "<h3>Always allowed</h3>"
-                  "<p><small class=muted>These secrets are released without asking when the request's "
-                  f"risk is within the auto-approve limit ({_AUTO_LABEL[broker.auto_approve_max()]}). "
-                  "Revoke to ask every time again.</small></p>" + table
+            _page(self, status, f"<h1>Policies</h1>{note}{self._standing_section(user)}"
                   + guidance_mod.policies_section(cfg["secrets"], broker.csrf_token(user))
                   + sshhosts_mod.policies_section(cfg["secrets"], broker.csrf_token(user), ssh_state)
                   + sshrules_mod.policies_section(cfg["secrets"], broker.csrf_token(user),
                                                   broker.ssh_rule_usage, state=rule_state),
                   script=_GRANTS_JS + guidance_mod.JS + sshhosts_mod.JS, tab="policies", badge=len(broker.pending()), user=user)
 
-        def _grants_section(self, user):
-            """'Active grants' card on the Policies tab: who allowed what, time left, Revoke."""
-            head = ("<h3 style='margin-top:0'>Active grants</h3><p><small class=muted>Time-boxed "
-                    "approvals: until the clock runs out, requests for these secrets that the broker "
-                    "runs itself are approved without asking, when the request names exactly the same secrets. Revoke to ask every time again."
-                    "</small></p>")
+        def _standing_section(self, user):
+            """'Standing approvals' on the Policies tab: every timed grant, Always
+            approval and legacy always-allowed credential, with Revoke."""
+            e = html.escape
+            token = broker.csrf_token(user)
+            head = ("<h3 style='margin-top:0'>Standing approvals</h3><p><small class=muted>Requests "
+                    "these cover are approved without asking. A time-boxed approval has no risk limit "
+                    "and ends at its deadline. An Always approval never expires and is used only when the "
+                    f"request is within the auto-approve limit ({_AUTO_LABEL[broker.auto_approve_max()]}). "
+                    "Each covers exactly the secrets, mode and method class shown. Revoke to ask every "
+                    "time again.</small></p>")
             if not broker.grants_cfg["enabled"]:
-                return head + "<div class='card empty'>Time-boxed grants are turned off.</div>"
+                head += "<p><small class=muted>Time-boxed grants are turned off.</small></p>"
             rows = []
-            for g in broker.active_grants():
+            for r in broker.standing_rows():
+                if r["expires_at"] is None:
+                    exp = "never"
+                else:
+                    exp = (f"<time data-gexp='{int(r['expires_at'])}'>"
+                           f"{e(_in_min(r['left_s']))}</time>")
+                who = e(r["created_by"]) + (f" <small class=muted>{e(r['created_at'])}</small>"
+                                            if r["created_at"] else "")
+                if r["kind"] == "legacy":
+                    form = ("<form method=post class=inline>"
+                            f"<input type=hidden name=csrf value='{token}'>"
+                            f"<input type=hidden name=name value='{e(r['name'])}'>"
+                            "<button name=approval value=prompt>Revoke</button></form>")
+                else:
+                    form = ("<form method=post action='/grants/revoke' class=inline>"
+                            f"<input type=hidden name=csrf value='{token}'>"
+                            f"<input type=hidden name=grant value='{e(r['id'])}'>"
+                            "<button>Revoke</button></form>")
                 rows.append(
-                    f"<tr><td data-label=Secret><b>{html.escape(', '.join(g['secrets']))}</b></td>"
-                    f"<td data-label=Covers>{html.escape(grants_mod.MODE_LABEL.get(g.get('mode'), ''))}: "
-                    f"{'reads only' if g['scope'] == 'read' else 'all requests'}</td>"
-                    f"<td data-label='Time left'><time data-gexp='{int(g['expires_at'])}'>"
-                    f"{html.escape(_left(g['left_s']))}</time></td>"
-                    f"<td data-label='Allowed by'>{html.escape(g['created_by'])}"
-                    f" <small class=muted>({int(g['minutes'])} min)</small></td>"
-                    "<td><form method=post action='/grants/revoke' class=inline>"
-                    f"<input type=hidden name=csrf value='{broker.csrf_token(user)}'>"
-                    f"<input type=hidden name=grant value='{html.escape(g['id'])}'>"
-                    "<button>Revoke</button></form></td></tr>")
+                    f"<tr><td data-label=Secrets><b>{e(', '.join(r['secrets']))}</b></td>"
+                    f"<td data-label=Covers>{e(r['covers'])}</td>"
+                    f"<td data-label=Expires>{exp}</td>"
+                    f"<td data-label='Created by'>{who}</td><td>{form}</td></tr>")
             if not rows:
-                return head + "<div class='card empty'>No active grants</div>"
-            return (head + "<table class=tbl><thead><tr><th>Secrets</th><th>Covers</th><th>Time left</th>"
-                    "<th>Allowed by</th><th></th></tr></thead><tbody>" + "".join(rows)
-                    + "</tbody></table>")
+                return head + "<div class='card empty'>No standing approvals</div>"
+            return (head + "<table class=tbl><thead><tr><th>Secrets</th><th>Covers</th><th>Expires</th>"
+                    "<th>Created by</th><th></th></tr></thead><tbody>" + "".join(rows) + "</tbody></table>")
 
         def do_GET(self):
             user = self._user()
@@ -3799,14 +3943,17 @@ def approval_handler(broker):
                                                        "norule" if code in (403, 409) else "stale"))
                 tag = ("denied" if decision == "deny" else
                        "sshrule" if done.ssh_rule in ("created", "exists") else
-                       "always" if done.always == "applied" else
+                       "always" if done.always in ("applied", "exists") else
                        "grant" if parsed[2] is not None else "approved")
                 return self._redirect(f"/?note={tag}")
             if path == "/grants/revoke":
                 gid = form.get("grant", [""])[0][:16]
                 done = broker.revoke_grant(gid, user, self.client_address[0], self._fwd())
                 return self._policies_page(
-                    user, f"<p>{'Grant revoked' if done else 'That grant is no longer active'}.</p>")
+                    user, "<p>" + ("Standing approval revoked" if done else
+                                   "That standing approval is no longer active" if done is False else
+                                   "Could not revoke the standing approval") + ".</p>",
+                    status=500 if done is None else 200)
             if path == "/policies/ssh_rules/revoke":
                 name, rid = form.get("secret", [""])[0], form.get("rule", [""])[0][:16]
                 if name not in cfg["secrets"] or not cfg["secrets"][name].get("ssh"):
@@ -3894,8 +4041,9 @@ def approval_handler(broker):
             if not approve:
                 return _page(self, 200, "<h1>Denied</h1>")
             extra = ""
-            if req.always == "applied":
-                extra = (f"<p>Always allow saved for <b>{html.escape(req.names[0])}</b>. "
+            if req.always in ("applied", "exists"):
+                what = standing_mod.scope_phrase(req.mode, grants_mod.scope_for(req.mode, req.spec))
+                extra = (f"<p>Always allow saved for <b>{html.escape(req.names[0])}</b> ({html.escape(what)}). "
                          "Revoke it at <a href='/policies'>/policies</a>.</p>")
             elif req.always:
                 extra = f"<p><small>Always allow {html.escape(req.always)}.</small></p>"

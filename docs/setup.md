@@ -69,8 +69,8 @@ Settings are a JSON object in the `BROKER_CONFIG` environment variable of
 | `notify` | One or more transports, see step 5 |
 
 Useful optional keys: `risk.auto_approve_max` (`low`, the default, is
-recommended: an always-allowed secret is released unprompted only for low-risk
-requests; `none` turns auto-approval off, `high` lets every risk level through
+recommended: an always-allowed secret (and an Always standing approval) is released
+unprompted only for low-risk requests; `none` turns auto-approval off, `high` lets every risk level through
 and fails open when the analysis model is down; see the reference),
 `risk.auto_modes` (default `["http", "env"]`: which request types an
 `approval: allow` secret auto-approves; `["http"]` keeps run-with-secret

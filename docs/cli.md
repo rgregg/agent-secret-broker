@@ -76,7 +76,7 @@ Check it:
   `approval: allow` (and not limited to `auto_modes: ["http"]`) and the request
   rates within `risk.auto_approve_max`, it runs without a phone prompt, and the
   plaintext value is released to this machine; a script that cannot be read or
-  comes from stdin always asks. A time-boxed grant can cover it too.
+  comes from stdin always asks. A standing approval (Always or timed) can cover it too.
 - **Scripts are shown to you.** For `NAME -- command`, `asb` looks for the script
   file the command runs and sends its text with the request, so the approval card
   and the risk check see what the script does, not just `bash deploy.sh`. It skips

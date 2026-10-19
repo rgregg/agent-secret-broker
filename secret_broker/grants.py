@@ -11,6 +11,11 @@ The grant expires at an absolute deadline (no sliding extension) and can be
 revoked early. Grants are persisted (names, times and creator only; no values,
 no tokens) so a broker restart does not drop them.
 
+A timed grant has no risk ceiling by default (the human chose it explicitly for
+a short time; `timed_grants.max_risk` defaults to `high`, and an operator may set
+it lower to cap them); the no-expiry kind, "Always", lives in the credential's vault metadata
+and is checked against risk.auto_approve_max (see standing.py).
+
 This module holds the store, config validation and persistence. The decision
 hooks live in broker.py (`Broker.create`, `Broker.decide_via`).
 
@@ -88,14 +93,18 @@ def parse_config(raw, field="timed_grants"):
     return out
 
 
-def describe(cfg):
+def describe(cfg, auto_max="low"):
     """One line for the Settings page."""
-    if not cfg["enabled"]:
-        return "Off"
     ceil = cfg["max_risk"]
-    return ("On: " + ", ".join(f"{m} min" for m in cfg["durations"])
-            + "; " + ("no risk ceiling" if ceil == "high" else
-                      "never used" if ceil == "none" else f"used up to {ceil} risk"))
+    if not cfg["enabled"]:
+        timed = "timed grants off"
+    else:
+        lim = ("(no ceiling)" if ceil == "high" else "(never used)" if ceil == "none"
+               else f"(up to {ceil} risk)")
+        timed = f"timed grants {lim} " + "/".join(str(m) for m in cfg["durations"]) + " min"
+    always = ("Always off (risk.auto_approve_max none)" if auto_max == "none"
+              else f"Always up to {auto_max} risk")
+    return f"Standing approvals: {timed}; {always}"
 
 
 class GrantStore:

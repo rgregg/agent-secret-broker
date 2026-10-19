@@ -242,7 +242,7 @@ class Using(Base):
         self.assertEqual(row["outcome"], "auto-approved")
         self.assertTrue(row["grant_id"])
         _, frag = self.get(f"/request/{rid}?fragment=1")
-        self.assertIn("time-boxed grant", frag)
+        self.assertIn("standing approval (15 min, reads only)", frag)
         self.assertIn("min left when used", frag)
         first = [r for r in self.broker.history.rows() if r["outcome"] == "approved"][-1]
         _, frag2 = self.get(f"/request/{first['id']}?fragment=1")
@@ -362,7 +362,23 @@ class Using(Base):
         self.assertEqual(len(self.notifier.sent), n)
 
 
+class NoCeilingByDefault(Base):
+    """`timed_grants.max_risk` defaults to high: a timed grant releases at any risk."""
+    risk = "high"
+
+    def test_high_risk_and_missing_verdict_are_released(self):
+        self.grant_it()
+        n = len(self.notifier.sent)
+        self.assertEqual(self.result(self.http())["status"], "approved")
+        self.broker.summarizer = None
+        self.assertEqual(self.result(self.http(path="/y"))["status"], "approved")
+        self.assertEqual(len(self.notifier.sent), n)
+        self.assertEqual(self.events("grant_skipped"), [])
+        self.assertEqual(self.events("config_warning"), [])
+
+
 class RiskCeiling(Base):
+    """An operator may opt in to a ceiling for timed grants."""
     risk = "medium"
     grants_cfg = {"max_risk": "low"}
 
@@ -383,15 +399,6 @@ class RiskCeiling(Base):
         n = len(self.notifier.sent)
         self.http()
         self.assertEqual(len(self.notifier.sent), n + 1)
-
-
-class NoCeilingByDefault(Base):
-    risk = None
-
-    def test_missing_verdict_is_fine_with_default_ceiling(self):
-        self.grant_it()
-        self.broker.summarizer = None
-        self.assertEqual(self.result(self.http())["status"], "approved")
 
 
 class CeilingNone(Base):
@@ -615,22 +622,25 @@ class CardLayout(Base):
 
 
 class Pages(Base):
-    grants_cfg = {"durations": [10, 60, 120], "max_minutes": 120, "max_risk": "medium"}
+    grants_cfg = {"durations": [10, 60, 120], "max_minutes": 120}
 
     def test_policies_empty_then_listed_with_revoke(self):
         _, pol = self.get("/policies")
-        self.assertIn("No active grants", pol)
-        self.assertLess(pol.index("Active grants"), pol.index("Always allowed"))
+        self.assertIn("No standing approvals", pol)
+        self.assertIn("Standing approvals", pol)
+        self.assertNotIn("Active grants", pol)
+        self.assertNotIn("Always allowed", pol)
         self.grant_it(minutes=60)
         _, pol = self.get("/policies")
         self.assertIn("data-gexp", pol)
         self.assertIn("/grants/revoke", pol)
         self.assertIn("<b>svc</b>", pol)
-        self.assertIn("reads only", pol)
+        self.assertIn("web reads only", pol)
+        self.assertRegex(pol, r"<time data-gexp='\d+'>in (59|60) min</time>")
         self.grant_it(("svc", "other"), 10, method="POST")
         _, pol = self.get("/policies")
         self.assertIn("<b>other, svc</b>", pol)
-        self.assertIn("all requests", pol)
+        self.assertIn("web any method", pol)
         gid = next(g["id"] for g in self.broker.active_grants() if g["scope"] == "read")
         form = {"grant": gid, "csrf": "bad"}
         def post(form):
@@ -648,9 +658,7 @@ class Pages(Base):
 
     def test_settings_line_and_card_durations(self):
         _, s = self.get("/settings")
-        self.assertIn("Time-boxed grants", s)
-        self.assertIn("10 min, 60 min, 120 min", s)
-        self.assertIn("up to medium risk", s)
+        self.assertIn("Standing approvals: timed grants (no ceiling) 10/60/120 min; Always up to low risk", s)
         self.http()
         _, page = self.get("/")
         self.assertIn(">2 hr</button>", page)

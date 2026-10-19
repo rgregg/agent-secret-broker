@@ -45,7 +45,7 @@ Then:
 ## The web app
 
 `https://<your approval site>/` has three tabs: **Requests** (what is waiting, and
-recent history), **Policies** (what is always allowed, with Revoke), and
+recent history), **Policies** (standing approvals, with Revoke), and
 **Settings** (browser and push notifications). It follows your system light or
 dark setting and works on a phone.
 
