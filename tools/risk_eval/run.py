@@ -3,6 +3,7 @@
 
     asb openrouter -- python tools/risk_eval/run.py --provider jev
     python tools/risk_eval/run.py --dry-run          # stub model, no network
+    python tools/risk_eval/run.py --guidance         # + per-credential guidance (guidance.json)
 
 The API key is read from the environment variable OPENROUTER_TOKEN (override the
 name with --key-env) and is never printed. Cases are split deterministically
@@ -21,11 +22,41 @@ import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, ROOT)
-from secret_broker import description, riskmodel  # noqa: E402
+from secret_broker import description, guidance as guidance_mod, riskmodel  # noqa: E402
 
 LEVELS = riskmodel.LEVELS
 DEFAULT_CASES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cases.jsonl")
 SCRIPT_CASES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "script_cases.jsonl")
+DEFAULT_GUIDANCE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "guidance.json")
+
+
+def load_guidance_file(path):
+    """{secret name: guidance text} from a JSON file; a missing default file is empty."""
+    if not os.path.exists(path):
+        if path == DEFAULT_GUIDANCE:
+            return {}
+        raise ValueError(f"{path}: no such file")
+    with open(path) as f:
+        g = json.load(f)
+    if not isinstance(g, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in g.items()):
+        raise ValueError(f"{path}: must map secret name -> guidance text")
+    return {k: guidance_mod.clean(v)[:guidance_mod.MAX_LEN] for k, v in g.items()}
+
+
+def case_guidance(case, file_map):
+    """Guidance for one case: its own `guidance` ({"secret", "guidance"}, a list of those, or
+    a plain string for its first secret) wins over the file entry for the same secret."""
+    out = {n: file_map[n] for n in case["names"] if file_map.get(n)}
+    g = case.get("guidance")
+    items = [g] if isinstance(g, (dict, str)) else (g or [])
+    for it in items:
+        if isinstance(it, str):
+            it = {"secret": case["names"][0], "guidance": it}
+        if isinstance(it, dict) and isinstance(it.get("guidance"), str) and it.get("secret") in case["names"]:
+            text = guidance_mod.clean(it["guidance"])[:guidance_mod.MAX_LEN]
+            if text:
+                out[it["secret"]] = text
+    return out
 
 
 def split_of(case_id):
@@ -59,9 +90,15 @@ class StubAnalyzer:
     """Dry-run model: a crude method/command heuristic. No network."""
 
     last_cost = 0.0
+    prompts = None            # guidance cases only: id-less list of the prompts built
 
-    def analyze(self, mode, names, spec):
+    def analyze(self, mode, names, spec, guidance=None):
         time.sleep(0.001)
+        if guidance:
+            # show that the text arrives in the prompts the real classifiers would send
+            jev = riskmodel.JevAnalyzer("none").payload(mode, names, spec, guidance)
+            chat = riskmodel.ChatAnalyzer("none", "m", prompt="rubric")._messages(mode, names, spec, guidance)
+            self.prompts = (self.prompts or []) + [json.dumps(jev) + json.dumps(chat)]
         if mode == "ssh_sign":
             lvl = "high"
         elif mode == "http":
@@ -93,13 +130,15 @@ def make_analyzer(args, key):
                                   prompt=args.prompt, max_content_chars=300)
 
 
-def run_case(analyzer, case, floor):
+def run_case(analyzer, case, floor, guidance=None):
     t0 = time.time()
+    guide = case_guidance(case, guidance) if guidance is not None else {}
     try:
         if floor:
-            got = riskmodel.FloorAnalyzer(analyzer).analyze(case["mode"], case["names"], case["spec"])
+            got = riskmodel.FloorAnalyzer(analyzer).analyze(case["mode"], case["names"], case["spec"],
+                                                            guidance=guide or None)
         else:
-            got = analyzer.analyze(case["mode"], case["names"], case["spec"])
+            got = guidance_mod.call(analyzer.analyze, case["mode"], case["names"], case["spec"], guide or None)
     except Exception:  # noqa: BLE001
         got = None
     dt = time.time() - t0
@@ -109,7 +148,7 @@ def run_case(analyzer, case, floor):
             "expected": case["expected"],
             "ambiguous": case["ambiguous"], "predicted": raw if raw in LEVELS else "high",
             "failed": raw not in LEVELS, "latency": dt, "cost": got.get("cost"),
-            "note": case.get("note", "")}
+            "note": case.get("note", ""), "guided": bool(guide)}
 
 
 def pct(a, b):
@@ -280,6 +319,10 @@ def main(argv=None, out=sys.stdout):
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--high-threshold", type=float, default=0.5)
     ap.add_argument("--low-threshold", type=float, default=0.5)
+    ap.add_argument("--guidance", nargs="?", const=DEFAULT_GUIDANCE, metavar="FILE",
+                    help="apply per-credential guidance to cases whose secret has an entry "
+                         "(FILE maps secret name -> text; default tools/risk_eval/guidance.json; "
+                         "a case's own `guidance` field also counts)")
     ap.add_argument("--descriptions", action="store_true",
                     help="evaluate the description pipeline (sanitizer, injection obedience) instead of risk levels")
     ap.add_argument("--desc-model", default="openai/gpt-5-mini")
@@ -299,6 +342,8 @@ def main(argv=None, out=sys.stdout):
     cases = [] if args.only_scripts else load_cases(args.cases)
     if args.scripts or args.only_scripts:
         cases += load_cases(SCRIPT_CASES)
+    cases = load_cases(args.cases)
+    gmap = load_guidance_file(args.guidance) if args.guidance else {}
     analyzer = make_analyzer(args, key)
     if args.split != "all":
         cases = [c for c in cases if c["split"] == args.split]
@@ -307,7 +352,11 @@ def main(argv=None, out=sys.stdout):
         if args.provider == "jev" else f"chat {args.model or 'openai/gpt-5-mini'} prompt={args.prompt}")
     print(f"provider: {desc}; floor={'on' if args.floor else 'off'}; cases: {len(cases)}", file=out)
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.workers)) as ex:
-        results = list(ex.map(lambda c: run_case(analyzer, c, args.floor), cases))
+        results = list(ex.map(lambda c: run_case(analyzer, c, args.floor, gmap if args.guidance else None),
+                                        cases))
+    if args.guidance:
+        n = sum(r.get("guided", False) for r in results)
+        print(f"guidance applied to {n} of {len(results)} cases", file=out)
     for sp in ("train", "holdout"):
         sub = [r for r in results if r["split"] == sp]
         if sub:

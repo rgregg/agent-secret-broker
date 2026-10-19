@@ -52,15 +52,19 @@ MAX_SCRUB_CHARS = 2 * MAX_TEXT
 _ID_AFTER = 64          # identifier characters examined after a keyword
 _VALUE_MAX = 200        # value characters examined after the separator
 
+_AZN = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+# (prefix regex, characters of the rest, minimum length of the rest). The whole run of
+# those characters after the prefix is redacted, however long it is, so no tail is left.
 _FIXED = (
-    (re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"), REDACTED),
-    (re.compile(r"\bgh[pousr]_[A-Za-z0-9]{30,100}"), REDACTED),
-    (re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,100}"), REDACTED),
-    (re.compile(r"\bglpat-[A-Za-z0-9_-]{16,100}"), REDACTED),
-    (re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,100}"), REDACTED),
-    (re.compile(r"\bsk-[A-Za-z0-9_-]{20,200}"), REDACTED),
-    (re.compile(r"\beyJ[A-Za-z0-9_-]{8,200}\.[A-Za-z0-9_-]{8,200}\.[A-Za-z0-9_-]{4,200}"), REDACTED),
+    (re.compile(r"\b(?:AKIA|ASIA)"), frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"), 16),
+    (re.compile(r"\bgh[pousr]_"), frozenset(_AZN), 30),
+    (re.compile(r"\bgithub_pat_"), frozenset(_AZN + "_"), 20),
+    (re.compile(r"\bglpat-"), frozenset(_AZN + "_-"), 16),
+    (re.compile(r"\bxox[abprs]-"), frozenset(_AZN + "-"), 10),
+    (re.compile(r"\bsk-"), frozenset(_AZN + "_-"), 20),
 )
+_JWT_PREFIX = re.compile(r"\beyJ")
+_JWTCH = frozenset(_AZN + "_-.")
 _KEYWORDS = re.compile(
     r"password|passwd|pwd|passphrase|token|secret|api[_-]?key|access[_-]?key|private[_-]?key|auth|"
     r"credential|bearer|basic", re.I)
@@ -89,12 +93,14 @@ def _keyword_spans(text, deadline):
         if m.start() < last:
             continue
         hits += 1
-        if hits > MAX_HITS:
-            break
         if hits % 32 == 0 and time.monotonic() > deadline:
             raise _Budget
+        if len(spans) > MAX_HITS:
+            raise _Budget                                   # cap reached: fail closed
         kw = m.group(0).lower()
         i = _run(text, m.end(), _IDCH, _ID_AFTER)           # rest of the identifier
+        if i < len(text) and text[i] in _IDCH:
+            raise _Budget                                   # identifier too long to judge: withhold
         j = i
         if j < len(text) and text[j] in "\"'":
             j += 1
@@ -107,69 +113,118 @@ def _keyword_spans(text, deadline):
                 k += 1
             if k < len(text) and text[k] in "\"'":
                 k += 1
-            end = _run(text, k, _VALCH, _VALUE_MAX)
+            end = _run(text, k, _VALCH, len(text))
             need = 4 if _PASSWORDISH.fullmatch(kw) or _PASSWORDISH.search(text[m.start():i]) else 8
             if end - k >= need and text[k] not in _NOT_VALUE_START:
                 spans.append((k, end))
                 last = end
             continue
         if kw in ("bearer", "basic", "token") and i == m.end() and k > j and k - j <= 8:
-            end = _run(text, k, _TOKCH, _VALUE_MAX)
+            end = _run(text, k, _TOKCH, len(text))
             if end - k >= 16 and text[k] not in _NOT_VALUE_START:
                 spans.append((k, end))
                 last = end
+    if len(spans) > MAX_HITS:
+        raise _Budget
     return spans
 
 
 def _userinfo_spans(text, deadline):
-    spans, pos, hits = [], 0, 0
-    while hits < MAX_HITS:
+    spans, pos = [], 0
+    while True:
         a = text.find("://", pos)
         if a < 0:
             break
-        hits += 1
         pos = a + 3
-        u = _run(text, pos, _TOKCH - {"/"}, 100)
+        u = _run(text, pos, _TOKCH - {"/"}, len(text))
         if u < len(text) and text[u] == ":":
             p = u + 1
             q = p
-            stop = min(len(text), p + 100)
-            while q < stop and text[q] not in "/@ \t\r\n'\"":
+            while q < len(text) and text[q] not in "/@ \t\r\n'\"":
                 q += 1
             if q < len(text) and text[q] == "@" and q - p >= 3:
                 spans.append((p, q))
-    pos, hits = 0, 0
-    while hits < MAX_HITS:
+                if len(spans) > MAX_HITS:
+                    raise _Budget
+        if time.monotonic() > deadline:
+            raise _Budget
+    pos = 0
+    while True:
         a = text.find(" -u ", pos)
         if a < 0:
             break
-        hits += 1
         pos = a + 4
         p = pos
         if p < len(text) and text[p] in "\"'":
             p += 1
-        u = _run(text, p, _TOKCH - {":"}, 100)
+        u = _run(text, p, _TOKCH - {":"}, len(text))
         if u < len(text) and text[u] == ":":
-            q = _run(text, u + 1, frozenset(c for c in map(chr, range(33, 127)) if c not in "'\""), 100)
+            q = _run(text, u + 1, frozenset(c for c in map(chr, range(33, 127)) if c not in "'\""), len(text))
             if q - (u + 1) >= 3 and text[u + 1] not in _NOT_VALUE_START:
                 spans.append((u + 1, q))
+                if len(spans) > MAX_HITS:
+                    raise _Budget
+        if time.monotonic() > deadline:
+            raise _Budget
     return spans
 
 
+def _fixed_spans(text, deadline):
+    spans = []
+    for rx, chars, need in _FIXED:
+        pos = 0
+        while True:
+            m = rx.search(text, pos)
+            if not m:
+                break
+            end = _run(text, m.end(), chars, len(text))
+            if end - m.end() >= need:
+                spans.append((m.start(), end))
+                if len(spans) > MAX_HITS:
+                    raise _Budget
+                pos = end
+            else:
+                pos = m.end()
+        if time.monotonic() > deadline:
+            raise _Budget
+    pos = 0
+    while True:
+        m = _JWT_PREFIX.search(text, pos)
+        if not m:
+            break
+        end = _run(text, m.end(), _JWTCH, len(text))
+        parts = text[m.start():end].split(".")
+        if len(parts) >= 3 and len(parts[0]) >= 11 and len(parts[1]) >= 8 and len(parts[2]) >= 4:
+            spans.append((m.start(), end))
+            if len(spans) > MAX_HITS:
+                raise _Budget
+            pos = end
+        else:
+            pos = m.end()
+    return spans
+
+
+MAX_KEYS = 20
+_KEY_WINDOW = 16384
+
+
 def _private_key_spans(text):
-    spans, pos, hits = [], 0, 0
-    while hits < 20:
+    """Spans covering the body of each PRIVATE KEY block, from just after the BEGIN line's
+    closing dashes to the start of its END line. A block with no END line in reach is
+    redacted to the end of the text (never left half-visible)."""
+    spans, pos = [], 0
+    while True:
         a = text.find("-----BEGIN ", pos)
         if a < 0:
             break
-        hits += 1
         head_end = text.find("-----", a + 11, a + 80)
         if head_end < 0 or "PRIVATE KEY" not in text[a:head_end]:
             pos = a + 11
             continue
-        e = text.find("-----END ", head_end, head_end + 16384)
-        end = len(text) if e < 0 else (text.find("-----", e + 9, e + 80) + 5 or e + 9)
-        end = min(end, head_end + 16384)
+        if len(spans) >= MAX_KEYS:
+            raise _Budget                                   # more keys than we scrub: withhold all
+        e = text.find("-----END ", head_end + 5, head_end + 5 + _KEY_WINDOW)
+        end = len(text) if e < 0 else e          # the END line itself stays (idempotent rescrub)
         spans.append((head_end + 5, end))
         pos = max(end, a + 11)
     return spans
@@ -178,7 +233,11 @@ def _private_key_spans(text):
 def _apply(text, spans):
     out, cur = [], 0
     for a, b in sorted(spans):
+        if not (isinstance(a, int) and isinstance(b, int) and 0 <= a <= b <= len(text)):
+            raise _Budget                                   # invalid span: fail closed
         if a < cur:
+            if b > cur:
+                cur = b                                     # overlap: extend the redaction
             continue
         out.append(text[cur:a])
         out.append(REDACTED)
@@ -196,10 +255,7 @@ def scrub(text, budget=None):
         return WITHHELD
     deadline = time.monotonic() + (BUDGET_S if budget is None else budget)
     try:
-        for rx, rep in _FIXED:
-            text = rx.sub(rep, text)
-            if time.monotonic() > deadline:
-                raise _Budget
+        text = _apply(text, _fixed_spans(text, deadline))
         spans = _private_key_spans(text)
         text = _apply(text, spans)
         text = _apply(text, _userinfo_spans(text, deadline))
@@ -381,35 +437,97 @@ def _wget_ok(toks):
     return urls == 1 and ("-qO-" in toks or "-O-" in toks or "-O" in toks)
 
 
+# Positive per-command flag allowlists: only these exact spellings pass. A single-dash
+# cluster passes when every letter is listed; a double-dash option passes only when it
+# is listed in full (GNU abbreviations such as --se= are therefore rejected). Anything
+# else makes the script "not read-only".
+_DIGITS = "0123456789"
+_FLAGS = {
+    "cat": ("nbsAEeTtuv", (), "--number", "--number-nonblank", "--squeeze-blank", "--show-all",
+            "--show-ends", "--show-tabs"),
+    "ls": ("1aAdFghiklLnprRsStuxCmH", (), "--all", "--almost-all", "--human-readable", "--classify",
+           "--directory", "--recursive", "--reverse", "--size", "--inode", "--si"),
+    "head": ("nqvc" + _DIGITS, (), "--quiet", "--silent", "--verbose"),
+    "tail": ("nqvc" + _DIGITS, (), "--quiet", "--silent", "--verbose"),
+    "grep": ("ivnclLhHsEFGwxqoaIrRzeABC" + _DIGITS, (), "--ignore-case", "--invert-match",
+             "--line-number", "--count", "--files-with-matches", "--files-without-match", "--no-filename",
+             "--with-filename", "--quiet", "--silent", "--word-regexp", "--line-regexp", "--only-matching",
+             "--recursive", "--extended-regexp", "--fixed-strings", "--no-messages"),
+    "wc": ("lwcmL", (), "--lines", "--words", "--bytes", "--chars"),
+    "stat": ("cLfFt", (), "--dereference", "--file-system", "--terse"),
+    "uname": ("asnrvmpio", (), "--all", "--kernel-name", "--nodename", "--kernel-release",
+              "--kernel-version", "--machine", "--processor", "--hardware-platform", "--operating-system"),
+    "uptime": ("ps", (), "--pretty", "--since"),
+    "df": ("aHhiklPTm", (), "--human-readable", "--si", "--all", "--local", "--inodes", "--portability",
+           "--print-type"),
+    "du": ("ahskcxdSmbHL", (), "--human-readable", "--summarize", "--total", "--all", "--si",
+           "--apparent-size"),
+    "ps": ("AaefxuwlLjHmcTop", (), "--forest", "--no-headers"),
+    "id": ("ugGnrz", (), "--user", "--group", "--groups", "--name", "--real"),
+    "whoami": ("", ()),
+    "pwd": ("LP", ()),
+    "echo": ("neE", ()),
+    "jq": ("rcsnSeCMjaR", (), "--raw-output", "--compact-output", "--slurp", "--null-input", "--sort-keys",
+           "--exit-status", "--monochrome-output", "--join-output", "--ascii-output", "--raw-input",
+           "--tab", "--arg", "--argjson"),
+    "date": ("uR", (), "--utc", "--universal", "--rfc-email", "--rfc-3339=date", "--rfc-3339=seconds",
+             "--rfc-3339=ns"),
+    "hostname": ("sfIid", (), "--short", "--fqdn", "--all-ip-addresses", "--ip-address", "--domain"),
+}
+for _k, _v in list(_FLAGS.items()):
+    _FLAGS[_k] = (frozenset(_v[0]), frozenset(_v[2:]))
+
+
+def _flags_ok(cmd, args):
+    short, longs = _FLAGS[cmd]
+    for a in args:
+        if a.startswith("--"):
+            if a not in longs:                  # exact spelling only; "--" itself is refused too
+                return False
+        elif a.startswith("-") and len(a) > 1:
+            if not all(c in short for c in a[1:]):
+                return False
+    return True
+
+
+_DANGEROUS_VAR = re.compile(
+    r"^(?:PATH|LD_.*|DYLD_.*|BASH_ENV|ENV|IFS|CDPATH|PS[0-9]|PROMPT_COMMAND|PYTHON.*|NODE_.*|GIT_.*|"
+    r"[A-Za-z0-9]*_PROXY|CURL_.*|WGETRC|HOME|SHELL|TMPDIR|SHELLOPTS|BASHOPTS|GLOBIGNORE|FIGNORE|"
+    r"BASH_.*|PERL.*|RUBY.*|LANG|LC_.*|TZ|TERM|USER|LOGNAME|OLDPWD|PWD)$", re.I)
+
+
 def _segment_ok(toks):
-    while toks and (toks[0] in _CTRL_WORDS or _ASSIGN.match(toks[0])):
+    while toks and toks[0] in _CTRL_WORDS:
         toks = toks[1:]
     if not toks:
         return True
+    if _ASSIGN.match(toks[0]):
+        return False                            # any assignment (PATH=, LD_PRELOAD=, ...) is not read-only
     if toks[0] == "for":                        # for x in a b c  (the body is separate segments)
-        return len(toks) >= 4 and toks[2] == "in" and re.match(r"^[A-Za-z_]\w*$", toks[1]) is not None
+        return (len(toks) >= 4 and toks[2] == "in" and re.match(r"^[A-Za-z_]\w*$", toks[1]) is not None
+                and not _DANGEROUS_VAR.match(toks[1]))
     cmd, args = toks[0], toks[1:]
     if cmd not in READ_CMDS:
         return False
-    short = [a for a in args if a.startswith("-")]
     if cmd in ("grep", "egrep", "fgrep"):
-        return not any(a.startswith("--file") or (not a.startswith("--") and "f" in a[1:]) for a in short)
-    if cmd == "jq":
-        return not any(a.startswith("--from-file") or (not a.startswith("--") and "f" in a[1:]) for a in short)
-    if cmd == "date":
-        return not any(a in ("-s", "--set") or a.startswith("--set=") or a.startswith("-s") for a in args)
-    if cmd == "hostname":
-        return all(a.startswith("-") and a not in ("-F", "--file", "-b") for a in args)
+        return _flags_ok("grep", args)
+    if cmd in _FLAGS:
+        if not _flags_ok(cmd, args):
+            return False
+        ops = [a for a in args if not (a.startswith("-") and len(a) > 1)]
+        if cmd == "date":
+            return len(ops) <= 1 and all(o.startswith("+") for o in ops)
+        if cmd == "hostname":
+            return not ops
+        return True
     if cmd == "printf":
-        return "-v" not in args
+        return bool(args) and not args[0].startswith("-") and "-v" not in args
     if cmd == "set":
         return all(_SET_OK.match(a) for a in args) and bool(args)
     if cmd == "curl":
         return _curl_ok(args)
     if cmd == "wget":
         return _wget_ok(args)
-    if cmd in ("tail", "head", "cat", "ls", "wc", "stat", "du", "df", "ps"):
-        return not any(a.startswith(("--output", "--file")) for a in args)
     return True
 
 

@@ -68,7 +68,12 @@ the call stays small. Obvious secrets (`token=...`, `Bearer ...`, `password=...`
 AWS/GitHub/Slack key patterns, private key blocks) are replaced by `[redacted]`
 before anything is sent to a model or shown. The scrubber is linear-time (bounded
 windows, capped hits) and has a 50 ms budget; if that runs out the whole text is
-withheld (`[scrub budget exceeded; text withheld]`), never sent half-scrubbed. `send_content: false` withholds the text.
+withheld (`[scrub budget exceeded; text withheld]`), never sent half-scrubbed. The same marker replaces the text whenever a cap is reached (more than 200 redactions,
+more than 20 private keys, an identifier too long to judge) or a computed span is invalid:
+the scrubber fails closed and never returns a partial scrub. Token values are redacted to
+the end of their run of value characters, however long (a 300-character JWT or a
+150-character `ghp_` token leaves no tail). A `PRIVATE KEY` block is redacted from its
+BEGIN line to its END line, or to the end of the text when there is no END line in reach. `send_content: false` withholds the text.
 
 The `SCRIPT_RUBRIC` constant in `riskmodel.py` is appended to the instructions
 only when the request has scripts. It rates what the script would do with the
@@ -93,11 +98,53 @@ read-only commands (`cat`, `ls`, `head`, `tail`, `grep` without `-f`, `wc`, `sta
 `date`, `uname`, `uptime`, `df`, `du`, `ps`, `hostname`, `whoami`, `id`, `pwd`,
 `test`, `echo`, `printf`, `jq`), with no redirection to a file, command substitution,
 backticks, here-document, subshell, background job or variable in command position;
-`sort`, `tee`, `xargs`, `find`, `sed`, `awk`, `env` and the like are not on the list.
+`sort`, `tee`, `xargs`, `find`, `sed`, `awk`, `env` and the like are not on the list. Flags are checked against a positive list per command: only
+exact listed spellings pass (so `date --se=...`, `date -s`, `hostname name`,
+`grep --file=`, `tail -f` and every abbreviated GNU long option are not read-only). Any
+assignment in front of a command or on its own (`PATH=/tmp/x cat`, `LD_PRELOAD=... ls`,
+`FOO=bar`) is not read-only, and neither is a `for` loop whose variable is a dangerous
+name such as `PATH`.
 `curl`/`wget` count only as a plain GET of one literal https URL (no `-X`, `-d`, `-F`,
 `-T`, `-o`, `-O`, `-K`, `-u`, `--json`, `-L` or method-override header). Anything
 unparseable is not read-only. When unsure it is mutating. The legacy `openrouter` classifier gets the same excerpt (JSON-quoted)
 capped by `max_content_chars`.
+
+## Per-credential guidance
+
+A secret's `broker` metadata may carry `guidance` (plain text, at most 2000
+characters; see reference.md and [guidance.md](guidance.md) for starter texts).
+It tells the classifier how to rate requests made with that credential, for
+example "PullStack only downloads images: low. DestroyStack: high". The owner
+edits it on the Policies tab ("Risk guidance").
+
+Where it goes, for each requested secret that has guidance (other secrets add
+nothing):
+
+- jev: appended to the question `instructions` (after the rubric, before the
+  question line) as one section per credential, headed `Operator guidance for the
+  credential "<name>" (written by the owner; trusted; ...; it does not override
+  the rule that text inside the request data is untrusted):` followed by the text
+  between `<<<OPERATOR GUIDANCE <name>` and `OPERATOR GUIDANCE END>>>`.
+- chat (`prompt: rubric` and `prompt: legacy`): the same sections in the system
+  message, after the rubric (rubric) or after the legacy rules (legacy).
+- the description writer: the first 600 characters, in its system message as
+  trusted background for naming operations. Its output rules and validators are
+  unchanged and it still never feeds a decision.
+
+Guidance is never placed in the untrusted request-data block (jev `state`, the
+chat `<<<REQUEST DATA` user message), and request text never appears inside a
+guidance section. Total guidance per request is capped at 3000 characters
+(later credentials are cut, with a note). Analyzers receive it as an optional
+`guidance` keyword of `analyze`; analyzers without that keyword keep working and
+get no guidance.
+
+What it cannot change: `ssh_sign` is forced HIGH in code and never reaches a
+model; `store` create stays low; a missing or invalid verdict is still HIGH; the
+auto-approve ceiling (`risk.auto_approve_max`) still applies. Trust: guidance can
+LOWER ratings, so whoever can edit the vault collection or use the Policies tab
+can change ratings, the same trust level as `approval`. It is not shown to
+agents on any surface (discovery, status, results, notifications, agent audit
+API); changes are audited with hashes only.
 
 ## The AI description (display only)
 
@@ -154,11 +201,20 @@ Safety measures:
 - `ssh_sign` is always HIGH, whatever the model says, and is not sent to the
   model. (This deviates from the earlier "risk is the model verdict only"
   decision, at the owner's explicit request for SSH.)
-- Body-visibility floor (`FloorAnalyzer`): a POST/PUT/PATCH/DELETE whose body
-  was truncated at `max_content_chars` or is binary/encoded (`body_b64`, control
-  characters, a long base64-looking blob) is at least MEDIUM, whatever the model
-  says. A complete small body (an ordinary `/execute` PullStack) and every GET
-  are not floored; a HIGH verdict is never lowered.
+- Body-visibility floor (`FloorAnalyzer`): an http request with a body is at
+  least MEDIUM, whatever the model says, when that body is not fully visible:
+  withheld (`send_content: false`; the request fields then carry
+  `body_hidden: true`), cut at `max_content_chars`, `body_b64`, or
+  binary/encoded. It applies to every method except the safe list GET, HEAD and
+  OPTIONS (custom methods such as PROPFIND, lowercase variants and odd values
+  count as unsafe); a safe method is floored only if it carries such a body.
+  "Encoded" means: control characters, a base64/hex/url-safe-base64 run of 64 or
+  more characters anywhere (also a `data:...;base64,` URI, or base64 split over
+  whitespace or lines in pieces of 16+ characters), or Shannon entropy above 4.8
+  bits per character on a body longer than 128 characters. The check is linear
+  time and looks at the first 32 KB. A complete small body (an ordinary
+  `/execute` PullStack) and bodiless requests are not floored; a HIGH verdict is
+  never lowered.
 - Creating a new credential (`store` create) is low (existing rule in `risk.py`).
 - Failure, timeout, malformed reply or an unknown option: HIGH.
 
@@ -168,6 +224,7 @@ Safety measures:
     asb openrouter -- python tools/risk_eval/run.py --provider chat --prompt legacy
     asb openrouter -- python tools/risk_eval/run.py --descriptions   # description pipeline
     python tools/risk_eval/run.py --dry-run          # no network
+    python tools/risk_eval/run.py --guidance         # + tools/risk_eval/guidance.json
 
 `--scripts` adds `tools/risk_eval/script_cases.jsonl` (env requests with a
 `scripts` list: status checks, deploys, backups, credential leaks, curl|sh,
@@ -183,6 +240,13 @@ a confusion matrix, the over-flag rate (expected low/medium rated high; the
 metric that matters for annoyance), the under-flag rate (expected high rated
 low; the dangerous direction), latency p50/p95, cost and every miss. The key is
 read from `OPENROUTER_TOKEN` and never printed.
+
+`--guidance [FILE]` applies guidance to cases whose secret has an entry in FILE
+(JSON mapping secret name to text; default `tools/risk_eval/guidance.json`, which
+may be absent). A case can also carry its own `guidance`: `{"secret": "komodo",
+"guidance": "..."}`, a list of those, or a string for its first secret. The
+report prints how many cases carried guidance; with `--dry-run` the stub builds
+the real jev and chat prompts so tests can see the text arrive.
 
 ## Changing the prompt
 

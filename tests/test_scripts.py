@@ -623,7 +623,7 @@ class ReadOnlyFailsClosed(unittest.TestCase):
         "ls -la /var/log", "cat /etc/hostname", "grep -ri error /var/log/app | head -20 | wc -l",
         "echo done", "printf '%s\\n' ready", "date +%F", "uname -a; uptime; df -h; du -sh /srv", "ps aux | grep nginx",
         "stat /etc/passwd", "id; whoami; hostname; pwd", "[ -f /etc/hosts ] && echo yes", "test -d /srv || exit 1",
-        "set -euo pipefail", "cat x 2>/dev/null", "ls >/dev/null 2>&1", "X=1 ls", "cd /srv && ls",
+        "set -euo pipefail", "cat x 2>/dev/null", "ls >/dev/null 2>&1", "cd /srv && ls",
         "curl -s https://api.example.com/v1/status", "curl -sf -H \"Authorization: Bearer $T\" https://api.example.com/a?b=c | jq .",
         "curl -sS --max-time 10 https://api.example.com/health", "wget -qO- https://api.example.com/x",
         "for f in /var/log/*.log; do wc -l $f; done",
@@ -689,8 +689,95 @@ class ScrubberIsLinear(unittest.TestCase):
         self.assertEqual(S.scrub("x" * (2 * S.MAX_TEXT + 1)), S.WITHHELD)
 
     def test_hit_cap_bounds_work(self):
+        # (updated: reaching the hit cap now withholds the whole text instead of partial scrubbing)
         out = self.timed("TOKEN=Zk9sd2VyUXRXZXJ0eTEyMzQ1\n" * 1000)
-        self.assertIn(S.REDACTED, out)
+        self.assertEqual(out, S.WITHHELD)
+
+
+class ScrubHardening(unittest.TestCase):
+    BODY = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7VJTUt9Us8cKj"
+
+    def test_private_key_variants_never_leave_body(self):
+        b = self.BODY
+        cases = [
+            f"-----BEGIN PRIVATE KEY-----\n{b}\n",                                   # no END at all
+            f"-----BEGIN PRIVATE KEY-----\n{b}\n-----END PRIVATE KEY",               # END line cut
+            f"-----BEGIN OPENSSH PRIVATE KEY-----\n{b}\n-----END OPENSSH PRIVATE KEY-----\n",
+            f"-----BEGIN PRIVATE KEY-----\n{b}\n" + "x\n" * 9000 + "-----END PRIVATE KEY-----\n",
+            f"-----BEGIN PRIVATE KEY-----\n{b}\n" + "y" * 20000 + "\n-----END PRIVATE KEY-----\n",
+            f"-----BEGIN RSA PRIVATE KEY-----\n-----BEGIN PRIVATE KEY-----\n{b}\n-----END PRIVATE KEY-----\n",
+            f"-----BEGIN PRIVATE KEY-----\n{b}\n-----END PRIVATE KEY-----\n-----BEGIN PRIVATE KEY-----\n{b}2\n",
+        ]
+        for c in cases:
+            out = S.scrub(c)
+            self.assertNotIn(b[:20], out, c[:60])
+            self.assertNotIn(b[-20:], out, c[:60])
+            self.assertEqual(S.scrub(out), out)            # idempotent
+        # text after a closed key block is kept
+        out = S.scrub(f"-----BEGIN PRIVATE KEY-----\n{b}\n-----END PRIVATE KEY-----\necho done\n")
+        self.assertIn("echo done", out)
+
+    def test_invalid_span_fails_closed(self):
+        with self.assertRaises(S._Budget):
+            S._apply("abc", [(2, 1)])
+        with self.assertRaises(S._Budget):
+            S._apply("abc", [(0, 9)])
+        with mock.patch.object(S, "_private_key_spans", return_value=[(5, 2)]):
+            self.assertEqual(S.scrub("-----BEGIN PRIVATE KEY-----\nabc"), S.WITHHELD)
+
+    def test_caps_withhold(self):
+        key = "-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n"
+        self.assertEqual(S.scrub(key * (S.MAX_KEYS + 1)), S.WITHHELD)
+        self.assertNotEqual(S.scrub(key * S.MAX_KEYS), S.WITHHELD)
+        self.assertEqual(S.scrub("curl https://u:pa55word1@h/\n" * (S.MAX_HITS + 5)), S.WITHHELD)
+        self.assertEqual(S.scrub("curl -u adm:pa55word1 h\n" * (S.MAX_HITS + 5)), S.WITHHELD)
+        self.assertEqual(S.scrub("ghp_" + "a" * 40 + "\n" * 1 + ("ghp_" + "b" * 40 + "\n") * (S.MAX_HITS + 5)),
+                         S.WITHHELD)
+        self.assertEqual(S.scrub("password=hunter22x\n" * (S.MAX_HITS + 5)), S.WITHHELD)
+        # non-matching keyword hits are not "real matches"
+        self.assertEqual(S.scrub("auth\n" * (S.MAX_HITS * 3)), "auth\n" * (S.MAX_HITS * 3))
+
+    def test_long_values_leave_no_tail(self):
+        jwt = "eyJ" + "a" * 297 + "." + "b" * 300 + "." + "c" * 250
+        ghp = "ghp_" + "Z9" * 75
+        for tok, tail in ((jwt, "c" * 20), (ghp, "Z9Z9Z9")):
+            out = S.scrub(f"X {tok} Y")
+            self.assertEqual(out, "X [redacted] Y")
+        self.assertEqual(S.scrub("sk-" + "q" * 400), "[redacted]")
+        self.assertEqual(S.scrub("password=" + "w" * 350), "password=[redacted]")
+        self.assertNotIn("p" * 10, S.scrub("curl https://u:" + "p" * 300 + "@h/"))
+
+
+class ReadOnlyHardening(unittest.TestCase):
+    def ro(self, body):
+        return S.script_is_read_only(_sh(body + "\n"))
+
+    def test_abbreviated_and_unlisted_flags_rejected(self):
+        for body in ("date --se=2020-01-01", "date -s 2020-01-01", "date -uo", "date --set 1", "date -f x",
+                     "date foo", "hostname newname", "hostname -F f", "hostname -b x", "hostname --fq",
+                     "printf -v x hi", "printf", "ls --col=always", "ls --time-style=x",
+                     "cat --nu x", "cat --vers", "head --lines=1 x", "tail -f x", "tail --foll x",
+                     "grep --file=x y", "grep --exclude-from=x y z", "grep -f x y", "grep --ex x y",
+                     "grep -rf x .", "wc --files0-from=x", "wc --fi x", "du --files0-from=x", "ps --sort x",
+                     "stat --format=x y", "uname --ker", "jq --from-file x", "jq -f x", "jq --arg"[:5] + "x",
+                     "id --gr", "df --out", "uptime --pre"):
+            self.assertFalse(self.ro(body), body)
+
+    def test_normal_use_still_passes(self):
+        for body in ("date +%F", "date -u +%s", "date", "date -R", "hostname", "hostname -s", "printf '%s\\n' hi",
+                     "ls -la /srv", "ls -lh", "cat -n x", "head -n 5 x", "head -5 x", "tail -n5 x",
+                     "grep -rin foo .", "grep -A3 foo x", "grep --ignore-case foo x", "wc -l x",
+                     "du -sh .", "df -h", "ps aux", "ps -ef", "stat -c %s x", "uname -a", "id -u",
+                     "uptime -p", "jq -r .a x.json", "echo -n hi", "whoami", "pwd"):
+            self.assertTrue(self.ro(body), body)
+
+    def test_command_prefix_assignments_rejected(self):
+        for body in ("PATH=/tmp/x cat f", "LD_PRELOAD=/tmp/x.so ls", "X=1 ls", "IFS=: cat f", "FOO=bar",
+                     "PATH=/tmp/x\nls", "if PATH=/x ls; then echo hi; fi", "while X=1 ls; do echo hi; done",
+                     "BASH_ENV=/tmp/e cat f", "GIT_SSH_COMMAND=x ls", "https_proxy=x curl -s https://a.example/x",
+                     "for PATH in a b; do ls; done"):
+            self.assertFalse(self.ro(body), body)
+        self.assertTrue(self.ro("for f in a b; do ls $f; done"))
 
 
 if __name__ == "__main__":

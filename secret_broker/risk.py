@@ -15,6 +15,8 @@ read or alter anything that exists, and it is never auto-approved. Updating an
 existing credential still takes the model's verdict (or high).
 """
 
+from . import guidance as guidance_mod
+
 LEVELS = ("low", "medium", "high")
 AUTO_MAX = ("none",) + LEVELS       # values of risk.auto_approve_max
 
@@ -23,14 +25,14 @@ def rank(level):
     return LEVELS.index(level)
 
 
-def assess(mode, names, spec, analyzer=None):
+def assess(mode, names, spec, analyzer=None, guidance=None):
     """Return {"level", "model", "reasons", "summary", "summary_model",
     "summary_source", "summary_reason"}."""
     summary, model_risk, summary_model, src, why = None, None, None, None, None
     if analyzer is not None:
         try:
             if hasattr(analyzer, "analyze"):
-                got = analyzer.analyze(mode, names, spec) or {}
+                got = guidance_mod.call(analyzer.analyze, mode, names, spec, guidance) or {}
                 summary, model_risk = got.get("summary"), got.get("risk")
                 summary_model = got.get("summary_model")
                 src, why = got.get("summary_source"), got.get("summary_reason")

@@ -287,11 +287,64 @@ class Harness(unittest.TestCase):
         self.assertEqual(fl.analyze("http", ["k"], sp("POST", body="QUJD" * 20))["risk"], "medium")
         # unaffected: complete small body, GET with a long body, high stays high
         self.assertEqual(fl.analyze("http", ["k"], sp("POST", body='{"type":"PullStack"}'))["risk"], "low")
-        self.assertEqual(fl.analyze("http", ["k"], sp("GET", body="a" * 500))["risk"], "low")
+        # (stale after floor hardening: a GET carrying a cut body is now floored too)
+        self.assertEqual(fl.analyze("http", ["k"], sp("GET", body="a" * 500))["risk"], "medium")
+        self.assertEqual(fl.analyze("http", ["k"], sp("GET"))["risk"], "low")
         self.assertEqual(fl.analyze("http", ["k"], sp("POST"))["risk"], "low")
         hi = riskmodel.FloorAnalyzer(summarize.FakeSummarizer("x", "high"))
         self.assertEqual(hi.analyze("http", ["k"], sp("POST", body="a" * 500))["risk"], "high")
         self.assertEqual(fl.analyze("ssh_sign", [], {"ssh": {"text": "x"}})["risk"], "high")
+
+    def test_floor_every_method_and_hidden_body(self):
+        fl = riskmodel.FloorAnalyzer(summarize.FakeSummarizer("x", "low"))
+        sp = lambda m, **kw: dict({"method": m, "url": "https://k.example.com/execute", "headers": {}}, **kw)
+        for m in ("DELETE", "POST", "PUT", "PATCH", "PROPFIND", "TRACE", "post", "", "x y"):
+            self.assertEqual(fl.analyze("http", ["k"], sp(m, body="a" * 500))["risk"], "medium", m)
+        self.assertEqual(fl.analyze("http", ["k"], sp("GET", body="QUJD" * 30))["risk"], "medium")
+        for m in ("GET", "HEAD", "OPTIONS"):
+            self.assertEqual(fl.analyze("http", ["k"], sp(m))["risk"], "low")
+        self.assertEqual(fl.analyze("http", ["k"], sp("POST", body='{"type":"PullStack"}'))["risk"], "low")
+        # hidden body: send_content off on the inner analyzer
+        hidden = summarize.FakeSummarizer("x", "low")
+        hidden._send = False
+        hf = riskmodel.FloorAnalyzer(hidden)
+        self.assertEqual(hf.analyze("http", ["k"], sp("POST", body='{"type":"PullStack"}'))["risk"], "medium")
+        self.assertEqual(hf.analyze("http", ["k"], sp("POST"))["risk"], "low")
+        f = riskmodel.request_fields("http", ["k"], sp("POST", body="{}"), 400, False)
+        self.assertIs(f["body_hidden"], True)
+        self.assertNotIn("body_hidden", riskmodel.request_fields("http", ["k"], sp("POST", body="{}"), 400, True))
+        self.assertTrue(riskmodel.body_incomplete(sp("POST", body="{}"), 400, send_content=False))
+
+    def test_encoded_detection(self):
+        import base64, os, random, time, uuid, zlib
+        enc = riskmodel._binary_or_encoded
+        mk = lambda b: {"body": b}
+        rnd = random.Random(1)
+        blob = base64.b64encode(bytes(rnd.randrange(256) for _ in range(120))).decode()
+        for t in ('{"file": "%s"}' % blob,
+                  "\n".join(blob[i:i + 40] for i in range(0, len(blob), 40)),
+                  " ".join(blob[i:i + 24] for i in range(0, len(blob), 24)),
+                  '{"x":"' + os.urandom(40).hex() + '"}',
+                  '{"u":"data:application/zip;base64,' + blob + '"}',
+                  zlib.compress(b"hello world " * 40 + bytes(range(256))).decode("latin-1"),
+                  bytes(rnd.randrange(256) for _ in range(200)).decode("latin-1"),
+                  "ok\x00bin"):
+            self.assertTrue(enc(mk(t)), t[:40])
+        ids = ", ".join('"%s"' % uuid.UUID(int=rnd.getrandbits(128)) for _ in range(12))
+        compose = ("services:\n  web:\n    image: ghcr.io/example/web:1.2.3\n    ports:\n      - \"8080:80\"\n"
+                   "    environment:\n      - LOG_LEVEL=info\n      - TZ=America/Los_Angeles\n"
+                   "    volumes:\n      - /srv/data/web:/var/lib/web\n    restart: unless-stopped\n") * 2
+        for t in ('{"ids": [%s], "name": "backup nightly", "enabled": true}' % ids,
+                  '{"type":"PullStack","params":{"stack":"media","services":[]}}',
+                  json.dumps({"type": "UpdateStack", "params": {"stack": "media", "file_contents": compose}}),
+                  "query { viewer { login repositories(first: 20) { nodes { name } } } }",
+                  "name=Ryan+Gregg&note=hello+world&x=1"):
+            self.assertFalse(enc(mk(t)), t[:60])
+        for t in ("A" * 32768, "ab+/" * 8192, ("QUJD " * 6553) + "x", "a-" * 16384, "\n" * 32768,
+                  "".join(chr(33 + (i * 7919) % 90) for i in range(32768))):
+            t0 = time.time()
+            enc(mk(t))
+            self.assertLess(time.time() - t0, 0.5)
 
     def test_dry_run(self):
         out = io.StringIO()
