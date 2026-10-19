@@ -193,6 +193,7 @@ class WebPushNotifier:
     It renders both action buttons; which ones a request gets is decided by the
     central policy (or this transport's `actions` override) and arrives in
     `n.actions` together with the request id and single-use token."""
+    type_name = "webpush"
 
     supports_actions = ("deny", "approve")
 

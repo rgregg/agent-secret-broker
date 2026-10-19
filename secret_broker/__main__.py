@@ -13,7 +13,7 @@ import threading
 
 from .backends import BwBackend, BwServeBackend, FileBackend
 from .broker import Broker, serve
-from . import grants, notify, request_details, risk, riskmodel
+from . import grants, notify, presence, request_details, risk, riskmodel
 
 
 def _read(path):
@@ -53,6 +53,7 @@ def main():
     if cfg.get("webpush") is not None:
         from .webpush import parse_actions
         parse_actions(cfg["webpush"])       # fail at startup on a bad webpush.actions
+    presence.parse_config(cfg.get("notify_presence"))   # fail at startup, naming the field
     notify.parse_ha_hook(cfg.get("ha_hook"), _read)     # fail at startup, naming the field
     push = None
     if any(sp.get("type") == "webpush" for sp in cfg.get("notify") or []):

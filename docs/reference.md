@@ -806,6 +806,67 @@ holds the browser's SSO session can approve from it, without seeing the request
 details. Use `approve_max_risk` to limit which requests offer Approve (or `none`),
 and rely on the audit log: every push decision is recorded with the SSO user.
 
+### Holding notifications while a page is open (`notify_presence`)
+
+If you are looking at an approval page, a phone buzz adds nothing. While at least
+one approval tab is visible, the broker holds the configured transports back and
+the request simply appears on the page (cards refresh as usual).
+
+```json
+"notify_presence": {"enabled": true, "ttl_s": 25, "fallback_s": 60,
+                    "transports": ["ticker", "telegram", "webpush"], "require_focus": false}
+```
+
+- `enabled` (default true). False restores the old behavior exactly: everything is
+  sent at once, and the pages stop sending heartbeats. `POST /presence` still answers 204.
+- `ttl_s` (10..120, default 25): a visible beat counts as presence for this long.
+- `fallback_s` (5..3600 or `null`, default 60): a held notification is sent this many seconds
+  after the request was created if it is still waiting. `null` means never: pure suppression.
+- `transports` (default all three): the transport `type`s to hold. Types not listed (and
+  any other transport) are sent immediately as usual. `[]` holds nothing.
+- `require_focus` (default false): the page also needs `document.hasFocus()` to count as
+  present (a visible but unfocused window then does not hold notifications).
+
+Heartbeat protocol: every approval page (any page with the shared chrome: Requests,
+Policies, Settings, the approval link page) sends `POST /presence` on the approval listener
+with `X-Requested-With: asb`, `Content-Type: application/json` and a body
+`{"v": true|false, "tab": "<random id>"}` (`tab` optional). It sends `v: true` about every
+10 s while the tab is visible (and focused, with `require_focus`), at once on
+`visibilitychange`/`focus`/`blur`, and a final `v: false` when the tab becomes hidden or the
+page is left (fetch `keepalive`; it never throws and never blocks the page). The answer is 204
+(403 guard/identity, 413 over 256 bytes, 400 bad body, 429 over 120 per minute per user).
+It sits behind the same SSO identity and trusted-peer checks as the other approval POSTs, has no CSRF
+form token, and is not on the client API port, so an agent cannot fake presence. The broker keeps
+the last beat per user and tab in memory (bounded maps); the user is present when some tab's
+last beat is visible and younger than `ttl_s`. Beats are not audited.
+
+Rules:
+
+- Every request is treated alike: SSH signing and high-risk requests are held too. The fallback
+  keeps an unattended open tab from swallowing a request forever.
+- Not held (sent at once) when the request would expire before `fallback_s` + 10 s
+  (with `fallback_s: null` this check does not apply), or when nobody is present.
+- The Notification is built once as usual (same action token, hash kept on the request), so
+  an Approve/Deny button on a late-released notification works.
+- A monitor thread (daemon, 2 s tick, never raises) releases a held notification when presence
+  lapses (no visible beat within `ttl_s`, or a hidden beat and no other visible tab) or at the
+  fallback. One transport failing does not stop the others; if nothing was ever delivered and
+  every released transport fails, the request fails with "could not notify" as it does today.
+- A request decided, denied, expired or failed while held has its notification dropped, never sent
+  late, and transports that never sent get no `resolved` call. After a release the normal
+  `resolved` flow applies to the transports that did send.
+- Held state is in memory: after a broker restart nothing is held (requests do not survive
+  either).
+- Timing: the agent's create call waits for the sends that are not held, as before, and never
+  waits for a release. When every transport is held the create call returns sooner than it
+  would have; this is not hidden from an agent that measures it.
+
+Audit events (all hidden from the agent audit API): `notify_held` (`transports`,
+`reason: presence`), `notify_released` (`transports`, `reason: presence_lapsed|fallback`),
+`notify_dropped` (`outcome`: how the request ended). They show in the history timeline of the
+request. The agent sees nothing about presence: no field in results, status, discovery or the
+audit API. Settings > Broker shows the configured behavior.
+
 ### Client-side diagnostics (`POST /push/event`)
 
 The service worker and the dashboard page report their own steps (install,
@@ -1094,6 +1155,8 @@ that something happened and when), and does not count toward `count`. A test req
 event the broker emits to be either whitelisted or listed as hidden, so a new event forces a
 decision. Hidden on purpose:
 
+- Notification holding (`notify_held`, `notify_released`, `notify_dropped`): shows when the
+  approver had a page open.
 - Policy and risk: `startup`, `assessed`, `escalated`, `policy_changed`,
   `policy_change_refused`, `policy_change_failed`, `policies_viewed`, `ha_hook_any_device`,
   `config_warning`.
