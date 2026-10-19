@@ -815,52 +815,133 @@ MAX_SPLIT_DEPTH = 4         # nested env -S / shell strings examined before givi
 MAX_HOPS = 32               # wrapper commands skipped before giving up
 _SYSTEM_BIN = ("/bin/", "/usr/bin/", "/sbin/", "/usr/sbin/")
 _SCRIPT_EXT = (".sh", ".py", ".js", ".rb", ".pl", ".php", ".ps1", ".lua", ".R")
-_NO_SPEC = {"deny_short": "", "deny_long": (), "deny_tokens": (), "deny_at": False, "max_operands": None}
+_NO_SPEC = {"short": "", "valued": {}, "long": frozenset(), "longv": {}, "exact": frozenset(), "digits": False,
+            "max_operands": None, "operand": None}
+_NUM = r"^\d+(?:\.\d+)?$"
+_URL = r"^https?://[^\s@]+$"
+_HOST = r"^[A-Za-z0-9._:@+=-]+$"
 
 
 def _plain(**kw):
-    return {**_NO_SPEC, **kw}
+    sp = {**_NO_SPEC, **kw}
+    sp["long"], sp["exact"] = frozenset(sp["long"]), frozenset(sp["exact"])
+    return sp
 
 
-# Programs that cannot run other commands, with the options that would make them
-# read or write files in unusual ways refused.
+def _jq_filter_ok(operands):
+    return not operands or not re.search(r"\b(?:input_filename|ENV|env|include|import|get_search_list)\b",
+                                         operands[0])
+
+
+# Programs that cannot run other commands, each with an explicit allowlist of its plain
+# read-only options (exact spellings; anything else makes the command not understood).
+# short: flag letters (may be clustered); valued: short options with a value pattern;
+# long / longv: long flags / long options with a value pattern; exact: other whole tokens.
 PLAIN_PROGRAMS = {
-    **{n: _plain() for n in ("cat ls head tail wc echo printf date uname uptime df du ps id whoami hostname "
-                             "pwd stat jq ping dig nslookup sha256sum md5sum true false test").split()},
-    **{n: _plain(deny_short="f", deny_long=("--file",)) for n in ("grep", "egrep", "fgrep")},
-    "curl": _plain(deny_short="KToODc", deny_at=True,
-                   deny_long=("--config", "--upload-file", "--output", "--remote-name", "--remote-name-all",
-                              "--output-dir", "--dump-header", "--cookie-jar", "--create-dirs", "--trace",
-                              "--trace-ascii", "--stderr", "--libcurl", "--netrc-file")),
-    "wget": _plain(deny_short="iOoaePB", deny_long=("--input-file", "--output-document", "--output-file",
-                                                    "--append-output", "--execute", "--config", "--post-file",
-                                                    "--directory-prefix", "--use-askpass", "--body-file")),
-    "openssl": _plain(deny_tokens=("-engine", "-provider", "-provider-path", "-config", "-propquery")),
-    "sort": _plain(deny_short="o", deny_long=("--output", "--compress-program")),
-    "uniq": _plain(max_operands=1),
+    "cat": _plain(short="nbsvAET"),
+    "ls": _plain(short="lahtr1AFRSdisL"),
+    "head": _plain(short="qv", valued={"n": _NUM, "c": _NUM}, digits=True),
+    "tail": _plain(short="qvfF", valued={"n": r"^[+]?\d+$", "c": r"^[+]?\d+$"}, digits=True),
+    "wc": _plain(short="lwcmL"),
+    **{n: _plain(short="invcEFwxrRHhlLqsoaI", valued={"e": None, "m": _NUM, "A": _NUM, "B": _NUM, "C": _NUM})
+       for n in ("grep", "egrep", "fgrep")},
+    "echo": _plain(short="neE"),
+    "printf": _plain(),
+    "date": _plain(short="uRI", long=("--utc", "--rfc-email"), max_operands=1,
+                   operand=lambda ops: all(o.startswith("+") for o in ops)),
+    "uname": _plain(short="asnrvmpio"),
+    "uptime": _plain(short="ps"),
+    "df": _plain(short="hHTikPla"),
+    "du": _plain(short="shackmbx", valued={"d": r"^\d+$"}),
+    "ps": _plain(short="aefulwAxHjLm", valued={"p": r"^[\d,]+$"},
+                 operand=lambda ops: all(re.match(r"^[A-Za-z]+$", o) for o in ops)),
+    "id": _plain(short="ugGnrz", max_operands=1),
+    "whoami": _plain(max_operands=0),
+    "hostname": _plain(short="sfiI", max_operands=0),
+    "pwd": _plain(short="LP", max_operands=0),
+    "stat": _plain(short="L", valued={"c": None}),
+    "jq": _plain(short="rcesnSCMajR", long=("--raw-output", "--compact-output", "--exit-status", "--slurp",
+                                         "--null-input", "--sort-keys", "--tab", "--join-output"),
+                 operand=_jq_filter_ok),
+    "ping": _plain(short="n46q", valued={"c": r"^\d+$", "W": _NUM, "w": r"^\d+$", "i": _NUM},
+                   max_operands=1, operand=lambda ops: all(re.match(_HOST, o) for o in ops)),
+    "dig": _plain(short="46x", valued={"t": r"^[A-Za-z]+$", "p": r"^\d+$"},
+                  operand=lambda ops: all(re.match(_HOST, o) for o in ops)),
+    "nslookup": _plain(operand=lambda ops: all(re.match(_HOST, o) for o in ops)),
+    "sha256sum": _plain(short="bt"),
+    "md5sum": _plain(short="bt"),
+    "sort": _plain(short="nrubdfghMVsc", valued={"k": r"^[\d.,nrb]+$", "t": r"^.$"}),
+    "uniq": _plain(short="cdui", max_operands=1),
+    "test": _plain(exact=("-e", "-f", "-d", "-r", "-w", "-x", "-s", "-z", "-n", "-L", "-h", "-eq", "-ne", "-lt",
+                          "-le", "-gt", "-ge", "-a", "-o")),
+    "true": _plain(max_operands=0),
+    "false": _plain(max_operands=0),
+    "curl": _plain(short="sSfLI", valued={"H": r"^[^\n\r@]+$", "X": r"^(?:GET|HEAD)$"},
+                   long=("--silent", "--show-error", "--fail", "--location", "--head"),
+                   longv={"--max-time": _NUM, "--connect-timeout": _NUM, "--retry": r"^\d+$",
+                          "--header": r"^[^\n\r@]+$", "--request": r"^(?:GET|HEAD)$"},
+                   operand=lambda ops: all(re.match(_URL, o) for o in ops)),
 }
+# programs xargs / parallel may launch: no options that run commands or take file names
+XARGS_TARGETS = frozenset("cat ls head tail wc echo stat sha256sum md5sum du df true false".split())
+
+
+def _val_ok(rx, v):
+    return "\0" not in v and (rx is None or bool(re.match(rx, v)))
 
 
 def _plain_ok(name, args):
-    spec = PLAIN_PROGRAMS[name]
-    operands, opts = 0, True
-    for a in args:
+    sp = PLAIN_PROGRAMS[name]
+    operands, i, opts = [], 0, True
+    while i < len(args):
+        a = args[i]
         if "\0" in a:
             return False
-        if spec["deny_at"] and (a.startswith("@") or "=@" in a):
-            return False
         if opts and a == "--":
-            opts = False
+            opts, i = False, i + 1
         elif opts and a.startswith("--"):
-            nm = a.partition("=")[0]
-            if any(nm == d or (len(nm) > 3 and d.startswith(nm)) for d in spec["deny_long"]):
+            nm, eq, val = a.partition("=")
+            if nm in sp["long"] and not eq:
+                i += 1
+            elif nm in sp["longv"]:
+                if eq:
+                    v, i = val, i + 1
+                elif i + 1 < len(args):
+                    v, i = args[i + 1], i + 2
+                else:
+                    return False
+                if not _val_ok(sp["longv"][nm], v):
+                    return False
+            else:
                 return False
         elif opts and a.startswith("-") and len(a) > 1:
-            if a in spec["deny_tokens"] or (set(a[1:]) & set(spec["deny_short"]) and not a[1:].isdigit()):
-                return False
+            i += 1
+            if a in sp["exact"] or (sp["digits"] and re.fullmatch(r"-\d+", a)):
+                continue
+            j = 1
+            while j < len(a):
+                c = a[j]
+                if c in sp["short"]:
+                    j += 1
+                elif c in sp["valued"]:
+                    rest = a[j + 1:]
+                    if rest:
+                        v = rest
+                    elif i < len(args):
+                        v, i = args[i], i + 1
+                    else:
+                        return False
+                    if not _val_ok(sp["valued"][c], v):
+                        return False
+                    break
+                else:
+                    return False
         else:
-            operands += 1
-    return spec["max_operands"] is None or operands <= spec["max_operands"]
+            operands.append(a)
+            i += 1
+    if sp["max_operands"] is not None and len(operands) > sp["max_operands"]:
+        return False
+    return sp["operand"] is None or bool(sp["operand"](operands))
 
 
 def _w(s="", sv="", so="", l=(), lv=(), pos=0, pos_unless=(), digits=False, dash=False, chdir=()):
@@ -938,9 +1019,20 @@ _PARALLEL_OPTS = _w("kvqXm0", "jnNSaCdILlE", l=("--keep-order", "--verbose", "--
                         "--delay", "--load", "--memfree"))
 _ENV_OPTS = _w("i0v", "uCaS", l=("--ignore-environment", "--null", "--debug"),
                lv=("--unset", "--chdir", "--argv0", "--split-string"), dash=True, chdir=("-C", "--chdir"))
-_DANGEROUS_ENV = frozenset(("BASH_ENV ENV LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT PATH IFS SHELLOPTS BASHOPTS PS4 "
-                            "PROMPT_COMMAND PYTHONSTARTUP PYTHONPATH PYTHONHOME NODE_OPTIONS PERL5OPT PERL5LIB "
-                            "RUBYOPT RUBYLIB CDPATH GLOBIGNORE").split())
+_ENV_NAMES = re.compile(r"^(?:LANG|LANGUAGE|LC_[A-Z_]+|TZ|TERM|COLUMNS|LINES|NO_COLOR|CLICOLOR|FORCE_COLOR|CI|"
+                        r"DEBUG|VERBOSE|TERM_PROGRAM|PYTHONUNBUFFERED|PYTHONDONTWRITEBYTECODE|PYTHONIOENCODING|"
+                        r"NODE_NO_WARNINGS)$")
+
+
+def _assignment(word):
+    """None when `word` is not NAME=value; else True/False: is it an allowed assignment
+    (an allowlisted NAME, and a value with no $, backslash, backtick or newline)."""
+    m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", word, re.S)
+    if not m:
+        return None
+    return bool(_ENV_NAMES.match(m.group(1))) and not re.search(r"[$\\`\n\r\0]", m.group(2))
+
+
 _SAFE_SHELLS = frozenset("sh bash dash zsh ksh ash".split())
 _SHELL_RESERVED = frozenset("if then else elif fi for while until do done case esac function select time { } ! [[ "
                       "coproc in".split())
@@ -1169,10 +1261,10 @@ def _env_unwrap(args, splits):
                         return None, splits
                     args, i = pieces + args[i:], 0
         else:
-            m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)=", a)
-            if not m:
+            ok = _assignment(a)
+            if ok is None:
                 break
-            if m.group(1) in _DANGEROUS_ENV or m.group(1).startswith("BASH_FUNC_"):
+            if not ok:
                 return None, splits
             i += 1
     return args[i:], splits
@@ -1224,7 +1316,7 @@ def _shell_string(s, depth):
         segs[-1].append("".join(word))
     out, ok = [], True
     for seg in segs:
-        if not seg or seg[0] in _SHELL_RESERVED or re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", seg[0]):
+        if not seg or seg[0] in _SHELL_RESERVED:
             return out, False
         found, good = _analyze(seg, depth + 1)
         out += [x for x in found if x not in out]
@@ -1258,19 +1350,27 @@ def _analyze(argv, depth=0, trace=None):
     cmd, hops, splits = list(argv), 0, 0
     while True:
         if not cmd:
-            return out, bool(argv)
+            return out, False                   # nothing left to run: not understood
         hops += 1
         if hops > MAX_HOPS or depth + splits > MAX_SPLIT_DEPTH:
             return out, False
         a0, args = cmd[0], cmd[1:]
         if _bad_path(a0):
             return out, False
+        if _assignment(a0) is not None:                     # VAR=value prefix of a command
+            if not _assignment(a0):
+                return out, False
+            cmd = args
+            continue
         name = os.path.basename(a0)
         simple = "/" not in a0 or _in_system_bin(a0)        # bare name or a standard system path
         if simple and name == "env":
             nxt, splits = _env_unwrap(args, splits)
             if nxt is None or depth + splits > MAX_SPLIT_DEPTH:
                 return out, False
+            if not nxt:
+                # a bare `env` (plain options only) just prints the environment
+                return out, hops == 1 and depth == 0 and splits == 0 and not any("=" in a for a in args)
             cmd = nxt
             continue
         if simple and name in ("su", "runuser", "script", "flock", "watch", "parallel"):
@@ -1323,7 +1423,11 @@ def _analyze(argv, depth=0, trace=None):
                         break
             if not rest:
                 return out, False
-            found, good = _shell_string(" ".join(rest), depth + 1)
+            joined = " ".join(rest)
+            if name == "parallel" and (re.search(r"[&|;<>]", joined) or
+                                       os.path.basename(joined.split()[0]) not in XARGS_TARGETS):
+                return out, False                           # extra arguments come from stdin / :::
+            found, good = _shell_string(joined, depth + 1)
             merge(found)
             return out, good
         if simple and name in SCRIPT_WRAPPERS:
@@ -1344,6 +1448,11 @@ def _analyze(argv, depth=0, trace=None):
                 return out, False
             if name == "busybox" and not rest:
                 return out, False
+            if name == "xargs":
+                # stdin supplies extra arguments: only commands with nothing dangerous to inject
+                t = os.path.basename(rest[0]) if rest else ""
+                return out, bool(rest) and ("/" not in rest[0] or _in_system_bin(rest[0])) and \
+                    t in XARGS_TARGETS and _plain_ok(t, rest[1:])
             cmd = rest
             continue
         break

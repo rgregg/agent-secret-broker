@@ -483,15 +483,31 @@ credentials with `"risk": {"auto_modes": ["http"]}` in the broker config.
   request is "script visible" (eligible for env auto-approval, timed-grant
   coverage and the Always/grant chips) only when its argv is one of:
   - (a) a program on a small allowlist of programs that cannot run other
-    commands, with plain operands: cat ls head tail wc grep/egrep/fgrep (no
-    `-f`/`--file`) echo printf date uname uptime df du ps id whoami hostname
-    pwd stat jq ping dig nslookup sha256sum md5sum true false test, sort
-    (no `-o`, `--compress-program`), uniq (one operand), openssl (no `-engine`,
-    `-provider`, `-config`), curl (no `-K/--config`, `-T`, `-o/-O/--output`,
-    `-D`, `-c`, `--create-dirs`, no `@file` operands) and wget (no `-i`, `-O`,
-    `-o`, `-e`, `-P`, `--config`, ...). The name must be bare or under
+    commands, **with only options on that program's positive flag allowlist**
+    (exact spellings; any other option is not understood): cat, ls (`-lahtr1AFRSdisL`,
+    no `--color`), head, tail, wc, grep/egrep/fgrep (`-invcEFwxrRHhlLqsoaI`, `-e`,
+    `-m/-A/-B/-C N`; no `-f`), echo, printf, date (only a `+FORMAT` operand and
+    `-u`/`--utc`/`-R`/`-I`), uname, uptime, df, du, ps, id, whoami, hostname (no
+    operands), pwd, stat (`-c`), jq (`-r -c -e -s -n -S`, a filter operand that does not
+    mention `input_filename`, `env`, `ENV`, `include`, `import`; never `-f`,
+    `--from-file`, `-L`, `--seq`, `--arg*file`, `--rawfile`, `--slurpfile`), ping,
+    dig, nslookup, sha256sum, md5sum, sort (no `-o`, `--output`, `-T`,
+    `--files0-from`, `--compress-program`), uniq (one operand), test, true, false,
+    and curl as a plain fetch: only `-s -S -f -L -I`, `-H` (no newline or `@`), `-X
+    GET|HEAD`, `--max-time N`, `--connect-timeout N`, `--retry N`, `--silent`,
+    `--show-error`, `--fail`, `--location`, `--head`, `--header`, `--request`, with
+    literal `http(s)://` URL operands without `@`. Everything else (`-w`, `-o`,
+    `-O`, `-D`, `-c`, `-b`, `-d`, `-F`, `-T`, `-K`, `-k`, `--etag-save`, `--hsts`,
+    `--alt-svc`, `--trace*`, `--stderr`, `--libcurl`, ...) is not understood. wget and
+    openssl are not on the list. The name must be bare or under
     /bin, /usr/bin, /sbin, /usr/sbin (after `os.path.normpath`; an argv[0] with
-    a `..` component, glob character, NUL or newline is never understood);
+    a `..` component, glob character, NUL or newline is never understood). A
+    leading `NAME=value` (an env assignment or a `VAR=x cmd` prefix) is allowed only
+    for LANG, LANGUAGE, LC_*, TZ, TERM, COLUMNS, LINES, NO_COLOR, CLICOLOR,
+    FORCE_COLOR, CI, DEBUG, VERBOSE, TERM_PROGRAM, PYTHONUNBUFFERED,
+    PYTHONDONTWRITEBYTECODE, PYTHONIOENCODING, NODE_NO_WARNINGS, with a value that
+    has no `$`, backslash, backtick or newline (no `*_PROXY`, PATH, LD_*, BASH_ENV,
+    ZDOTDIR, ...); any other name is not understood. `env -u NAME` is fine.
   - (b) an interpreter (sh bash zsh dash ksh ash fish python node deno bun ruby
     perl php pwsh lua Rscript, `sed -f`, `awk -f`) running a script file
     operand, **which needs a matching readable `scripts` entry**, or running
@@ -504,7 +520,9 @@ credentials with `"risk": {"auto_modes": ["http"]}` in the broker config.
     outside the system bin dirs) also needs an entry; a program on stdin (`bash -s`,
     `python -`) is never visible;
   - (c) a known wrapper whose wrapped command is understood under (a), (b) or
-    (c) (nesting at most 4, at most 32 wrappers): env (including
+    (c) (nesting at most 4, at most 32 wrappers). A wrapper left with no command
+    (`nice`, `sudo -n`, `env -S ''`, `xargs`) is not understood; only a bare `env`
+    (plain options, no assignments) that prints the environment is: env (including
     `-S`/`--split-string`, refused when the value has a backslash, `$`, `#` or
     newline; `-C/--chdir` refused), sudo, doas, nohup, time, timeout, nice, ionice,
     stdbuf, exec, command, setsid, chrt, taskset, flock (including `-c`),
@@ -512,7 +530,9 @@ credentials with `"risk": {"auto_modes": ["http"]}` in the broker config.
     a standard shell), setpriv, busybox (the applet is the next operand), strace,
     ltrace, unshare (without mount/root/chdir options), numactl, watch (without
     `-x` the arguments are joined with spaces and parsed as a shell string),
-    parallel (same), script (`-c`), xargs. Every wrapper's options are an explicit
+    script (`-c`). xargs and parallel take extra arguments from stdin or `:::`, so
+    their target must be one of cat, ls, head, tail, wc, echo, stat, sha256sum,
+    md5sum, du, df, true, false (never env, nice, sh, ...). Every wrapper's options are an explicit
     list: **an option the parser does not recognise makes the command not
     understood**, never "an interactive shell" and never unflagged. nsenter, chroot
     and options that change the directory or root (sudo `-D/-R`, env `-C`) are

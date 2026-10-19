@@ -83,7 +83,7 @@ Check it:
   leading wrappers (`env VAR=..` and `env -S`, `sudo`, `doas`, `nohup`, `time`,
   `timeout N`, `nice`, `ionice`, `stdbuf`, `exec`, `command`, `setsid`, `chrt`,
   `taskset`, `flock`, `su`/`runuser` (`-c`), `setpriv`, `busybox`, `strace`,
-  `ltrace`, `unshare`, `numactl`, `watch`, `parallel`, `script -c`, `xargs`), then
+  `ltrace`, `unshare`, `numactl`, `watch`, `script -c`; `xargs`/`parallel` only around cat, ls, wc and the like), then
   takes either an interpreter's script file
   (`bash`, `sh`, `zsh`, `python3`, `node`, `deno`, `bun`, `ruby`, `perl`, `php`,
   `pwsh`, `awk -f`, `sed -f`: the first operand that is a file) or the command
@@ -92,8 +92,9 @@ Check it:
   **auto-approves only commands it positively understands**: a script file with a
   matching entry, a restricted `sh -c` string, a known wrapper around those, or a
   short list of programs that cannot run other commands (cat, ls, grep, curl as a
-  plain fetch, ...). Anything else, including git, docker, make, npm, find and
-  `python -c`, always prompts and is not covered by a time-boxed grant either (see
+  plain fetch with a fixed set of flags, ...). Anything else, including git,
+  docker, make, npm, find, wget, openssl, `python -c` and a command with an
+  unlisted option, always prompts and is not covered by a time-boxed grant either (see
   docs/reference.md for the full rules and the cost). `asb` sends its working
   directory as `cwd` and each entry's `path` is absolute (symlinks resolved, with
   `given` holding the path as named when it differs); the broker matches the
