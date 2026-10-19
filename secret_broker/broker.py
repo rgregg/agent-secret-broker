@@ -21,6 +21,7 @@ import http.client
 import ipaddress
 import json
 import os
+import queue
 import re
 import secrets
 import ssl
@@ -126,6 +127,8 @@ class Request:
         self.approver = None
         self.action_hash = None   # sha256 of the push-button token; None once spent
         self.notification = None  # the Notification sent for this request
+        self._notify_state = "none"   # none|queued|sending|done: the send job (see _notify_job)
+        self._resolve_after = None    # status to announce when the in-flight send finishes
         self._sent_to = None      # leaf transports that sent it; None = all (presence hold)
         self.offered = frozenset()  # action ids offered on any token-carrying transport
         self.done = threading.Event()
@@ -175,6 +178,10 @@ class Broker:
         self._held = {}                         # rid -> held notification; in memory only
         self._held_lock = threading.Lock()
         self._presence_thread = None
+        self._nq = queue.Queue()                # notification sends, run off the request thread
+        self._nq_cv = threading.Condition()
+        self._nq_pending = 0
+        self._nq_threads = 0
         self._presence_rate = {}                # user -> {"t","n"}; <= RATE_MAP_CAP
         self._csrf_key = secrets.token_bytes(32)    # per process: tokens die with a restart
         self._lock = threading.Lock()
@@ -1086,16 +1093,89 @@ class Broker:
         req.offered = frozenset(a.id for a in n.actions) if n.action_token else frozenset()
         if n.action_token:                          # only its hash is kept
             req.action_hash = hashlib.sha256(n.action_token.encode()).digest()
+        # Sends never run on the request thread: the agent's create call returns at the same
+        # speed whether anything is held, sent at once, or slow (see _notify_job).
         held = self._presence_hold_set(req)
         if held:
             self._hold(req, n, held)
-            return
+        else:
+            req._notify_state = "queued"
+            self._notify_submit(lambda: self._notify_job(req, n, None))
+
+    # -- asynchronous dispatch ------------------------------------------------
+    NOTIFY_WORKERS = 8
+
+    def _notify_submit(self, job):
+        with self._nq_cv:
+            self._nq_pending += 1
+            start = self._nq_threads < self.NOTIFY_WORKERS
+            if start:
+                self._nq_threads += 1
+        self._nq.put(job)
+        if start:
+            threading.Thread(target=self._notify_worker, daemon=True).start()
+
+    def _notify_worker(self):
+        while True:
+            job = self._nq.get()
+            try:
+                job()
+            except Exception:           # noqa: BLE001 -- never raises
+                pass
+            finally:
+                with self._nq_cv:
+                    self._nq_pending -= 1
+                    self._nq_cv.notify_all()
+
+    def flush_notifications(self, timeout=10.0):
+        """Wait until every queued notification send has finished (tests, shutdown).
+        True if the queue drained within `timeout`."""
+        end = time.time() + timeout
+        with self._nq_cv:
+            while self._nq_pending:
+                left = end - time.time()
+                if left <= 0:
+                    return False
+                self._nq_cv.wait(left)
+        return True
+
+    def _notify_job(self, req, n, rest):
+        """Send `n` now: to every transport (rest None) or just `rest` (the others are held).
+        Runs on a worker. Nothing is sent for a request that settled while queued."""
         try:
-            self.notifier.send(n)
-        except BaseException:
+            with self._held_lock:
+                if req.status != "pending":
+                    req._notify_state = "done"
+                    req._resolve_after = None   # never sent: nothing to resolve
+                    return
+                req._notify_state = "sending"
+            ok = True
+            try:
+                if rest is None:
+                    self.notifier.send(n)
+                else:
+                    notify_mod.send_to(rest, n)
+            except Exception as e:      # noqa: BLE001
+                ok, err = False, e
+            if ok:
+                self.audit("notified", req)
+            elif rest is None:          # nothing delivered and nothing held: fail like a sync send
+                self._fail_notify(req, err)
+        finally:
+            with self._held_lock:
+                req._notify_state = "done"
+                later = req._resolve_after
+                req._resolve_after = None
+            if later:                   # settled while the send was in flight
+                self._call_resolved(req, later)
+
+    def _fail_notify(self, req, err):
+        with self._lock:                # same claim a decision makes: one of the two wins
+            if req.status != "pending":
+                return
+            req.status = "deciding"
             req.action_hash = None
-            raise
-        self.audit("notified", req)
+        self._finish(req, "failed", error=f"could not notify: {err}")
 
     # -- presence: hold phone notifications while an approval page is open ----
     # Every request is treated alike (SSH signing and high risk included): while
@@ -1125,12 +1205,8 @@ class Broker:
             {notify_mod.transport_type(t) or "?" for t in held}), reason="presence")
         self._presence_start()
         if rest:
-            try:
-                notify_mod.send_to(rest, n)
-            except (NotifyError, OSError):
-                pass            # the held transports are still to go out
-            else:
-                self.audit("notified", req)
+            req._notify_state = "queued"
+            self._notify_submit(lambda: self._notify_job(req, n, rest))
 
     def _presence_start(self):
         if not self._presence_autostart or self._presence_thread is not None:
@@ -1225,6 +1301,13 @@ class Broker:
     def _resolved(self, req, status):
         """Tell the transport the request is settled (e.g. edit the chat message)."""
         self._drop_held(req, status)
+        with self._held_lock:
+            if req._notify_state in ("queued", "sending"):
+                req._resolve_after = status     # the send job calls resolved once it is done
+                return
+        self._call_resolved(req, status)
+
+    def _call_resolved(self, req, status):
         fn = getattr(self.notifier, "resolved", None)
         if fn is None or req.mode is None:
             return

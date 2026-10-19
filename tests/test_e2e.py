@@ -155,7 +155,10 @@ class Harness(unittest.TestCase):
             req_.done.wait(10)          # accepted: release runs asynchronously
 
     def api(self, method, path, body=None, key=KEY):
-        return req(self.base + path, method, body, {"X-Client-Key": key, "Content-Type": "application/json"})
+        out = req(self.base + path, method, body, {"X-Client-Key": key, "Content-Type": "application/json"})
+        if method == "POST" and path == "/v1/requests":
+            self.broker.flush_notifications(10)     # sends run on a worker, not the request thread
+        return out
 
     def create_env(self, names=("svc",)):
         return self.api("POST", "/v1/requests", {"mode": "env", "names": list(names), "argv": ["echo", "hi"]})

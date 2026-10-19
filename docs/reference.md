@@ -857,9 +857,14 @@ Rules:
   `resolved` flow applies to the transports that did send.
 - Held state is in memory: after a broker restart nothing is held (requests do not survive
   either).
-- Timing: the agent's create call waits for the sends that are not held, as before, and never
-  waits for a release. When every transport is held the create call returns sooner than it
-  would have; this is not hidden from an agent that measures it.
+- Sends are asynchronous, always: after the request is created and assessed, the create call returns
+  without waiting for any transport (a small pool of daemon workers does the sends and the later
+  releases), so its latency is the same whether anything was held, sent at once, or slow, and
+  presence cannot be inferred from timing. If a send (with nothing held) fails on every
+  transport, the request is marked `failed` ("could not notify", audited as today) a moment later,
+  and the agent sees that on its next poll; a decision that arrives first wins. A request settled
+  before its queued send starts is never sent; a send already in flight completes and `resolved` is
+  called after it. `notified` is audited after at least one successful send.
 
 Audit events (all hidden from the agent audit API): `notify_held` (`transports`,
 `reason: presence`), `notify_released` (`transports`, `reason: presence_lapsed|fallback`),

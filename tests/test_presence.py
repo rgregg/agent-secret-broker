@@ -476,6 +476,174 @@ class Release(Base):
         self.assertEqual(b2._held, {})
 
 
+class Slow(FakeNotifier):
+    """Sends take `delay` seconds (or wait for `gate`); the end of a send is recorded in `log`."""
+
+    def __init__(self, delay=0.5, gate=None, log=None, **kw):
+        super().__init__(**kw)
+        self.delay, self.gate, self.log = delay, gate, log if log is not None else []
+        self.started = threading.Event()
+
+    def send(self, n):
+        self.started.set()
+        if self.gate is not None:
+            self.gate.wait(10)
+        else:
+            time.sleep(self.delay)
+        super().send(n)
+        self.log.append(("sent", self.type_name))
+
+    def resolved(self, n, status):
+        super().resolved(n, status)
+        self.log.append(("resolved", status))
+
+
+class AsyncDispatch(Base):
+    def setUp(self):
+        super().setUp()
+        old = bmod.MAX_PENDING
+        bmod.MAX_PENDING = 50
+        self.addCleanup(setattr, bmod, "MAX_PENDING", old)
+
+    def raw_create(self):
+        t0 = time.time()
+        code, body = t.req(self.base + "/v1/requests", "POST",
+                           {"mode": "env", "names": ["svc"], "argv": ["x"]},
+                           {"X-Client-Key": t.KEY, "Content-Type": "application/json"})
+        return code, json.loads(body), time.time() - t0
+
+    def test_create_latency_does_not_depend_on_presence(self):
+        slow = [Slow(0.5, type_name="ticker"), Slow(0.5, type_name="telegram")]
+        self.install(slow)
+        lat = {}
+        lat["absent"] = self.raw_create()[2]                       # sent at once, slowly
+        self.here()
+        lat["held"] = self.raw_create()[2]                         # everything held
+        self.broker.presence_cfg["transports"] = ["ticker"]
+        lat["partial"] = self.raw_create()[2]                      # one held, one slow immediate
+        self.broker.presence_cfg["transports"] = []
+        lat["unheld"] = self.raw_create()[2]
+        for k, v in lat.items():
+            self.assertLess(v, 0.3, k)
+        self.assertTrue(self.broker.flush_notifications(10))
+        self.assertEqual([len(x.sent) for x in slow], [2, 3])      # absent, partial(tele), unheld
+
+    def test_response_shape_is_the_same_held_or_not(self):
+        a = self.raw_create()
+        self.here()
+        b = self.raw_create()
+        self.assertEqual(a[0], b[0])
+        self.assertEqual(sorted(a[1]), sorted(b[1]))
+        self.assertEqual(a[1].get("status"), b[1].get("status"))
+        self.assertTrue(self.broker.flush_notifications(10))
+
+    def test_failure_after_async_dispatch_fails_and_audits(self):
+        self.install([Boom(type_name="ticker")])
+        code, body, _ = self.raw_create()
+        self.assertEqual(code, 202)
+        self.assertTrue(self.broker.flush_notifications(10))
+        self.assertEqual(self.broker._by_id[body["id"]].status, "failed")
+        (f,) = self.ev("failed")
+        self.assertIn("could not notify", f["error"])
+        self.assertEqual(self.ev("notified"), [])
+        _, b = self.api("GET", f"/v1/requests/{body['id']}?wait=0")
+        self.assertEqual(json.loads(b)["status"], "failed")
+        self.assertEqual(audit_api.error_class(f["error"]), "other")
+
+    def test_notified_audited_after_success(self):
+        self.raw_create()
+        self.assertTrue(self.broker.flush_notifications(10))
+        self.assertEqual(len(self.ev("notified")), 1)
+
+    def test_decision_before_slow_send_finishes_resolves_after_the_send(self):
+        gate, log = threading.Event(), []
+        slow = Slow(gate=gate, log=log, type_name="ticker")
+        self.install([slow])
+        rid = self.raw_create()[1]["id"]
+        self.assertTrue(slow.started.wait(5))
+        self.decide(rid, "deny")
+        self.assertEqual(self.broker._by_id[rid].status, "denied")
+        time.sleep(0.2)
+        self.assertEqual(slow.resolutions, [])                     # send still in flight
+        gate.set()
+        self.assertTrue(self.broker.flush_notifications(10))
+        self.assertEqual(log, [("sent", "ticker"), ("resolved", "denied")])
+
+    def test_failure_racing_a_decision_never_overrides_it(self):
+        gate = threading.Event()
+
+        class FailLate(Slow):
+            def send(self, n):
+                self.started.set()
+                self.gate.wait(10)
+                raise NotifyError("late failure")
+        slow = FailLate(gate=gate, type_name="ticker")
+        self.install([slow])
+        rid = self.raw_create()[1]["id"]
+        self.assertTrue(slow.started.wait(5))
+        self.decide(rid, "deny")
+        gate.set()
+        self.assertTrue(self.broker.flush_notifications(10))
+        self.assertEqual(self.broker._by_id[rid].status, "denied")
+        self.assertEqual(self.ev("failed"), [])
+
+    def test_queued_send_for_a_settled_request_never_goes_out(self):
+        jobs = []
+        self.broker._notify_submit = jobs.append
+        rid = self.raw_create()[1]["id"]
+        self.assertEqual(len(jobs), 1)
+        self.decide(rid, "deny")
+        time.sleep(0.2)
+        jobs[0]()
+        self.assertEqual(self.counts(), [0, 0, 0])
+        self.assertEqual([len(x.resolutions) for x in (self.tick, self.tele, self.wp)], [0, 0, 0])
+
+    def test_held_request_decided_during_partial_send(self):
+        gate, log = threading.Event(), []
+        slow = Slow(gate=gate, log=log, type_name="telegram")
+        self.install([self.tick, slow])
+        self.broker.presence_cfg["transports"] = ["ticker"]
+        self.here()
+        rid = self.raw_create()[1]["id"]
+        self.assertTrue(slow.started.wait(5))
+        self.decide(rid, "deny")
+        gate.set()
+        self.assertTrue(self.broker.flush_notifications(10))
+        self.assertEqual(self.tick.sent, [])
+        self.assertEqual(self.tick.resolutions, [])
+        self.assertEqual(log, [("sent", "telegram"), ("resolved", "denied")])
+
+    def test_concurrent_requests(self):
+        slow = [Slow(0.3, type_name="ticker")]
+        self.install(slow)
+        out = []
+        ts = [threading.Thread(target=lambda: out.append(self.raw_create())) for _ in range(6)]
+        t0 = time.time()
+        for x in ts:
+            x.start()
+        for x in ts:
+            x.join(10)
+        self.assertLess(time.time() - t0, 0.3)
+        self.assertEqual(len({o[1]["id"] for o in out}), 6)
+        self.assertTrue(self.broker.flush_notifications(10))
+        self.assertEqual(len(slow[0].sent), 6)
+        self.assertEqual(len(self.ev("notified")), 6)
+
+    def test_pending_work_does_not_block_shutdown(self):
+        gate = threading.Event()
+        slow = Slow(gate=gate, type_name="ticker")
+        self.install([slow])
+        self.raw_create()
+        self.assertTrue(slow.started.wait(5))
+        t0 = time.time()
+        self.assertFalse(self.broker.flush_notifications(0.2))     # gives up, does not hang
+        self.assertLess(time.time() - t0, 2)
+        workers = [x for x in threading.enumerate() if x.name.startswith("Thread") and x.daemon]
+        self.assertTrue(workers)
+        gate.set()
+        self.assertTrue(self.broker.flush_notifications(10))
+
+
 class ActionToken(Base):
     with_actions = True
 
