@@ -23,7 +23,8 @@ _EV_KEYS = ("reason", "reasons", "model", "risk", "error", "via", "channel", "de
             "to_peer", "auto_max", "ssh_fingerprint", "sign_bytes", "value_bytes", "op",
             "item", "field", "key", "hosts", "grant_id", "scope", "secrets", "grant_minutes",
             "grant_left_s", "expires_at", "created_by", "max_risk", "risk_level",
-            "host_bound", "host_fp", "host_type", "host_name", "claimed_dest", "forwarding", "host_lines")
+            "host_bound", "host_fp", "host_type", "host_name", "claimed_dest", "forwarding", "host_lines",
+            "rule_id", "account", "rule_host", "ssh_rule_requested", "decision_source")
 _MAX_EVENTS = 60            # per request
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 
@@ -111,7 +112,7 @@ class History:
                 "id": rid, "ts": rec["ts"], "time": rec["time"], "names": rec.get("names") or [],
                 "mode": rec.get("mode"), "source": rec.get("source"), "outcome": "pending",
                 "via": None, "approver": None, "risk": None, "summary": None, "summary_model": None, "summary_source": None, "error": None,
-                "latency_ms": None, "grant_id": None, "delivered": False, "escalated": False,
+                "latency_ms": None, "grant_id": None, "rule_id": None, "delivered": False, "escalated": False,
                 "method": rec.get("method"), "url": _short_url(rec.get("url")),
                 "op": rec.get("op"), "item": rec.get("item"), "field": rec.get("field"),
                 "key": rec.get("key"), "hosts": rec.get("hosts"), "final_seq": -1,
@@ -149,6 +150,7 @@ class History:
             row["error"] = rec.get("error")
             row["latency_ms"] = rec.get("latency_ms")
             row["grant_id"] = rec.get("grant_id")
+            row["rule_id"] = rec.get("rule_id")
             if ev == "approved" and row["via"] == "policy":
                 row["outcome"] = "auto-approved"
 

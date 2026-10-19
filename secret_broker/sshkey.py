@@ -8,6 +8,7 @@ Only unencrypted OpenSSH-format keys are accepted: the broker is the thing
 protecting the key, so a passphrase would have nowhere to come from.
 """
 import base64
+import re
 import struct
 
 from cryptography.hazmat.primitives import hashes, serialization
@@ -205,6 +206,22 @@ def _blob_type(blob):
         return _Reader(blob).string().decode("ascii")
     except (IndexError, struct.error, UnicodeDecodeError):
         return ""
+
+
+ACCOUNT_RE = re.compile(r"[\x21-\x7e]{1,64}")     # printable ASCII, no spaces: what a rule may name
+
+
+def account(data):
+    """The account name signed inside SSH login data, or None when `data` is not
+    an ssh-connection login or the name is not plain printable ASCII (1-64)."""
+    ua = parse_userauth(data)
+    if not ua or ua["service"] != b"ssh-connection":
+        return None
+    try:
+        name = ua["user"].decode("ascii")
+    except UnicodeDecodeError:
+        return None
+    return name if ACCOUNT_RE.fullmatch(name) else None
 
 
 def userauth_session_id(data):
