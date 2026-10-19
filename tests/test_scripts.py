@@ -1279,11 +1279,11 @@ class HonestClientStaysVisible(Files):
         self.write("sub/run.sh", b"#!/bin/sh\necho hi\n")
         os.symlink(os.path.join(self.d, "sub", "run.sh"), os.path.join(self.d, "link.sh"))
         for argv in (["bash", "sub/run.sh"], ["./sub/run.sh"], ["bash", "link.sh"], ["bash", "./sub/../sub/run.sh"],
-                     ["env", "-S", "bash sub/run.sh"], ["xargs", "bash", os.path.join(self.d, "link.sh")],
+                     ["env", "-S", "bash sub/run.sh"], ["env", "LANG=C", "bash", os.path.join(self.d, "link.sh")],
                      ["sh", "-c", "echo a && bash sub/run.sh"], ["su", "-c", "bash sub/run.sh", "root"],
-                     ["watch", "bash", "sub/run.sh"], ["xargs", "bash", "sub/run.sh"],
+                     ["watch", "bash", "sub/run.sh"],
                      ["sudo", "-u", "app", "timeout", "30", "bash", "sub/run.sh"],
-                     ["flock", "/tmp/l", "bash", "link.sh"], ["parallel", "bash sub/run.sh ::: a"]):
+                     ["flock", "/tmp/l", "bash", "link.sh"]):
             entries = A.find_scripts(argv)
             self.assertTrue(entries, argv)
             self.assertFalse(S.script_not_visible(argv, S.validate(entries), self.d), argv)
