@@ -509,23 +509,80 @@ class Revocation(Base):
         self.assertEqual(self.events("grant_revoked")[-1]["kind"], "timed")
 
 
-class MaxRiskIgnored(Base):
-    grants_cfg = {"max_risk": "none"}
+class TimedCeilingConfig(Base):
+    grants_cfg = {"max_risk": "medium"}
 
-    def test_accepted_ignored_and_warned(self):
-        out = grants_mod.parse_config({"max_risk": "low"})
-        self.assertNotIn("max_risk", out)
-        warns = [e["warning"] for e in self.events("config_warning")]
-        self.assertTrue(any("timed_grants.max_risk is ignored" in w for w in warns), warns)
-        self.grant_it()
+    def test_configured_ceiling_skips_high_but_not_medium(self):
+        self.grant_it(("svc",), 15, method="POST")
+        self.broker.summarizer = _Stub("x", "medium")
+        self.assertEqual(self.result(self.http(path="/m", method="POST"))["status"], "approved")
         self.broker.summarizer = _Stub("x", "high")
-        self.assertEqual(self.result(self.http(path="/y"))["status"], "approved")
+        n = self.pushes()
+        self.http(path="/h", method="POST")
+        self.assertEqual(self.pushes(), n + 1)
+        sk = self.events("grant_skipped")[-1]
+        self.assertEqual((sk["kind"], sk["reason"], sk["max_risk"]), ("timed", "risk", "medium"))
+
+    def test_invalid_value_rejected_and_default_is_no_ceiling(self):
+        with self.assertRaises(ValueError) as cm:
+            grants_mod.parse_config({"max_risk": "extreme"})
+        self.assertIn("timed_grants.max_risk", str(cm.exception))
+        self.assertEqual(grants_mod.parse_config(None)["max_risk"], "high")
 
     def test_describe(self):
         self.assertEqual(grants_mod.describe(grants_mod.parse_config(None), "low"),
                          "Standing approvals: timed grants (no ceiling) 5/15/30 min; Always up to low risk")
+        self.assertIn("(up to medium risk)",
+                      grants_mod.describe(grants_mod.parse_config({"max_risk": "medium"}), "low"))
         self.assertIn("timed grants off", grants_mod.describe(grants_mod.parse_config({"enabled": False}), "high"))
         self.assertIn("Always off", grants_mod.describe(grants_mod.parse_config(None), "none"))
+
+
+class AutoModes(Base):
+    """Always respects the operator's mode restrictions; timed grants do not."""
+
+    def test_credential_auto_modes_blocks_env_chip_and_use(self):
+        self.broker.cfg["secrets"]["svc"]["auto_modes"] = ["http"]
+        rid = self.env()
+        self.assertNotIn("value=approve_always", self.card(rid))
+        ok, why = self.broker.always_allow_eligibility(self.broker._by_id[rid])
+        self.assertFalse(ok)
+        self.assertIn("auto_modes", why)
+        self.broker.decide_via("dashboard", rid, "approve", "alice", always=True)
+        self.assertEqual(self.standing(), [])
+        # web is still offered
+        self.always_it("GET")
+        self.assertEqual([e["mode"] for e in self.standing()], ["http"])
+
+    def test_existing_env_entry_is_skipped_and_listed_as_inactive(self):
+        self.always_it(mode="env")
+        self.broker.cfg["secrets"]["svc"]["auto_modes"] = ["http"]
+        n = self.pushes()
+        self.env()
+        self.assertEqual(self.pushes(), n + 1)
+        sk = self.events("grant_skipped")[-1]
+        self.assertEqual((sk["kind"], sk["reason"]), ("always", "auto_modes"))
+        self.assertIn("not active: mode not enabled", req_text(self, "/policies"))
+
+    def test_global_risk_auto_modes(self):
+        self.always_it(mode="env")
+        self.broker._default_auto_modes = ["http"]
+        n = self.pushes()
+        self.env()
+        self.assertEqual(self.pushes(), n + 1)
+        self.assertEqual(self.events("grant_skipped")[-1]["reason"], "auto_modes")
+        self.broker.decide_via("dashboard", self.pending_id(), "deny", "alice")
+        self.broker._denied_at.clear()
+        self.assertFalse(self.broker.always_allow_eligibility(
+            self.broker._by_id[self.env()])[0])
+
+    def test_timed_grants_ignore_auto_modes(self):
+        self.broker.cfg["secrets"]["svc"]["auto_modes"] = ["http"]
+        rid = self.env()
+        self.broker.decide_via("dashboard", rid, "approve", "alice", grant_minutes=15)
+        n = self.pushes()
+        self.assertEqual(self.result(self.env())["status"], "approved")
+        self.assertEqual(self.pushes(), n)
 
 
 class Pages(Base):

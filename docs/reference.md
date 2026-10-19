@@ -1224,7 +1224,7 @@ values are `approve_grant_<minutes>` and `approve_always`.
 | | Always | Timed |
 | --- | --- | --- |
 | Expires | never (until revoked) | at an absolute deadline (using it does not extend it) |
-| Risk ceiling | `risk.auto_approve_max` | none |
+| Risk ceiling | `risk.auto_approve_max` | none by default (`timed_grants.max_risk`, default `high`) |
 | Stored in | the credential's vault metadata (`standing`) | `grants.json` beside the audit log |
 
 - **Always** is checked against `risk.auto_approve_max`. A request rated above
@@ -1233,11 +1233,20 @@ values are `approve_grant_<minutes>` and `approve_always`.
   high for this check only. With `auto_approve_max` `none` an Always is never used.
   The Always chip is not offered for a request already rated above the ceiling or
   rated high.
-- **Timed grants have no risk ceiling.** The human chose one explicitly for a
-  short time, so it releases at any risk level, including HIGH (every `ssh_sign`
-  is rated high) and with no model verdict. `timed_grants.max_risk` is still
-  accepted in the config for older files but ignored; the broker logs a
-  `config_warning` saying so.
+- **Timed grants have no risk ceiling by default.** The human chose one
+  explicitly for a short time, so it releases at any risk level, including HIGH
+  (every `ssh_sign` is rated high) and with no model verdict. This is
+  `timed_grants.max_risk` (`none|low|medium|high`, default `high` = no ceiling);
+  set it lower to cap timed grants: a request rated above it prompts and is audited
+  `grant_skipped` (`kind: timed`, `reason: risk`), and `none` means timed grants are
+  never used. Nothing changes unless an operator opts in.
+- **Always respects mode restrictions.** An Always approval is used (and its chip
+  offered) only for a mode that is in the credential's effective auto modes: its own
+  `auto_modes` metadata, else `risk.auto_modes` (SSH keys default to
+  `["ssh_sign"]`). With `auto_modes: ["http"]` there is no env Always chip, and an
+  existing env Always entry is skipped (`grant_skipped`, `reason: auto_modes`) and
+  shown on the Policies tab as "not active: mode not enabled". Timed grants are
+  explicit human choices and are not subject to `auto_modes`.
 
 ### Evaluation order
 
@@ -1246,10 +1255,11 @@ For each new request, after assessment and after an SSH host rule claim:
 1. The legacy credential-wide `approval: allow` policy (see
    "What `approval: allow` covers"): `auto_modes` / `risk.auto_modes`, with the
    `auto_approve_max` ceiling and the script safeguard, exactly as before.
-2. An Always standing approval (mode, exact set and scope; `auto_approve_max`
-   ceiling; script safeguard for env). One that does not apply is audited
+2. An Always standing approval (mode, exact set and scope; effective `auto_modes`;
+   `auto_approve_max` ceiling; script safeguard for env). One that does not apply is audited
    `grant_skipped` and evaluation continues.
-3. A timed grant (mode, exact set and scope; script safeguard; no ceiling).
+3. A timed grant (mode, exact set and scope; script safeguard; `timed_grants.max_risk`,
+   default no ceiling).
 4. Otherwise the request prompts (or escalates) as before.
 
 A request that step 1 escalated because of risk can still be released by step 2
@@ -1308,10 +1318,10 @@ approval never both act. A request released by a standing approval ends
 - **Config** (`timed_grants`, validated at startup naming the field): `enabled`
   (default `true`), `durations` (minutes offered; 1-6 distinct whole numbers > 0
   and <= `max_minutes`; default `[5, 15, 30]`), `max_minutes` (cap, default 60, at
-  most 1440), and the ignored `max_risk`. `enabled: false` hides the timed chips,
+  most 1440) and `max_risk` (`none|low|medium|high`, default `high` = no ceiling). `enabled: false` hides the timed chips,
   rejects timed choices and ignores persisted timed grants; Always is unaffected.
   Settings shows "Standing approvals: timed grants (no ceiling) 5/15/30 min; Always
-  up to low risk".
+  up to low risk" ("(up to medium risk)" when `max_risk` is lowered).
 
 ### Legacy `approval: allow`
 
@@ -1341,12 +1351,11 @@ All but the last few carry the request `id`; all are hidden from the agent audit
 | `policy_change_refused` | `reason` when an Always was requested but is not eligible |
 | `grant_used` | `kind`, `grant_id`, `scope`, `grant_minutes`, `grant_left_s` (timed) |
 | `approved` (auto) | `via: policy`, `grant_id`, `grant_left_s` |
-| `grant_skipped` | `kind`, `reason: risk` (Always only), `method` or `script_not_visible`, `grant_mode`, `grant_id`, `scope`, `risk_level`, `max_risk` |
+| `grant_skipped` | `kind`, `reason: risk`, `method`, `auto_modes` (Always only) or `script_not_visible`, `grant_mode`, `grant_id`, `scope`, `risk_level`, `max_risk` |
 | `grant_revoked` | `kind`, `mode`, `grant_id`, `secrets`, `scope`, `created_by`, `revoked_by`, `left_s`, `peer`, `client_ip` |
 | `grant_expired` | `mode`, `grant_id`, `secrets`, `expires_at`, `created_by` (timed; lazily, by a 15 s sweep, or on load) |
 | `standing_change_failed` | `op` (`create`/`revoke`), `error` |
 | `grants_file_corrupt`, `grant_dropped`, `grants_file_write_failed` | `warning` / `reason`, `error` |
-| `config_warning` | `timed_grants.max_risk is ignored` |
 | `policy_changed` | legacy `approval` changes only (`from`, `to`, `user`) |
 
 For any API that exposes audit events outside the approver UI: treat `grant_*`

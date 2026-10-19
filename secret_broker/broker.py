@@ -552,11 +552,15 @@ class Broker(sshrules_mod.SshRulesMixin):
                 "host_lines": sshkey.host_lines(host)}
 
     # -- policy -----------------------------------------------------------
+    def _effective_auto_modes(self, sc):
+        """The credential's own `auto_modes`, else `risk.auto_modes` (an SSH key can
+        only ever be used to sign, so that is its default mode)."""
+        return list(sc.get("auto_modes", ["ssh_sign"] if sc.get("ssh") else self._default_auto_modes))
+
     def _auto_modes(self, sc):
         if sc.get("approval", "prompt") != "allow":
             return []
-        # an SSH key can only ever be used to sign, so that is its default mode
-        return list(sc.get("auto_modes", ["ssh_sign"] if sc.get("ssh") else self._default_auto_modes))
+        return self._effective_auto_modes(sc)
 
     def _auto_allowed(self, mode, names, spec=None):
         if mode == "store":
@@ -588,6 +592,9 @@ class Broker(sshrules_mod.SshRulesMixin):
         sc = self.cfg["secrets"][name]
         if sc.get("approval", "prompt") == "allow":
             return False, "already always-allowed"
+        if req.mode not in self._effective_auto_modes(sc):
+            return False, (f"{_MODE_LABEL.get(req.mode, req.mode)} requests are not enabled "
+                           "for auto-approval (auto_modes)")
         if not hasattr(self.backend, "set_meta"):
             return False, "the vault backend cannot record this"
         if req.risk:
@@ -1611,9 +1618,6 @@ class Broker(sshrules_mod.SshRulesMixin):
     # -- time-boxed grants (see grants.py) ----------------------------------
     def _init_grants(self, config):
         self.grants_cfg = grants_mod.parse_config(config.get("timed_grants"))
-        if isinstance(config.get("timed_grants"), dict) and "max_risk" in config["timed_grants"]:
-            self.log("config_warning", warning="timed_grants.max_risk is ignored: timed grants have no "
-                     "risk ceiling; only Always approvals are limited (risk.auto_approve_max)")
         apath = self._audit._path
         gpath = os.path.join(os.path.dirname(os.path.abspath(apath)), "grants.json") if apath else None
         self.grants = grants_mod.GrantStore(gpath, self.log, clock=lambda: time.time(),
@@ -1671,8 +1675,10 @@ class Broker(sshrules_mod.SshRulesMixin):
             secrets_now = sorted(self.cfg["secrets"].items())
         for name, sc in secrets_now:
             for e in sc.get("standing") or []:
+                off = e["mode"] not in self._effective_auto_modes(sc)
                 rows.append({"kind": "always", "id": e["id"], "secrets": [name], "mode": e["mode"],
-                             "scope": e["scope"], "covers": standing_mod.covers_label(e["mode"], e["scope"]),
+                             "scope": e["scope"], "covers": standing_mod.covers_label(e["mode"], e["scope"])
+                             + (" (not active: mode not enabled)" if off else ""),
                              "expires_at": None, "left_s": None, "created_by": e["created_by"],
                              "created_at": e["created_at"].replace("T", " ").replace("Z", " UTC")})
         for name, sc in secrets_now:
@@ -1783,6 +1789,7 @@ class Broker(sshrules_mod.SshRulesMixin):
         level = req.risk["level"] if req.risk else "high"
         hidden = self._script_not_visible(req.mode, req.spec)
         for kind in ("always", "timed"):
+            ceiling = self._auto_max if kind == "always" else self.grants_cfg["max_risk"]
             g = self._standing_find(req, kind)
             if g is None:
                 continue
@@ -1790,16 +1797,19 @@ class Broker(sshrules_mod.SshRulesMixin):
             with self._lock:
                 if hidden:
                     skip = "script_not_visible"
+                elif kind == "always" and req.mode not in self._effective_auto_modes(
+                        self.cfg["secrets"][req.names[0]]):
+                    skip = "auto_modes"
                 elif not grants_mod.covers(g, req.mode, req.spec):
                     skip = "method"
-                elif kind == "always" and not risk_mod.auto_ok(level, self._auto_max):
+                elif not risk_mod.auto_ok(level, ceiling):
                     skip = "risk"
                 elif req.status != "pending":
                     return False
                 else:
                     req.status = "deciding"
             if skip:
-                extra = {"max_risk": self._auto_max} if skip == "risk" else {}
+                extra = {"max_risk": ceiling} if skip == "risk" else {}
                 self.audit("grant_skipped", req, kind=kind, reason=skip, grant_id=g["id"], scope=g["scope"],
                            grant_mode=g.get("mode"), risk_level=level, **extra)
                 continue

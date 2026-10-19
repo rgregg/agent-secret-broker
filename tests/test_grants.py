@@ -362,23 +362,53 @@ class Using(Base):
         self.assertEqual(len(self.notifier.sent), n)
 
 
-class NoRiskCeiling(Base):
-    """Timed grants have no ceiling; `max_risk` is accepted but ignored."""
+class NoCeilingByDefault(Base):
+    """`timed_grants.max_risk` defaults to high: a timed grant releases at any risk."""
     risk = "high"
-    grants_cfg = {"max_risk": "none"}
 
     def test_high_risk_and_missing_verdict_are_released(self):
         self.grant_it()
         n = len(self.notifier.sent)
         self.assertEqual(self.result(self.http())["status"], "approved")
-        self.broker.summarizer = None                    # no verdict: still released
+        self.broker.summarizer = None
         self.assertEqual(self.result(self.http(path="/y"))["status"], "approved")
         self.assertEqual(len(self.notifier.sent), n)
         self.assertEqual(self.events("grant_skipped"), [])
+        self.assertEqual(self.events("config_warning"), [])
 
-    def test_max_risk_logs_a_config_warning(self):
-        warns = [e["warning"] for e in self.events("config_warning")]
-        self.assertTrue(any("timed_grants.max_risk is ignored" in w for w in warns), warns)
+
+class RiskCeiling(Base):
+    """An operator may opt in to a ceiling for timed grants."""
+    risk = "medium"
+    grants_cfg = {"max_risk": "low"}
+
+    def test_above_ceiling_prompts_and_audits_skip(self):
+        self.grant_it()
+        n = len(self.notifier.sent)
+        rid = self.http()
+        self.assertEqual(len(self.notifier.sent), n + 1)
+        sk = self.events("grant_skipped")[0]
+        self.assertEqual((sk["id"], sk["reason"], sk["max_risk"]), (rid, "risk", "low"))
+        self.assertEqual(self.events("grant_used"), [])
+
+    def test_within_ceiling_and_missing_verdict(self):
+        self.grant_it()
+        self.broker.summarizer = _Stub("x", "low")
+        self.assertEqual(self.result(self.http())["status"], "approved")
+        self.broker.summarizer = None                    # no verdict counts as high
+        n = len(self.notifier.sent)
+        self.http()
+        self.assertEqual(len(self.notifier.sent), n + 1)
+
+
+class CeilingNone(Base):
+    grants_cfg = {"max_risk": "none"}
+
+    def test_none_never_uses(self):
+        self.grant_it()
+        n = len(self.notifier.sent)
+        self.http()
+        self.assertEqual(len(self.notifier.sent), n + 1)
 
 
 class Disabled(Base):
@@ -466,7 +496,7 @@ class Config(unittest.TestCase):
 
     def test_defaults(self):
         self.assertEqual(grants_mod.parse_config(None), {
-            "enabled": True, "durations": [5, 15, 30], "max_minutes": 60})
+            "enabled": True, "durations": [5, 15, 30], "max_minutes": 60, "max_risk": "high"})
 
     def test_validation_names_fields(self):
         self.bad("x", "timed_grants must")
