@@ -623,3 +623,194 @@ CSS = (".scripts{margin-top:.5rem}.scripts summary{cursor:pointer;color:var(--mu
        "pre.scripttext{max-height:14rem;overflow:auto;white-space:pre;font-family:ui-monospace,monospace;"
        "font-size:.78rem;background:var(--card);border:1px solid var(--line);border-radius:.4rem;"
        "padding:.4rem .55rem;margin:.2rem 0}")
+
+
+# -- broker-side check: does the command run a script the client did not report? --
+# The client decides what goes in `scripts`; a client that leaves it out would make a
+# script run look like a plain command. This mirrors the client's detection (kept in
+# step with client/asb by hand) so the broker can notice the omission. It catches
+# clients that omit entries; it cannot stop a client that reports false contents.
+# wrapper -> (options that take a value, number of positional args to skip)
+SCRIPT_WRAPPERS = {
+    "env": ({"-u", "--unset", "-C", "--chdir", "-S", "--split-string"}, 0),
+    "sudo": ({"-u", "-g", "-h", "-p", "-C", "-D", "-r", "-t", "-T", "-U", "-R", "--user", "--group"}, 0),
+    "doas": ({"-u", "-C"}, 0),
+    "nohup": (set(), 0),
+    "time": ({"-f", "-o", "--format", "--output"}, 0),
+    "timeout": ({"-s", "-k", "--signal", "--kill-after"}, 1),
+    "nice": ({"-n", "--adjustment"}, 0),
+    "ionice": ({"-c", "-n", "-p", "-P", "-u"}, 0),
+    "stdbuf": ({"-i", "-o", "-e"}, 0),
+    "exec": ({"-a"}, 0),
+    "command": (set(), 0),
+    "setsid": (set(), 0),
+    "chrt": (set(), 1),
+}
+# interpreter name pattern -> (kind, flags that take the next arg, inline-code flags, stdin flags)
+_SHELLS = r"(?:ba|z|da|k|a|c|tc)?sh|fish"
+SCRIPT_INTERPRETERS = (
+    (re.compile(r"^(?:%s)$" % _SHELLS), {"-o", "+o", "-O", "+O", "--rcfile", "--init-file"}, {"-c"}, {"-s"}),
+    (re.compile(r"^python(?:\d+(?:\.\d+)*)?$"), {"-W", "-X", "-Q"}, {"-c", "-m"}, set()),
+    (re.compile(r"^(?:node|nodejs)$"), {"-r", "--require", "--import", "--loader", "--input-type"},
+     {"-e", "--eval", "-p", "--print"}, set()),
+    (re.compile(r"^ruby$"), {"-I", "-r", "-C", "-x"}, {"-e"}, set()),
+    (re.compile(r"^perl$"), {"-I", "-M", "-m"}, {"-e", "-E"}, set()),
+    (re.compile(r"^php$"), {"-d", "-c", "-z"}, {"-r"}, set()),
+    (re.compile(r"^(?:pwsh|powershell)$"), set(), {"-c", "-command", "-encodedcommand", "-e"}, set()),
+    (re.compile(r"^(?:lua|luajit)$"), {"-l"}, {"-e"}, set()),
+    (re.compile(r"^Rscript$"), set(), {"-e"}, set()),
+)
+SCRIPT_FILE_FLAGS = {"php": {"-f"}, "awk": {"-f", "--file"}, "gawk": {"-f", "--file"}, "mawk": {"-f"},
+                     "sed": {"-f", "--file"}, "pwsh": {"-file", "-f"}, "powershell": {"-file", "-f"}}
+_AWK_LIKE = re.compile(r"^(?:awk|gawk|mawk|sed)$")
+_RUNNERS = re.compile(r"^(?:deno|bun)$")
+
+
+def _strip_wrappers(argv):
+    """argv without leading wrapper commands (env VAR=.., sudo, timeout 5, ...)."""
+    i = 0
+    while i < len(argv):
+        w = os.path.basename(argv[i])
+        if w not in SCRIPT_WRAPPERS:
+            break
+        valued, positional = SCRIPT_WRAPPERS[w]
+        i += 1
+        while i < len(argv):
+            a = argv[i]
+            if a == "--":
+                i += 1
+                break
+            if w == "env" and "=" in a and not a.startswith("-"):
+                i += 1
+            elif a.startswith("-") and len(a) > 1:
+                i += 2 if a in valued else 1
+            else:
+                break
+        i += positional
+    return argv[i:]
+
+
+def _script_args(name, args):
+    """-> ("file", [candidate paths]) | ("inline", None) | ("stdin", None) | ("none", None)
+    for the arguments of a recognised interpreter."""
+    spec = next((x for x in SCRIPT_INTERPRETERS if x[0].match(name)), None)
+    is_awk = bool(_AWK_LIKE.match(name))
+    if spec is None and not is_awk and not _RUNNERS.match(name):
+        return None
+    if _RUNNERS.match(name):
+        # deno run [opts] file | deno eval ... | bun [run] file
+        sub = args[0] if args else ""
+        if sub == "eval":
+            return ("inline", None)
+        rest = args[1:] if sub in ("run", "x") else args
+        for i, a in enumerate(rest):
+            if a == "-":
+                return ("stdin", None)
+            if not a.startswith("-"):
+                return ("file", [a])
+        return ("none", None)
+    if is_awk:
+        files, i = [], 0
+        ffl = SCRIPT_FILE_FLAGS[name] if name in SCRIPT_FILE_FLAGS else SCRIPT_FILE_FLAGS["awk"]
+        inline = False
+        while i < len(args):
+            a = args[i]
+            if a in ffl and i + 1 < len(args):
+                files.append(args[i + 1])
+                i += 2
+                continue
+            if a.startswith("--file="):
+                files.append(a.split("=", 1)[1])
+            elif a in ("-e", "--expression", "--source"):
+                inline, i = True, i + 1
+            elif a.startswith("-") and a != "-":
+                pass
+            elif not files and not inline:
+                return ("inline", None)             # the program text is the first operand
+            else:
+                break
+            i += 1
+        return ("file", files) if files else ("inline" if inline else "none", None)
+    _, valued, inline_flags, stdin_flags = spec
+    short_inline = {f[1] for f in inline_flags if len(f) == 2}
+    short_stdin = {f[1] for f in stdin_flags if len(f) == 2}
+    ffl = SCRIPT_FILE_FLAGS.get(name, set())
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            return ("file", [args[i + 1]]) if i + 1 < len(args) else ("none", None)
+        if a == "-":
+            return ("stdin", None)
+        if a in ffl and i + 1 < len(args):
+            return ("file", [args[i + 1]])
+        if a in inline_flags or a.lower() in inline_flags:
+            return ("inline", None)
+        if a in stdin_flags:
+            return ("stdin", None)
+        if a in valued:
+            i += 2
+            continue
+        if name == "perl" and re.match(r"^-[A-Za-z]*[eE]$", a):
+            return ("inline", None)
+        if re.match(r"^-[A-Za-z]+$", a) and len(a) > 2 and name != "perl":
+            letters = a[1:]
+            if short_inline & set(letters):
+                return ("inline", None)
+            if short_stdin & set(letters):
+                return ("stdin", None)
+        elif a.startswith("-") or a.startswith("+"):
+            if name == "perl" and re.match(r"^-[eE]", a):
+                return ("inline", None)
+            if name.startswith("python") and re.match(r"^-[cm]", a):
+                return ("inline", None)
+        else:
+            return ("file", [a])
+        i += 1
+    return ("none", None)
+
+_SYSTEM_BIN = ("/bin/", "/usr/bin/", "/sbin/", "/usr/sbin/")
+_SCRIPT_EXT = (".sh", ".py", ".js", ".rb", ".pl", ".php", ".ps1", ".lua", ".R")
+
+
+def argv_runs_script(argv):
+    """Operand paths of the script files `argv` appears to execute ([] when it runs
+    none): an interpreter's script operand, or argv[0] itself when it contains a
+    slash (outside the standard system bin directories) or ends in a script
+    extension. "-" stands for code read from standard input. Inline code (-c, -e,
+    -m, eval) is not a script file. A bare program name (curl, git) is not flagged."""
+    if not isinstance(argv, list) or not all(isinstance(a, str) for a in argv):
+        return []
+    cmd = _strip_wrappers(argv)
+    if not cmd:
+        return []
+    name = os.path.basename(cmd[0])
+    found = _script_args(name, cmd[1:])
+    if found is not None:
+        kind, paths = found
+        if kind == "stdin" or (kind == "none" and not name.startswith(("sed", "awk", "gawk", "mawk"))):
+            return ["-"]
+        return list(paths) if kind == "file" else []
+    if cmd[0].endswith(_SCRIPT_EXT):
+        return [cmd[0]]
+    if "/" in cmd[0] and not cmd[0].startswith(_SYSTEM_BIN):
+        return [cmd[0]]
+    return []
+
+
+def _same_path(a, b):
+    return (a == b or os.path.normpath(a) == os.path.normpath(b)
+            or os.path.basename(a.rstrip("/")) == os.path.basename(b.rstrip("/")))
+
+
+def script_not_visible(argv, scripts):
+    """True when the script text for this command is not fully visible: an entry is
+    unreadable, from stdin or cut off, or `argv` runs a script file that has no
+    matching readable entry in `scripts`."""
+    scripts = scripts or []
+    if has_blind_spot(scripts):
+        return True
+    for p in argv_runs_script(argv):
+        if p == "-" or not any("path" in s and _same_path(p, s["path"]) for s in scripts):
+            return True
+    return False

@@ -586,7 +586,7 @@ class Broker(sshrules_mod.SshRulesMixin):
             lvl = req.risk["level"]
             if lvl == "high" or not risk_mod.auto_ok(lvl, self._auto_max):
                 return False, f"this request is rated {lvl}; such requests always prompt"
-        if req.mode == "env" and scripts_mod.has_blind_spot(req.spec.get("scripts")):
+        if self._script_not_visible(req.mode, req.spec):
             return False, "the script text is not visible, so env requests like this always prompt"
         return True, ""
 
@@ -594,7 +594,8 @@ class Broker(sshrules_mod.SshRulesMixin):
     def _script_not_visible(mode, spec):
         """An env request whose script text the classifier and approver cannot see
         (unreadable, read from stdin, or cut off) is never auto-approved."""
-        return mode == "env" and scripts_mod.has_blind_spot((spec or {}).get("scripts"))
+        return mode == "env" and scripts_mod.script_not_visible((spec or {}).get("argv"),
+                                                                (spec or {}).get("scripts"))
 
     def auto_approve_max(self):
         """Highest risk level at which an auto-eligible request is released

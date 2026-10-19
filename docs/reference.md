@@ -478,6 +478,22 @@ credentials with `"risk": {"auto_modes": ["http"]}` in the broker config.
   `unreadable` or `stdin`, or text that was cut off, `truncated`) is **never**
   auto-approved, at any `auto_approve_max`: it always prompts and is audited as
   `escalated` with `reason: script_not_visible`.
+- **The broker also checks argv itself.** It does not trust the client's `scripts`
+  list to be complete: a command whose argv runs a script file (a leading
+  `env`/`sudo`/`doas`/`nohup`/`time`/`timeout`/`nice`/`ionice`/`stdbuf`/`exec`/
+  `command`/`setsid`/`chrt` wrapper is skipped; then an interpreter such as
+  bash, sh, zsh, python, node, deno, bun, ruby, perl, php, pwsh, lua, Rscript,
+  awk or `sed -f` followed by a script operand, or an argv[0] that has a script
+  extension or a path outside /bin, /usr/bin, /sbin, /usr/sbin) needs a matching
+  readable `scripts` entry (same path as given, or the same normalised path or
+  file name). A missing or mismatched entry, or an interpreter reading stdin, counts
+  as "script not visible": the request is never auto-approved, never covered by a
+  timed grant, never offered the Always or grant chips, and is audited `escalated` /
+  `grant_skipped` with `reason: script_not_visible`. Inline code (`-c`, `-e`, `-m`,
+  `eval`) and plain program names (`curl`, `git`, `docker compose up`) are not
+  flagged. **This catches clients that omit entries. It cannot stop a client that
+  lies**: one that reports a harmless script text for a different file, or runs
+  something other than the argv it states, is not detected.
 - Scripts that print or send the credential are rated high by the model, so they
   auto-approve only when `auto_approve_max` is `high`.
 - What auto-approval of env means: the plaintext secret value is released to the

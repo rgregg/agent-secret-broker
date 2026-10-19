@@ -33,7 +33,7 @@ class EnvAutoBase(Harness):
         self.broker.summarizer = _Stub("Runs a script", self.risk_level)
 
     def env(self, scripts=None):
-        body = {"mode": "env", "names": ["svc"], "argv": ["bash", "run.sh"]}
+        body = {"mode": "env", "names": ["svc"], "argv": ["bash", "run.sh"] if scripts else ["echo", "hi"]}
         if scripts is not None:
             body["scripts"] = scripts
         code, b = self.api("POST", "/v1/requests", body)
@@ -292,7 +292,7 @@ import test_grants as tg  # noqa: E402  (Base only; its tests are not re-collect
 
 class EnvGrants(tg.Base):
     def env(self, names=("svc",), scripts=None):
-        body = {"mode": "env", "names": list(names), "argv": ["bash", "run.sh"]}
+        body = {"mode": "env", "names": list(names), "argv": ["bash", "run.sh"] if scripts else ["echo", "hi"]}
         if scripts is not None:
             body["scripts"] = scripts
         code, b = self.api("POST", "/v1/requests", body)
@@ -439,3 +439,126 @@ class EnvGrants(tg.Base):
         self.env()
         self.assertEqual(len(self.notifier.sent), n + 1)
         self.assertEqual(self.events("grant_skipped")[-1]["reason"], "risk")
+
+
+# -- the broker checks argv itself: an omitted `scripts` entry is "not visible" ----
+from secret_broker import scripts as scripts_mod  # noqa: E402
+
+FLAGGED = (["bash", "deploy.sh"], ["python3", "x.py"], ["./run.sh"], ["sudo", "-u", "x", "bash", "y.sh"],
+           ["env", "A=1", "node", "app.js"], ["/opt/tools/run"], ["deploy.sh"], ["bash"])
+NOT_FLAGGED = (["bash", "-c", "echo hi"], ["python3", "-c", "print(1)"], ["python3", "-m", "http.server"],
+               ["curl", "-s", "https://example.com"], ["git", "status"], ["docker", "compose", "up"],
+               ["/usr/bin/curl", "x"], ["echo", "hi"], ["sed", "s/a/b/"])
+
+
+class ArgvRunsScript(unittest.TestCase):
+    def test_flagged(self):
+        for argv in FLAGGED:
+            self.assertTrue(scripts_mod.argv_runs_script(argv), argv)
+
+    def test_not_flagged(self):
+        for argv in NOT_FLAGGED:
+            self.assertEqual(scripts_mod.argv_runs_script(argv), [], argv)
+
+    def test_operands(self):
+        self.assertEqual(scripts_mod.argv_runs_script(["sudo", "-u", "x", "bash", "y.sh"]), ["y.sh"])
+        self.assertEqual(scripts_mod.argv_runs_script(["./run.sh"]), ["./run.sh"])
+        self.assertEqual(scripts_mod.argv_runs_script(["timeout", "5", "python3.12", "-u", "a/b.py"]), ["a/b.py"])
+
+    def test_matching(self):
+        ok = [{**VISIBLE, "path": "/home/u/deploy.sh"}]
+        self.assertFalse(scripts_mod.script_not_visible(["bash", "deploy.sh"], ok))      # basename
+        self.assertFalse(scripts_mod.script_not_visible(["bash", "/home/u/deploy.sh"], ok))
+        self.assertTrue(scripts_mod.script_not_visible(["bash", "other.sh"], ok))
+        self.assertTrue(scripts_mod.script_not_visible(["bash", "deploy.sh"], []))
+        self.assertTrue(scripts_mod.script_not_visible(["bash", "deploy.sh"], None))
+        self.assertFalse(scripts_mod.script_not_visible(["curl", "x"], None))
+
+
+class OmittedScripts(EnvAutoBase):
+    risk_cfg = {"auto_approve_max": "high"}
+
+    def post(self, argv, scripts=None):
+        body = {"mode": "env", "names": ["svc"], "argv": argv}
+        if scripts is not None:
+            body["scripts"] = scripts
+        code, b = self.api("POST", "/v1/requests", body)
+        self.assertEqual(code, 202, b)
+        return json.loads(b)["id"]
+
+    def test_omitted_list_prompts_even_at_high_with_allow(self):
+        for argv in FLAGGED[:5]:
+            self.notifier.sent.clear()
+            self.broker._by_id.clear()
+            self.post(argv)
+            self.assertEqual(len(self.notifier.sent), 1, argv)
+            self.assertEqual(self.events("escalated")[-1]["reason"], "script_not_visible")
+        self.assertEqual(self.events("approved"), [])
+
+    def test_honest_client_with_visible_entry_is_auto(self):
+        rid = self.post(["bash", "deploy.sh"], [{**VISIBLE, "path": "deploy.sh"}])
+        self.assertAuto(rid)
+
+    def test_path_mismatch_prompts(self):
+        self.post(["bash", "deploy.sh"], [VISIBLE])        # entry says run.sh
+        self.assertPrompts()
+        self.assertEqual(self.events("escalated")[-1]["reason"], "script_not_visible")
+
+    def test_empty_list_does_not_help(self):
+        self.post(["bash", "deploy.sh"], [])
+        self.assertPrompts()
+
+    def test_inline_and_plain_programs_auto(self):
+        for argv in (["bash", "-c", "echo hi"], ["python3", "-c", "print(1)"], ["curl", "-s", "https://x.example"],
+                     ["docker", "compose", "up"]):
+            rid = self.post(argv)
+            self.assertEqual(self.result(rid)["env"], {"SVC_TOKEN": SECRET}, argv)
+        self.assertEqual(self.notifier.sent, [])
+
+    def test_always_chip_not_offered_when_omitted(self):
+        self.broker.cfg["secrets"]["svc"]["approval"] = "prompt"
+        self.post(["./run.sh"])
+        r = list(self.broker._by_id.values())[-1]
+        ok, why = self.broker.always_allow_eligibility(r)
+        self.assertFalse(ok)
+        self.assertIn("not visible", why)
+        self.assertNotIn("value=approve_always", req(self.abase + f"/a/{r.nonce}",
+                                                     headers={"X-authentik-username": "alice"})[1])
+
+
+class OmittedScriptsGrants(tg.Base):
+    def grant_env(self):
+        rid = self.post(["echo", "hi"])
+        self.assertEqual(self.approve(rid, "approve_grant_15"), 303)
+        self.broker._by_id[rid].done.wait(10)
+
+    def post(self, argv, scripts=None):
+        body = {"mode": "env", "names": ["svc"], "argv": argv}
+        if scripts is not None:
+            body["scripts"] = scripts
+        code, b = self.api("POST", "/v1/requests", body)
+        self.assertEqual(code, 202, b)
+        return json.loads(b)["id"]
+
+    def test_omitted_list_is_not_covered_by_a_grant_and_no_chips(self):
+        self.grant_env()
+        for argv in (["bash", "deploy.sh"], ["sudo", "-u", "x", "bash", "y.sh"], ["./run.sh"]):
+            n = len(self.notifier.sent)
+            self.post(argv)
+            self.assertEqual(len(self.notifier.sent), n + 1, argv)
+            sk = self.events("grant_skipped")[-1]
+            self.assertEqual((sk["reason"], sk["mode"]), ("script_not_visible", "env"))
+        self.assertEqual(self.events("grant_used"), [])
+
+    def test_no_grant_chips_or_creation_when_omitted(self):
+        rid = self.post(["python3", "x.py"])
+        self.assertNotIn("approve_grant_", self.get("/")[1])
+        self.approve(rid, "approve_grant_15")
+        self.assertEqual(self.broker.active_grants(), [])
+
+    def test_grant_covers_inline_and_plain(self):
+        self.grant_env()
+        n = len(self.notifier.sent)
+        for argv in (["bash", "-c", "echo hi"], ["curl", "-s", "https://x.example"]):
+            self.assertEqual(self.result(self.post(argv))["status"], "approved")
+        self.assertEqual(len(self.notifier.sent), n)
