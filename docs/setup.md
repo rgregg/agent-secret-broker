@@ -139,8 +139,14 @@ Your phone or browser notifies you; approve; the call returns.
 
 ### Optional: tie an SSH key to servers
 
-An SSH key (`asb store NAME --ssh`) can say which servers it may log in to. Edit
-the key item's `broker` field in the vault and add
+An SSH key (`asb store NAME --ssh`) can say which servers it may log in to. The
+easiest way is the **SSH host policy** card for the key on the **Policies** tab: paste
+lines from `~/.ssh/known_hosts` into Known hosts, list the allowed names or `SHA256:`
+fingerprints in Allowed hosts (empty means no enforcement), and save. After saving the
+card shows each line's fingerprint and warns about entries that can never match. The
+server asks for an extra tick before it lowers enforcement or saves a list that would
+lock the key out, and the change applies to the next signature. The same policy is
+stored in the key item's `broker` field in the vault, so you can also edit it there:
 
     "ssh_hosts": {"known_hosts": ["web.example.com ssh-ed25519 AAAA..."],
                   "allowed_hosts": ["web.example.com"]}

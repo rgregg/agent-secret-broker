@@ -38,6 +38,7 @@ from . import notify as notify_mod
 from .notify import NotifyError
 from . import grants as grants_mod
 from . import guidance as guidance_mod
+from . import sshhosts as sshhosts_mod
 from . import risk as risk_mod
 from . import scripts as scripts_mod
 from . import sshkey
@@ -623,6 +624,78 @@ class Broker:
         self.log("guidance_changed", length=len(new), old_sha256=guidance_mod.digest(old),
                  new_sha256=guidance_mod.digest(new), **who)
         return True
+
+    def _persist_ssh_hosts(self, name, raw, user):
+        """Write the key's `ssh_hosts` policy into its broker metadata in the vault
+        (the same path as _persist_guidance); an empty policy removes the key."""
+        sc = self.cfg["secrets"][name]
+        meta = {**sc["_meta"],
+                "ssh_hosts_changed": {"by": user, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}}
+        if raw:
+            meta["ssh_hosts"] = raw
+        else:
+            meta.pop("ssh_hosts", None)
+        self.backend.set_meta(sc["_item"], meta)
+        sc["_meta"] = meta
+
+    def set_ssh_hosts(self, name, known_text, allowed_text, allow_forwarded, user, confirm_weaken=False,
+                      save_anyway=False, peer=None, client_ip=None):
+        """Set (or, when empty, remove) an SSH key's `ssh_hosts` policy from the
+        editor's text: validated by the same code the catalog loader runs, vault
+        first, then memory. Returns {"status": saved|unchanged|refused|failed,
+        "message", "enforcing", "need_confirm", "need_anyway"}; raises ValueError
+        for an unknown secret. Audit events carry counts and hashes, never names."""
+        if name not in self.cfg["secrets"]:
+            raise ValueError("bad ssh_hosts change")
+        who = dict(secret=name, user=user, peer=peer, client_ip=client_ip)
+
+        def refused(cls, msg, **flags):
+            self.log("ssh_hosts_change_refused", reason=cls, **who)
+            return {"status": "refused", "message": msg, **flags}
+        if not self.cfg["secrets"][name].get("ssh"):
+            return refused("not_ssh_key", "ssh_hosts only applies to an ssh key secret")
+        try:
+            raw = sshhosts_mod.build(known_text, allowed_text, bool(allow_forwarded))
+            parsed = Broker._ssh_hosts(raw) if raw else None
+        except ValueError as e:
+            return refused("invalid", str(e)[:200])
+        with self._cfg_lock:
+            sc = self.cfg["secrets"][name]
+            old_raw = sshhosts_mod.normalize(sc["_meta"].get("ssh_hosts"))
+            if old_raw == raw:
+                return {"status": "unchanged", "message": "", "enforcing": bool(raw.get("allowed_hosts"))}
+            old_live = sc.get("ssh_hosts") or {}
+            old_enf, old_fwd = bool(old_live.get("allowed")), bool(old_live.get("allow_forwarded"))
+            new_enf, new_fwd = bool(raw.get("allowed_hosts")), bool(raw.get("allow_forwarded"))
+            weaker = old_enf and (not new_enf or (new_fwd and not old_fwd))
+            lockout = new_enf and not sshhosts_mod.can_ever_match(parsed)
+            need_confirm, need_anyway = weaker and not confirm_weaken, lockout and not save_anyway
+            if need_confirm or need_anyway:
+                msgs = []
+                if need_confirm:
+                    msgs.append("This reduces enforcement for this key: tick \"I understand this reduces "
+                                "enforcement\" to save it.")
+                if need_anyway:
+                    msgs.append("None of the Allowed hosts can ever match (every entry is a name that no "
+                                "Known hosts line gives to a key, and none is a fingerprint), so this would "
+                                "lock the key out of use. Add the matching known_hosts line or a SHA256: "
+                                "fingerprint, or tick \"Save anyway\".")
+                return refused("needs_confirmation" if need_confirm else "lockout", " ".join(msgs),
+                               need_confirm=need_confirm, need_anyway=need_anyway)
+            try:
+                self._persist_ssh_hosts(name, raw, user)
+            except (OSError, ValueError, KeyError, BackendError) as e:
+                self.log("ssh_hosts_change_failed", error=str(e)[:200], **who)
+                return {"status": "failed", "message": "Could not save the policy"}
+            sc.pop("ssh_hosts", None)
+            if parsed and (parsed["known"] or parsed["allowed"] or parsed["allow_forwarded"]):
+                sc["ssh_hosts"] = parsed
+        self.log("ssh_hosts_changed", known_lines=len(raw.get("known_hosts", [])),
+                 allowed_entries=len(raw.get("allowed_hosts", [])),
+                 allow_forwarded_old=old_fwd, allow_forwarded_new=new_fwd,
+                 enforcing_old=old_enf, enforcing_new=new_enf,
+                 old_sha256=sshhosts_mod.digest(old_raw), new_sha256=sshhosts_mod.digest(raw), **who)
+        return {"status": "saved", "message": "", "enforcing": new_enf}
 
     # -- discovery (no approval, no push, no values) ----------------------
     def available(self, host=None):
@@ -3011,7 +3084,7 @@ def approval_handler(broker):
             parts = self.path.split("?")[0].strip("/").split("/")
             return parts[1] if len(parts) == 2 and parts[0] == "a" else None
 
-        def _policies_page(self, user, note=""):
+        def _policies_page(self, user, note="", status=200, ssh_state=None):
             rows = []
             for name, sc in sorted(cfg["secrets"].items()):
                 if sc.get("approval", "prompt") != "allow":
@@ -3027,13 +3100,14 @@ def approval_handler(broker):
             table = ("<table class=tbl><thead><tr><th>Secret</th><th>Allowed by</th><th></th></tr></thead>"
                      "<tbody>" + "".join(rows) + "</tbody></table>" if rows else
                      "<div class='card empty'>Nothing is always allowed. Every use asks you first.</div>")
-            _page(self, 200, f"<h1>Policies</h1>{note}{self._grants_section(user)}"
+            _page(self, status, f"<h1>Policies</h1>{note}{self._grants_section(user)}"
                   "<h3>Always allowed</h3>"
                   "<p><small class=muted>These secrets are released without asking when the request's "
                   f"risk is within the auto-approve limit ({_AUTO_LABEL[broker.auto_approve_max()]}). "
                   "Revoke to ask every time again.</small></p>" + table
-                  + guidance_mod.policies_section(cfg["secrets"], broker.csrf_token(user)),
-                  script=_GRANTS_JS + guidance_mod.JS, tab="policies", badge=len(broker.pending()), user=user)
+                  + guidance_mod.policies_section(cfg["secrets"], broker.csrf_token(user))
+                  + sshhosts_mod.policies_section(cfg["secrets"], broker.csrf_token(user), ssh_state),
+                  script=_GRANTS_JS + guidance_mod.JS + sshhosts_mod.JS, tab="policies", badge=len(broker.pending()), user=user)
 
         def _grants_section(self, user):
             """'Active grants' card on the Policies tab: who allowed what, time left, Revoke."""
@@ -3232,12 +3306,14 @@ def approval_handler(broker):
                 return self._push_decide(user)
             path = self.path.split("?")[0].rstrip("/")
             # a guidance form can hold 2000 characters of percent-encoded text
-            limit = 40000 if path == "/policies/guidance" else 8192
-            if int(self.headers.get("Content-Length", 0)) > limit and path == "/policies/guidance":
+            limit = {"/policies/guidance": 40000, "/policies/ssh_hosts": sshhosts_mod.FORM_LIMIT}.get(path, 8192)
+            if (int(self.headers.get("Content-Length", 0)) > limit
+                    and path in ("/policies/guidance", "/policies/ssh_hosts")):
                 return _page(self, 413, "<h1>Too large</h1>")
             form = urllib.parse.parse_qs(
                 self.rfile.read(min(int(self.headers.get("Content-Length", 0)), limit)).decode())
-            if path in ("/decide", "/policies", "/policies/guidance", "/grants/revoke", "/push/subscribe",
+            if path in ("/decide", "/policies", "/policies/guidance", "/policies/ssh_hosts", "/grants/revoke",
+                        "/push/subscribe",
                         "/push/revoke", "/push/test") and not self._csrf_ok(user, form.get("csrf", [""])[0]):
                 broker.log("csrf_refused", path=path, peer=self.client_address[0],
                            client_ip=self._fwd(), origin=(self.headers.get("Origin") or "")[:80],
@@ -3266,6 +3342,28 @@ def approval_handler(broker):
                 done = broker.revoke_grant(gid, user, self.client_address[0], self._fwd())
                 return self._policies_page(
                     user, f"<p>{'Grant revoked' if done else 'That grant is no longer active'}.</p>")
+            if path == "/policies/ssh_hosts":
+                name = form.get("secret", [""])[0]
+                if name not in cfg["secrets"]:
+                    return _page(self, 400, "<h1>Bad request</h1>")
+                one = lambda k: form.get(k, [""])[0]  # noqa: E731
+                res = broker.set_ssh_hosts(
+                    name, one("known_hosts"), one("allowed_hosts"), one("allow_forwarded") == "1", user,
+                    confirm_weaken=one("confirm_weaken") == "1", save_anyway=one("save_anyway") == "1",
+                    peer=self.client_address[0], client_ip=self._fwd())
+                if res["status"] in ("saved", "unchanged"):
+                    msg = ("SSH host policy saved" if res["status"] == "saved" else "SSH host policy unchanged")
+                    note = f"<p>{msg}: {html.escape(name)}</p>"
+                    if res["status"] == "saved" and res["enforcing"]:
+                        note += ("<p><small class=muted>Enforcement is on: unbound clients (old OpenSSH, git "
+                                 "commit signing) will be refused for this key.</small></p>")
+                    return self._policies_page(user, note, ssh_state={name: {"open": True}})
+                st = {"open": True, "error": res["message"], "known": one("known_hosts"),
+                      "allowed": one("allowed_hosts"), "fwd": one("allow_forwarded") == "1",
+                      "need_confirm": res.get("need_confirm"), "need_anyway": res.get("need_anyway")}
+                return self._policies_page(
+                    user, f"<p>Could not save the SSH host policy: {html.escape(name)}</p>",
+                    status=400 if res["status"] == "refused" else 500, ssh_state={name: st})
             if path == "/policies/guidance":
                 name = form.get("name", [""])[0]
                 if name not in cfg["secrets"]:

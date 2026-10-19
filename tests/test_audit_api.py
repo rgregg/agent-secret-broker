@@ -133,7 +133,8 @@ class Redaction(unittest.TestCase):
     def test_hidden_events_are_not_returned(self):
         for ev in ("assessed", "escalated", "notified", "decided", "startup", "policy_changed",
                    "approval_viewed", "dashboard_viewed", "client_event_dropped", "push_subscribed",
-                   "push_test", "csrf_refused"):
+                   "push_test", "csrf_refused", "ssh_hosts_changed", "ssh_hosts_change_refused",
+                   "ssh_hosts_change_failed"):
             self.assertIsNone(audit_api.redact(rec(ev, id="r1")), ev)
 
     def test_unknown_events_are_dropped_and_not_counted(self):

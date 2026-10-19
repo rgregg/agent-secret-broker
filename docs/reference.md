@@ -176,6 +176,36 @@ socket, and every signature ssh asks for becomes a broker request (mode
   config error (name the field), not "allow everything". Neither `ssh_hosts` nor
   its contents appear in `list`, `which`, `status`, or the agent's audit view;
   the refusal message does not say what is allowed.
+- **Editing `ssh_hosts` on the Policies tab.** The policy lives in the key item's
+  `broker` metadata (vault field `ssh_hosts`) and is edited from the **Policies** tab
+  ("SSH host policy"): a collapsed card per SSH key with a **Known hosts** box (one
+  plain known_hosts line per line, pasted from `~/.ssh/known_hosts`; hashed `|1|`
+  entries are unsupported and listed as ignored), an **Allowed hosts** box (one host
+  name or `SHA256:` fingerprint per line; empty means no enforcement) and an **Allow
+  forwarded agent** checkbox. A badge shows `Enforcing: N allowed hosts` or `Not
+  enforcing`. The saved card lists each known_hosts line's names, key type and SHA256
+  fingerprint (copy fingerprints into Allowed hosts), lines that were ignored with the
+  reason, and Allowed hosts entries that cannot match (`unknown name`, or `will only
+  match by fingerprint`). `POST /policies/ssh_hosts` (fields `secret`, `known_hosts`,
+  `allowed_hosts`, `allow_forwarded`) has the same SSO, trusted-peer, CSRF and Origin
+  checks as the other Policies forms and a 1.5 MB body limit (413 above). It runs the
+  same validator as catalog load (plus: no control characters, `SHA256:` entries need
+  43 base64 characters, names are letters/digits/`._:-`), so the editor cannot write
+  something the loader rejects; any error refuses the whole save (400, nothing
+  changed). The change takes effect on the next sign request, without a restart.
+  Emptying both boxes and clearing the checkbox removes the key. Safety rails, enforced
+  by the server: lowering enforcement (clearing Allowed hosts, or turning on Allow
+  forwarded while enforcing) needs the "I understand this reduces enforcement" box,
+  which appears on the refused form; an Allowed hosts list in which no entry can ever
+  match (all names that no known_hosts line gives to a key, no fingerprints) is refused
+  as locking the key out unless "Save anyway" is ticked; after a save that enforces, the
+  page reminds you that unbound clients (old OpenSSH, git commit signing) are refused.
+  Audit: `ssh_hosts_changed` (secret, user, peer, client_ip, `known_lines`,
+  `allowed_entries`, `allow_forwarded_old/new`, `enforcing_old/new`, 12-character
+  `old_sha256`/`new_sha256` of the policy; never names or keys),
+  `ssh_hosts_change_refused` (`reason`: `invalid`, `needs_confirmation`, `lockout`,
+  `not_ssh_key`) and `ssh_hosts_change_failed`. The vault item also gets
+  `ssh_hosts_changed: {by, at}`. All three events are hidden from the agent audit API.
 - `approval: allow` only auto-approves signing if `auto_modes` includes
   `ssh_sign`; "always allow" is never offered for it.
 
@@ -999,7 +1029,8 @@ decision. Hidden on purpose:
   `approval_viewed`, `request_detail_viewed`, `approval_stale`, `approval_forbidden`,
   `csrf_refused`, `dashboard_viewed`, `history_viewed`, `push_subscribed`, `push_revoked`,
   `push_refused`, `push_test`, `ha_decide_dropped`.
-- Server-identity policy: `ssh_sign_refused` (a key's `ssh_hosts.allowed_hosts` is approval
+- Server-identity policy: `ssh_hosts_changed`, `ssh_hosts_change_refused`, `ssh_hosts_change_failed`,
+  `ssh_sign_refused` (a key's `ssh_hosts.allowed_hosts` is approval
   policy; the refusal itself is already returned to the client without the allowed list).
 - Browser telemetry: every `client_event` (page loads, visibility, service-worker delivery
   diagnostics) and `client_event_dropped`. Even the delivery diagnostics only occur when a
