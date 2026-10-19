@@ -806,62 +806,144 @@ SCRIPT_HASH_MAX = 64 * 1024 * 1024   # larger files are not hashed: unreadable t
 SCRIPT_REFUSED = ("~/tokens", "~/.ssh", "~/.config/secret-broker", "/proc", "/sys", "/dev")
 
 # --- shared-detection:begin (identical in client/asb; tests/test_scripts.py compares them) ---
-MAX_SPLIT_DEPTH = 4         # nested `env -S` / `su -c` strings examined before failing closed
-MAX_HOPS = 32               # wrapper commands skipped before failing closed
+# PRINCIPLE: a command is "understood" only when it is positively recognised; anything
+# else (a parse doubt, an unknown option on a wrapper, unusual shell syntax, a program
+# that can run other programs) is NOT understood and the broker prompts for it.
+# _analyze() returns ([(path, strict)], understood). The paths are the script files the
+# command runs ("-": code from stdin); the broker also needs an entry for each.
+MAX_SPLIT_DEPTH = 4         # nested env -S / shell strings examined before giving up
+MAX_HOPS = 32               # wrapper commands skipped before giving up
 _SYSTEM_BIN = ("/bin/", "/usr/bin/", "/sbin/", "/usr/sbin/")
 _SCRIPT_EXT = (".sh", ".py", ".js", ".rb", ".pl", ".php", ".ps1", ".lua", ".R")
-# A bare program name in this set is never treated as a script, whatever its operands
-# look like. Any other bare name is flagged only when an operand ends in a script
-# extension or contains a slash (a file-like operand); with none it stays unflagged.
-NOT_SCRIPT_PROGRAMS = frozenset((
-    "git curl wget docker kubectl ssh scp rsync make cargo npm npx yarn pnpm pip pip3 go rustc mvn gradle "
-    "java dotnet brew apt apt-get dpkg rpm yum dnf ls cat grep rg find echo printf date uname ps df du head "
-    "tail wc jq tar gzip gunzip zip unzip ffmpeg terraform ansible helm aws gcloud az gh systemctl "
-    "journalctl ping dig nslookup openssl sqlite3 psql mysql redis-cli mongosh sort uniq cut tr mkdir cp mv "
-    "rm touch chmod chown cd pwd which whoami id hostname sleep true false test tee less more diff stat file "
-    "ln readlink basename dirname nc ip ss").split())
-# wrapper -> (options that take a value, number of positional args to skip)
-SCRIPT_WRAPPERS = {
-    "sudo": ({"-u", "-g", "-h", "-p", "-C", "-D", "-r", "-t", "-T", "-U", "-R", "--user", "--group"}, 0),
-    "doas": ({"-u", "-C"}, 0),
-    "nohup": (set(), 0),
-    "time": ({"-f", "-o", "--format", "--output"}, 0),
-    "timeout": ({"-s", "-k", "--signal", "--kill-after"}, 1),
-    "nice": ({"-n", "--adjustment"}, 0),
-    "ionice": ({"-c", "-n", "-p", "-P", "-u"}, 0),
-    "stdbuf": ({"-i", "-o", "-e"}, 0),
-    "exec": ({"-a"}, 0),
-    "command": (set(), 0),
-    "setsid": (set(), 0),
-    "chrt": (set(), 1),
-    "xargs": ({"-a", "-d", "-E", "-I", "-L", "-n", "-P", "-s", "-R", "-S", "--arg-file", "--delimiter",
-               "--max-args", "--max-procs", "--max-lines", "--max-chars"}, 0),
-    "busybox": (set(), 0),                    # the applet name is the next operand
-    "strace": ({"-a", "-b", "-e", "-E", "-I", "-o", "-O", "-p", "-P", "-s", "-S", "-u", "-U", "-X", "-D"}, 0),
-    "ltrace": ({"-a", "-A", "-e", "-F", "-l", "-n", "-o", "-p", "-s", "-u", "-w"}, 0),
-    "nsenter": ({"-t", "--target", "-S", "--setuid", "-G", "--setgid", "-w", "--wd", "--root"}, 0),
-    "unshare": ({"-S", "-G", "-w", "--wd", "-R", "--root", "--propagation", "--setgroups", "--map-user",
-                 "--map-group", "--map-users", "--map-groups"}, 0),
-    "taskset": ({"-c", "--cpu-list"}, 1),     # the mask operand is absent when -c is given
-    "flock": ({"-w", "--timeout", "-E", "--conflict-exit-code"}, 1),
-    "chroot": ({"--userspec", "--groups"}, 1),
-    "setpriv": ({"--reuid", "--regid", "--ruid", "--euid", "--rgid", "--egid", "--groups", "--inh-caps",
-                 "--bounding-set", "--ambient-caps", "--securebits", "--pdeathsig", "--selinux-label",
-                 "--apparmor-profile", "--landlock-access"}, 0),
-    "numactl": ({"-C", "-N", "-m", "-i", "-p", "--physcpubind", "--cpunodebind", "--cpubind", "--membind",
-                 "--interleave", "--preferred"}, 0),
-    "watch": ({"-n", "--interval"}, 0),
-    "runuser": ({"-u", "--user", "-g", "--group", "-G", "--supp-group", "-s", "--shell"}, 0),
-    "parallel": ({"-j", "--jobs", "-n", "-N", "-S", "--sshlogin", "-a", "--arg-file", "--colsep", "-C", "-d",
-                  "--delimiter", "--results", "--joblog", "-I", "-L", "-l", "--timeout", "--retries",
-                  "--sshloginfile", "--wd", "--workdir", "--tmpdir", "-E", "--eof", "--delay", "--load",
-                  "--memfree"}, 0),
+_NO_SPEC = {"deny_short": "", "deny_long": (), "deny_tokens": (), "deny_at": False, "max_operands": None}
+
+
+def _plain(**kw):
+    return {**_NO_SPEC, **kw}
+
+
+# Programs that cannot run other commands, with the options that would make them
+# read or write files in unusual ways refused.
+PLAIN_PROGRAMS = {
+    **{n: _plain() for n in ("cat ls head tail wc echo printf date uname uptime df du ps id whoami hostname "
+                             "pwd stat jq ping dig nslookup sha256sum md5sum true false test").split()},
+    **{n: _plain(deny_short="f", deny_long=("--file",)) for n in ("grep", "egrep", "fgrep")},
+    "curl": _plain(deny_short="KToODc", deny_at=True,
+                   deny_long=("--config", "--upload-file", "--output", "--remote-name", "--remote-name-all",
+                              "--output-dir", "--dump-header", "--cookie-jar", "--create-dirs", "--trace",
+                              "--trace-ascii", "--stderr", "--libcurl", "--netrc-file")),
+    "wget": _plain(deny_short="iOoaePB", deny_long=("--input-file", "--output-document", "--output-file",
+                                                    "--append-output", "--execute", "--config", "--post-file",
+                                                    "--directory-prefix", "--use-askpass", "--body-file")),
+    "openssl": _plain(deny_tokens=("-engine", "-provider", "-provider-path", "-config", "-propquery")),
+    "sort": _plain(deny_short="o", deny_long=("--output", "--compress-program")),
+    "uniq": _plain(max_operands=1),
 }
-_SKIP_POSITIONAL_UNLESS = {"taskset": {"-c", "--cpu-list"}}
-# wrappers that take a shell string with -c (the string is examined like a command line)
-_INLINE_WRAPPERS = ("su", "script")
-_ENV_LONG = ("--ignore-environment", "--null", "--unset", "--chdir", "--split-string", "--debug", "--argv0",
-             "--block-signal", "--default-signal", "--ignore-signal", "--list-signal-handling")
+
+
+def _plain_ok(name, args):
+    spec = PLAIN_PROGRAMS[name]
+    operands, opts = 0, True
+    for a in args:
+        if "\0" in a:
+            return False
+        if spec["deny_at"] and (a.startswith("@") or "=@" in a):
+            return False
+        if opts and a == "--":
+            opts = False
+        elif opts and a.startswith("--"):
+            nm = a.partition("=")[0]
+            if any(nm == d or (len(nm) > 3 and d.startswith(nm)) for d in spec["deny_long"]):
+                return False
+        elif opts and a.startswith("-") and len(a) > 1:
+            if a in spec["deny_tokens"] or (set(a[1:]) & set(spec["deny_short"]) and not a[1:].isdigit()):
+                return False
+        else:
+            operands += 1
+    return spec["max_operands"] is None or operands <= spec["max_operands"]
+
+
+def _w(s="", sv="", so="", l=(), lv=(), pos=0, pos_unless=(), digits=False, dash=False, chdir=()):
+    # chdir: options that change the directory/filesystem view the command runs in ("*": always),
+    # after which the files the client read are not the ones that run: not understood
+    return {"s": s, "sv": sv, "so": so, "l": frozenset(l), "lv": frozenset(lv), "pos": pos,
+            "pos_unless": frozenset(pos_unless), "digits": digits, "dash": dash, "chdir": frozenset(chdir)}
+
+
+# wrapper -> its recognised options. s: flags, sv: options taking a value, so: optional
+# attached value (rest of the cluster), l/lv: long flags / long options with a value.
+# An option not listed means the command is not understood.
+SCRIPT_WRAPPERS = {
+    "sudo": _w("AbEHnPSB", "ughpCDrtTUR", l=("--askpass", "--background", "--preserve-env", "--set-home",
+                                             "--non-interactive", "--stdin", "--bell"),
+               lv=("--user", "--group", "--host", "--prompt", "--close-from", "--chdir", "--role", "--type",
+                   "--command-timeout", "--other-user", "--chroot"), chdir=("-D", "--chdir", "-R", "--chroot")),
+    "doas": _w("n", "uC"),
+    "nohup": _w(),
+    "time": _w("apqvV", "fo", l=("--append", "--portability", "--quiet", "--verbose"), lv=("--format", "--output")),
+    "timeout": _w("v", "sk", l=("--foreground", "--preserve-status", "--verbose"),
+                  lv=("--signal", "--kill-after"), pos=1),
+    "nice": _w("", "n", lv=("--adjustment",), digits=True),
+    "ionice": _w("t", "cnpPu", l=("--ignore",), lv=("--class", "--classdata", "--pid", "--pgid", "--uid")),
+    "stdbuf": _w("", "ioe", lv=("--input", "--output", "--error")),
+    "exec": _w("cl", "a"),
+    "command": _w("p"),
+    "setsid": _w("cfw", l=("--ctty", "--fork", "--wait")),
+    "chrt": _w("bfimoRrvd", l=("--batch", "--fifo", "--idle", "--other", "--rr", "--reset-on-fork",
+                               "--verbose", "--deadline"), pos=1),
+    "xargs": _w("0oprtx", "adEILnPsS", so="ile", l=("--null", "--interactive", "--no-run-if-empty", "--verbose",
+                                                    "--exit", "--open-tty", "--show-limits", "--max-lines",
+                                                    "--replace", "--eof"),
+                lv=("--arg-file", "--delimiter", "--max-args", "--max-procs", "--max-chars")),
+    "busybox": _w(),
+    "strace": _w("cCdfFhiqrtTvVxyYzDw", "abeEIoOpPsSuUX", l=("--follow-forks", "--summary", "--summary-only")),
+    "ltrace": _w("cCfiSrtTV", "aAeFlnopswu"),
+    "nsenter": _w("FZ", "tSG", so="muinpCUTrw", l=("--no-fork", "--preserve-credentials", "--follow-context",
+                                                   "--mount", "--uts", "--ipc", "--net", "--pid", "--cgroup",
+                                                   "--user", "--time", "--root", "--wd"),
+                  lv=("--target", "--setuid", "--setgid"), chdir=("*",)),
+    "unshare": _w("frc", "SGRw", so="muinpCUT", l=("--fork", "--kill-child", "--mount-proc", "--map-root-user",
+                                                      "--map-current-user", "--map-auto", "--mount", "--uts",
+                                                      "--ipc", "--net", "--pid", "--user", "--cgroup", "--time",
+                                                      "--keep-caps"),
+                  lv=("--propagation", "--setgroups", "--map-user", "--map-group", "--map-users", "--map-groups",
+                      "--root", "--wd"), chdir=("-m", "--mount", "-R", "--root", "-w", "--wd", "--mount-proc")),
+    "taskset": _w("a", "c", l=("--all-tasks",), lv=("--cpu-list",), pos=1, pos_unless=("-c", "--cpu-list")),
+    "chroot": _w("", "", l=("--skip-chdir",), lv=("--userspec", "--groups"), pos=1, chdir=("*",)),
+    "setpriv": _w("", "", l=("--clear-groups", "--init-groups", "--keep-groups", "--no-new-privs", "--reset-env"),
+                  lv=("--reuid", "--regid", "--ruid", "--euid", "--rgid", "--egid", "--groups", "--inh-caps",
+                      "--bounding-set", "--ambient-caps", "--securebits", "--pdeathsig", "--selinux-label",
+                      "--apparmor-profile", "--landlock-access")),
+    "numactl": _w("ltHs", "CNmip", l=("--localalloc", "--touch", "--hardware", "--show", "--all"),
+                  lv=("--physcpubind", "--cpunodebind", "--cpubind", "--membind", "--interleave", "--preferred",
+                      "--preferred-many", "--weighted-interleave")),
+}
+# wrappers that take their own parsing (a command string with -c, or watch/parallel)
+_SU_OPTS = _w("lmpfP", "cgGsuw", dash=True, l=("--login", "--preserve-environment", "--fast", "--pty"),
+              lv=("--command", "--group", "--supp-group", "--shell", "--session-command", "--user",
+                  "--whitelist-environment"))
+_SCRIPT_OPTS = _w("aefq", "cEBIOTmo", l=("--append", "--return", "--flush", "--quiet", "--force"),
+                  lv=("--command", "--echo", "--log-in", "--log-out", "--log-io", "--log-timing",
+                      "--logging-format", "--output-limit"))
+_FLOCK_OPTS = _w("sxenuoFv", "wEc", l=("--shared", "--exclusive", "--nonblock", "--nb", "--unlock", "--no-fork",
+                                      "--close", "--verbose"), lv=("--timeout", "--wait", "--conflict-exit-code",
+                                                                    "--command"))
+_WATCH_OPTS = _w("bectgqrxp", "n", so="d", l=("--beep", "--errexit", "--color", "--no-color", "--no-title",
+                                              "--chgexit", "--exec", "--precise", "--no-wrap", "--differences"),
+                 lv=("--interval",))
+_PARALLEL_OPTS = _w("kvqXm0", "jnNSaCdILlE", l=("--keep-order", "--verbose", "--quote", "--null", "--tag", "--bar",
+                                                "--will-cite", "--no-notice"),
+                    lv=("--jobs", "--sshlogin", "--arg-file", "--colsep", "--delimiter", "--results", "--joblog",
+                        "--timeout", "--retries", "--sshloginfile", "--wd", "--workdir", "--tmpdir", "--eof",
+                        "--delay", "--load", "--memfree"))
+_ENV_OPTS = _w("i0v", "uCaS", l=("--ignore-environment", "--null", "--debug"),
+               lv=("--unset", "--chdir", "--argv0", "--split-string"), dash=True, chdir=("-C", "--chdir"))
+_DANGEROUS_ENV = frozenset(("BASH_ENV ENV LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT PATH IFS SHELLOPTS BASHOPTS PS4 "
+                            "PROMPT_COMMAND PYTHONSTARTUP PYTHONPATH PYTHONHOME NODE_OPTIONS PERL5OPT PERL5LIB "
+                            "RUBYOPT RUBYLIB CDPATH GLOBIGNORE").split())
+_SAFE_SHELLS = frozenset("sh bash dash zsh ksh ash".split())
+_SHELL_RESERVED = frozenset("if then else elif fi for while until do done case esac function select time { } ! [[ "
+                      "coproc in".split())
 # interpreter name pattern -> (kind, flags that take the next arg, inline-code flags, stdin flags)
 _SHELLS = r"(?:ba|z|da|k|a|c|tc)?sh|fish"
 SCRIPT_INTERPRETERS = (
@@ -882,134 +964,6 @@ _AWK_LIKE = re.compile(r"^(?:awk|gawk|mawk|sed)$")
 _RUNNERS = re.compile(r"^(?:deno|bun)$")
 
 
-def _env_long(name):
-    """Canonical GNU env long option for `name` (unique abbreviations allowed), else None."""
-    if name in _ENV_LONG:
-        return name
-    hits = [o for o in _ENV_LONG if len(name) > 2 and o.startswith(name)]
-    return hits[0] if len(hits) == 1 else None
-
-
-def _skip_options(name, args):
-    valued, positional = SCRIPT_WRAPPERS[name]
-    i, seen = 0, set()
-    while i < len(args):
-        a = args[i]
-        if a == "--":
-            i += 1
-            break
-        if a.startswith("-") and len(a) > 1:
-            seen.add(a)
-            i += 2 if a in valued else 1
-        else:
-            break
-    if not (seen & _SKIP_POSITIONAL_UNLESS.get(name, set())):
-        i += positional
-    return args[i:]
-
-
-def _env_unwrap(args, splits):
-    """env's options and VAR=value words skipped -> (command argv, splits used), or
-    (None, splits) when an -S/--split-string value cannot be split (fail closed)."""
-    i = 0
-    while i < len(args):
-        a = args[i]
-        if a == "--":
-            i += 1
-            break
-        piece = None
-        if a.startswith("--"):
-            nm, eq, val = a.partition("=")
-            canon = _env_long(nm)
-            if canon == "--split-string":
-                if eq:
-                    piece, i = val, i + 1
-                elif i + 1 < len(args):
-                    piece, i = args[i + 1], i + 2
-                else:
-                    return None, splits
-            elif canon in ("--unset", "--chdir", "--argv0"):
-                i += 1 if eq else 2
-            else:
-                i += 1
-        elif a.startswith("-") and len(a) > 1:
-            j, i = 1, i + 1
-            while j < len(a):
-                c = a[j]
-                if c in "uCaS":
-                    rest = a[j + 1:]
-                    if not rest:
-                        if i >= len(args):
-                            return (None, splits) if c == "S" else (args[i:], splits)
-                        rest, i = args[i], i + 1
-                    if c == "S":
-                        piece = rest
-                    break
-                j += 1
-        elif "=" in a:
-            i += 1
-        else:
-            break
-        if piece is not None:
-            splits += 1
-            try:
-                pieces = shlex.split(piece)
-            except ValueError:
-                return None, splits
-            # the pieces take the place of the option; parsing carries on over them
-            args = pieces + args[i:]
-            i = 0
-    return args[i:], splits
-
-
-def _shell_segments(s):
-    """The commands (argv lists) in a shell string, split at ; && || | & and parentheses;
-    redirection targets dropped. None when it cannot be tokenised."""
-    try:
-        lex = shlex.shlex(s, posix=True, punctuation_chars=True)
-        lex.whitespace_split = True
-        toks = list(lex)
-    except ValueError:
-        return None
-    segs, skip = [[]], False
-    for t in toks:
-        if skip:
-            skip = False
-        elif t and all(c in "();<>|&" for c in t):
-            if "<" in t or ">" in t:
-                skip = True
-            else:
-                segs.append([])
-        else:
-            segs[-1].append(t)
-    return [x for x in segs if x]
-
-
-def _inline_string(args):
-    """(found, value) for a -c / --command shell string among a wrapper's arguments."""
-    for i, a in enumerate(args):
-        if a in ("-c", "--command"):
-            return True, (args[i + 1] if i + 1 < len(args) else None)
-        if a.startswith("--command="):
-            return True, a.split("=", 1)[1]
-        if re.match(r"^-c.", a) and not a.startswith("--"):
-            return True, a[2:]
-    return False, None
-
-
-def _bad_path(p):
-    return "\0" in p or "\n" in p or ".." in p.split("/")
-
-
-def _in_system_bin(p):
-    return not _bad_path(p) and os.path.isabs(p) and os.path.normpath(p).startswith(_SYSTEM_BIN)
-
-
-def _file_like(a):
-    return (not a.startswith("-") and not re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", a)
-            and (a.endswith(_SCRIPT_EXT) or "/" in a))
-
-
 def _script_args(name, args):
     """-> ("file", [candidate paths]) | ("inline", None) | ("stdin", None) | ("none", None)
     for the arguments of a recognised interpreter."""
@@ -1017,6 +971,7 @@ def _script_args(name, args):
     is_awk = bool(_AWK_LIKE.match(name))
     if spec is None and not is_awk and not _RUNNERS.match(name):
         return None
+    lo = _loader_opts(name)
     if _RUNNERS.match(name):
         # deno run [opts] file | deno eval ... | bun [run] file
         sub = args[0] if args else ""
@@ -1041,8 +996,10 @@ def _script_args(name, args):
                 continue
             if a.startswith("--file="):
                 files.append(a.split("=", 1)[1])
-            elif a in ("-e", "--expression", "--source"):
-                inline, i = True, i + 1
+            elif a in ("-e", "--expression", "--source") or a.startswith(("--expression=", "--source=")):
+                inline = True
+                if a in ("-e", "--expression", "--source"):
+                    i += 1
             elif a.startswith("-") and a != "-":
                 pass
             elif not files and not inline:
@@ -1050,6 +1007,8 @@ def _script_args(name, args):
             else:
                 break
             i += 1
+        if files and inline:
+            return ("unknown", None)
         return ("file", files) if files else ("inline" if inline else "none", None)
     _, valued, inline_flags, stdin_flags = spec
     short_inline = {f[1] for f in inline_flags if len(f) == 2}
@@ -1058,6 +1017,8 @@ def _script_args(name, args):
     i = 0
     while i < len(args):
         a = args[i]
+        if lo and (a in lo or a.split("=")[0] in lo or (len(a) > 2 and not a.startswith("--") and a[:2] in lo)):
+            return ("unknown", None)                # loads code that is not a reported script
         if a == "--":
             return ("file", [args[i + 1]]) if i + 1 < len(args) else ("none", None)
         if a == "-":
@@ -1065,7 +1026,7 @@ def _script_args(name, args):
         if a in ffl and i + 1 < len(args):
             return ("file", [args[i + 1]])
         if a in inline_flags or a.lower() in inline_flags:
-            return ("inline", None)
+            return ("inline", args[i + 1] if i + 1 < len(args) else None)
         if a in stdin_flags:
             return ("stdin", None)
         if a in valued:
@@ -1076,7 +1037,7 @@ def _script_args(name, args):
         if re.match(r"^-[A-Za-z]+$", a) and len(a) > 2 and name != "perl":
             letters = a[1:]
             if short_inline & set(letters):
-                return ("inline", None)
+                return ("inline", args[i + 1] if i + 1 < len(args) else None)
             if short_stdin & set(letters):
                 return ("stdin", None)
         elif a.startswith("-") or a.startswith("+"):
@@ -1090,107 +1051,345 @@ def _script_args(name, args):
     return ("none", None)
 
 
-def _runs(argv, depth=0, trace=None):
-    """[(path, strict)] for the script files `argv` appears to execute. `strict` marks
-    argv[0] itself being the script (so a client may skip a compiled program); "-"
-    stands for code read from stdin or for anything that could not be examined (fail
-    closed). See argv_runs_script."""
+def _loader_opts(name):
+    """Interpreter options that load code which is not a reported script."""
+    if name in ("node", "nodejs"):
+        return {"-r", "--require", "--import", "--loader", "--experimental-loader"}
+    if name == "ruby":
+        return {"-r", "-I"}
+    if name == "perl":
+        return {"-M", "-m", "-I"}
+    if name == "php":
+        return {"-d", "-c", "-z"}
+    if name in ("lua", "luajit"):
+        return {"-l"}
+    if re.match(r"^(?:%s)$" % _SHELLS, name):
+        return {"--rcfile", "--init-file"}
+    return set()
+
+
+def _canon_long(nm, spec):
+    names = spec["l"] | spec["lv"]
+    if nm in names:
+        return nm
+    hits = [n for n in names if len(nm) > 2 and n.startswith(nm)]
+    return hits[0] if len(hits) == 1 else None
+
+
+def _parse_one(args, i, spec, seen, vals):
+    """Parse the option at args[i] -> index after it, or None when not recognised."""
+    a = args[i]
+    if a.startswith("--"):
+        nm, eq, val = a.partition("=")
+        canon = _canon_long(nm, spec)
+        if canon is None:
+            return None
+        seen.add(canon)
+        if canon in spec["lv"]:
+            if eq:
+                vals.append((canon, val))
+                return i + 1
+            if i + 1 >= len(args):
+                return None
+            vals.append((canon, args[i + 1]))
+            return i + 2
+        return i + 1
+    if spec["digits"] and re.fullmatch(r"-\d+", a):
+        return i + 1
+    j, nxt = 1, i + 1
+    while j < len(a):
+        c = a[j]
+        seen.add("-" + c)
+        if c in spec["sv"]:
+            rest = a[j + 1:]
+            if rest:
+                vals.append(("-" + c, rest))
+                return nxt
+            if nxt >= len(args):
+                return None
+            vals.append(("-" + c, args[nxt]))
+            return nxt + 1
+        if c in spec["so"]:
+            vals.append(("-" + c, a[j + 1:]))
+            return nxt
+        if c not in spec["s"]:
+            return None
+        j += 1
+    return nxt
+
+
+def _parse_opts(args, spec):
+    """-> (operands, seen options, [(option, value)]) or None when an option is not
+    recognised (or the wrapper changes the directory/filesystem the command runs in)."""
+    i, seen, vals = 0, set(), []
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            i += 1
+            break
+        if a == "-" and spec["dash"]:
+            seen.add("-")
+            i += 1
+        elif a.startswith("-") and len(a) > 1:
+            i = _parse_one(args, i, spec, seen, vals)
+            if i is None:
+                return None
+        else:
+            break
+    if spec["chdir"] and ("*" in spec["chdir"] or seen & spec["chdir"]):
+        return None
+    return args[i:], seen, vals
+
+
+def _env_unwrap(args, splits):
+    """env's options and VAR=value words skipped -> (command argv, splits used), or
+    (None, splits) when something is not recognised. An -S/--split-string value is
+    split with shlex and parsing carries on over the pieces; a value with a
+    backslash, $, # or newline (GNU env's own escapes and comments) is refused."""
+    i, done, seen, vals = 0, False, set(), []
+    while i < len(args):
+        a = args[i]
+        if not done and a == "--":
+            done, i = True, i + 1
+        elif not done and a == "-":
+            i += 1
+        elif not done and a.startswith("-") and len(a) > 1:
+            n0 = len(vals)
+            i = _parse_one(args, i, _ENV_OPTS, seen, vals)
+            if i is None or seen & _ENV_OPTS["chdir"]:
+                return None, splits
+            for k, v in vals[n0:]:
+                if k in ("-S", "--split-string"):
+                    splits += 1
+                    if re.search(r"[\\$#\n\r\0]", v):
+                        return None, splits
+                    try:
+                        pieces = shlex.split(v)
+                    except ValueError:
+                        return None, splits
+                    args, i = pieces + args[i:], 0
+        else:
+            m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)=", a)
+            if not m:
+                break
+            if m.group(1) in _DANGEROUS_ENV or m.group(1).startswith("BASH_FUNC_"):
+                return None, splits
+            i += 1
+    return args[i:], splits
+
+
+def _shell_string(s, depth):
+    """A restricted shell command line -> ([(path, strict)], understood). Anything
+    beyond plain words, quotes, && || ; | and a lone 2>&1 is not understood; every
+    command in it must itself be understood."""
+    if depth > MAX_SPLIT_DEPTH or not isinstance(s, str):
+        return [], False
+    if re.search(r"[\n\r#`$\\\0]", s) or "<<" in s or "<(" in s or ">(" in s:
+        return [], False
+    segs, word, i, n = [[]], None, 0, len(s)
+    while i < n:
+        c = s[i]
+        if c in " \t":
+            if word is not None:
+                segs[-1].append("".join(word))
+                word = None
+            i += 1
+        elif c in "'\"":
+            j = s.find(c, i + 1)
+            if j < 0:
+                return [], False
+            word = (word or []) + list(s[i + 1:j])
+            i = j + 1
+        elif c in "&|;":
+            two = s[i:i + 2]
+            if two in (";;", "|&") or (c == "&" and two != "&&"):
+                return [], False
+            if word is not None:
+                segs[-1].append("".join(word))
+                word = None
+            segs.append([])
+            i += len(two) if two in ("&&", "||") else 1
+        elif c in "<>":
+            if c == ">" and word == ["2"] and s.startswith(">&1", i) and (i + 3 == n or s[i + 3] in " \t&|;"):
+                word = None
+                i += 3
+            else:
+                return [], False
+        elif c in "(){}":
+            return [], False
+        else:
+            word = (word or []) + [c]
+            i += 1
+    if word is not None:
+        segs[-1].append("".join(word))
+    out, ok = [], True
+    for seg in segs:
+        if not seg or seg[0] in _SHELL_RESERVED or re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", seg[0]):
+            return out, False
+        found, good = _analyze(seg, depth + 1)
+        out += [x for x in found if x not in out]
+        ok = ok and good
+    return out, ok
+
+
+def _bad_path(p):
+    return "\0" in p or "\n" in p or ".." in p.split("/") or any(c in p for c in "*?[")
+
+
+def _in_system_bin(p):
+    return not _bad_path(p) and os.path.isabs(p) and os.path.normpath(p).startswith(_SYSTEM_BIN)
+
+
+def _analyze(argv, depth=0, trace=None):
+    """-> ([(path, strict)], understood). `strict` marks argv[0] itself being the
+    script (a client may skip a compiled program); "-" is code read from stdin.
+    understood is True only when every command in argv is positively recognised: a
+    plain program, an interpreter with a script file or a restricted shell string,
+    or a known wrapper whose command is understood. See argv_runs_script."""
     out = []
 
     def add(p, strict=False):
         if (p, strict) not in out:
             out.append((p, strict))
 
-    def closed():
-        add("-")
-        return out
+    def merge(items):
+        for it in items:
+            add(*it)
     cmd, hops, splits = list(argv), 0, 0
-    while cmd:
+    while True:
+        if not cmd:
+            return out, bool(argv)
         hops += 1
         if hops > MAX_HOPS or depth + splits > MAX_SPLIT_DEPTH:
-            return closed()
+            return out, False
         a0, args = cmd[0], cmd[1:]
         if _bad_path(a0):
-            add(a0, True)                       # `..`, NUL or newline in the program path
+            return out, False
         name = os.path.basename(a0)
-        if name == "env":
+        simple = "/" not in a0 or _in_system_bin(a0)        # bare name or a standard system path
+        if simple and name == "env":
             nxt, splits = _env_unwrap(args, splits)
             if nxt is None or depth + splits > MAX_SPLIT_DEPTH:
-                return closed()
+                return out, False
             cmd = nxt
             continue
-        if name in _INLINE_WRAPPERS or (name == "runuser" and not any(
-                a in ("-u", "--user") or a.startswith("--user=") for a in args)) or (
-                name == "flock" and _inline_string(args)[0]):
-            found, value = _inline_string(args)
-            if not found or value is None:
-                return out                      # su/script with no command: an interactive shell
-            segs = _shell_segments(value)
-            if segs is None:
-                return closed()
-            for seg in segs:
-                for item in _runs(seg, depth + 1):
-                    add(*item)
-            return out
-        if name == "watch" or name == "parallel":
-            rest = _skip_options(name, args)
-            if name == "parallel":
+        if simple and name in ("su", "runuser", "script", "flock", "watch", "parallel"):
+            spec = {"su": _SU_OPTS, "runuser": _SU_OPTS, "script": _SCRIPT_OPTS, "flock": _FLOCK_OPTS,
+                    "watch": _WATCH_OPTS, "parallel": _PARALLEL_OPTS}[name]
+            parsed = _parse_opts(args, spec)
+            if parsed is None:
+                return out, False
+            rest, seen, vals = parsed
+            if name in ("su", "runuser", "flock") and rest:
+                if name != "flock" and not ("-u" in seen or "--user" in seen):
+                    # su [options] user [options]: options may follow the user name
+                    p2 = _parse_opts(rest[1:], spec)
+                    if p2 is None:
+                        return out, False
+                    rest, seen2, vals2 = p2
+                    seen, vals = seen | seen2, vals + vals2
+            for k, v in vals:
+                if k in ("-s", "--shell") and not (os.path.basename(v) in _SAFE_SHELLS and (
+                        "/" not in v or _in_system_bin(v))):
+                    return out, False
+            strings = [v for k, v in vals if k in ("-c", "--command", "--session-command")]
+            if name == "runuser" and ("-u" in seen or "--user" in seen):
+                if strings:
+                    return out, False
+                cmd = rest
+                continue
+            if name == "flock" and not strings:
+                cmd = rest[1:]                              # the lock file/fd, then the command
+                if not rest:
+                    return out, False
+                continue
+            if name in ("su", "runuser", "script", "flock"):
+                if not strings:
+                    return out, False                       # an interactive shell: nothing to see
+                for st in strings:
+                    found, good = _shell_string(st, depth + 1)
+                    merge(found)
+                    if not good:
+                        return out, False
+                return out, True
+            if name == "watch":
+                if "-x" in seen or "--exec" in seen:
+                    cmd = rest
+                    continue
+            else:                                           # parallel: cut at ::: / ::::
                 for k, a in enumerate(rest):
                     if a in (":::", "::::", ":::+", "::::+"):
                         rest = rest[:k]
                         break
-            if len(rest) == 1 and re.search(r"\s", rest[0]):
-                segs = _shell_segments(rest[0])
-                if segs is None:
-                    return closed()
-                for seg in segs:
-                    for item in _runs(seg, depth + 1):
-                        add(*item)
-                return out
+            if not rest:
+                return out, False
+            found, good = _shell_string(" ".join(rest), depth + 1)
+            merge(found)
+            return out, good
+        if simple and name in SCRIPT_WRAPPERS:
+            if name == "command" and args[:1] in (["-v"], ["-V"]):
+                return out, True                            # only prints where a command is
+            parsed = _parse_opts(args, SCRIPT_WRAPPERS[name])
+            if parsed is None:
+                return out, False
+            rest, seen, _ = parsed
+            spec = SCRIPT_WRAPPERS[name]
+            if name == "taskset" and "-p" in seen:
+                return out, False
+            if not (seen & spec["pos_unless"]):
+                if len(rest) < spec["pos"]:
+                    return out, False
+                rest = rest[spec["pos"]:]
+            if name == "chroot" and not rest:
+                return out, False
+            if name == "busybox" and not rest:
+                return out, False
             cmd = rest
             continue
-        if name in SCRIPT_WRAPPERS:
-            cmd = _skip_options(name, args)
-            continue
         break
-    else:
-        return out
     if trace is not None:
         trace["cmd"] = cmd
-    found = _script_args(name, args)
+    found = _script_args(name, args) if ("/" not in a0 or os.path.isabs(a0)) else None
     if found is not None:
-        kind, paths = found
+        kind, payload = found
         if kind == "stdin" or (kind == "none" and not name.startswith(("sed", "awk", "gawk", "mawk"))):
             add("-")
-        elif kind == "file":
-            for p in paths:
+            return out, True
+        if kind == "file":
+            for p in payload:
                 add(p)
-        return out
-    if a0.endswith(_SCRIPT_EXT):
-        add(a0, True)
-    elif "/" in a0:
-        if not _in_system_bin(a0):
-            add(a0, True)
-    elif a0 not in NOT_SCRIPT_PROGRAMS:
-        for a in args:
-            if _file_like(a):
-                add(a)
-    return out
+            return out, True
+        if kind == "inline" and re.match(r"^(?:ba|z|da|k|a)?sh$", name):
+            found2, good = _shell_string(payload, depth + 1)
+            merge(found2)
+            return out, good
+        return out, False                                   # other inline code, unknown options, bare sed/awk
+    if a0.endswith(_SCRIPT_EXT) or ("/" in a0 and not _in_system_bin(a0)):
+        add(a0, True)                                       # the command is itself a script file
+        return out, True
+    if simple and name in PLAIN_PROGRAMS:
+        return out, _plain_ok(name, args)
+    return out, False
 
 
 def argv_runs_script(argv):
-    """Operand paths of the script files `argv` appears to execute ([] when it runs
-    none). Looked through: wrapper commands (env, sudo, xargs, busybox, strace,
-    flock, ...), env -S/--split-string and -c shell strings (su, script, flock,
-    runuser), then an interpreter's script operand, argv[0] itself when it has a
-    script extension or a slash outside /bin, /usr/bin, /sbin, /usr/sbin (compared
-    after normpath; a `..`, NUL or newline in it is always flagged), or, for a bare
-    program name outside NOT_SCRIPT_PROGRAMS, its file-like operands. "-" stands for
-    code read from stdin or anything that could not be examined (fail closed).
-    Inline code (-c, -e, -m, eval) is not a script file."""
+    """The script files `argv` appears to execute, in order ([] when none): an
+    interpreter's script operand, a script run directly (a script extension or a
+    path outside /bin, /usr/bin, /sbin, /usr/sbin, compared after normpath), looked
+    through wrappers and the commands of restricted shell strings. "-" is code read
+    from standard input. Whether the whole command is understood is separate:
+    see argv_understood."""
     if not isinstance(argv, list) or not all(isinstance(a, str) for a in argv):
         return []
-    return [p for p, _ in _runs(argv)]
+    return [p for p, _ in _analyze(argv)[0]]
+
+
+def argv_understood(argv):
+    """True only when every command in `argv` is positively recognised (see
+    _analyze). Anything else is not visible: the broker prompts for it."""
+    if not isinstance(argv, list) or not all(isinstance(a, str) for a in argv):
+        return False
+    return _analyze(argv)[1]
 # --- shared-detection:end ---
 
 
@@ -1274,7 +1473,7 @@ def find_scripts(argv):
     applies the same ones to the argv it receives)."""
     argv = list(argv)
     trace = {}
-    items = _runs(argv, 0, trace)
+    items, _understood = _analyze(argv, 0, trace)       # the broker decides whether it is understood
     entries, seen = [], set()
 
     def add(e):

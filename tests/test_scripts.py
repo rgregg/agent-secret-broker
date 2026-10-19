@@ -785,116 +785,238 @@ if __name__ == "__main__":
 
 
 # -- argv detection: broker and client share one table; hardening cases -------------
-SH = ["bash", "x.sh"]
 NEST5 = ["env", "-S", "env -S 'env -S \"env -S \\\"env -S \\\\\\\"bash x.sh\\\\\\\"\\\"\"'"]
-# (argv, operand paths both sides must report)
+X = ["x.sh"]
+# (argv, script paths both sides must report, understood?)
 DETECT_TABLE = (
-    # plain / existing behaviour
-    (["bash", "deploy.sh"], ["deploy.sh"]),
-    (["sudo", "-u", "x", "bash", "y.sh"], ["y.sh"]),
-    (["timeout", "5", "python3.12", "-u", "a/b.py"], ["a/b.py"]),
-    (["bash", "-c", "echo hi"], []),
-    (["python3", "-m", "http.server"], []),
-    (["bash"], ["-"]),
-    (["sed", "-f", "p.sed", "in"], ["p.sed"]),
-    (["sed", "s/a/b/"], []),
-    # env -S in every form
-    (["env", "-S", "bash x.sh"], ["x.sh"]),
-    (["env", "-Sbash x.sh"], ["x.sh"]),
-    (["env", "--split-string=bash x.sh"], ["x.sh"]),
-    (["env", "--split-string", "bash x.sh"], ["x.sh"]),
-    (["env", "--split", "bash x.sh"], ["x.sh"]),
-    (["env", "-S", "sh -c 'echo hi'"], []),
-    (["env", "-S'sh -c \"echo hi\"'"], []),
-    (["env", "-S", "A=1 B=2 bash x.sh", "extra"], ["x.sh"]),
-    (["env", "-iS", "bash x.sh"], ["x.sh"]),
-    (["env", "-S", "env -S 'bash x.sh'"], ["x.sh"]),
-    (["env", "-S", "bash 'unbalanced"], ["-"]),
-    (["env", "-S"], ["-"]),
-    (NEST5, ["-"]),
-    (["env", "-i", "-0", "-v", "--ignore-environment", "bash", "x.sh"], ["x.sh"]),
-    (["env", "-u", "FOO", "-C", "/tmp", "--unset=BAR", "--chdir", "/", "bash", "x.sh"], ["x.sh"]),
-    (["env", "-uFOO", "A=1", "bash", "x.sh"], ["x.sh"]),
+    # honest simple commands that qualify
+    (["cat", "/etc/hostname"], [], True),
+    (["curl", "-s", "https://example.com/health"], [], True),
+    (["bash", "deploy.sh"], ["deploy.sh"], True),
+    (["sudo", "-u", "app", "python3", "sync.py"], ["sync.py"], True),
+    (["timeout", "30", "bash", "x.sh"], X, True),
+    (["sh", "-c", "echo hi && date"], [], True),
+    (["bash", "-c", "echo hi"], [], True),
+    (["/usr/bin/curl", "u"], [], True),
+    (["/usr/bin/./cat", "f"], [], True),
+    (["./run.sh"], ["./run.sh"], True),
+    (["/opt/tools/run"], ["/opt/tools/run"], True),
+    (["deploy.sh"], ["deploy.sh"], True),
+    (["sed", "-f", "p.sed", "in"], ["p.sed"], True),
+    (["bash"], ["-"], True),
+    (["bash", "-s"], ["-"], True),
+    # (a) the allowlist: only programs that cannot run other commands
+    (["ls", "-l", "/tmp/x.py"], [], True),
+    (["grep", "-rn", "foo", "src/"], [], True),
+    (["grep", "-f", "pats", "x"], [], False),
+    (["grep", "--file=pats", "x"], [], False),
+    (["curl", "-K", "cfg", "https://e.com"], [], False),
+    (["curl", "--config", "cfg", "https://e.com"], [], False),
+    (["curl", "-T", "f", "https://e.com"], [], False),
+    (["curl", "-sSo", "out", "https://e.com"], [], False),
+    (["curl", "-O", "https://e.com/x"], [], False),
+    (["curl", "--output=x", "https://e.com"], [], False),
+    (["curl", "-d", "@body.json", "https://e.com"], [], False),
+    (["curl", "-H", "X-A: b", "-s", "https://e.com"], [], True),
+    (["wget", "-qO-", "https://e.com"], [], False),
+    (["wget", "-q", "https://e.com"], [], True),
+    (["sort", "-o", "out", "in"], [], False),
+    (["sort", "--compress-program=sh", "in"], [], False),
+    (["sort", "-n", "in"], [], True),
+    (["uniq", "in", "out"], [], False),
+    (["openssl", "x509", "-engine", "e"], [], False),
+    (["openssl", "x509", "-in", "c.pem"], [], True),
+    (["/tmp/cat", "x"], ["/tmp/cat"], True),
+    (["/usr/bin/git", "status"], [], False),
+    # programs that can run commands are never on the allowlist
+    (["git", "status"], [], False),
+    (["git", "-c", "alias.x=!sh x.sh", "x"], [], False),
+    (["find", ".", "-exec", "sh", "x.sh", "{}", ";"], [], False),
+    (["make", "deploy"], [], False),
+    (["npm", "run", "x"], [], False),
+    (["tar", "--to-command=sh", "-xf", "a.tar"], [], False),
+    (["sqlite3", "db", ".shell cmd"], [], False),
+    (["docker", "compose", "up"], [], False),
+    (["ssh", "host", "ls"], [], False),
+    (["mytool", "run.sh"], [], False),
+    (["mytool"], [], False),
+    # (b) interpreters
+    (["python3", "-c", "print(1)"], [], False),
+    (["python3", "-m", "http.server"], [], False),
+    (["node", "-e", "1"], [], False),
+    (["node", "-r", "./evil.js", "x.js"], [], False),
+    (["perl", "-MEvil", "x.pl"], [], False),
+    (["bash", "--rcfile", "r", "-c", "echo"], [], False),
+    (["sed", "s/a/b/"], [], False),
+    (["sed", "-f", "p.sed", "-e", "e id"], [], False),
+    (["awk", "{print}"], [], False),
+    (["python3", "-u", "a/b.py"], ["a/b.py"], True),
+    (["python3.12", "x.py"], ["x.py"], True),
+    (["fish", "-c", "echo hi"], [], False),
+    # shell strings: restricted shell, every segment understood
+    (["sh", "-c", "echo hi; date | wc -l"], [], True),
+    (["sh", "-c", "echo hi 2>&1"], [], True),
+    (["sh", "-c", "echo 'a b' && bash x.sh"], X, True),
+    (["sh", "-c", "echo hi\nbash x.sh"], [], False),
+    (["sh", "-c", "echo hi # c"], [], False),
+    (["sh", "-c", "echo `id`"], [], False),
+    (["sh", "-c", "echo $(id)"], [], False),
+    (["sh", "-c", "echo $HOME"], [], False),
+    (["sh", "-c", "echo ${HOME}"], [], False),
+    (["sh", "-c", "echo \\x"], [], False),
+    (["sh", "-c", "cat <<EOF"], [], False),
+    (["sh", "-c", "cat <(id)"], [], False),
+    (["sh", "-c", "echo hi > f"], [], False),
+    (["sh", "-c", "echo hi &"], [], False),
+    (["sh", "-c", "if true; then echo; fi"], [], False),
+    (["sh", "-c", "for i in 1; do echo; done"], [], False),
+    (["sh", "-c", "echo a; { echo b; }"], [], False),
+    (["sh", "-c", "echo {a,b}"], [], False),
+    (["sh", "-c", "(echo a)"], [], False),
+    (["sh", "-c", "A=1 echo a"], [], False),
+    (["sh", "-c", "! echo a"], [], False),
+    (["sh", "-c", "echo a; git status"], [], False),
+    (["sh", "-c", "echo 'unterminated"], [], False),
+    (["sh", "-c", "./*.sh"], [], False),
+    (["sh", "-c"], [], False),
+    # (c) wrappers
+    (["env", "A=1", "node", "app.js"], ["app.js"], True),
+    (["env", "BASH_ENV=x.sh", "bash", "-c", "echo"], [], False),
+    (["env", "LD_PRELOAD=x.so", "cat", "f"], [], False),
+    (["env", "-i", "-0", "-v", "--ignore-environment", "bash", "x.sh"], X, True),
+    (["env", "-u", "FOO", "--unset=BAR", "--unset", "Z", "bash", "x.sh"], X, True),
+    (["env", "-C", "/tmp", "bash", "x.sh"], [], False),
+    (["env", "--chdir=/tmp", "bash", "x.sh"], [], False),
+    (["env", "--bogus", "bash", "x.sh"], [], False),
+    (["env", "-z", "bash", "x.sh"], [], False),
+    (["env", "-S", "bash x.sh"], X, True),
+    (["env", "-Sbash x.sh"], X, True),
+    (["env", "--split-string=bash x.sh"], X, True),
+    (["env", "--split-string", "bash x.sh"], X, True),
+    (["env", "--split", "bash x.sh"], X, True),
+    (["env", "-iS", "bash x.sh"], X, True),
+    (["env", "-S", "A=1 B=2 bash x.sh", "extra"], X, True),
+    (["env", "-S", "env -S 'bash x.sh'"], X, True),
+    (["env", "-S", "sh -c 'echo hi'"], [], True),
+    (["env", "-S", "sh -c 'echo \\n hi'"], [], False),
+    (["env", "-S", "sh -c \"echo $X\""], [], False),
+    (["env", "-S", "bash \\_x.sh"], [], False),
+    (["env", "-S", "bash x.sh # c"], [], False),
+    (["env", "-S", "bash 'unbalanced"], [], False),
+    (["env", "-S"], [], False),
+    (NEST5, [], False),
+    (["env", "-S", "env -S 'env -S \"bash x.sh\"'"], X, True),
+    (["/usr/bin/env", "bash", "x.sh"], X, True),
+    (["/tmp/env", "bash", "x.sh"], ["/tmp/env"], True),
     # path prefix tricks
-    (["/usr/bin/../../tmp/x.sh"], ["/usr/bin/../../tmp/x.sh"]),
-    (["/usr/bin/./x"], []),
-    (["/usr/bin/curl", "u"], []),
-    (["/usr/bin/../bin/ls"], ["/usr/bin/../bin/ls"]),
-    (["/usr/bin/ls\n"], ["/usr/bin/ls\n"]),
-    (["/usr/bin/a\0b"], ["/usr/bin/a\0b"]),
-    (["//usr/bin/x"], ["//usr/bin/x"]),
-    (["/tmp/run"], ["/tmp/run"]),
-    (["/usr/bin/../../tmp/python3", "x.py"], ["/usr/bin/../../tmp/python3", "x.py"]),
-    # wrappers with a script operand, and with inline code
-    (["xargs", "-n", "1", "bash", "x.sh"], ["x.sh"]),
-    (["xargs", "-I", "{}", "echo", "{}"], []),
-    (["busybox", "sh", "x.sh"], ["x.sh"]),
-    (["busybox", "sed", "-f", "p.sed"], ["p.sed"]),
-    (["busybox", "sh", "-c", "echo"], []),
-    (["strace", "-o", "t.out", "-f", "bash", "x.sh"], ["x.sh"]),
-    (["strace", "-e", "trace=open", "python3", "-c", "1"], []),
-    (["ltrace", "-o", "t.out", "bash", "x.sh"], ["x.sh"]),
-    (["nsenter", "-t", "1", "-m", "bash", "x.sh"], ["x.sh"]),
-    (["nsenter", "-t", "1", "-m", "sh", "-c", "id"], []),
-    (["unshare", "-m", "--propagation", "private", "bash", "x.sh"], ["x.sh"]),
-    (["unshare", "-m", "sh", "-c", "id"], []),
-    (["taskset", "0x1", "bash", "x.sh"], ["x.sh"]),
-    (["taskset", "-c", "0-3", "bash", "x.sh"], ["x.sh"]),
-    (["taskset", "0x1", "bash", "-c", "id"], []),
-    (["flock", "/tmp/l", "bash", "x.sh"], ["x.sh"]),
-    (["flock", "-w", "5", "/tmp/l", "sh", "-c", "id"], []),
-    (["flock", "-c", "bash x.sh", "/tmp/l"], ["x.sh"]),
-    (["flock", "-c", "echo hi", "/tmp/l"], []),
-    (["su", "-c", "bash x.sh", "root"], ["x.sh"]),
-    (["su", "root", "-c", "bash x.sh"], ["x.sh"]),
-    (["su", "-c", "echo hi", "root"], []),
-    (["su", "-c", "echo hi; bash x.sh", "root"], ["x.sh"]),
-    (["su", "-c", "echo 'oops", "root"], ["-"]),
-    (["chroot", "/jail", "bash", "x.sh"], ["x.sh"]),
-    (["chroot", "--userspec", "u:g", "/jail", "sh", "-c", "id"], []),
-    (["runuser", "-u", "u", "--", "bash", "x.sh"], ["x.sh"]),
-    (["runuser", "u", "-c", "bash x.sh"], ["x.sh"]),
-    (["runuser", "-u", "u", "--", "sh", "-c", "id"], []),
-    (["setpriv", "--reuid", "1", "bash", "x.sh"], ["x.sh"]),
-    (["setpriv", "--reuid=1", "sh", "-c", "id"], []),
-    (["numactl", "--cpunodebind", "0", "bash", "x.sh"], ["x.sh"]),
-    (["numactl", "-N", "0", "sh", "-c", "id"], []),
-    (["ionice", "-c", "3", "bash", "x.sh"], ["x.sh"]),
-    (["watch", "-n", "5", "bash", "x.sh"], ["x.sh"]),
-    (["watch", "-n", "5", "bash x.sh"], ["x.sh"]),
-    (["watch", "-n", "5", "date"], []),
-    (["script", "-c", "bash x.sh", "/dev/null"], ["x.sh"]),
-    (["script", "-qc", "echo hi", "/dev/null"], []),
-    (["parallel", "-j", "2", "bash", "x.sh", "{}", ":::", "a", "b"], ["x.sh"]),
-    (["parallel", "bash x.sh {} ::: a b"], ["x.sh"]),
-    (["parallel", "echo", ":::", "a/b.sh"], []),
-    # unknown bare names
-    (["mytool", "run.sh"], ["run.sh"]),
-    (["mytool", "--cfg", "conf/a.yml"], ["conf/a.yml"]),
-    (["mytool", "--flag", "value"], []),
-    (["mytool", "https://example.com/x.sh"], []),
-    (["mytool"], []),
-    (["deploy.sh"], ["deploy.sh"]),
-    # allowlisted programs never flagged, even with file-like operands
-    (["git", "apply", "p/x.sh"], []),
-    (["curl", "-o", "/tmp/x.sh", "https://e.com/x.sh"], []),
-    (["docker", "run", "-v", "/a:/b", "img"], []),
-    (["ls", "-l", "/tmp/x.py"], []),
-    (["cat", "/etc/hosts"], []),
-    (["make", "-f", "build/Makefile"], []),
-    (["sqlite3", "db/a.db", ".tables"], []),
+    (["/usr/bin/../../tmp/x.sh"], [], False),
+    (["/usr/bin/../bin/ls"], [], False),
+    (["/usr/bin/ls\n"], [], False),
+    (["/usr/bin/a\0b"], [], False),
+    (["//usr/bin/x"], ["//usr/bin/x"], True),
+    (["/usr/bin/../../tmp/python3", "x.py"], [], False),
+    # new wrappers: script operand, inline, unknown option
+    (["xargs", "-n", "1", "bash", "x.sh"], X, True),
+    (["xargs", "-I", "{}", "echo", "{}"], [], True),
+    (["xargs", "-0", "cat"], [], True),
+    (["xargs", "bash"], ["-"], True),
+    (["xargs", "--bogus", "cat"], [], False),
+    (["busybox", "sh", "x.sh"], X, True),
+    (["busybox", "sed", "-f", "p.sed"], ["p.sed"], True),
+    (["busybox", "sh", "-c", "echo"], [], True),
+    (["busybox", "ls"], [], True),
+    (["busybox", "nc", "u"], [], False),
+    (["strace", "-o", "t.out", "-f", "bash", "x.sh"], X, True),
+    (["strace", "--bogus", "bash", "x.sh"], [], False),
+    (["ltrace", "-o", "t.out", "bash", "x.sh"], X, True),
+    (["nsenter", "-t", "1", "bash", "x.sh"], [], False),
+    (["unshare", "-n", "bash", "x.sh"], X, True),
+    (["unshare", "-m", "bash", "x.sh"], [], False),
+    (["unshare", "--propagation", "private", "-n", "bash", "x.sh"], X, True),
+    (["taskset", "0x1", "bash", "x.sh"], X, True),
+    (["taskset", "-c", "0-3", "bash", "x.sh"], X, True),
+    (["taskset", "-p", "0x1", "99"], [], False),
+    (["flock", "/tmp/l", "bash", "x.sh"], X, True),
+    (["flock", "-w", "5", "-n", "/tmp/l", "cat", "f"], [], True),
+    (["flock", "-c", "bash x.sh", "/tmp/l"], X, True),
+    (["flock", "-c", "echo hi", "/tmp/l"], [], True),
+    (["flock", "-c", "echo hi\nid", "/tmp/l"], [], False),
+    (["flock", "--bogus", "/tmp/l", "cat"], [], False),
+    (["flock", "/tmp/l"], [], True),
+    (["su", "-c", "bash x.sh", "root"], X, True),
+    (["su", "root", "-c", "bash x.sh"], X, True),
+    (["su", "-lc", "bash x.sh", "root"], X, True),
+    (["su", "-l", "-c", "echo hi", "root"], [], True),
+    (["su", "-s", "/bin/bash", "-c", "echo hi", "root"], [], True),
+    (["su", "-sc", "/tmp/evil", "root"], [], False),
+    (["su", "-s", "/tmp/evil", "-c", "echo hi", "root"], [], False),
+    (["su", "-c", "echo hi\nbash x.sh", "root"], [], False),
+    (["su", "-c", "echo hi; bash x.sh", "root"], X, True),
+    (["su", "--bogus", "-c", "echo", "root"], [], False),
+    (["su", "-Z", "-c", "echo", "root"], [], False),
+    (["su", "root"], [], False),
+    (["su"], [], False),
+    (["su", "-c", "echo 'oops", "root"], [], False),
+    (["chroot", "/jail", "bash", "x.sh"], [], False),
+    (["runuser", "-u", "u", "--", "bash", "x.sh"], X, True),
+    (["runuser", "u", "-c", "bash x.sh"], X, True),
+    (["runuser", "-u", "u", "--", "cat", "f"], [], True),
+    (["runuser", "-u", "u", "--bogus", "cat"], [], False),
+    (["setpriv", "--reuid", "1", "bash", "x.sh"], X, True),
+    (["setpriv", "--reuid=1", "cat", "f"], [], True),
+    (["setpriv", "--bogus", "cat"], [], False),
+    (["numactl", "--cpunodebind", "0", "bash", "x.sh"], X, True),
+    (["numactl", "--bogus", "cat"], [], False),
+    (["ionice", "-c", "3", "bash", "x.sh"], X, True),
+    (["nice", "-n", "5", "bash", "x.sh"], X, True),
+    (["nice", "-5", "bash", "x.sh"], X, True),
+    (["nohup", "bash", "x.sh"], X, True),
+    (["sudo", "-E", "bash", "x.sh"], X, True),
+    (["sudo", "-s", "bash", "x.sh"], [], False),
+    (["sudo", "-D", "/tmp", "bash", "x.sh"], [], False),
+    (["sudo", "-e", "f"], [], False),
+    (["doas", "-u", "u", "bash", "x.sh"], X, True),
+    (["time", "-p", "bash", "x.sh"], X, True),
+    (["command", "-v", "foo"], [], True),
+    (["watch", "-n", "5", "bash", "x.sh"], X, True),
+    (["watch", "-n", "5", "bash x.sh"], X, True),
+    (["watch", "-n", "5", "date"], [], True),
+    (["watch", "a", "b"], [], False),
+    (["watch", "echo hi", "bash x.sh"], [], True),
+    (["watch", "echo hi", "; bash", "x.sh"], X, True),
+    (["watch", "-x", "bash", "x.sh"], X, True),
+    (["watch", "--bogus", "date"], [], False),
+    (["watch", "echo $HOME"], [], False),
+    (["script", "-c", "bash x.sh", "/dev/null"], X, True),
+    (["script", "-qc", "echo hi", "/dev/null"], [], True),
+    (["script", "-q", "/dev/null"], [], False),
+    (["script", "--bogus", "-c", "echo"], [], False),
+    (["parallel", "-j", "2", "bash", "x.sh", "{}", ":::", "a", "b"], [], False),
+    (["parallel", "bash x.sh a ::: a b"], X, True),
+    (["parallel", "echo", ":::", "a/b.sh"], [], True),
+    (["parallel", "--bogus", "echo"], [], False),
+    (["parallel", "{}", ":::", "./x.sh"], [], False),
+    (["parallel", ":::", "a"], [], False),
+    # arguments that are not strings / empty
+    (["env"], [], True),
+    ([], [], False),
 )
 
 
 class ArgvDetectionShared(unittest.TestCase):
     def test_table_broker(self):
-        for argv, want in DETECT_TABLE:
-            self.assertEqual(S.argv_runs_script(argv), want, argv)
+        for argv, paths, ok in DETECT_TABLE:
+            self.assertEqual(S.argv_understood(argv), ok, argv)
+            if ok:
+                self.assertEqual(S.argv_runs_script(argv), paths, argv)
 
     def test_table_client_agrees(self):
-        for argv, want in DETECT_TABLE:
-            self.assertEqual(A.argv_runs_script(argv), want, argv)
+        for argv, paths, ok in DETECT_TABLE:
+            self.assertEqual(A._analyze(argv), S._analyze(argv), argv)
+            self.assertEqual(A.argv_understood(argv), ok, argv)
             self.assertEqual(A.argv_runs_script(argv), S.argv_runs_script(argv), argv)
+            if ok:
+                self.assertEqual(A.argv_runs_script(argv), paths, argv)
 
     def test_shared_source_identical(self):
         def block(path):
@@ -904,25 +1026,42 @@ class ArgvDetectionShared(unittest.TestCase):
             return t[a:b]
         self.assertEqual(block(CLI), block(os.path.join(HERE, "..", "secret_broker", "scripts.py")))
 
-    def test_allowlist_programs(self):
-        for prog in ("git curl wget docker kubectl ssh scp rsync make cargo npm ls cat grep echo printf date "
-                     "uname ps df du head tail wc jq tar gzip unzip ffmpeg terraform ansible helm aws gcloud "
-                     "az gh systemctl journalctl ping dig nslookup openssl sqlite3 psql mysql redis-cli "
-                     "mongosh").split():
-            self.assertEqual(S.argv_runs_script([prog, "a/b.sh", "c.py"]), [], prog)
+    def test_not_understood_means_not_visible(self):
+        for argv, paths, ok in DETECT_TABLE:
+            full = [{"path": p, "size": 1, "sha256": "a" * 64, "text": "x", "truncated": False}
+                    for p in paths if p != "-"]
+            if not ok or "-" in paths:
+                self.assertTrue(S.script_not_visible(argv, full), argv)
+            else:
+                self.assertFalse(S.script_not_visible(argv, full), argv)
 
     def test_nesting_limit(self):
         ok = ["env", "-S", "env -S 'env -S \"bash x.sh\"'"]               # 3 levels
-        self.assertEqual(S.argv_runs_script(ok), ["x.sh"])
-        self.assertEqual(S.argv_runs_script(NEST5), ["-"])
+        self.assertTrue(S.argv_understood(ok))
+        self.assertFalse(S.argv_understood(NEST5))
 
-    def test_hostile_argv0_never_exempt(self):
-        for a0 in ("/usr/bin/../../tmp/x", "/bin/../tmp/x", "/usr/bin/x/..", "../usr/bin/x"):
-            self.assertEqual(S.argv_runs_script([a0]), [a0], a0)
+    def test_depth_limits(self):
+        self.assertEqual(S._shell_string("echo hi", 1), ([], True))
+        self.assertEqual(S._shell_string("echo hi", S.MAX_SPLIT_DEPTH + 1), ([], False))
+        self.assertTrue(S.argv_understood(["su", "-c", "sh -c 'echo hi'", "root"]))
+        self.assertFalse(S.argv_understood(["env"] * 40 + ["cat"]))   # wrapper chain limit
 
     def test_non_list_input(self):
+        self.assertFalse(S.argv_understood("bash x.sh"))
         self.assertEqual(S.argv_runs_script("bash x.sh"), [])
-        self.assertEqual(S.argv_runs_script([]), [])
+        self.assertFalse(S.argv_understood(["bash", 3]))
+
+    def test_unknown_programs_prompt_even_without_operands(self):
+        for prog in ("git", "docker", "make", "npm", "kubectl", "terraform", "ansible", "helm", "aws", "gh",
+                     "systemctl", "tar", "rsync", "find", "ffmpeg", "psql", "nc", "ssh", "scp", "cargo"):
+            self.assertFalse(S.argv_understood([prog, "status"]), prog)
+            self.assertTrue(S.script_not_visible([prog, "status"], []), prog)
+
+    def test_allowlist_programs_understood(self):
+        for prog in ("cat ls head tail wc grep egrep fgrep echo printf date uname uptime df du ps id whoami "
+                     "hostname pwd stat jq curl wget ping dig nslookup openssl sha256sum md5sum sort uniq true "
+                     "false test").split():
+            self.assertTrue(S.argv_understood([prog, "plainoperand"]), prog)
 
 
 class PathMatching(unittest.TestCase):
@@ -984,7 +1123,10 @@ class HonestClientStaysVisible(Files):
         os.symlink(os.path.join(self.d, "sub", "run.sh"), os.path.join(self.d, "link.sh"))
         for argv in (["bash", "sub/run.sh"], ["./sub/run.sh"], ["bash", "link.sh"], ["bash", "./sub/../sub/run.sh"],
                      ["env", "-S", "bash sub/run.sh"], ["xargs", "bash", os.path.join(self.d, "link.sh")],
-                     ["mytool", "sub/run.sh"]):
+                     ["sh", "-c", "echo a && bash sub/run.sh"], ["su", "-c", "bash sub/run.sh", "root"],
+                     ["watch", "bash", "sub/run.sh"], ["xargs", "bash", "sub/run.sh"],
+                     ["sudo", "-u", "app", "timeout", "30", "bash", "sub/run.sh"],
+                     ["flock", "/tmp/l", "bash", "link.sh"], ["parallel", "bash sub/run.sh ::: a"]):
             entries = A.find_scripts(argv)
             self.assertTrue(entries, argv)
             self.assertFalse(S.script_not_visible(argv, S.validate(entries), self.d), argv)

@@ -533,11 +533,21 @@ class OmittedScripts(EnvAutoBase):
         self.assertPrompts()
 
     def test_inline_and_plain_programs_auto(self):
-        for argv in (["bash", "-c", "echo hi"], ["python3", "-c", "print(1)"], ["curl", "-s", "https://x.example"],
-                     ["docker", "compose", "up"]):
+        for argv in (["bash", "-c", "echo hi"], ["sh", "-c", "echo hi && date"], ["cat", "/etc/hostname"],
+                     ["curl", "-s", "https://x.example/health"]):
             rid = self.post(argv)
             self.assertEqual(self.result(rid)["env"], {"SVC_TOKEN": SECRET}, argv)
         self.assertEqual(self.notifier.sent, [])
+
+    def test_programs_that_can_run_commands_always_prompt(self):
+        for argv in (["git", "status"], ["docker", "compose", "up"], ["make", "deploy"], ["python3", "-c", "1"],
+                     ["find", ".", "-exec", "sh", "x.sh", "{}", ";"], ["sh", "-c", "echo $(id)"],
+                     ["su", "-lc", "bash x.sh", "root"], ["watch", "a", "b"]):
+            self.notifier.sent.clear()
+            self.broker._by_id.clear()
+            self.post(argv)
+            self.assertEqual(len(self.notifier.sent), 1, argv)
+            self.assertEqual(self.events("escalated")[-1]["reason"], "script_not_visible", argv)
 
     def test_always_chip_not_offered_when_omitted(self):
         self.broker.cfg["secrets"]["svc"]["approval"] = "prompt"

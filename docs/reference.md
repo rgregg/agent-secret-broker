@@ -478,55 +478,80 @@ credentials with `"risk": {"auto_modes": ["http"]}` in the broker config.
   `unreadable` or `stdin`, or text that was cut off, `truncated`) is **never**
   auto-approved, at any `auto_approve_max`: it always prompts and is audited as
   `escalated` with `reason: script_not_visible`.
-- **The broker also checks argv itself.** It does not trust the client's `scripts`
-  list to be complete: a command whose argv runs a script file needs a matching
-  readable `scripts` entry (the same rules run in `client/asb`; a test asserts the
-  two copies are identical and agree on a table of examples). What is examined:
-  - Wrappers are looked through: `env` (options `-i -0 -v -u -C`, `VAR=value`, and
-    `-S`/`--split-string` in every form, whose value is split with shlex and
-    examined again, nested at most 4 deep), `sudo`, `doas`, `nohup`, `time`,
-    `timeout`, `nice`, `ionice`, `stdbuf`, `exec`, `command`, `setsid`, `chrt`,
-    `xargs`, `busybox` (the applet is the next operand), `strace`, `ltrace`,
-    `nsenter`, `unshare`, `taskset`, `flock`, `chroot`, `setpriv`, `numactl`,
-    `runuser`, `watch`, `parallel`. The `-c` shell string of `su`, `script`,
-    `flock -c` and `runuser` (without `-u`), and a single-string `watch` or
-    `parallel` command, is split at `;`, `&&`, `||`, `|`, `&` and examined command
-    by command (no `$(...)`/backtick expansion).
-  - Then an interpreter (bash, sh, zsh, python, node, deno, bun, ruby, perl, php,
-    pwsh, lua, Rscript, awk, `sed -f`) followed by a script operand, or an
-    interpreter reading stdin, is flagged.
-  - argv[0] itself is flagged when it has a script extension or a slash. The
-    exemption for `/bin/`, `/usr/bin/`, `/sbin/`, `/usr/sbin/` applies to the
-    `os.path.normpath` of an absolute path; an argv[0] containing a `..` component,
-    a NUL or a newline is always flagged (`/usr/bin/../../tmp/x.sh`).
-  - A bare program name that is not in the built-in allowlist of common non-script
-    programs (git, curl, wget, docker, kubectl, ssh, scp, rsync, make, cargo, npm,
-    ls, cat, grep, jq, tar, ffmpeg, terraform, ansible, helm, aws, gcloud, az, gh,
-    systemctl, psql, ...; see `NOT_SCRIPT_PROGRAMS`) is flagged when any operand
-    ends in a script extension or contains a slash (URLs and `-options` excepted);
-    with no file-like operand it stays unflagged, so ordinary commands do not prompt
-    forever. Allowlisted programs are never flagged.
-  - Fail closed: an `env -S` or `-c` string that cannot be split, nesting deeper than
-    4, or a wrapper chain longer than 32 counts as an unreadable script.
-  Matching: the flagged operand and an entry's `path` (or its optional `given`, the
-  path as named before symlinks) must be equal after `os.path.normpath`. A relative
-  operand is first resolved against the request's optional `cwd` (the client's
-  working directory: an absolute path of at most 300 printable characters, no
-  control characters; anything else is a 400). With no `cwd`, a relative operand
-  matches only an entry whose absolute path ends in that exact relative path at a `/`
-  boundary, never by bare file name (so `./deploy.sh` does not match
-  `/other/dir/deploy.sh` when `cwd` is given and differs). Two matching entries is
-  fine; no match means not visible. A missing or mismatched entry, or an
-  interpreter reading stdin, counts as "script not visible": the request is never
-  auto-approved, never covered by a timed grant, never offered the Always or grant
-  chips, and is audited `escalated` / `grant_skipped` with
-  `reason: script_not_visible`. Inline code (`-c`, `-e`, `-m`, `eval`) is not a
-  script file. **This catches clients that omit entries. It cannot stop a client
-  that lies**: one that reports a harmless script text for a different file, sends
-  a false `cwd`, runs something other than the argv it states, or reaches a script
-  through an allowlisted program (`make`, `git`, `find -exec`), a wrapper not listed
-  above, or a program found only on the client's PATH, is not detected. A wrapper or
-  interpreter is recognised by its base name, wherever it lives.
+- **The broker also checks argv itself, and only auto-approves what it
+  positively understands.** It does not trust the client's `scripts` list. A
+  request is "script visible" (eligible for env auto-approval, timed-grant
+  coverage and the Always/grant chips) only when its argv is one of:
+  - (a) a program on a small allowlist of programs that cannot run other
+    commands, with plain operands: cat ls head tail wc grep/egrep/fgrep (no
+    `-f`/`--file`) echo printf date uname uptime df du ps id whoami hostname
+    pwd stat jq ping dig nslookup sha256sum md5sum true false test, sort
+    (no `-o`, `--compress-program`), uniq (one operand), openssl (no `-engine`,
+    `-provider`, `-config`), curl (no `-K/--config`, `-T`, `-o/-O/--output`,
+    `-D`, `-c`, `--create-dirs`, no `@file` operands) and wget (no `-i`, `-O`,
+    `-o`, `-e`, `-P`, `--config`, ...). The name must be bare or under
+    /bin, /usr/bin, /sbin, /usr/sbin (after `os.path.normpath`; an argv[0] with
+    a `..` component, glob character, NUL or newline is never understood);
+  - (b) an interpreter (sh bash zsh dash ksh ash fish python node deno bun ruby
+    perl php pwsh lua Rscript, `sed -f`, `awk -f`) running a script file
+    operand, **which needs a matching readable `scripts` entry**, or running
+    inline `-c` code that is a shell and passes the restricted shell rules
+    below. Inline code of any other language (`python -c`, `node -e`,
+    `python -m`, `sed 's/a/b/'`, `awk '{...}'`) is not understood. Options that load
+    other code (`node -r`, `perl -M`, `ruby -r`, `php -d`, `bash --rcfile`) and
+    `env VAR=` assignments of BASH_ENV, LD_PRELOAD, PATH and similar are not
+    understood. A script run directly (`./run.sh`, a script extension, a path
+    outside the system bin dirs) also needs an entry; a program on stdin (`bash -s`,
+    `python -`) is never visible;
+  - (c) a known wrapper whose wrapped command is understood under (a), (b) or
+    (c) (nesting at most 4, at most 32 wrappers): env (including
+    `-S`/`--split-string`, refused when the value has a backslash, `$`, `#` or
+    newline; `-C/--chdir` refused), sudo, doas, nohup, time, timeout, nice, ionice,
+    stdbuf, exec, command, setsid, chrt, taskset, flock (including `-c`),
+    su and runuser (`-c` string, clustered options like `-lc`, `-s` only with
+    a standard shell), setpriv, busybox (the applet is the next operand), strace,
+    ltrace, unshare (without mount/root/chdir options), numactl, watch (without
+    `-x` the arguments are joined with spaces and parsed as a shell string),
+    parallel (same), script (`-c`), xargs. Every wrapper's options are an explicit
+    list: **an option the parser does not recognise makes the command not
+    understood**, never "an interactive shell" and never unflagged. nsenter, chroot
+    and options that change the directory or root (sudo `-D/-R`, env `-C`) are
+    not understood, because the files the client read would not be the ones that
+    run.
+  Restricted shell strings (every `-c`, `su -c`, `watch`, `parallel`, `flock -c`,
+  `script -c`): the string must contain no newline, `#`, backtick, `$`, backslash,
+  here-document, process substitution, braces, parentheses, `&` (background) or
+  redirection other than a lone `2>&1`; it is split on unquoted `&&`, `||`, `;`
+  and `|`, no segment may start with a reserved word (`if`, `for`, `while`, `{`,
+  `!`, `[[`, `time`, ...) or a `VAR=value` assignment, and **every** segment must
+  itself be understood under (a), (b) or (c).
+  **The cost:** everything else is not understood and prompts, even though it
+  may be harmless: git, docker, kubectl, make, npm/npx/yarn/pnpm, cargo, tar,
+  rsync, find, ssh/scp, nc, terraform, ansible, helm, aws/gcloud/az, gh,
+  systemctl/journalctl, psql/mysql/redis-cli/mongosh, sqlite3, ffmpeg, an
+  unknown bare program name, `python -c`, a shell string with a pipe into a
+  redirect, and so on. Those need one tap each; a time-boxed grant does not
+  cover them either, because a grant also requires visibility. (Visibility
+  never changes a request that the credential's own policy already prompts.)
+  Matching: the script operand and an entry's `path` (or its optional `given`,
+  the path as named before symlinks) must be equal after `os.path.normpath`. A
+  relative operand is first resolved against the request's optional `cwd` (the
+  client's working directory: an absolute path of at most 300 printable
+  characters, no control characters; anything else is a 400). With no `cwd`, a
+  relative operand matches only an entry whose absolute path ends in that exact
+  relative path at a `/` boundary, never by bare file name (so `./deploy.sh`
+  does not match `/other/dir/deploy.sh` when `cwd` is given and differs). Two
+  matching entries is fine; no match means not visible. A not-understood command, a
+  missing or mismatched entry, or an interpreter reading stdin is audited
+  `escalated` / `grant_skipped` with `reason: script_not_visible`. The same
+  detection code is in `client/asb` (a test asserts the two copies are identical
+  and agree on a table of examples); the client's part is to find and read the
+  script files. **This catches clients that omit entries. It cannot stop a client
+  that lies**: one that reports a harmless script text for a different file,
+  sends a false `cwd`, or runs something other than the argv it states is not
+  detected. A script can also call other files the client never read, and an
+  interpreter or wrapper is recognised by its base name, wherever it lives (an
+  absolute path).
 - Scripts that print or send the credential are rated high by the model, so they
   auto-approve only when `auto_approve_max` is `high`.
 - What auto-approval of env means: the plaintext secret value is released to the
