@@ -38,6 +38,7 @@ from . import notify as notify_mod
 from .notify import NotifyError
 from . import grants as grants_mod
 from . import risk as risk_mod
+from . import scripts as scripts_mod
 from . import sshkey
 from . import structured
 from .history import History, OUTCOMES
@@ -426,6 +427,9 @@ class Broker:
                        ssh_fingerprint=sp.get("fingerprint"), sign_bytes=sp.get("data_bytes"))
         else:
             rec["argv"] = (req.spec.get("argv") or [])[:50]
+            if req.spec.get("scripts"):
+                # paths, hashes, sizes and marker classes only; never any script text
+                rec.update(scripts_mod.audit_fields(req.spec["scripts"]))
         self._audit.log(event, **rec)
 
     # -- policy -----------------------------------------------------------
@@ -536,6 +540,10 @@ class Broker:
             self._refresh_if(0 if (mode != "store" and any(n not in self.cfg["secrets"] for n in names))
                              else self.CATALOG_TTL)
             secrets_cfg = self.cfg["secrets"]
+            if mode == "env":
+                spec["scripts"] = scripts_mod.validate(spec.get("scripts"))
+            elif spec.get("scripts") is not None:
+                raise ValueError("scripts are only allowed for env requests")
             if mode == "store":
                 self._validate_store(names, spec)
             else:
@@ -2051,7 +2059,7 @@ def _page(h, code, body, wide=False, nav=True, script=None, tab=None, badge=0, u
            "<meta name=viewport content='width=device-width,initial-scale=1'>"
            "<meta name=color-scheme content='light dark'><title>Agent Secret Broker</title>"
            f"<link rel=icon href=\"{_ICON}\">"
-           f"<style>{_CSS}</style><body>{_chrome(tab, badge, user) if nav else ''}"
+           f"<style>{_CSS}{scripts_mod.CSS}</style><body>{_chrome(tab, badge, user) if nav else ''}"
            f"<main class='{'wide' if wide else 'narrow'}'>{body}</main>{scr}</body></html>").encode()
     h.send_response(code)
     h.send_header("Content-Type", "text/html; charset=utf-8")
@@ -2083,7 +2091,8 @@ def _describe(req):
                 f"{html.escape(req.spec['ssh']['text'])}",
                 "The private key stays in the broker; only the signature goes back. "
                 "Advisory: the request text is what the client sent.")
-    return ("run <code>" + html.escape(" ".join(req.spec.get("argv") or [])) + "</code>",
+    return ("run <code>" + html.escape(" ".join(req.spec.get("argv") or [])) + "</code>"
+            + scripts_mod.card_html(req.spec.get("scripts")),
             "Advisory only: the secret is released to the requesting host and the "
             "command shown is what it <em>said</em> it would run.")
 
@@ -2239,6 +2248,11 @@ def _detail_html(r, evs):
         add("Request", f"{r['method'] or ''} {r['url'] or ''}".strip())
     elif r["mode"] == "env":
         add("Command", "<code>" + e(" ".join(r["argv"] or [])) + "</code>", True)
+        if r.get("scripts"):
+            # path, size and short hash only: the text is not in the audit log (separate store, issue #9)
+            add("Scripts", "<br>".join(
+                f"<code>{e(str(x['path']))}</code> "
+                f"({e(str(x['size']))} bytes, sha256 <code>{e(x['sha'])}</code>)" for x in r["scripts"]), True)
     elif r["mode"] == "store":
         add("Operation", f"{r['op'] or 'store'} credential")
         add("Vault item", r["item"])
@@ -2397,7 +2411,8 @@ def client_handler(broker, client_key):
                             "headers": dict(body.get("headers") or {}), "body": body.get("body"),
                             "body_b64": body.get("body_b64")}
                 elif mode == "env":
-                    spec = {"argv": [str(a) for a in body.get("argv") or []]}
+                    spec = {"argv": [str(a) for a in body.get("argv") or []],
+                            "scripts": body.get("scripts")}
                 elif mode == "store":
                     spec = {"op": body.get("op"), "value": body.get("value"),
                             "field": body.get("field"), "item": body.get("item"),
@@ -2407,6 +2422,8 @@ def client_handler(broker, client_key):
                     spec = {"data_b64": body.get("data_b64"), "flags": body.get("flags", 0)}
                 else:
                     raise ValueError("bad mode")
+                if mode != "env" and body.get("scripts") is not None:
+                    raise ValueError("scripts are only allowed for env requests")
                 req = broker.create(mode, names, spec, str(body.get("source", self.client_address[0]))[:80],
                                     peer=self.client_address[0])
             except (ValueError, KeyError, TypeError, json.JSONDecodeError) as e:

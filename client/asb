@@ -23,8 +23,10 @@ asb help COMMAND    usage and an example for one command
 asb guide           the manual for agents: workflow, placeholders, approvals, exit codes
 """
 import base64
+import hashlib
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -36,6 +38,7 @@ import urllib.request
 
 # Exit codes (also in `asb guide`).
 EXIT_NOT_FOUND, EXIT_USAGE, EXIT_BROKER, EXIT_DENIED, EXIT_EXPIRED = 1, 2, 3, 4, 5
+EXIT_SCRIPT_CHANGED = 6
 EXIT_HTTP_ERROR = 22
 
 GUIDE = """asb guide (for agents)
@@ -55,6 +58,12 @@ Workflow
      The broker only sends the credential to the hosts it is allowed for.
   3. Or run a local command with the value in its environment (output is masked):
      asb NAME -- curl -sH "Authorization: Bearer $VAR" https://api.example.com/
+     If the command runs a script (bash deploy.sh, python3 sync.py, ./run.sh), asb
+     reads it (up to 32 KB, text only) and sends it with the request so the human and
+     the risk check can see what it does. Obvious secrets in it are removed. Just before
+     running, asb re-checks the script; if it changed after approval it does not run
+     (exit 6). Advisory: asb cannot prove what finally runs. Scripts piped on stdin
+     cannot be shown and make the request look more opaque.
 
 Approval
   The command blocks, printing "waiting for approval", for up to about 5 minutes.
@@ -89,6 +98,7 @@ Exit codes
   0 ok            1 nothing found (which/list/audit)     2 usage or config error
   3 broker unreachable or refused the request
   4 denied by the human (or the policy)            5 expired or timed out waiting
+  6 env: a script changed between the request and the run (nothing was executed)
   22 http: the upstream answered with status >= 400 (body is still printed)
   other: env mode returns the wrapped command's own exit code
 """
@@ -138,6 +148,10 @@ example: asb http grafana GET https://grafana.example.com/api/health \\
 
 Run a command with the credential's variables in its environment. Waits for
 approval; stdout/stderr of the command are masked. Exits with the command's code.
+If the command runs a script file (bash deploy.sh, python3 sync.py, ./run.sh) its text
+(up to 32 KB, up to 3 files, text only) is sent with the request for the approver and
+the risk check; it is re-hashed just before running and, if it changed after approval,
+nothing runs and asb exits 6. Advisory and best effort.
 example: asb grafana -- sh -c 'curl -s -H "Authorization: Bearer $GRAFANA_TOKEN" $URL'""",
     "store": """usage: asb store NAME --hosts H[,H] [--field F] [--item I] [--var V]   < value
 
@@ -520,6 +534,288 @@ def run_audit(argv):
         return 0
 
 
+# -- script detection (env mode) ------------------------------------------------
+# Find the script file(s) a command will run so the broker can show them. Nothing
+# is executed. Best effort: the agent is the client and can run something else.
+SCRIPT_MAX_FILES = 3
+SCRIPT_TEXT_BYTES = 32 * 1024        # text sent per script
+SCRIPT_HEAD_ONLY = 256 * 1024        # (documented limit: beyond this only the head is ever read)
+SCRIPT_HASH_MAX = 64 * 1024 * 1024   # larger files are not hashed: unreadable too_large
+SCRIPT_REFUSED = ("~/tokens", "~/.ssh", "~/.config/secret-broker", "/proc", "/sys", "/dev")
+
+# wrapper -> (options that take a value, number of positional args to skip)
+SCRIPT_WRAPPERS = {
+    "env": ({"-u", "--unset", "-C", "--chdir", "-S", "--split-string"}, 0),
+    "sudo": ({"-u", "-g", "-h", "-p", "-C", "-D", "-r", "-t", "-T", "-U", "-R", "--user", "--group"}, 0),
+    "doas": ({"-u", "-C"}, 0),
+    "nohup": (set(), 0),
+    "time": ({"-f", "-o", "--format", "--output"}, 0),
+    "timeout": ({"-s", "-k", "--signal", "--kill-after"}, 1),
+    "nice": ({"-n", "--adjustment"}, 0),
+    "ionice": ({"-c", "-n", "-p", "-P", "-u"}, 0),
+    "stdbuf": ({"-i", "-o", "-e"}, 0),
+    "exec": ({"-a"}, 0),
+    "command": (set(), 0),
+    "setsid": (set(), 0),
+    "chrt": (set(), 1),
+}
+# interpreter name pattern -> (kind, flags that take the next arg, inline-code flags, stdin flags)
+_SHELLS = r"(?:ba|z|da|k|a|c|tc)?sh|fish"
+SCRIPT_INTERPRETERS = (
+    (re.compile(r"^(?:%s)$" % _SHELLS), {"-o", "+o", "-O", "+O", "--rcfile", "--init-file"}, {"-c"}, {"-s"}),
+    (re.compile(r"^python(?:\d+(?:\.\d+)*)?$"), {"-W", "-X", "-Q"}, {"-c", "-m"}, set()),
+    (re.compile(r"^(?:node|nodejs)$"), {"-r", "--require", "--import", "--loader", "--input-type"},
+     {"-e", "--eval", "-p", "--print"}, set()),
+    (re.compile(r"^ruby$"), {"-I", "-r", "-C", "-x"}, {"-e"}, set()),
+    (re.compile(r"^perl$"), {"-I", "-M", "-m"}, {"-e", "-E"}, set()),
+    (re.compile(r"^php$"), {"-d", "-c", "-z"}, {"-r"}, set()),
+    (re.compile(r"^(?:pwsh|powershell)$"), set(), {"-c", "-command", "-encodedcommand", "-e"}, set()),
+    (re.compile(r"^(?:lua|luajit)$"), {"-l"}, {"-e"}, set()),
+    (re.compile(r"^Rscript$"), set(), {"-e"}, set()),
+)
+SCRIPT_FILE_FLAGS = {"php": {"-f"}, "awk": {"-f", "--file"}, "gawk": {"-f", "--file"}, "mawk": {"-f"},
+                     "sed": {"-f", "--file"}, "pwsh": {"-file", "-f"}, "powershell": {"-file", "-f"}}
+_AWK_LIKE = re.compile(r"^(?:awk|gawk|mawk|sed)$")
+_RUNNERS = re.compile(r"^(?:deno|bun)$")
+
+
+def _strip_wrappers(argv):
+    """argv without leading wrapper commands (env VAR=.., sudo, timeout 5, ...)."""
+    i = 0
+    while i < len(argv):
+        w = os.path.basename(argv[i])
+        if w not in SCRIPT_WRAPPERS:
+            break
+        valued, positional = SCRIPT_WRAPPERS[w]
+        i += 1
+        while i < len(argv):
+            a = argv[i]
+            if a == "--":
+                i += 1
+                break
+            if w == "env" and "=" in a and not a.startswith("-"):
+                i += 1
+            elif a.startswith("-") and len(a) > 1:
+                i += 2 if a in valued else 1
+            else:
+                break
+        i += positional
+    return argv[i:]
+
+
+def _script_args(name, args):
+    """-> ("file", [candidate paths]) | ("inline", None) | ("stdin", None) | ("none", None)
+    for the arguments of a recognised interpreter."""
+    spec = next((x for x in SCRIPT_INTERPRETERS if x[0].match(name)), None)
+    is_awk = bool(_AWK_LIKE.match(name))
+    if spec is None and not is_awk and not _RUNNERS.match(name):
+        return None
+    if _RUNNERS.match(name):
+        # deno run [opts] file | deno eval ... | bun [run] file
+        sub = args[0] if args else ""
+        if sub == "eval":
+            return ("inline", None)
+        rest = args[1:] if sub in ("run", "x") else args
+        for i, a in enumerate(rest):
+            if a == "-":
+                return ("stdin", None)
+            if not a.startswith("-"):
+                return ("file", [a])
+        return ("none", None)
+    if is_awk:
+        files, i = [], 0
+        ffl = SCRIPT_FILE_FLAGS[name] if name in SCRIPT_FILE_FLAGS else SCRIPT_FILE_FLAGS["awk"]
+        inline = False
+        while i < len(args):
+            a = args[i]
+            if a in ffl and i + 1 < len(args):
+                files.append(args[i + 1])
+                i += 2
+                continue
+            if a.startswith("--file="):
+                files.append(a.split("=", 1)[1])
+            elif a in ("-e", "--expression", "--source"):
+                inline, i = True, i + 1
+            elif a.startswith("-") and a != "-":
+                pass
+            elif not files and not inline:
+                return ("inline", None)             # the program text is the first operand
+            else:
+                break
+            i += 1
+        return ("file", files) if files else ("inline" if inline else "none", None)
+    _, valued, inline_flags, stdin_flags = spec
+    short_inline = {f[1] for f in inline_flags if len(f) == 2}
+    short_stdin = {f[1] for f in stdin_flags if len(f) == 2}
+    ffl = SCRIPT_FILE_FLAGS.get(name, set())
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            return ("file", [args[i + 1]]) if i + 1 < len(args) else ("none", None)
+        if a == "-":
+            return ("stdin", None)
+        if a in ffl and i + 1 < len(args):
+            return ("file", [args[i + 1]])
+        if a in inline_flags or a.lower() in inline_flags:
+            return ("inline", None)
+        if a in stdin_flags:
+            return ("stdin", None)
+        if a in valued:
+            i += 2
+            continue
+        if name == "perl" and re.match(r"^-[A-Za-z]*[eE]$", a):
+            return ("inline", None)
+        if re.match(r"^-[A-Za-z]+$", a) and len(a) > 2 and name != "perl":
+            letters = a[1:]
+            if short_inline & set(letters):
+                return ("inline", None)
+            if short_stdin & set(letters):
+                return ("stdin", None)
+        elif a.startswith("-") or a.startswith("+"):
+            if name == "perl" and re.match(r"^-[eE]", a):
+                return ("inline", None)
+            if name.startswith("python") and re.match(r"^-[cm]", a):
+                return ("inline", None)
+        else:
+            return ("file", [a])
+        i += 1
+    return ("none", None)
+
+
+def _refused(path):
+    for r in SCRIPT_REFUSED:
+        base = os.path.expanduser(r)
+        if path == base or path.startswith(base.rstrip("/") + "/"):
+            return True
+    return False
+
+
+def _printable(path):
+    return "".join(c if c.isprintable() and c not in "\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069"
+                   else "?" for c in path)[:300]
+
+
+def _read_script(path, require_text, via_path_lookup=False):
+    """-> entry dict, or None to ignore (not a file / not a script worth reporting).
+    `path` is the path as named in the command; one realpath is applied."""
+    try:
+        absolute = os.path.abspath(os.path.expanduser(path))
+        real = os.path.realpath(absolute)
+    except (OSError, ValueError):
+        return {"path": _printable(path), "unreadable": "missing"}
+    shown = _printable(real)
+    if _refused(absolute) or _refused(real):
+        return {"path": shown, "unreadable": "refused"}
+    try:
+        st = os.stat(real)
+    except FileNotFoundError:
+        return None if require_text else {"path": shown, "unreadable": "missing"}
+    except PermissionError:
+        return {"path": shown, "unreadable": "permission"}
+    except OSError:
+        return {"path": shown, "unreadable": "missing"}
+    import stat as _stat
+    if not _stat.S_ISREG(st.st_mode):
+        return None                             # directory, device, fifo: nothing to read
+    try:
+        fd = os.open(real, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    except PermissionError:
+        return {"path": shown, "unreadable": "permission"}
+    except OSError:
+        return {"path": shown, "unreadable": "missing"}
+    with os.fdopen(fd, "rb") as f:
+        head = f.read(SCRIPT_TEXT_BYTES + 4)[:SCRIPT_TEXT_BYTES + 4]
+        text_part = head[:SCRIPT_TEXT_BYTES]
+        is_text = _looks_text(text_part)
+        if require_text and (not is_text or (via_path_lookup and not text_part.startswith(b"#!"))):
+            return None                         # a compiled program: nothing to show, not worth a marker
+        if st.st_size > SCRIPT_HASH_MAX:
+            return {"path": shown, "unreadable": "too_large"}
+        if not is_text:
+            return {"path": shown, "unreadable": "binary"}
+        h = hashlib.sha256(head)
+        total = len(head)
+        while True:
+            chunk = f.read(1 << 20)
+            if not chunk:
+                break
+            h.update(chunk)
+            total += len(chunk)
+    text = text_part.decode("utf-8", "ignore")      # a multi-byte character cut at the limit is dropped
+    return {"path": shown, "size": total, "sha256": h.hexdigest(), "text": text,
+            "truncated": total > SCRIPT_TEXT_BYTES}
+
+
+def _looks_text(b):
+    if b"\x00" in b:
+        return False
+    s = b.decode("utf-8", "replace")
+    return not s or s.count(chr(0xfffd)) * 10 <= len(s) * 3
+
+
+def find_scripts(argv):
+    """Script entries for the `scripts` field of an env-mode request ([] when the
+    command runs no script we can find). Reads files, never executes anything."""
+    cmd = _strip_wrappers(list(argv))
+    if not cmd:
+        return []
+    name = os.path.basename(cmd[0])
+    found = _script_args(name, cmd[1:])
+    entries, seen = [], set()
+
+    def add(e):
+        if e is None:
+            return
+        key = e.get("path") or "stdin"
+        if key in seen or len(entries) >= SCRIPT_MAX_FILES:
+            return
+        seen.add(key)
+        entries.append(e)
+    if found is not None:
+        kind, paths = found
+        if kind == "stdin":
+            add({"stdin": True})
+        elif kind == "none" and not name.startswith(("sed", "awk", "gawk", "mawk")):
+            add({"stdin": True})                  # an interpreter with nothing to run reads stdin
+        elif kind == "file":
+            for p in paths:
+                if p == "-" or p in ("/dev/stdin", "/proc/self/fd/0") or p.startswith("/dev/fd/"):
+                    add({"stdin": True})
+                else:
+                    add(_read_script(p, require_text=False))
+        return entries
+    # not an interpreter: is argv[0] itself a script?
+    if os.path.isabs(cmd[0]) or "/" in cmd[0]:
+        add(_read_script(cmd[0], require_text=True))
+    else:
+        import shutil
+        hit = shutil.which(cmd[0])
+        if hit:
+            add(_read_script(hit, require_text=True, via_path_lookup=True))
+    return entries
+
+
+def script_digest(path):
+    """sha256 of the whole file as it is now, or None if it cannot be read."""
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
+
+
+def changed_script(entries):
+    """The path of the first reported script whose content differs now, else None."""
+    for e in entries:
+        if e.get("sha256") and script_digest(e["path"]) != e["sha256"]:
+            return e["path"]
+    return None
+
+
 def mask(text, values):
     for v in sorted(values, key=len, reverse=True):
         if len(v) >= 6:
@@ -699,7 +995,18 @@ def main(argv):
         die(HELP["run"])
     for n in names:
         check_name(n)
-    env = obtain({"mode": "env", "names": names, "argv": cmd})["env"]
+    payload = {"mode": "env", "names": names, "argv": cmd}
+    try:
+        scripts = find_scripts(cmd)
+    except Exception:  # noqa: BLE001  (script detection is a courtesy; it never blocks a request)
+        scripts = []
+    if scripts:
+        payload["scripts"] = scripts
+    env = obtain(payload)["env"]
+    moved = changed_script(scripts)
+    if moved:
+        # advisory: catches an edit between the request and the run, nothing more
+        die(f"script {moved} changed after it was reviewed", EXIT_SCRIPT_CHANGED)
     p = subprocess.run(cmd, env={**os.environ, **env}, capture_output=True, text=True)
     sys.stdout.write(mask(p.stdout, env.values()))
     sys.stderr.write(mask(p.stderr, env.values()))

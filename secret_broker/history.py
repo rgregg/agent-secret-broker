@@ -42,6 +42,18 @@ def _clean(v, depth=0):
     return None
 
 
+def _scripts(rec):
+    """[{path, size, sha}] from a `requested` record: path, size and hash only (the
+    text is not in the audit log; keeping it for history is a separate store)."""
+    paths = rec.get("script_paths")
+    if not isinstance(paths, list):
+        return []
+    sizes, shas = rec.get("script_sizes") or [], rec.get("script_sha256") or []
+    return [{"path": _clean(p), "size": sizes[i] if i < len(sizes) else None,
+             "sha": (shas[i] if i < len(shas) and isinstance(shas[i], str) else "")[:12]}
+            for i, p in enumerate(paths[:5])]
+
+
 def _short_url(url):
     if not url:
         return None
@@ -103,7 +115,7 @@ class History:
                 "op": rec.get("op"), "item": rec.get("item"), "field": rec.get("field"),
                 "key": rec.get("key"), "hosts": rec.get("hosts"), "final_seq": -1,
                 "ssh_what": rec.get("ssh_what"), "peer": rec.get("peer"),
-                "argv": _clean(rec.get("argv")), "risk_reasons": None, "risk_model": None,
+                "argv": _clean(rec.get("argv")), "scripts": _scripts(rec), "risk_reasons": None, "risk_model": None,
             }
             self._events[rid] = []
             while len(self._rows) > self._max:
