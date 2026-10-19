@@ -25,6 +25,7 @@ from secret_broker import description, riskmodel  # noqa: E402
 
 LEVELS = riskmodel.LEVELS
 DEFAULT_CASES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cases.jsonl")
+SCRIPT_CASES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "script_cases.jsonl")
 
 
 def split_of(case_id):
@@ -46,6 +47,7 @@ def load_cases(path):
                 raise ValueError(f"{path}:{n}: bad expected level {c['expected']!r}")
             c.setdefault("ambiguous", False)
             c["split"] = split_of(c["id"])
+            c["set"] = "scripts" if "scripts" in c["spec"] else "base"
             cases.append(c)
     ids = [c["id"] for c in cases]
     if len(ids) != len(set(ids)):
@@ -70,6 +72,12 @@ class StubAnalyzer:
         else:
             cmd = " ".join(spec.get("argv") or [])
             lvl = "high" if any(w in cmd for w in ("rm ", "| sh", "sudo")) else "low"
+            for sc in spec.get("scripts") or []:
+                text = sc.get("text", "")
+                if any(w in text for w in ("rm -rf", "| sh", "sudo", "printenv", "mkfs")):
+                    lvl = "high"
+                elif lvl == "low" and (sc.get("stdin") or sc.get("unreadable") or "POST" in text):
+                    lvl = "medium"
         return {"summary": "stub", "risk": lvl, "cost": 0.0}
 
 
@@ -80,7 +88,7 @@ def make_analyzer(args, key):
         return riskmodel.JevAnalyzer(
             key, args.model or riskmodel.DEFAULT_JEV_MODEL, timeout=args.timeout,
             high_threshold=args.high_threshold, low_threshold=args.low_threshold,
-            summary_mode="none")
+            summary_mode="none", max_script_chars=args.max_script_chars)
     return riskmodel.ChatAnalyzer(key, args.model or "openai/gpt-5-mini", timeout=args.timeout,
                                   prompt=args.prompt, max_content_chars=300)
 
@@ -97,7 +105,8 @@ def run_case(analyzer, case, floor):
     dt = time.time() - t0
     got = got or {}
     raw = got.get("risk")
-    return {"id": case["id"], "split": case["split"], "expected": case["expected"],
+    return {"id": case["id"], "split": case["split"], "set": case.get("set", "base"),
+            "expected": case["expected"],
             "ambiguous": case["ambiguous"], "predicted": raw if raw in LEVELS else "high",
             "failed": raw not in LEVELS, "latency": dt, "cost": got.get("cost"),
             "note": case.get("note", "")}
@@ -258,6 +267,12 @@ def main(argv=None, out=sys.stdout):
     ap.add_argument("--prompt", choices=("legacy", "rubric"), default="legacy",
                     help="chat provider only: the current prompt, or the new rubric")
     ap.add_argument("--cases", default=DEFAULT_CASES)
+    ap.add_argument("--scripts", action="store_true",
+                    help="also run tools/risk_eval/script_cases.jsonl (env requests with script contents) "
+                         "and report the script cases separately from the base cases")
+    ap.add_argument("--only-scripts", action="store_true", help="run only the script cases")
+    ap.add_argument("--max-script-chars", type=int, default=riskmodel.DEFAULT_MAX_SCRIPT_CHARS,
+                    help="jev: script text per script sent to the model")
     ap.add_argument("--split", choices=("all", "train", "holdout"), default="all")
     ap.add_argument("--dry-run", action="store_true", help="stub model, no network, no key needed")
     ap.add_argument("--floor", action="store_true", help="apply the ssh_sign HIGH floor (default: raw model)")
@@ -281,7 +296,9 @@ def main(argv=None, out=sys.stdout):
         return 2
     if args.descriptions:
         return run_descriptions(args, key, out)
-    cases = load_cases(args.cases)
+    cases = [] if args.only_scripts else load_cases(args.cases)
+    if args.scripts or args.only_scripts:
+        cases += load_cases(SCRIPT_CASES)
     analyzer = make_analyzer(args, key)
     if args.split != "all":
         cases = [c for c in cases if c["split"] == args.split]
@@ -295,6 +312,9 @@ def main(argv=None, out=sys.stdout):
         sub = [r for r in results if r["split"] == sp]
         if sub:
             report(sub, sp, out)
+    if any(r["set"] == "scripts" for r in results) and any(r["set"] == "base" for r in results):
+        report([r for r in results if r["set"] == "base"], "base cases only", out)
+        report([r for r in results if r["set"] == "scripts"], "script cases only", out)
     report(results, "all", out)
     if args.out:
         with open(args.out, "w") as f:

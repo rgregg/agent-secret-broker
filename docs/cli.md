@@ -67,6 +67,31 @@ Check it:
   value. This is `http` mode and it is the one to prefer.
 - `NAME -- command` (env mode) hands the value to a command on the agent's host.
   The broker cannot check what the command does with it.
+- **Scripts are shown to you.** For `NAME -- command`, `asb` looks for the script
+  file the command runs and sends its text with the request, so the approval card
+  and the risk check see what the script does, not just `bash deploy.sh`. It skips
+  leading wrappers (`env VAR=..`, `sudo`, `nohup`, `time`, `timeout N`, `nice`,
+  `stdbuf`, `exec`, `command`), then takes either an interpreter's script file
+  (`bash`, `sh`, `zsh`, `python3`, `node`, `deno`, `bun`, `ruby`, `perl`, `php`,
+  `pwsh`, `awk -f`, `sed -f`: the first operand that is a file) or the command
+  itself when it is an executable text script (a bare name must be found on PATH and
+  start with `#!`). Inline code (`-c`, `-e`, `-m`) is already in the command and
+  reads no file. Limits: at most 3 files, 32 KB of text each (larger files send only
+  the head and say so; the hash is of the whole file), text only (a binary, missing,
+  unreadable, oversized or protected file is reported as such, never read), one
+  `realpath` per file and never `~/tokens`, `~/.ssh`, `~/.config/secret-broker`,
+  `/proc`, `/sys` or `/dev`. A script on standard input (`bash -s`, `python -`)
+  cannot be seen and is reported as such, which makes the request look more
+  opaque. Nothing is executed to find a script, and files the script itself
+  includes or downloads are not followed.
+  Just before running, `asb` re-hashes each script it sent; if one differs it does
+  not run the command, prints `asb: script PATH changed after it was reviewed` and
+  exits 6. **This is advisory and best effort**: the client is the agent, so it
+  cannot prove what finally runs (a script can call others, and the agent could run
+  something else). It catches an edit between the request and the run, nothing more.
+  Obvious secrets in the text (`token=...`, `Bearer ...`, `password=...`, AWS and
+  GitHub key patterns, private key blocks) are replaced by `[redacted]` by the
+  broker before the text is stored, shown or sent to a model.
 - Every use asks you to approve, in the browser or from the push notification. The
   command waits, up to about 5 minutes. **A denial or timeout is final**: the
   agent should stop and tell you what it needed rather than retry or look for
@@ -86,6 +111,7 @@ Check it:
 | 3 | Broker unreachable, or it refused the request (`status` too) |
 | 4 | Denied by you or by policy |
 | 5 | Expired or timed out waiting for approval |
+| 6 | Env mode: a script changed between the request and the run (`asb: script PATH changed after it was reviewed`); nothing was executed |
 | 22 | `http`: the upstream answered with status 400 or more (body still printed) |
 | other | Env mode returns the wrapped command's own exit code |
 
