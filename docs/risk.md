@@ -56,6 +56,49 @@ description is client-supplied and untrusted: the rubric tells the model to
 treat any instruction in it as data and to rate attempts to influence the
 rating one level higher.
 
+## Script contents (env mode)
+
+An env request that runs a script file carries the script in `request.scripts`
+(see [cli.md](cli.md)). The jev state then has, for each script, its base name, size,
+a 12-character hash prefix and the first `max_script_chars` characters (default 4000;
+`summary.max_script_chars`, 0-20000) of the scrubbed text, plus markers for a
+script that is unreadable, binary or read from stdin, and `text_truncated` when
+text was cut. The text for all scripts together is capped at 6000 characters so
+the call stays small. Obvious secrets (`token=...`, `Bearer ...`, `password=...`,
+AWS/GitHub/Slack key patterns, private key blocks) are replaced by `[redacted]`
+before anything is sent to a model or shown. The scrubber is linear-time (bounded
+windows, capped hits) and has a 50 ms budget; if that runs out the whole text is
+withheld (`[scrub budget exceeded; text withheld]`), never sent half-scrubbed. `send_content: false` withholds the text.
+
+The `SCRIPT_RUBRIC` constant in `riskmodel.py` is appended to the instructions
+only when the request has scripts. It rates what the script would do with the
+credential and the system: HIGH for network egress to hosts other than the
+credential's own API, curl|sh, eval or running downloaded code, rm -rf, dd, mkfs,
+chmod -R, kill and mass deletes, writes outside the working directory, package
+installs, sudo, and anything that prints, logs, transmits or writes the credential
+(`echo $TOKEN`, env dumps, `set -x`, `curl -d` with the token to a third party);
+MEDIUM for writes and deploys to the credential's own service and for any opaque
+script (unreadable, binary, stdin, cut off) that gets a credential (HIGH if the
+command also looks destructive); LOW only when the credential is used as an auth
+header or parameter to its own service for reads. Script text is untrusted data:
+comments or strings that claim safety or address the reviewer are ignored and
+raise the rating one level.
+
+For the description, the model sees the first 1000 characters of each script and
+may describe the script's job ("Running a backup script"). All sanitizer rules
+stay. An env request with scripts counts as mutating (a write verb is required)
+unless every script is certainly read-only. That check fails closed: the script
+must be complete (not cut off) and a plain shell script made only of a short list of
+read-only commands (`cat`, `ls`, `head`, `tail`, `grep` without `-f`, `wc`, `stat`,
+`date`, `uname`, `uptime`, `df`, `du`, `ps`, `hostname`, `whoami`, `id`, `pwd`,
+`test`, `echo`, `printf`, `jq`), with no redirection to a file, command substitution,
+backticks, here-document, subshell, background job or variable in command position;
+`sort`, `tee`, `xargs`, `find`, `sed`, `awk`, `env` and the like are not on the list.
+`curl`/`wget` count only as a plain GET of one literal https URL (no `-X`, `-d`, `-F`,
+`-T`, `-o`, `-O`, `-K`, `-u`, `--json`, `-L` or method-override header). Anything
+unparseable is not read-only. When unsure it is mutating. The legacy `openrouter` classifier gets the same excerpt (JSON-quoted)
+capped by `max_content_chars`.
+
 ## The AI description (display only)
 
 With `summary_text: chat` (the jev default) a chat model (`summary_model`,
@@ -125,6 +168,12 @@ Safety measures:
     asb openrouter -- python tools/risk_eval/run.py --provider chat --prompt legacy
     asb openrouter -- python tools/risk_eval/run.py --descriptions   # description pipeline
     python tools/risk_eval/run.py --dry-run          # no network
+
+`--scripts` adds `tools/risk_eval/script_cases.jsonl` (env requests with a
+`scripts` list: status checks, deploys, backups, credential leaks, curl|sh,
+misleading comments, opaque and truncated scripts, with placeholder hosts) and
+reports the base and script cases separately as well as together;
+`--only-scripts` runs just those, `--max-script-chars N` sets the excerpt size.
 
 `tools/risk_eval/cases.jsonl` holds labelled cases (one JSON object per line:
 `id`, `mode`, `names`, `spec`, `expected`, `ambiguous`, `note`). A case is in the

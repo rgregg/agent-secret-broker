@@ -41,6 +41,7 @@ _I = "int"
 _B = "bool"
 _L = "strlist"      # list of strings, 50 items max
 _CH = "channel"     # one of CHANNELS
+_IL = "intlist"     # list of ints, 50 items max
 _ERR = "errclass"   # free text reduced to a coarse class
 
 # event -> {output field: (source field, kind)}
@@ -49,7 +50,11 @@ WHITELIST = {
     "requested": {"names": ("names", _L), "mode": ("mode", _S), "source": ("source", _S),
                   "peer": ("peer", _S), "method": ("method", _S), "url": ("url", _S),
                   "argv": ("argv", _L), "op": ("op", _S), "field": ("field", _S),
-                  "ssh_kind": ("ssh_kind", _S), "fingerprint": ("ssh_fingerprint", _S)},
+                  "ssh_kind": ("ssh_kind", _S), "fingerprint": ("ssh_fingerprint", _S),
+                  # env mode scripts the client reported: paths, hashes, sizes and marker
+                  # classes describe the agent's own request; script text is never logged
+                  "script_paths": ("script_paths", _L), "script_sha256": ("script_sha256", _L),
+                  "script_sizes": ("script_sizes", _IL), "script_markers": ("script_markers", _L)},
     "rejected": {"names": ("names", _L), "mode": ("mode", _S), "source": ("source", _S),
                  "peer": ("peer", _S), "url": ("url", _S), "reason": ("reason", _S)},
     # Decision outcomes. channel/approver are ALWAYS present (null when there was
@@ -125,6 +130,10 @@ def _clean(val, kind, rec, event):
         if not isinstance(val, list):
             return None
         return [x[:200] for x in val[:50] if isinstance(x, str)]
+    if kind == _IL:
+        if not isinstance(val, list):
+            return None
+        return [x for x in val[:50] if isinstance(x, int) and not isinstance(x, bool)]
     if kind == _CH:
         return val if val in CHANNELS else None
     if kind == _ERR:

@@ -14,6 +14,8 @@ import json
 import urllib.parse
 import urllib.request
 
+from . import scripts as scripts_mod
+
 SYSTEM = (
     "You label API requests for a human approver. Reply with ONLY a JSON "
     'object: {"summary": "<=12 words saying what the request does", '
@@ -52,6 +54,11 @@ def describe(mode, names, spec, max_content_chars=300, send_content=True):
     else:
         cmd = " ".join(spec.get("argv") or [])
         lines.append("command: " + (cmd[:max_content_chars] if send_content else "<not shown>"))
+        if spec.get("scripts"):
+            # same cap and switch as the command; the text is JSON-quoted so it cannot
+            # break out of its line
+            for sc in scripts_mod.model_view(spec["scripts"], max_content_chars, 6000, send_content):
+                lines.append("script (untrusted file contents): " + json.dumps(sc))
     return "\n".join(lines)
 
 

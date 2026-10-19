@@ -20,6 +20,28 @@ How the broker works, in detail. For installing and configuring it see
 - **env (advisory).** The value is released to the requesting host and injected
   into the command's environment. The command shown in the prompt is what the
   client *said* it would run; approve it only if it looks right.
+  - **Script contents.** If the command runs a script file, the client adds a
+    `scripts` list to the env request (see `asb help run`, docs/cli.md for what it
+    looks for and its limits). Each entry is exactly one of
+    `{path, size, sha256, text, truncated}`, `{path, unreadable}` (`missing`,
+    `binary`, `permission`, `too_large`, `refused`) or `{stdin: true}`. The broker
+    rejects (400) more than 3 entries, unknown keys, a path that is not 1-300
+    printable characters, a non-integer `size`, a `sha256` that is not 64 hex
+    digits, `text` over 32 KB or non-boolean flags, and `scripts` on any mode other
+    than env. It removes control characters other than newline and tab and
+    scrubs obvious secrets (`secret_broker/scripts.py`) before storing the entries
+    on the request. The card and the `/a/<nonce>` page show a collapsed
+    **Script contents (reported by the client)** section: path, size, short hash,
+    a notice when only the start is shown, and the text in a scrollable monospace
+    box, all HTML-escaped; unreadable and stdin entries show as plain notes. Script
+    text is never put in a notification (push, Telegram, ticker, Home Assistant) or in
+    the audit log. The audit `requested` event gets only `script_paths`,
+    `script_sha256`, `script_sizes` and `script_markers` (marker classes), which the
+    audit API returns because they describe the agent's own request. The history
+    pop-over shows path, size and short hash only; keeping the text for history is
+    the separate issue #9 store. All of this is advisory: the client chooses what to
+    send. The client re-hashes the scripts before running them and exits 6 if one
+    changed.
 
 ### SSH keys: the broker signs, the key never leaves
 
@@ -239,6 +261,7 @@ Set `type` to pick another:
 | `model` | both | required for `openrouter`; `typesafe/jev-1.14` for `jev` | OpenRouter model id |
 | `timeout` | both | 4 (`openrouter`), 6 (`jev`) | seconds; a timeout is a HIGH verdict |
 | `max_content_chars` | both | 300 / 400 | body or command characters sent |
+| `max_script_chars` | `jev` | 4000 | script text characters sent per script for an env request that carries scripts (0 sends only name, size, hash and markers; total across scripts is capped at 6000; `send_content: false` withholds all text). The description model gets 1000 |
 | `send_content` | both | true | false sends only "present, not shown" |
 | `prompt` | `openrouter` | `legacy` | `legacy` (old prompt) or `rubric` (the prompt in docs/risk.md) |
 | `high_threshold` | `jev` | 0.5 | rate HIGH when P(high) >= this |
@@ -926,7 +949,7 @@ Whitelist (output field from the recorded field; every event also has `seq`, `ts
 
 | Event | Fields returned |
 |---|---|
-| `requested` | names, mode, source, peer, method, url, argv, op, field, ssh_kind, fingerprint |
+| `requested` | names, mode, source, peer, method, url, argv, op, field, ssh_kind, fingerprint, script_paths, script_sha256, script_sizes, script_markers (env scripts: never any text) |
 | `rejected` | names, mode, source, peer, url, reason (already returned to the client) |
 | `approved`, `denied`, `expired` | channel (dashboard, push, ha, link or null), approver (null for policy) |
 | `failed` | error_class (release_failed, timeout, tls, dns, connection, vault, other), channel, approver |
