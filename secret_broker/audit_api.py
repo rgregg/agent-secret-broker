@@ -107,6 +107,10 @@ HIDDEN = frozenset({
     "push_test", "ha_decide_dropped",
     # server-identity policy (a key's allowed_hosts) is approval context
     "ssh_sign_refused",
+    # standing per-host SSH rules are approval policy: a rule-approved request shows as plain "approved",
+    # and the agent must never learn which servers have rules
+    "ssh_rule_created", "ssh_rule_used", "ssh_rule_revoked", "ssh_rule_expired", "ssh_rule_refused",
+    "ssh_rule_change_failed", "ssh_rules_state_corrupt", "ssh_rules_state_write_failed",
 })
 
 def error_class(text):

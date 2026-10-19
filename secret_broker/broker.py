@@ -39,6 +39,7 @@ from .notify import NotifyError
 from . import grants as grants_mod
 from . import guidance as guidance_mod
 from . import sshhosts as sshhosts_mod
+from . import sshrules as sshrules_mod
 from . import risk as risk_mod
 from . import request_details as details_mod
 from . import scripts as scripts_mod
@@ -74,18 +75,20 @@ class Channel:
     decide_via is responsible for the channel's own authentication (SSO header,
     CSRF / same-origin guards, ...)."""
 
-    def __init__(self, token_required, may_create_always, may_create_grant=False):
+    def __init__(self, token_required, may_create_always, may_create_grant=False,
+                 may_create_ssh_rule=False):
         self.token_required = token_required        # must present the request's action token
         self.may_create_always = may_create_always  # may create an always-allow rule
         self.may_create_grant = may_create_grant    # may create a time-boxed grant
+        self.may_create_ssh_rule = may_create_ssh_rule  # may create a standing per-host SSH rule
 
 
 # Registry of decision channels; the key is the `channel` audit field.
 CHANNELS = {
     "dashboard": Channel(token_required=False, may_create_always=True,
-                         may_create_grant=True),                          # POST /decide
+                         may_create_grant=True, may_create_ssh_rule=True),  # POST /decide
     "link": Channel(token_required=False, may_create_always=True,
-                    may_create_grant=True),                               # POST /a/<nonce>
+                    may_create_grant=True, may_create_ssh_rule=True),      # POST /a/<nonce>
     "push": Channel(token_required=True, may_create_always=False),        # POST /push/decide
     "ha": Channel(token_required=True, may_create_always=False),          # POST /v1/hooks/ha/decide
 }
@@ -122,6 +125,7 @@ class Request:
         self.summary_source = None  # "model", "deterministic" or None
         self.risk = None          # {"level","model","reasons"}
         self.always = None        # outcome of an "always allow" click, if any
+        self.ssh_rule = None      # outcome of an "Always: this host" click: created|exists|refused|...
         self.approver = None
         self.action_hash = None   # sha256 of the push-button token; None once spent
         self.notification = None  # the Notification sent for this request
@@ -129,7 +133,7 @@ class Request:
         self.done = threading.Event()
 
 
-class Broker:
+class Broker(sshrules_mod.SshRulesMixin):
     def __init__(self, config, backend, notifier, audit=None, summarizer=None,
                  background_load=False, push=None):
         self.push = push                # PushStore when the webpush transport is configured
@@ -175,6 +179,7 @@ class Broker:
         if warn:
             self.log("config_warning", warning=warn)
         self._init_grants(config)
+        self._init_ssh_rules()
         if background_load:
             # Listen right away; the first requests wait on the same lock.
             self._refreshing.acquire()
@@ -264,6 +269,11 @@ class Broker:
             if not ssh:
                 raise ValueError("ssh_hosts only applies to an ssh key secret")
             ssh_hosts = Broker._ssh_hosts(meta["ssh_hosts"])
+        ssh_rules = None
+        if meta.get("ssh_rules") is not None:
+            if not ssh:
+                raise ValueError("ssh_rules only applies to an ssh key secret")
+            ssh_rules = sshrules_mod.parse(meta["ssh_rules"])
         vars_ = {}
         for var, ref in raw_vars.items():
             ref = ref if isinstance(ref, dict) else {}
@@ -285,6 +295,9 @@ class Broker:
                  "_tls": {"fingerprint": fp, "verify": verify}}
         entry.pop("guidance", None)
         entry.pop("ssh_hosts", None)
+        entry.pop("ssh_rules", None)
+        if ssh_rules:
+            entry["ssh_rules"] = ssh_rules      # parsed; policy context, never in discovery/status output
         if ssh_hosts and (ssh_hosts["known"] or ssh_hosts["allowed"] or ssh_hosts["allow_forwarded"]):
             entry["ssh_hosts"] = ssh_hosts      # parsed; never part of discovery/status output
         if note:
@@ -793,6 +806,8 @@ class Broker:
         req.summary_source = a.get("summary_source")
         self.audit("assessed", req, model=a["model"], reasons=a["reasons"],
                    summary_source=a.get("summary_source"), summary_reason=a.get("summary_reason"))
+        if self._ssh_rule_claim(req):       # standing per-host rule: explicit policy, any risk limit
+            return req
         auto = self._auto_allowed(mode, names, spec)
         auto_max = self._auto_max
         if not auto and self._grant_claim(req):
@@ -1215,14 +1230,19 @@ class Broker:
         return sorted(rows, key=lambda r: r.created)
 
     def decide_via(self, channel, rid, decision, actor, *, token=None, always=False,
-                   nonce=None, peer=None, client_ip=None, grant_minutes=None, **audit_extra):
+                   nonce=None, peer=None, client_ip=None, grant_minutes=None, ssh_rule=None,
+                   **audit_extra):
         """The single entry for every decision. Returns (http_status, req):
         200 decided; 403 wrong/missing token; 404 unknown; 410 already decided,
         expired or token spent (no state change). `decision` is "approve" or
         "deny". Enforced here and nowhere else: the single-decision claim, the
         token check (constant time; spent on match, and it dies with any
         decision), no always-allow rule from channels that may not create one,
-        and the audit fields. The request is found by `rid`, or by `nonce` (the
+        and the audit fields. `ssh_rule` ({"days": n|None}) asks to also create a
+        standing per-host SSH rule from this request: only channels that may, and
+        only an eligible request; otherwise ssh_rule_refused is audited and the
+        request is left pending (403 for a channel that may not, 409 otherwise).
+        The request is found by `rid`, or by `nonce` (the
         approval-link channel), or, for token channels with neither, by the
         token alone. Channel authentication (SSO header, CSRF, origin guards)
         is the caller's job. Unknown channel or decision raises ValueError."""
@@ -1236,6 +1256,11 @@ class Broker:
         grant_minutes = grant_minutes if (approve and ch.may_create_grant) else None
         if grant_minutes is not None and not self.grant_minutes_ok(grant_minutes):
             return 400, None            # unknown duration: nothing is claimed or changed
+        if ssh_rule is not None and not (approve and ch.may_create_ssh_rule):
+            self.log("ssh_rule_refused", reason="not_eligible", channel=channel, user=actor, peer=peer,
+                     client_ip=client_ip, why="channel may not create rules")
+            return 403, None            # nothing is claimed or changed
+        rule_refused = None
         check = ch.token_required or token is not None
         digest = hashlib.sha256((token or "").encode()).digest()
         stale_log, refused_log, code, req = False, False, None, None
@@ -1275,9 +1300,17 @@ class Broker:
                         req = match
                 else:
                     req = cands[0]
+                if req is not None and ssh_rule is not None:
+                    ok_r, cls_r = self.ssh_rule_eligibility(req)
+                    if not ok_r:
+                        rule_refused, req, code = (req, cls_r), None, 409
                 if req is not None:
                     req.status = "deciding"     # claim it: a second submit must not also act
         if req is None:
+            if rule_refused is not None:
+                self.audit("ssh_rule_refused", rule_refused[0], credential=rule_refused[0].names[0],
+                           reason=rule_refused[1], channel=channel, approver=actor, approver_peer=peer,
+                           approver_ip=client_ip)
             if unoffered is not None:
                 self.audit("decision_refused", unoffered, channel=channel, decision=decision,
                            reason="action not offered", approver=actor, approver_peer=peer,
@@ -1297,6 +1330,8 @@ class Broker:
         req.approver = actor
         req.action_hash = None           # a push-button token dies with the decision
         # The decision itself is recorded and announced immediately.
+        if ssh_rule is not None:
+            who["ssh_rule_requested"] = True
         self.audit("decided", req, decision=decision, always_requested=always, **who)
         if not approve:
             self._finish(req, "denied", **who)
@@ -1312,6 +1347,8 @@ class Broker:
                 req.always = "not applied: could not write the config file"
         if grant_minutes is not None:
             self._grant_create(req, grant_minutes, actor, channel, who)
+        if ssh_rule is not None:
+            req.ssh_rule = self._ssh_rule_create(req, ssh_rule["days"], actor, channel, who)
         self._resolved(req, "approved")
         # Releasing can take seconds (vault unlock, upstream call). It runs off
         # the request thread: the approver's page has already been answered, the
@@ -2477,7 +2514,8 @@ def _approve_actions(broker, req):
     ok_g, _ = broker.grant_eligibility(req)
     mins = broker.grant_durations() if ok_g else []
     ok_a, why = broker.always_allow_eligibility(req)
-    if not mins and not ok_a:
+    rule_chip = broker.ssh_rule_chip(req)      # (account, server, fp) when a host rule can be made
+    if not mins and not ok_a and not rule_chip:
         return row1
     scope = grants_mod.scope_for(req.mode, req.spec)
     chips = []
@@ -2500,6 +2538,8 @@ def _approve_actions(broker, req):
         tip = f"Always not offered: {why}."
         chips.append(f"<span class='chip off' tabindex=0 role=img data-tip='{e(tip)}' "
                      f"aria-label='{e(tip)}'>Always</span>")
+    if rule_chip:
+        chips.append(sshrules_mod.chip_html(*rule_chip))
     out = ("<div class=auto><span class=lbl>Automatically approve...</span>"
            f"<div class=chips>{''.join(chips)}</div>")
     if mins:
@@ -2610,7 +2650,12 @@ def _detail_html(r, evs, retained=""):
                             if r["risk_model"] else ""), True)
     add("Outcome", f"<span class='pill {kind}'>{e(label)}</span>"
         + (f" {e(r['error'])}" if r["error"] else ""), True)
-    if r["via"] == "policy" and r.get("grant_id"):
+    if r["via"] == "policy" and r.get("rule_id"):
+        used = first("ssh_rule_used") or {}
+        add("Decided by", "standing SSH rule (auto-approved): "
+            f"{used.get('account') or '?'}@{used.get('rule_host') or sshrules_mod.short_fp(used.get('host_fp')) or '?'}"
+            f", rule {str(r['rule_id'])[:16]}")
+    elif r["via"] == "policy" and r.get("grant_id"):
         left = (final or {}).get("grant_left_s")
         gs = (first("grant_used") or {}).get("scope")
         add("Decided by", "time-boxed grant"
@@ -2631,6 +2676,7 @@ def _detail_html(r, evs, retained=""):
                                                       decided.get("approver_ip")) if x))
         add("Decision", (decided.get("decision") or "")
             + (" and always allow" if decided.get("always_requested") else "")
+            + (" and always allow this host" if decided.get("ssh_rule_requested") else "")
             + (f" and approve for {decided['grant_minutes']} min"
                if decided.get("grant_minutes") else ""))
     elif outcome == "expired":
@@ -2848,6 +2894,8 @@ def approval_handler(broker):
             notes = {"approved": "Approved. Releasing now.", "denied": "Denied.",
                      "always": "Approved, and always allowed from now on.",
                      "grant": "Approved, and further requests are approved for a while.",
+                     "sshrule": "Approved, and this key is always approved for that account on that server.",
+                     "norule": "No standing rule was created; the request is still waiting.",
                      "revoked": "Grant revoked.",
                      "stale": "That request was already handled or has expired.",
                      "push_removed": "Device removed.",
@@ -3153,7 +3201,7 @@ def approval_handler(broker):
             parts = self.path.split("?")[0].strip("/").split("/")
             return parts[1] if len(parts) == 2 and parts[0] == "a" else None
 
-        def _policies_page(self, user, note="", status=200, ssh_state=None):
+        def _policies_page(self, user, note="", status=200, ssh_state=None, rule_state=None):
             rows = []
             for name, sc in sorted(cfg["secrets"].items()):
                 if sc.get("approval", "prompt") != "allow":
@@ -3175,7 +3223,9 @@ def approval_handler(broker):
                   f"risk is within the auto-approve limit ({_AUTO_LABEL[broker.auto_approve_max()]}). "
                   "Revoke to ask every time again.</small></p>" + table
                   + guidance_mod.policies_section(cfg["secrets"], broker.csrf_token(user))
-                  + sshhosts_mod.policies_section(cfg["secrets"], broker.csrf_token(user), ssh_state),
+                  + sshhosts_mod.policies_section(cfg["secrets"], broker.csrf_token(user), ssh_state)
+                  + sshrules_mod.policies_section(cfg["secrets"], broker.csrf_token(user),
+                                                  broker.ssh_rule_usage, state=rule_state),
                   script=_GRANTS_JS + guidance_mod.JS + sshhosts_mod.JS, tab="policies", badge=len(broker.pending()), user=user)
 
         def _grants_section(self, user):
@@ -3383,7 +3433,7 @@ def approval_handler(broker):
             form = urllib.parse.parse_qs(
                 self.rfile.read(min(int(self.headers.get("Content-Length", 0)), limit)).decode())
             if path in ("/decide", "/policies", "/policies/guidance", "/policies/ssh_hosts", "/grants/revoke",
-                        "/push/subscribe",
+                        "/policies/ssh_rules/add", "/policies/ssh_rules/revoke", "/push/subscribe",
                         "/push/revoke", "/push/test") and not self._csrf_ok(user, form.get("csrf", [""])[0]):
                 broker.log("csrf_refused", path=path, peer=self.client_address[0],
                            client_ip=self._fwd(), origin=(self.headers.get("Origin") or "")[:80],
@@ -3395,15 +3445,18 @@ def approval_handler(broker):
                 rid = form.get("id", [""])[0]
                 decision = form.get("decision", [""])[0]
                 r = broker._by_id.get(rid)
-                parsed = _parse_decision(decision)
-                if parsed is None or r is None:
+                rule = sshrules_mod.parse_decision(decision, form)
+                parsed = ("approve", False, None) if rule else _parse_decision(decision)
+                if parsed is None or r is None or rule is False:
                     return self._redirect("/?note=stale")
                 code, done = broker.decide_via(
                     "dashboard", rid, parsed[0], user, always=parsed[1], grant_minutes=parsed[2],
-                    peer=self.client_address[0], client_ip=self._fwd())
+                    ssh_rule=rule, peer=self.client_address[0], client_ip=self._fwd())
                 if done is None:
-                    return self._redirect("/?note=" + ("bad" if code == 400 else "stale"))
+                    return self._redirect("/?note=" + ("bad" if code == 400 else
+                                                       "norule" if code in (403, 409) else "stale"))
                 tag = ("denied" if decision == "deny" else
+                       "sshrule" if done.ssh_rule in ("created", "exists") else
                        "always" if done.always == "applied" else
                        "grant" if parsed[2] is not None else "approved")
                 return self._redirect(f"/?note={tag}")
@@ -3412,6 +3465,31 @@ def approval_handler(broker):
                 done = broker.revoke_grant(gid, user, self.client_address[0], self._fwd())
                 return self._policies_page(
                     user, f"<p>{'Grant revoked' if done else 'That grant is no longer active'}.</p>")
+            if path == "/policies/ssh_rules/revoke":
+                name, rid = form.get("secret", [""])[0], form.get("rule", [""])[0][:16]
+                if name not in cfg["secrets"] or not cfg["secrets"][name].get("ssh"):
+                    return _page(self, 400, "<h1>Bad request</h1>")
+                res = broker.revoke_ssh_rule(name, rid, user, self.client_address[0], self._fwd())
+                msg = {"revoked": "SSH rule revoked", "missing": "That SSH rule no longer exists",
+                       "failed": "Could not revoke the SSH rule"}[res]
+                return self._policies_page(user, f"<p>{msg}: {html.escape(name)}</p>",
+                                           status=500 if res == "failed" else 200,
+                                           rule_state={name: {"open": True}})
+            if path == "/policies/ssh_rules/add":
+                name = form.get("secret", [""])[0]
+                if name not in cfg["secrets"] or not cfg["secrets"][name].get("ssh"):
+                    return _page(self, 400, "<h1>Bad request</h1>")
+                one = lambda k: form.get(k, [""])[0]  # noqa: E731
+                res = broker.add_ssh_rule(name, one("host") or one("fp"), one("account"), one("expires"),
+                                          one("confirm") == "1", user, self.client_address[0], self._fwd())
+                if res["status"] in ("created", "exists"):
+                    return self._policies_page(
+                        user, f"<p>{'SSH rule added' if res['status'] == 'created' else res['message']}: "
+                              f"{html.escape(name)}</p>", rule_state={name: {"open": True}})
+                return self._policies_page(
+                    user, f"<p>Could not add the SSH rule: {html.escape(name)}</p>",
+                    status=400 if res["status"] == "refused" else 500,
+                    rule_state={name: {"open": True, "error": res["message"]}})
             if path == "/policies/ssh_hosts":
                 name = form.get("secret", [""])[0]
                 if name not in cfg["secrets"]:
@@ -3453,15 +3531,22 @@ def approval_handler(broker):
                     user, f"<p>{'Updated' if done else 'Could not update'}: {html.escape(name)}</p>")
             nonce = self._nonce()
             decision = form.get("decision", [""])[0]
-            parsed = _parse_decision(decision) or ("deny", False, None)
+            rule = sshrules_mod.parse_decision(decision, form)
+            parsed = (("approve", False, None) if rule else
+                      _parse_decision(decision) or ("deny", False, None))
             approve = parsed[0] == "approve"
             code, req = (broker.decide_via("link", None, parsed[0], user, nonce=nonce,
                                            always=parsed[1], grant_minutes=parsed[2],
+                                           ssh_rule=rule or None,
                                            peer=self.client_address[0], client_ip=self._fwd())
-                         if nonce else (404, None))
+                         if nonce and rule is not False else (404, None))
             if code == 400:
                 return _page(self, 400, "<h1>That duration is not available</h1>"
                              "<p>Go back and pick one of the offered options.</p>")
+            if code in (403, 409) and req is None:
+                return _page(self, 409, "<h1>No standing rule was created</h1>"
+                             "<p>This request cannot be approved for a standing rule (see the audit log). "
+                             "It is still waiting: go back and approve it normally.</p>")
             if req is None:
                 return _page(self, 404, "<h1>Request not found or already handled</h1>")
             if not approve:
@@ -3472,6 +3557,11 @@ def approval_handler(broker):
                          "Revoke it at <a href='/policies'>/policies</a>.</p>")
             elif req.always:
                 extra = f"<p><small>Always allow {html.escape(req.always)}.</small></p>"
+            if req.ssh_rule in ("created", "exists"):
+                extra += ("<p>Always approved for this account on this server with this key. Revoke it at "
+                          "<a href='/policies'>/policies</a>.</p>")
+            elif req.ssh_rule:
+                extra += "<p><small>The standing rule was not created; this request was approved once.</small></p>"
             if parsed[2] is not None:
                 extra += (f"<p>Further requests for <b>{html.escape(', '.join(req.names))}</b> are "
                           f"approved for {parsed[2]} minutes (same secrets only). Revoke it at "

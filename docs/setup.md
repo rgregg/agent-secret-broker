@@ -165,6 +165,19 @@ refused unless you add `"allow_forwarded": true`. Without
 `allowed_hosts` the approval card still shows the verified server when OpenSSH
 sends it. Details and limits: [reference.md](reference.md#ssh-keys-the-broker-signs-the-key-never-leaves).
 
+### Optional: always allow one server for an SSH key
+
+To stop being asked for a machine the key uses all day, approve one of its logins
+with **Always: this host** (in the "Automatically approve..." row of the card, with a
+confirm step and an optional 30 or 90 day expiry). From then on, logins with that key
+to that server (identified by its verified host key, not by name) as that account are
+signed without a prompt, at any `risk.auto_approve_max`. Other servers, other accounts
+and anything the broker cannot verify (old OpenSSH, forwarded agents, commit signing)
+still ask. You can list, add and revoke these rules on the **Policies** tab under
+"SSH host rules"; they are stored in the key's vault item (`ssh_rules`). They are never
+visible to agents, and a rule cannot override `allowed_hosts`. See
+[reference.md](reference.md#standing-per-host-rules-ssh_rules).
+
 ## Upgrading
 
     cd /opt/stacks/asb

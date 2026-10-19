@@ -214,7 +214,125 @@ socket, and every signature ssh asks for becomes a broker request (mode
   `auto_approve_max` is `high`. Host-level refusals (`ssh_hosts.allowed_hosts`,
   unverified or forwarded connections) still apply first. The credential-level
   "always allow" button is never offered for an SSH key; set `approval` in the
-  vault item yourself.
+  vault item yourself. To allow ONE server without that, use a standing host rule
+  (next).
+
+#### Standing per-host rules: `ssh_rules`
+
+A rule says "this key may log in to this server as this account without asking".
+It is exactly **credential + verified host key fingerprint + account** (no
+wildcard accounts; one rule per account). Rules live in the key item's `broker`
+metadata (vault field `ssh_rules`, so they survive restarts and redeploys) and are
+validated when the catalog loads like the rest of the metadata: a bad shape makes
+the secret invalid and the message names the field (`ssh_rules[2].fp`).
+
+    "ssh_rules": [
+      {"id": "3fa9c1d2", "fp": "SHA256:...43 characters...", "user": "deploy",
+       "host": "web.example.com", "by": "ryan", "at": "2026-10-19T16:00:00Z",
+       "expires_at": null}
+    ]
+
+| Field | Meaning |
+| --- | --- |
+| `id` | short random id (4-16 of letters, digits, `-`, `_`), unique in the list |
+| `fp` | the server host key fingerprint, `SHA256:` + 43 base64 characters |
+| `user` | the account, 1-64 printable ASCII characters, no spaces; compared exactly (case-sensitive) |
+| `host` | optional display label (up to 100 characters), taken from `known_hosts` when the rule is created; informational only, never matched on |
+| `by`, `at` | who created it and when (UTC, `YYYY-MM-DDTHH:MM:SSZ`) |
+| `expires_at` | optional UTC time, or `null` for never |
+
+Unknown keys are rejected; at most 100 rules per key. Last-used time and use counts
+are NOT written to the vault (its writes are rate limited): they live in
+`ssh_rules_state.json` next to the audit log (atomic, mode 0600). A corrupt file
+only loses those numbers (`ssh_rules_state_corrupt` audit warning).
+
+**Matching** (all must hold, otherwise the request prompts exactly as before):
+
+1. the request has a verified host identity: a valid session-bind chain whose last
+   bind is for this login's session, or host-bound login data. Plain `publickey`
+   logins, failed or invalid binds, mismatched chains and SSHSIG (commit signing)
+   never match;
+2. the chain has exactly one hop and no forwarding (a forwarded chain, or any
+   chain with more than one hop, never matches a rule in this version);
+3. the verified host key fingerprint equals the rule's `fp`;
+4. the account inside the signed login data equals the rule's `user` exactly, and
+   the login is for service `ssh-connection`;
+5. the credential is the key that owns the rule;
+6. the rule has not expired.
+
+**Order.** All server-identity refusals (`allowed_hosts`, `host_unverified`,
+`host_forwarded`, `bind_invalid`, `session_mismatch`, `host_conflict`) run first,
+in `Broker.create()` before the request exists, so a rule can never release a
+request they refuse. Removing a host from `allowed_hosts` therefore makes its
+rules ineffective (they stay stored; the Policies tab flags them). After the
+assessment, `create()` checks a matching rule *before* auto-approval, grants and
+the prompt. A matching rule releases the signature without a notification at
+ANY `risk.auto_approve_max` (including `none`) and regardless of the HIGH rating
+SSH requests carry: it is explicit human policy for exactly one server, like a
+time-boxed grant, and is audited as such (`approved` with `via: policy`,
+`rule_id`, `decision_source: rule`; `ssh_rule_used`). If a grant, `approval:
+allow` or a rule would each release a request, the audit shows the rule.
+Everything else (other servers, other accounts, other keys) still prompts or is
+released by grants / `auto_approve_max` as before.
+
+**Creating a rule from the approval card.** For a pending SSH login that is eligible
+(verified direct server with a fingerprint and a readable account, no forwarding, no
+invalid bind, a vault backend that can write metadata, fewer than 100 rules, and the
+server on `allowed_hosts` when that is set) the "Automatically approve..." row has an
+**Always: this host** chip on the dashboard card and on the `/a/<nonce>` page. Clicking
+it opens a confirm step ("Always approve deploy@web.example.com with this key?", the
+server name from `known_hosts` or else the short fingerprint) with an expiry select
+(Never expires (default), 30 days, 90 days) and Confirm. The form value is
+`approve_ssh_rule` (+ `ssh_rule_expiry`); the fingerprint and account always come from
+the stored, verified request, never from the form. `Broker.decide_via(..., ssh_rule={"days": n|None})`
+approves this request and creates the rule; only the `dashboard` and `link` channels
+may (`Channel.may_create_ssh_rule`; push and ha get 403 and nothing changes). If the
+request is not eligible, `ssh_rule_refused` is audited (`reason`: `not_eligible`, `cap`,
+`backend`, `not_verified`, `forwarded`) and NOTHING changes: the request stays
+pending (dashboard note, or a 409 page on the link). A duplicate (same fingerprint and
+account) is a no-op that still approves. If the vault write fails after eligibility, the
+request is approved once and `ssh_rule_change_failed` is audited.
+
+**Policies tab: "SSH host rules".** Per SSH key a table: host label, short fingerprint,
+account, created by/when, expires, last used and use count, and **Revoke**
+(`POST /policies/ssh_rules/revoke`, fields `secret`, `rule`). An "Add rule" form takes a
+server from the key's parsed `known_hosts` (or a `SHA256:` fingerprint), an account, an
+expiry and a confirmation tick (`POST /policies/ssh_rules/add`, fields `secret`, `host`
+or `fp`, `account`, `expires`, `confirm`), validated by the same code as the loader. Both
+POSTs are guarded like the other policy forms (SSO identity, trusted peer, CSRF token and
+same-origin check). A rule whose host is not on an enforcing `allowed_hosts` shows
+"blocked by the allowed hosts list". Whoever can edit the vault collection or use the
+Policies tab can add rules: the same trust level as `approval`.
+
+**Expiry.** Expired rules are ignored at match time, dropped lazily (the next matching
+request triggers it) and by a 60 s sweep, and `ssh_rule_expired` is audited once.
+
+**Audit** (all hidden from the agent audit API; none carries key material; the full
+public-key fingerprint is recorded):
+
+| Event | Fields |
+| --- | --- |
+| `ssh_rule_created` | `credential`, `host_fp`, `account`, `rule_id`, `rule_host`, `expires_at`, `created_by`, `channel` (`dashboard`, `link` or `policies`), `approver_peer`, `approver_ip`; `id` when made from a request |
+| `ssh_rule_used` | request `id`, `credential`, `host_fp`, `account`, `rule_id`, `rule_host` |
+| `ssh_rule_revoked` | `credential`, `host_fp`, `account`, `rule_id`, `created_by`, `revoked_by`, `peer`, `client_ip` |
+| `ssh_rule_expired` | `credential`, `host_fp`, `account`, `rule_id`, `expires_at`, `created_by` |
+| `ssh_rule_refused` | `reason` (see above, or `invalid`/`not_confirmed` from the Policies form), `credential`, who asked |
+| `ssh_rule_change_failed` | `op` (`create`, `revoke`, `expire`), `error`, ids when known |
+| `ssh_rules_state_corrupt`, `ssh_rules_state_write_failed` | `warning`, `error` |
+
+**What the agent can and cannot see.** Nothing about rules: not in discovery,
+`/v1/secrets`, `/v1/status`, request results, notifications or the agent audit API.
+A rule-approved request looks like any other approved one (`approved` with null
+`channel`/`approver`). History and the request pop-over (approver UI) show "Decided by:
+standing SSH rule (auto-approved): account@host, rule <id>".
+
+**Decisions** (issue #10): scope is host + account only (no wildcard accounts); rules
+match on the verified fingerprint, never on names; a matching rule is released at any
+`auto_approve_max`; no default expiry (never, revocable); git over SSH to a known host
+key works through the same rules (it is a login; SSHSIG commit signing stays excluded);
+a forwarded chain never matches in this version (no per-hop rules, so
+`allow_forwarded` only relaxes the `allowed_hosts` refusal, not rules); a per-host
+time-boxed variant is not built.
 
 ### Vault access: `backend.serve`
 
@@ -498,7 +616,7 @@ state, so bad-key floods cannot lock out Home Assistant.
 
 Every decision (dashboard `/decide`, approval-link page, `/push/decide`,
 `/v1/hooks/ha/decide`) goes through `Broker.decide_via(channel, rid, decision, actor, *,
-token=None, always=False, nonce=None, peer=None, client_ip=None, grant_minutes=None, **audit_extra)`
+token=None, always=False, nonce=None, peer=None, client_ip=None, grant_minutes=None, ssh_rule=None, **audit_extra)`
 -> `(http_status, request)`; `decision` is `approve|deny`. It alone enforces the
 single-decision claim, the constant-time token check (spent on match; any
 decision kills it), whether `always` may create an always-allow rule and `grant_minutes` a time-boxed grant (400 for a duration that is not on offer, nothing claimed), and the
@@ -508,12 +626,12 @@ already decided/expired/token spent. Channels are registered in
 `broker.CHANNELS` (unknown channel: `ValueError`); the caller does the channel's
 own authentication (SSO header, CSRF/origin, `X-Requested-With`):
 
-| Channel | token_required | may_create_always | may_create_grant |
-| --- | --- | --- | --- |
-| `dashboard` | no | yes | yes |
-| `link` (`/a/<nonce>`) | no | yes | yes |
-| `push` | yes | no | no |
-| `ha` (`/v1/hooks/ha/decide`) | yes | no | no |
+| Channel | token_required | may_create_always | may_create_grant | may_create_ssh_rule |
+| --- | --- | --- | --- | --- |
+| `dashboard` | no | yes | yes | yes |
+| `link` (`/a/<nonce>`) | no | yes | yes | yes |
+| `push` | yes | no | no | no |
+| `ha` (`/v1/hooks/ha/decide`) | yes | no | no | no |
 
 ### Home Assistant action buttons (`ha_hook`)
 
@@ -1112,6 +1230,10 @@ decision. Hidden on purpose:
 - Server-identity policy: `ssh_hosts_changed`, `ssh_hosts_change_refused`, `ssh_hosts_change_failed`,
   `ssh_sign_refused` (a key's `ssh_hosts.allowed_hosts` is approval
   policy; the refusal itself is already returned to the client without the allowed list).
+- Standing SSH rules: `ssh_rule_created`, `ssh_rule_used`, `ssh_rule_revoked`,
+  `ssh_rule_expired`, `ssh_rule_refused`, `ssh_rule_change_failed`,
+  `ssh_rules_state_corrupt`, `ssh_rules_state_write_failed`, and the `rule_id` /
+  `decision_source` fields (a rule-approved request shows as a plain `approved`).
 - Browser telemetry: every `client_event` (page loads, visibility, service-worker delivery
   diagnostics) and `client_event_dropped`. Even the delivery diagnostics only occur when a
   human was notified or acted, and the rest shows whether a page is open. The full
