@@ -355,6 +355,33 @@ unless the listener on that port belongs to the process it started. Anyone who
 can already run code in the container could read the same state from the
 persistent `/bw` volume.
 
+### Local encrypted backend: `backend.type = "local"`
+
+Instead of a vault, the broker can keep its items in one AES-256-GCM encrypted
+file (no Bitwarden or Vaultwarden needed). Items have the same shape and
+behavior as vault items, including `broker` metadata and auto-adoption.
+
+    "backend": {
+      "type": "local",
+      "path": "/data/store.enc",
+      "key_source": {"type": "file", "path": "/run/secrets/broker_store_key"},
+      "idle_timeout": 300
+    }
+
+- `path` (required): the store file. `idle_timeout` (default 300; 0 = never):
+  seconds after last use before the decrypted contents are dropped from memory.
+- `key_source` (required): `{"type": "file", "path": ...}` or
+  `{"type": "env", "name": ...}`. The value is a passphrase (run through scrypt)
+  or a raw 32-byte key as base64; one trailing newline is trimmed. Prefer the
+  file form: environment variables show up in `docker inspect` and `/proc`.
+- A missing or unknown field stops the broker at startup, naming the field.
+  A wrong or missing key does not: the broker stays up, the catalog is empty,
+  and `store_unlock_failed` is audited (names and reasons only, never values).
+- Audit events: `store_unlocked`, `store_locked` (idle), `store_unlock_failed`,
+  `store_written`, `store_reloaded` (the file was changed by someone else).
+- Creating the store file needs the admin tooling, which is not part of this
+  phase; until then use `secret_broker.localstore.create_store` from Python.
+
 ## The vault is the catalog
 
 There is no list of secrets in a config file. Every login and secure note in the
