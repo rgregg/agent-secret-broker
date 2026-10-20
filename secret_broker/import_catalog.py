@@ -14,7 +14,7 @@ import sys
 import time
 
 from .__main__ import build_backend, load_settings
-from .backends import BackendError
+from .backends import BackendError, error_class
 
 
 def plan(secrets):
@@ -73,7 +73,7 @@ def main(argv=None):
                     time.sleep(args.pause)
                     break
                 except BackendError as e:
-                    if "rate limit" in str(e).lower() or "too many" in str(e).lower():
+                    if error_class(e) == "rate_limited":
                         print(f"  rate limited, waiting {30 * attempt}s")
                         time.sleep(30 * attempt)
                         continue
@@ -83,8 +83,7 @@ def main(argv=None):
             else:
                 print("  FAILED: still rate limited")
                 bad = True
-    if hasattr(backend, "close"):
-        backend.close()
+    backend.close()
     return 1 if bad else 0
 
 

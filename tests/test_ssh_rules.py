@@ -22,6 +22,7 @@ import test_e2e as t  # noqa: E402
 import test_ssh as ts  # noqa: E402
 import test_ssh_host as th  # noqa: E402
 from secret_broker import audit_api, sshkey, sshrules  # noqa: E402
+from secret_broker.backends import MemoryBackend  # noqa: E402
 from secret_broker.broker import CHANNELS, Broker  # noqa: E402
 from secret_broker.notify import FakeNotifier  # noqa: E402
 
@@ -47,9 +48,11 @@ class NoMeta:
     def __init__(self, inner):
         self._inner = inner
 
+    @property
+    def capabilities(self):
+        return self._inner.capabilities - {"set_meta"}
+
     def __getattr__(self, name):
-        if name == "set_meta":
-            raise AttributeError(name)
         return getattr(self._inner, name)
 
 
@@ -669,7 +672,7 @@ class Validation(unittest.TestCase):
         self.assertIn("ssh_rules only applies to an ssh key", str(cm.exception))
 
     def test_invalid_rules_make_the_secret_invalid_in_the_catalog(self):
-        class Rows:
+        class Rows(MemoryBackend):
             def catalog(self):
                 m = Validation.meta(Validation(), ssh_rules=[{"id": "x"}])
                 return [{"item": "Item", "meta": m, "auto": {}}]

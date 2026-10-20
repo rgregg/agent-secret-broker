@@ -323,7 +323,7 @@ class SshRulesMixin:
         fp, _account, why = identity(req.spec)
         if why:
             return False, why
-        if not hasattr(self.backend, "set_meta"):
+        if "set_meta" not in self.backend.capabilities:
             return False, "backend"
         if not self._host_allowed_now(sc, fp):
             return False, "not_eligible"
@@ -353,7 +353,7 @@ class SshRulesMixin:
             rules = [r for r in rules if not (r["fp"] == fp and r["user"] == account)]
             if len(rules) >= MAX_RULES:
                 return "cap", None
-            if not hasattr(self.backend, "set_meta"):
+            if "set_meta" not in self.backend.capabilities:
                 return "backend", None
             rule = new_rule(fp, account, label, by, days, now, {r["id"] for r in rules})
             try:

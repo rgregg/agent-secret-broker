@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from secret_broker import audit as audit_mod  # noqa: E402
 from secret_broker import risk as risk_mod  # noqa: E402
 from secret_broker.backends import BwServeBackend  # noqa: E402
-from secret_broker.backends import BackendError, BwBackend, FileBackend  # noqa: E402
+from secret_broker.backends import BackendError, BwBackend, FileBackend, MemoryBackend  # noqa: E402
 from secret_broker.broker import Broker, serve  # noqa: E402
 from secret_broker import notify as notify_mod  # noqa: E402
 from secret_broker.notify import FakeNotifier, NotifyError  # noqa: E402
@@ -497,7 +497,7 @@ class CatalogFromVault(unittest.TestCase):
         self.assertEqual(b.cfg["secrets"]["my-api"]["vars"]["T_TOKEN"]["item"], "My API")
 
     def adopt(self, rows, explicit=None):
-        class Rows:
+        class Rows(MemoryBackend):
             def catalog(self_inner):
                 return (explicit or []) + rows
         b = Broker({"approve_base_url": "https://s.example"}, Rows(), FakeNotifier(), None)
@@ -625,7 +625,7 @@ class CatalogFromVault(unittest.TestCase):
             b.backend.put("A", "broker", "{}", create=False)
 
     def test_a_vault_that_cannot_be_read_does_not_stop_startup(self):
-        class Down:
+        class Down(MemoryBackend):
             def catalog(self):
                 raise BackendError("vault down")
         b = Broker({"approve_base_url": "https://s.example"}, Down(), FakeNotifier(), None)
@@ -635,7 +635,7 @@ class CatalogFromVault(unittest.TestCase):
         import threading, time as _t
         gate = threading.Event()
 
-        class Slow:
+        class Slow(MemoryBackend):
             def catalog(self):
                 gate.wait(5)
                 return [{"item": "A", "meta": {"name": "a", "allowed_hosts": ["h.example"],
@@ -1330,8 +1330,11 @@ class BwIdleLogout(BwBackendWarm):
     test_resync_after_interval = None
 
 
-class PrewarmStub:
+class PrewarmStub(MemoryBackend):
+    capabilities = frozenset({"warm"})
+
     def __init__(self):
+        super().__init__()
         self.warmed = threading.Event()
         self.count = 0
 
@@ -1361,7 +1364,7 @@ class Prewarm(Harness):
         self.assertEqual(len(self.events("backend_ready")), 1)
 
     def test_prewarm_can_be_disabled(self):
-        self.broker.cfg["backend"] = {"prewarm": False}
+        self.stub.capabilities = frozenset()      # a backend that does not declare "warm"
         self.create_env()
         time.sleep(0.3)
         self.assertEqual(self.stub.count, 0)
@@ -1514,6 +1517,8 @@ elif cmd == "list" and a[1] == "organizations":
     print(json.dumps(d.get("orgs", [{"id": "org1", "name": "Org"}])))
 elif cmd == "list" and a[1] == "collections":
     print(json.dumps(d.get("colls", [{"id": "col1", "name": "Shared"}])))
+elif cmd == "list" and a[1] == "items":
+    print(json.dumps(d["items"]))
 elif cmd == "get":
     hits = [i for i in d["items"] if i["name"] == a[2] or i["id"] == a[2]]
     if not hits:
@@ -2665,13 +2670,6 @@ class StoreFlow(Harness):
         self.assertEqual(self.result(body)["status"], "denied")
         self.assertNotIn("newapi", self.broker.backend._data)
         self.assertNotIn("newapi", self.disk()["secrets"])
-
-    def test_create_refused_when_the_backend_has_no_catalog(self):
-        class NoCatalog:
-            def put(self, *a, **k): pass
-            def get(self, *a, **k): return ""
-        self.broker.backend = NoCatalog()
-        self.assertEqual(self.store()[0], 403)
 
 
 class StatusEndpoint(Harness):

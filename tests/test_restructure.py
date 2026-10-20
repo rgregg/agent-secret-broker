@@ -4,6 +4,8 @@ from secret_broker import restructure
 
 
 class Fake:
+    capabilities = frozenset({"create_login", "edit_item", "set_meta"})
+
     def __init__(self, items, corrupt=False):
         self.items, self.corrupt = items, corrupt     # name -> {"notes","meta"} | login dict
 

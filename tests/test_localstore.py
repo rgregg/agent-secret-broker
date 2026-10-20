@@ -11,11 +11,13 @@ from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.dirname(__file__))
-from secret_broker import localstore as ls  # noqa: E402
+from secret_broker.backends import localstore as ls  # noqa: E402
 from secret_broker.__main__ import build_backend  # noqa: E402
 from secret_broker.backends import BackendError, FileBackend  # noqa: E402
 from secret_broker.broker import Broker  # noqa: E402
-from secret_broker.localstore import BackendConfigError, LocalBackend, StoreError  # noqa: E402
+from secret_broker.backends import BackendConfigError  # noqa: E402
+from secret_broker.backends.local import LocalBackend  # noqa: E402
+from secret_broker.backends.localstore import StoreError  # noqa: E402
 from secret_broker.notify import FakeNotifier  # noqa: E402
 import test_e2e as e2e  # noqa: E402
 
@@ -407,7 +409,7 @@ class Durability(Base):
         b = self.backend()
         b.put("A", "notes", "1", create=True)
         before = self.raw()
-        with mock.patch("secret_broker.localstore.os.replace", side_effect=OSError("disk full")):
+        with mock.patch("os.replace", side_effect=OSError("disk full")):
             with self.assertRaises(OSError):
                 b.put("B", "notes", "2", create=True)
         self.assertEqual(self.raw(), before)
@@ -421,7 +423,7 @@ class Durability(Base):
         b = self.backend()
         b.put("A", "notes", "1", create=True)
         before = self.raw()
-        with mock.patch("secret_broker.localstore.os.fsync", side_effect=OSError("io error")):
+        with mock.patch("os.fsync", side_effect=OSError("io error")):
             with self.assertRaises(OSError):
                 b.put("B", "notes", "2", create=True)
         self.assertEqual(self.raw(), before)
@@ -640,6 +642,99 @@ class Config(unittest.TestCase):
         b = {"type": "bw", "server_url": "https://v.example", "master_password_file": pw}
         self.assertIs(type(build_backend({"backend": b})), BwBackend)
         self.assertIs(type(build_backend({"backend": {**b, "serve": True}})), BwServeBackend)
+
+
+class UnlockableStoreAtStartup(Base):
+    """A store the key cannot open must not stop the broker: empty catalog, a clear
+    failure for requests, audited reasons, and recovery once the key is right."""
+
+    def start(self, background_load):
+        meta = {"name": "svc", "allowed_hosts": ["127.0.0.1"], "vars": {"SVC_TOKEN": {"field": "notes"}}}
+        self.init(doc={"items": {"Svc": {"type": "note", "notes": VAL, "uris": [], "fields": {},
+                                         "broker": meta}}})
+        self.write_key(base64.b64encode(b"\x07" * 32).decode())          # not the key
+        self.audit = os.path.join(self.dir, "audit.jsonl")
+        self.notifier = FakeNotifier()
+        self.broker = Broker({"approve_base_url": "https://s.example", "allowed_user": "alice"},
+                             self.backend(), self.notifier, self.audit,
+                             background_load=background_load)
+        self.broker.backend.on_event = self.broker.log
+        with self.broker._refreshing:                                   # waits for the first load
+            pass
+        self.c, self.a = e2e.serve(self.broker, ("127.0.0.1", 0), ("127.0.0.1", 0), e2e.KEY)
+        self.addCleanup(lambda: [s.shutdown() or s.server_close() for s in (self.c, self.a)])
+        self.base = f"http://127.0.0.1:{self.c.server_address[1]}"
+
+    def api(self, method, path, body=None):
+        return e2e.req(self.base + path, method, body, {"X-Client-Key": e2e.KEY, "Content-Type": "application/json"})
+
+    def audit_events(self):
+        with open(self.audit) as f:
+            return [json.loads(line) for line in f if line.strip()]
+
+    def check(self, background_load):
+        self.start(background_load)
+        self.assertEqual(self.broker.cfg["secrets"], {})
+        st = self.broker.status()
+        self.assertEqual(st["backend"], {"type": "local", "ok": False})
+        events = self.audit_events()
+        self.assertTrue([r for r in events if r["event"] == "catalog_error"])
+        self.assertEqual([r["reason"] for r in events if r["event"] == "store_unlock_failed"][:1],
+                         ["wrong_key"])
+        text = open(self.audit).read()
+        self.assertNotIn(VAL, text)
+        self.assertNotIn(base64.b64encode(b"\x07" * 32).decode(), text)
+        # the API is up and reports an empty catalog
+        code, body = self.api("GET", "/v1/secrets")
+        self.assertEqual(code, 200)
+        code, body = self.api("POST", "/v1/requests", {"mode": "env", "names": ["svc"],
+                                                       "argv": ["echo", "hi"]})
+        self.assertGreaterEqual(code, 400)
+        self.assertNotIn(VAL, body)
+        # a read through the backend fails with a classified error, never partial data
+        with self.assertRaises(StoreError) as cm:
+            self.broker.backend.get("Svc", "notes")
+        self.assertEqual(cm.exception.reason, "wrong_key")
+        self.assertNotIn(VAL, str(cm.exception))
+        # fix the key: the next refresh recovers without a restart
+        self.write_key(RAW)
+        self.broker.refresh_catalog()
+        self.assertEqual(sorted(self.broker.cfg["secrets"]), ["svc"])
+        self.assertEqual(self.broker.status()["backend"], {"type": "local", "ok": True})
+
+    def test_wrong_key_foreground_load(self):
+        self.check(False)
+
+    def test_wrong_key_background_load(self):
+        self.check(True)
+
+    def test_missing_key_file_and_missing_store(self):
+        self.init()
+        os.unlink(self.keyfile)
+        b = Broker({"approve_base_url": "https://s.example"}, self.backend(), FakeNotifier(),
+                   None, background_load=False)
+        self.assertEqual(b.cfg["secrets"], {})
+        self.assertFalse(b.status()["backend"]["ok"])
+        os.unlink(self.path)
+        self.write_key(RAW)
+        b2 = Broker({"approve_base_url": "https://s.example"}, self.backend(), FakeNotifier(),
+                    None, background_load=False)
+        self.assertEqual(b2.cfg["secrets"], {})
+        with self.assertRaises(StoreError) as cm:
+            b2.backend.catalog()
+        self.assertEqual(cm.exception.reason, "not_found")
+
+    def test_corrupt_store_at_startup_is_never_overwritten(self):
+        self.init()
+        raw = bytearray(self.raw())
+        raw[-5] ^= 0xFF
+        self.put_raw(bytes(raw))
+        b = Broker({"approve_base_url": "https://s.example"}, self.backend(), FakeNotifier(),
+                   None, background_load=False)
+        self.assertEqual(b.cfg["secrets"], {})
+        with self.assertRaises(StoreError):
+            b.backend.put("X", "notes", "v", create=True)
+        self.assertEqual(self.raw(), bytes(raw))
 
 
 class LocalHarness(e2e.Harness):

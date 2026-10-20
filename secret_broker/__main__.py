@@ -11,9 +11,8 @@ import os
 import signal
 import threading
 
-from .backends import BwBackend, BwServeBackend, FileBackend
+from .backends import BackendConfigError, registry
 from .broker import Broker, serve
-from .localstore import BackendConfigError, LocalBackend
 from . import grants, notify, presence, proposals, request_details, risk, riskmodel
 
 
@@ -30,29 +29,10 @@ def load_settings(config_path=None):
     return cfg
 
 
-def _bw_backend(b):
-    bw_class = BwServeBackend if b.get("serve") else BwBackend
-    return bw_class(b["server_url"], b["master_password_file"],
-                    idle_timeout=b.get("idle_timeout", 300),
-                    organization=b.get("organization"), collection=b.get("collection"))
-
-
-def _file_backend(b):
-    return FileBackend(b["path"])
-
-
-# backend `type` -> factory(settings dict). A new backend is one entry here.
-BACKENDS = {"bw": _bw_backend, "file": _file_backend, "local": LocalBackend.from_config}
-
-
 def build_backend(cfg):
-    b = cfg.get("backend")
-    if not isinstance(b, dict):
-        raise BackendConfigError("backend: required (an object with a type)")
-    kind = b.get("type")
-    if kind not in BACKENDS:
-        raise BackendConfigError(f"backend.type: must be one of {sorted(BACKENDS)}, got {kind!r}")
-    return BACKENDS[kind](b)
+    """The backend named by cfg["backend"]["type"], through the registry (which
+    validates the block and raises BackendConfigError naming the field)."""
+    return registry.build_backend(cfg)
 
 
 def main():

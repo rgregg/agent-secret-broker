@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 import test_e2e as t  # noqa: E402
 import test_ssh_host as th  # noqa: E402
 from secret_broker import audit_api, sshhosts  # noqa: E402
+from secret_broker.backends import MemoryBackend  # noqa: E402
 from secret_broker.broker import Broker  # noqa: E402
 from secret_broker.notify import FakeNotifier  # noqa: E402
 
@@ -91,7 +92,7 @@ class Editor(Base):
         row = {"item": "Modem", "meta": None, "auto": {
             "login": True, "username": True, "password": True, "notes": False, "fields": [], "uris": []}}
 
-        class Rows:
+        class Rows(MemoryBackend):
             def catalog(self):
                 return [row]
         b = Broker({"approve_base_url": "https://s.example"}, Rows(), FakeNotifier(), None)

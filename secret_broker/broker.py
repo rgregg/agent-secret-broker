@@ -37,6 +37,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .audit import AuditLog
 from .backends import BackendError
+from .backends import base as backend_base
 from . import audit_api
 from . import notify as notify_mod
 from . import presence as presence_mod
@@ -200,7 +201,7 @@ class Broker(sshrules_mod.SshRulesMixin):
         self._by_id = {}
         self._by_nonce = {}
         self._denied_at = {}
-        if hasattr(backend, "on_event"):
+        if backend_base.CAP_ON_EVENT in backend.capabilities:
             backend.on_event = self.log
         self._auto_max, warn = risk_mod.parse_auto_approve_max(config.get("risk"), "risk")
         if warn:
@@ -320,7 +321,7 @@ class Broker(sshrules_mod.SshRulesMixin):
             if ref.get("item") not in (None, "", item):
                 raise ValueError(f"{var}: a secret can only use its own item's fields")
             field = ref.get("field") or "auto"
-            if field in ("broker", "previous_value", "previous_replaced_at"):
+            if field in backend_base.RESERVED_FIELDS:
                 raise ValueError(f"{var}: field {field!r} is reserved")
             vars_[var] = {"item": item, "field": field}
             if ref.get("key"):
@@ -409,7 +410,7 @@ class Broker(sshrules_mod.SshRulesMixin):
             if host and _HOST_RE.match(host) and host.lower() not in hosts:
                 hosts.append(host.lower())
         if info.get("ssh_public_key"):
-            # a Bitwarden SSH key item: only ever usable to sign, never released
+            # an SSH key item (kind ssh_key): only ever usable to sign, never released
             return {"allowed_hosts": [], "vars": {f"{base}_SSH_KEY": {"field": "private_key"}},
                     "approval": "prompt", "ssh": True, "ssh_public_key": info["ssh_public_key"]}
         if not vars_:
@@ -419,8 +420,6 @@ class Broker(sshrules_mod.SshRulesMixin):
     def refresh_catalog(self):
         """Rebuild the secret catalog from the vault's items. Raises if the vault
         cannot be read, leaving the previous catalog in place."""
-        if not hasattr(self.backend, "catalog"):
-            return
         rows = self.backend.catalog()
         out, bad, owners, autos = {}, [], {}, []
         for row in rows:
@@ -487,8 +486,7 @@ class Broker(sshrules_mod.SshRulesMixin):
         kinds = ([sp.get("type") for sp in specs] if specs is not None
                  else (["ticker"] if self.cfg.get("ha_url") else []))
         notifiers = sorted({k for k in kinds if k in ("ticker", "telegram", "webpush")})
-        bname = type(self.backend).__name__
-        btype = "bw" if bname.startswith("Bw") else "file" if bname == "FileBackend" else "local"
+        btype = self.backend.kind
         now = time.time()
         with self._cfg_lock:
             stats = dict(self._catalog_stats)
@@ -620,7 +618,7 @@ class Broker(sshrules_mod.SshRulesMixin):
         if req.mode not in self._effective_auto_modes(sc):
             return False, (f"{_MODE_LABEL.get(req.mode, req.mode)} requests are not enabled "
                            "for auto-approval (auto_modes)")
-        if not hasattr(self.backend, "set_meta"):
+        if not self._backend_can("set_meta"):
             return False, "the vault backend cannot record this"
         if req.risk:
             lvl = req.risk["level"]
@@ -1013,9 +1011,9 @@ class Broker(sshrules_mod.SshRulesMixin):
             raise PermissionError(err)
         self.audit("requested", req)
         self._retain_details(req)
-        if self.cfg.get("backend", {}).get("prewarm", True):
-            # unlock while the human is reaching for their phone
-            self.warm_backend()
+        # unlock while the human is reaching for their phone (a backend that cannot
+        # or should not do this does not declare "warm")
+        self.warm_backend()
         if mode == "guidance":
             return self._propose(req)
         # ssh_sign never reaches a model, so it carries no guidance either
@@ -1176,8 +1174,6 @@ class Broker(sshrules_mod.SshRulesMixin):
         if op == "create":
             if name in secrets_cfg:
                 raise ValueError(f"{name} already exists; use update")
-            if not hasattr(self.backend, "catalog"):
-                raise PermissionError("this vault backend has no secret catalog")
             hosts = spec.get("allowed_hosts")
             if (not isinstance(hosts, list) or not (0 if spec.get("ssh") else 1) <= len(hosts) <= 10
                     or not all(isinstance(h, str) and _HOST_RE.match(h) for h in hosts)):
@@ -1189,8 +1185,8 @@ class Broker(sshrules_mod.SshRulesMixin):
             spec["item"] = spec.get("item") or name
             spec["var"] = spec.get("var") or re.sub(r"[^A-Za-z0-9]", "_", name).upper() + (
                 "_SSH_KEY" if spec.get("ssh") else "_TOKEN")
-            if not _FIELD_RE.match(spec["field"]) or spec["field"] in (
-                    "previous_value", "previous_replaced_at", "broker"):
+            if not _FIELD_RE.match(spec["field"]) or spec["field"] in \
+                    backend_base.RESERVED_FIELDS:
                 raise ValueError("bad field name")
             if not _ITEM_RE.match(spec["item"]):
                 raise ValueError("bad item name")
@@ -1992,7 +1988,7 @@ class Broker(sshrules_mod.SshRulesMixin):
             kept = [e for e in entries if e["mode"] != mode]
             if len(kept) >= standing_mod.MAX_STANDING:
                 return "cap", None
-            if not hasattr(self.backend, "set_meta"):
+            if not self._backend_can("set_meta"):
                 return "backend", None
             taken = {e["id"] for e in kept} | {g["id"] for g in self.grants.active()}
             sid = secrets.token_hex(4)
@@ -2156,11 +2152,16 @@ class Broker(sshrules_mod.SshRulesMixin):
             return
         self._finish(req, "approved", result=result, **who)
 
+    def _backend_can(self, capability):
+        """True when the backend declares the optional capability (the only way the
+        core asks; it never probes the backend's attributes)."""
+        return capability in self.backend.capabilities
+
     def warm_backend(self):
         """Pre-unlock the backend in the background; never raises."""
-        fn = getattr(self.backend, "warm", None)
-        if fn is None:
+        if not self._backend_can("warm"):
             return
+        fn = self.backend.warm
 
         def run():
             t0 = time.time()
@@ -2176,8 +2177,6 @@ class Broker(sshrules_mod.SshRulesMixin):
         """Write the credential to the vault; a create also writes its catalog entry."""
         sp = req.spec
         name, by = req.names[0], req.approver or "unknown"
-        if not hasattr(self.backend, "put"):
-            raise BackendError("this backend cannot store credentials")
         t0 = time.time()
         if sp["op"] == "create":
             # One atomic vault write: the item, its value and its broker metadata
@@ -2187,7 +2186,7 @@ class Broker(sshrules_mod.SshRulesMixin):
             meta = {"name": name, "vars": {sp["var"]: {"field": sp["field"]}},
                     "allowed_hosts": sp["allowed_hosts"], "approval": "prompt", "created": stamp}
             if sp.get("ssh"):
-                meta.update(ssh=True, ssh_public_key=sp["ssh_public_key"])   # item type 5 in Bitwarden
+                meta.update(ssh=True, ssh_public_key=sp["ssh_public_key"])   # stored as an ssh_key item
             self.backend.put(sp["item"], sp["field"], sp["value"], create=True, meta=meta)
             _, entry = self._entry(sp["item"], meta)
             with self._cfg_lock:

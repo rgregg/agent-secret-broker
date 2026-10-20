@@ -1,4 +1,8 @@
-"""Secret backends. A backend resolves a (item, field) reference to a string."""
+"""Bitwarden / Vaultwarden backends, through the `bw` CLI or one long-lived `bw serve`.
+
+Everything Bitwarden-specific lives here: organization and collection scoping,
+item type numbers, the `bw` process handling, `serve`, `prewarm`. The broker core
+sees only the `VaultBackend` contract (base.py)."""
 import json
 import os
 import socket
@@ -9,102 +13,60 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from . import sshkey
+from .. import sshkey
+from .base import (CAP_ADOPTS, CAP_CREATE_LOGIN, CAP_EDIT_ITEM, CAP_EXPORT_ITEMS, CAP_ON_EVENT,
+                   CAP_SET_META, CAP_WARM, LOGIN, META_FIELD, NOTE, RESERVED_FIELDS, SSH_KEY,
+                   BackendConfigError, BackendConflict, BackendError, BackendInvalid,
+                   BackendNotFound, BackendRateLimited, BackendSpec, BackendUnavailable, Item,
+                   VaultBackend, AUTO_ALIASES, auto_shape, catalog_rows, check_item_args,
+                   clean_meta, error_class, now_iso)
+
+_RESERVED_FIELDS = RESERVED_FIELDS      # kept for older imports
 
 
-class BackendError(Exception):
-    pass
+def _bw_error(message):
+    """The BackendError subclass that matches what `bw` / `bw serve` said."""
+    cls = error_class(BackendError(message))
+    low = message.lower()
+    if cls == "rate_limited":
+        return BackendRateLimited(message)
+    if cls == "backend_unavailable":
+        return BackendUnavailable(message)
+    if cls == "conflict":
+        return BackendConflict(message)
+    if cls == "invalid":
+        return BackendNotFound(message) if "not found" in low else BackendInvalid(message)
+    return BackendError(message)
 
 
-# Every secret the broker may hand out is a vault item carrying one custom text
-# field with this name. Its value is a JSON object: allowed_hosts, vars,
-# approval, ... The vault is the catalog; there is no separate config file.
-META_FIELD = "broker"
-
-
-def _catalog_rows(pairs):
-    out = []
-    for item, raw in pairs:
-        if not raw:
-            continue
-        try:
-            meta = json.loads(raw)
-        except ValueError:
-            meta = None
-        out.append({"item": item, "meta": meta if isinstance(meta, dict) else None})
-    return out
-
-
-_RESERVED_FIELDS = (META_FIELD, "previous_value", "previous_replaced_at")
+def _to_item(it):
+    """A Bitwarden item object -> neutral `Item` (with values), or None for kinds the
+    broker never serves (cards, identities)."""
+    if it.get("type") == 5:                 # Bitwarden's native SSH key item
+        sk = it.get("sshKey") or {}
+        return Item(it.get("name") or "", SSH_KEY, private_key=sk.get("privateKey"),
+                    public_key=sk.get("publicKey"))
+    if it.get("type") not in (1, 2):
+        return None
+    login = it.get("login") or {}
+    is_login = it.get("type") == 1
+    return Item(it.get("name") or "", LOGIN if is_login else NOTE,
+                username=login.get("username") if is_login else None,
+                password=login.get("password") if is_login else None,
+                notes=it.get("notes"),
+                uris=[u["uri"] for u in login.get("uris") or [] if u.get("uri")],
+                fields={f["name"]: f["value"] for f in it.get("fields") or []
+                        if f.get("name") and f.get("value") and f.get("type") in (0, 1)})
 
 
 def _auto_info(it):
     """What an item without broker metadata could offer: shapes only, never values.
-    None when it has nothing usable (or is not a login or secure note)."""
-    if it.get("type") == 5:                 # Bitwarden's native SSH key item
-        sk = it.get("sshKey") or {}
-        pub = (sk.get("publicKey") or "").strip()
-        return {"ssh_public_key": pub} if sk.get("privateKey") and pub else None
-    if it.get("type") not in (1, 2):
-        return None
-    login = it.get("login") or {}
-    info = {"login": it.get("type") == 1,
-            "username": bool(login.get("username")), "password": bool(login.get("password")),
-            "notes": bool(it.get("notes")),
-            "fields": [f["name"] for f in it.get("fields") or []
-                       if f.get("name") and f.get("value") and f.get("type") in (0, 1)
-                       and f["name"] not in _RESERVED_FIELDS],
-            "uris": [u["uri"] for u in login.get("uris") or [] if u.get("uri")]}
-    usable = (info["username"] or info["password"] or info["fields"]
-              or (info["notes"] and not info["login"]))
-    return info if usable else None
+    None when it has nothing usable (or is not a login, secure note or SSH key)."""
+    item = _to_item(it)
+    return auto_shape(item) if item is not None else None
 
 
-class FileBackend:
-    """JSON file {item: {field: value}}. For tests and bootstrapping only."""
-
-    def __init__(self, path):
-        with open(path) as f:
-            self._data = json.load(f)
-
-    def get(self, item, field):
-        field = "notes" if field in (None, "", "auto") else field
-        if field == META_FIELD:
-            raise BackendError("the broker metadata field is not a secret")
-        try:
-            return self._data[item][field]
-        except KeyError:
-            raise BackendError(f"{item}/{field} not found")
-
-    def put(self, item, field, value, create=False, keep_previous=False, meta=None):
-        if create and item in self._data:
-            raise BackendError(f"item {item!r} already exists")
-        if not create and item not in self._data:
-            raise BackendError(f"item {item!r} not found")
-        if field == META_FIELD:
-            raise BackendError("the broker metadata field cannot hold a secret")
-        field = "notes" if field in (None, "", "auto") else field
-        rec = self._data.setdefault(item, {})
-        if keep_previous and field in rec:
-            rec["previous_value"] = rec[field]
-        rec[field] = value
-        if meta is not None:
-            rec[META_FIELD] = json.dumps(meta)
-
-    def catalog(self):
-        """[{"item", "meta"}] for every item that carries broker metadata."""
-        return _catalog_rows((item, rec.get(META_FIELD)) for item, rec in self._data.items())
-
-    def set_meta(self, item, meta):
-        if item not in self._data:
-            raise BackendError(f"item {item!r} not found")
-        self._data[item][META_FIELD] = json.dumps(meta)
-
-    def delete(self, item):
-        self._data.pop(item, None)
-
-
-class BwBackend:
+class BwBackend(VaultBackend):
     """Bitwarden/Vaultwarden via the `bw` CLI.
 
     Logs in with an API key (BW_CLIENTID/BW_CLIENTSECRET) and unlocks with the
@@ -114,13 +76,22 @@ class BwBackend:
     `bw` is already logged in/unlocked (its on-disk state can outlive us).
     """
 
+    kind = "bw"
+
     def __init__(self, server_url, master_password_file, bw="bw", sync_interval=300,
-                 idle_timeout=300, organization=None, collection=None):
+                 idle_timeout=300, organization=None, collection=None, prewarm=True):
+        caps = {CAP_SET_META, CAP_CREATE_LOGIN, CAP_EDIT_ITEM, CAP_ON_EVENT, CAP_EXPORT_ITEMS}
+        if prewarm:
+            caps.add(CAP_WARM)              # `backend.prewarm: false` turns request-time unlock off
+        if organization and collection:
+            caps.add(CAP_ADOPTS)            # cannot scope adoption without both: adopt nothing
+        self.capabilities = frozenset(caps)
         self._bw = bw
         self._org_want, self._coll_want = organization, collection
         self._target_ids = None
         self._server_url = server_url
-        self._pw = open(master_password_file).read().strip()
+        with open(master_password_file) as f:
+            self._pw = f.read().strip()
         self._session = None
         self._sync_interval = sync_interval
         self._synced = 0.0
@@ -128,23 +99,20 @@ class BwBackend:
         self._last_used = 0.0
         self._timer = None
         self._lock = threading.Lock()
-        self.on_event = None        # optional callback(name, **fields), e.g. audit
 
     # -- plumbing ---------------------------------------------------------
     def _run(self, *args, env_extra=None, stdin=None):
         env = dict(os.environ, **(env_extra or {}))
-        p = subprocess.run([self._bw, *args], env=env, capture_output=True, text=True, timeout=60,
-                           input=stdin)
+        try:
+            p = subprocess.run([self._bw, *args], env=env, capture_output=True, text=True,
+                               timeout=60, input=stdin)
+        except subprocess.TimeoutExpired:
+            raise BackendUnavailable(f"bw {args[0]} timed out") from None
+        except OSError as e:
+            raise BackendUnavailable(f"cannot run {self._bw}: {e.strerror}") from None
         if p.returncode != 0:
-            raise BackendError(f"bw {args[0]} failed: {p.stderr.strip()[:200]}")
+            raise _bw_error(f"bw {args[0]} failed: {p.stderr.strip()[:200]}")
         return p.stdout.strip()
-
-    def _emit(self, name, **fields):
-        if self.on_event:
-            try:
-                self.on_event(name, **fields)
-            except Exception:  # noqa: BLE001
-                pass
 
     def _status(self):
         return json.loads(self._run("status"))["status"]
@@ -229,7 +197,7 @@ class BwBackend:
                     self._unlock()
                 return self._fetch(item)
             except BackendError as e:
-                if "not found" in str(e).lower():
+                if isinstance(e, BackendNotFound) or "not found" in str(e).lower():
                     return None
                 if attempt == 2:
                     raise
@@ -243,13 +211,13 @@ class BwBackend:
         if self._org_want:
             orgs = [o for o in orgs if self._org_want in (o["id"], o["name"])]
         if len(orgs) != 1:
-            raise BackendError("cannot choose an organization; set backend.organization")
+            raise BackendInvalid("cannot choose an organization; set backend.organization")
         org = orgs[0]["id"]
         colls = self._list_collections(org)
         if self._coll_want:
             colls = [c for c in colls if self._coll_want in (c["id"], c["name"])]
         if len(colls) != 1:
-            raise BackendError("cannot choose a collection; set backend.collection")
+            raise BackendInvalid("cannot choose a collection; set backend.collection")
         self._target_ids = (org, colls[0]["id"])
         return self._target_ids
 
@@ -275,7 +243,7 @@ class BwBackend:
             # their SSH agent see it as one; the public half comes with the request
             pub = (meta or {}).get("ssh_public_key")
             if not pub:
-                raise BackendError("an SSH key item needs its public key")
+                raise BackendInvalid("an SSH key item needs its public key")
             return {**base, "type": 5, "notes": None,
                     "sshKey": {"privateKey": value, "publicKey": pub,
                                "keyFingerprint": sshkey.fingerprint(sshkey.blob_from_line(pub))}}
@@ -313,14 +281,13 @@ class BwBackend:
             fields = obj.get("fields") or []
             hit = next((f for f in fields if f.get("name") == field), None)
             if hit is None:
-                raise BackendError(f"field {field!r} not found on item {obj.get('name')!r}")
+                raise BackendNotFound(f"field {field!r} not found on item {obj.get('name')!r}")
             old, hit["value"] = hit.get("value"), value
         if keep_previous and old:
             fields = [f for f in (obj.get("fields") or [])
                       if f.get("name") not in ("previous_value", "previous_replaced_at")]
             fields.append({"name": "previous_value", "value": old, "type": 1})
-            fields.append({"name": "previous_replaced_at", "type": 0,
-                           "value": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
+            fields.append({"name": "previous_replaced_at", "type": 0, "value": now_iso()})
             obj["fields"] = fields
 
     def _submit(self, verb, obj, item_id=None):
@@ -333,15 +300,23 @@ class BwBackend:
     def put(self, item, field, value, create=False, keep_previous=False, meta=None):
         """Create a new item (with its broker metadata), or replace one field of
         an existing item."""
+        check_item_args(item, value)
         if field == META_FIELD:
-            raise BackendError("the broker metadata field cannot hold a secret")
+            raise BackendInvalid("the broker metadata field cannot hold a secret")
+        if field in _RESERVED_FIELDS:
+            raise BackendInvalid(f"field {field!r} is reserved")
+        if meta is not None:
+            meta = clean_meta(meta)
+        if create and field in AUTO_ALIASES:
+            field = "notes"
         with self._lock:
             try:
                 self._put_locked(item, field, value, create, keep_previous, meta)
             except BackendError as e:
                 msg = str(e).lower()
-                if any(t in msg for t in ("already exists", "not found", "no rights",
-                                          "ambiguous", "more than one")):
+                if (isinstance(e, (BackendNotFound, BackendConflict, BackendInvalid))
+                        or any(t in msg for t in ("already exists", "not found", "no rights",
+                                                  "ambiguous", "more than one"))):
                     raise
                 # the session may have been invalidated behind our back (another
                 # bw process on the same state dir): start clean once and retry
@@ -352,13 +327,15 @@ class BwBackend:
         existing = self._find(item)
         if create:
             if existing is not None:
-                raise BackendError(f"item {item!r} already exists")
+                raise BackendConflict(f"item {item!r} already exists")
             org, coll = self._resolve_target()
             self._submit("create", self._template(item, field, value, org, coll, meta))
         else:
             if existing is None:
-                raise BackendError(f"item {item!r} not found")
+                raise BackendNotFound(f"item {item!r} not found")
             self._apply(existing, field, value, keep_previous)
+            if meta is not None:
+                self._with_meta(existing, meta)
             self._submit("edit", existing, existing["id"])
         self._synced = 0.0
         self._touch()
@@ -398,7 +375,7 @@ class BwBackend:
             raw = next((f.get("value") for f in it.get("fields") or []
                         if f.get("name") == META_FIELD), None)
             if raw:
-                rows.extend(_catalog_rows([(it["name"], raw)]))
+                rows.extend(catalog_rows([(it["name"], raw)]))
             elif (target and it.get("organizationId") == target[0]
                   and target[1] in (it.get("collectionIds") or [])):
                 info = _auto_info(it)
@@ -408,10 +385,12 @@ class BwBackend:
 
     def set_meta(self, item, meta):
         """Replace the broker metadata of an existing item."""
+        check_item_args(item)
+        meta = clean_meta(meta)
         with self._lock:
             existing = self._find(item)
             if existing is None:
-                raise BackendError(f"item {item!r} not found")
+                raise BackendNotFound(f"item {item!r} not found")
             self._with_meta(existing, meta)
             self._submit("edit", existing, existing["id"])
             self._synced = 0.0
@@ -421,7 +400,7 @@ class BwBackend:
         """Create a Login item with real username / password / URL fields."""
         with self._lock:
             if self._find(item) is not None:
-                raise BackendError(f"item {item!r} already exists")
+                raise BackendConflict(f"item {item!r} already exists")
             org, coll = self._resolve_target()
             obj = BwBackend._template_base(item, "password", password, org, coll)
             obj["login"]["username"] = username
@@ -438,10 +417,10 @@ class BwBackend:
         with self._lock:
             existing = self._find(item)
             if existing is None:
-                raise BackendError(f"item {item!r} not found")
+                raise BackendNotFound(f"item {item!r} not found")
             if new_name:
                 if self._find(new_name) is not None:
-                    raise BackendError(f"item {new_name!r} already exists")
+                    raise BackendConflict(f"item {new_name!r} already exists")
                 existing["name"] = new_name
             if drop_meta:
                 existing["fields"] = [f for f in (existing.get("fields") or [])
@@ -454,6 +433,7 @@ class BwBackend:
 
     def delete(self, item):
         """Permanently delete an item (used to roll back a half-finished create)."""
+        check_item_args(item)
         with self._lock:
             existing = self._find(item)
             if existing is None:
@@ -461,6 +441,44 @@ class BwBackend:
             self._delete_item(existing["id"])
             self._synced = 0.0
             self._touch()
+
+    def export_items(self):
+        """Every login, secure note and SSH key the broker serves, with values: the
+        items in the broker's collection plus any item carrying broker metadata
+        (which the catalog would list). For migration; the result is secret."""
+        with self._lock:
+            for attempt in (1, 2):
+                try:
+                    if self._session is None:
+                        self._unlock()
+                    self._sync()
+                    items = self._list_items()
+                    break
+                except BackendError:
+                    if attempt == 2:
+                        raise
+                    self._session, self._synced = None, 0.0
+            org, coll = self._resolve_target()
+            self._touch()
+        out = []
+        for it in items:
+            raw = next((f.get("value") for f in it.get("fields") or []
+                        if f.get("name") == META_FIELD), None)
+            in_scope = it.get("organizationId") == org and coll in (it.get("collectionIds") or [])
+            if not raw and not in_scope:
+                continue
+            item = _to_item(it)
+            if item is None:
+                continue
+            item.fields = {k: v for k, v in item.fields.items() if k not in _RESERVED_FIELDS}
+            if raw:
+                try:
+                    meta = json.loads(raw)
+                except ValueError:
+                    meta = None
+                item.meta = meta if isinstance(meta, dict) else None
+            out.append(item)
+        return out
 
     # -- public -----------------------------------------------------------
     def warm(self):
@@ -473,8 +491,9 @@ class BwBackend:
             self._touch()
 
     def get(self, item, field):
+        check_item_args(item)
         if field == META_FIELD:
-            raise BackendError("the broker metadata field is not a secret")
+            raise BackendInvalid("the broker metadata field is not a secret")
         with self._lock:
             try:
                 if self._session is None:
@@ -501,7 +520,7 @@ class BwBackend:
         for f in obj.get("fields") or []:
             if f.get("name") == field:
                 return f.get("value") or ""
-        raise BackendError(f"field {field!r} not found on item {item!r}")
+        raise BackendNotFound(f"field {field!r} not found on item {item!r}")
 
 
 class BwServeBackend(BwBackend):
@@ -535,13 +554,13 @@ class BwServeBackend(BwBackend):
         except urllib.error.HTTPError as e:
             raw = e.read()
         except OSError as e:
-            raise BackendError(f"bw serve unreachable: {e}") from None
+            raise BackendUnavailable(f"bw serve unreachable: {e}") from None
         try:
             out = json.loads(raw)
         except ValueError:
-            raise BackendError(f"bw serve returned a non-JSON reply ({len(raw)} bytes)") from None
+            raise BackendUnavailable(f"bw serve returned a non-JSON reply ({len(raw)} bytes)") from None
         if not out.get("success"):
-            raise BackendError(str(out.get("message") or "bw serve request failed")[:200])
+            raise _bw_error(str(out.get("message") or "bw serve request failed")[:200])
         return out.get("data")
 
     @staticmethod
@@ -603,7 +622,7 @@ class BwServeBackend(BwBackend):
         deadline = time.monotonic() + self._startup_timeout
         while time.monotonic() < deadline:
             if self._proc.poll() is not None:
-                raise BackendError("bw serve exited during startup")
+                raise BackendUnavailable("bw serve exited during startup")
             if self._owns_port():
                 try:
                     self._http("GET", "/status", timeout=2)
@@ -614,7 +633,7 @@ class BwServeBackend(BwBackend):
                     return
             time.sleep(0.2)
         self._stop_server()
-        raise BackendError("bw serve did not become ready on a port it owns")
+        raise BackendUnavailable("bw serve did not become ready on a port it owns")
 
     # -- session ------------------------------------------------------------
     def _unlock(self):
@@ -647,9 +666,9 @@ class BwServeBackend(BwBackend):
         if not exact:
             exact = [r for r in rows if str(r.get("name", "")).lower() == item.lower()]
         if not exact:
-            raise BackendError("Not found.")
+            raise BackendNotFound("Not found.")
         if len(exact) > 1:
-            raise BackendError(f"More than one item is named {item!r}")
+            raise BackendInvalid(f"More than one item is named {item!r}")
         return self._http("GET", "/object/item/" + urllib.parse.quote(exact[0]["id"]))
 
     def _list_orgs(self):
@@ -669,3 +688,40 @@ class BwServeBackend(BwBackend):
 
     def _delete_item(self, item_id):
         self._http("DELETE", "/object/item/" + urllib.parse.quote(item_id) + "?permanent=true")
+
+
+# -- configuration ---------------------------------------------------------------
+def _opt_str(b, key):
+    v = b.get(key)
+    if v is not None and (not isinstance(v, str) or not v):
+        raise BackendConfigError(f"backend.{key}: must be a non-empty string")
+
+
+def validate(b):
+    """Bitwarden settings. Unknown keys are ignored, as they always were."""
+    for k in ("server_url", "master_password_file"):
+        if not isinstance(b.get(k), str) or not b[k]:
+            raise BackendConfigError(f"backend.{k}: required (a non-empty string)")
+    _opt_str(b, "organization")
+    _opt_str(b, "collection")
+    idle = b.get("idle_timeout", 300)
+    if isinstance(idle, bool) or not isinstance(idle, (int, float)) or idle < 0:
+        raise BackendConfigError("backend.idle_timeout: must be a number of seconds >= 0")
+    for k in ("serve", "prewarm"):
+        if k in b and not isinstance(b[k], bool):
+            raise BackendConfigError(f"backend.{k}: must be true or false")
+
+
+def build(b):
+    bw_class = BwServeBackend if b.get("serve") else BwBackend
+    return bw_class(b["server_url"], b["master_password_file"],
+                    idle_timeout=b.get("idle_timeout", 300),
+                    organization=b.get("organization"), collection=b.get("collection"),
+                    prewarm=b.get("prewarm", True))
+
+
+SPEC = BackendSpec(
+    name="bw", build=build, validate=validate,
+    doc="Bitwarden / Vaultwarden through the bw CLI (serve: true keeps one bw serve). "
+        "Keys: server_url, master_password_file, organization, collection, serve, "
+        "idle_timeout, prewarm.")

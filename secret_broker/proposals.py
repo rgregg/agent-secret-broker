@@ -23,6 +23,7 @@ import html
 import re
 
 from . import guidance as guidance_mod
+from .backends.base import error_class
 
 MAX_ENTRIES = 25
 MAX_PENDING = 3                 # open proposals at once
@@ -70,23 +71,11 @@ def parse_config(raw, field="guidance_proposals"):
 
 
 def classify(exc):
-    """A coarse class for a failed vault write, from the exception type and text. Only the
-    class is ever kept or shown: the text may carry vault details."""
-    if isinstance(exc, (KeyError, ValueError)):
-        return "invalid"
-    msg = str(exc).lower()
-    if any(t in msg for t in ("too many requests", "rate limit", "rate-limit", "429", "throttl")):
-        return "rate_limited"
-    if (isinstance(exc, (TimeoutError, ConnectionError))
-            or any(t in msg for t in ("timed out", "timeout", "connection", "unavailable", "unreachable",
-                                      "502", "503", "504", "bad gateway", "temporarily", "not running",
-                                      "refused", "no route", "name resolution"))):
-        return "backend_unavailable"
-    if any(t in msg for t in ("conflict", "409", "out of date", "outdated", "revision", "modified")):
-        return "conflict"
-    if any(t in msg for t in ("not found", "invalid", "400", "bad request", "no rights", "ambiguous")):
-        return "invalid"
-    return "other"
+    """A coarse class for a failed vault write. Typed backend errors (BackendRateLimited,
+    BackendUnavailable, BackendConflict, BackendNotFound/Invalid) decide by class; anything
+    else falls back to the exception text (see backends.base.error_class). Only the class
+    is ever kept or shown: the text may carry vault details."""
+    return error_class(exc)
 
 
 def entry_status(name, res, classes):

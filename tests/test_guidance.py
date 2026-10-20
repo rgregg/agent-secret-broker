@@ -15,7 +15,7 @@ import test_e2e as t  # noqa: E402  (module import only: no test re-collection)
 import test_ssh as ts  # noqa: E402
 
 from secret_broker import audit_api, description, guidance, risk, riskmodel, summarize  # noqa: E402
-from secret_broker.backends import FileBackend  # noqa: E402
+from secret_broker.backends import FileBackend, MemoryBackend  # noqa: E402
 from secret_broker.broker import Broker  # noqa: E402
 from secret_broker.notify import FakeNotifier  # noqa: E402
 from tools.risk_eval import run as evalrun  # noqa: E402
@@ -70,7 +70,7 @@ class Metadata(unittest.TestCase):
         adopted = {"item": "Modem", "meta": None, "auto": {
             "login": True, "username": True, "password": True, "notes": False, "fields": [], "uris": []}}
 
-        class Rows:
+        class Rows(MemoryBackend):
             def catalog(self):
                 return [adopted]
         sc = Broker({"approve_base_url": "https://s.example"}, Rows(), FakeNotifier(), None).cfg["secrets"]["modem"]
@@ -482,7 +482,7 @@ class Editor(t.Harness):
             "uris": ["http://192.168.100.1/"]}}
         saved = {}
 
-        class Rows:
+        class Rows(MemoryBackend):
             def catalog(self):
                 return [row]
 

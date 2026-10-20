@@ -66,6 +66,11 @@ def run(backend, entries, apply=False, pause=3.0, out=print):
             continue
         verb = "apply" if apply else "would"
         if e["kind"] == "login":
+            lacking = [c for c in ("create_login", "edit_item") if c not in backend.capabilities]
+            if lacking and apply:
+                out(f"error  {name}: this backend lacks {lacking}; nothing changed")
+                failed = True
+                continue
             out(f"{verb}  {name}: Login(username<-{e['username']}, password<-{e['password']}"
                 f"{', uri<-' + e['uri'] if e.get('uri') else ''}), "
                 f"notes<-{e.get('notes') or []}, vars {sorted(e['vars'])}")
