@@ -379,8 +379,79 @@ behavior as vault items, including `broker` metadata and auto-adoption.
   and `store_unlock_failed` is audited (names and reasons only, never values).
 - Audit events: `store_unlocked`, `store_locked` (idle), `store_unlock_failed`,
   `store_written`, `store_reloaded` (the file was changed by someone else).
-- Creating the store file needs the admin tooling, which is not part of this
-  phase; until then use `secret_broker.localstore.create_store` from Python.
+- Create and manage the store with `python -m secret_broker.localstore` (below).
+  A vault-free quick start is in [setup.md](setup.md#alternative-no-vault-the-encrypted-local-store).
+
+#### What the store protects, and what it does not
+
+Encryption at rest helps against a stolen disk, a leaked backup or snapshot, and
+other local users reading the file. It does NOT help against anything that can
+read both the store file and the key source while the broker runs (the same
+user, root, a process in the container, anything that can `docker exec`). Run
+the broker as its own user or container, mount the store and the key only into
+it, and keep the agent's account away from both. The key must not live next to
+the data: a key file on the same volume as the store protects against nothing
+but casual browsing.
+
+#### Store format and behavior
+
+One file, header then body. The header is plain JSON (format version, cipher,
+and the key wraps) and is the AEAD associated data of the body, so a changed
+version, cipher or wrap makes the body fail to authenticate. The body is
+`nonce || AES-256-GCM(JSON document) || tag`, with a fresh random nonce on
+every write. A random 256-bit data key encrypts the body; each wrap holds that
+key encrypted under a key derived from one passphrase (scrypt, `n` at least
+2^15, 16-byte salt) or used directly (a raw 32-byte key, as base64). Changing
+the passphrase or adding a recovery key re-wraps the data key only; rotating
+the data key re-encrypts the body. Item names and metadata are inside the
+encrypted body.
+
+- Writes take an exclusive `flock` on `<store>.lock`, re-read the file, apply the
+  change and replace the file atomically (temp file in the same directory, fsync,
+  rename, fsync of the directory). One `.bak` generation (the previous file) is
+  kept. A crash or error at any step leaves the old file in place.
+- The file's modification time and inode are checked on every read, so a
+  restore, or a change made by the admin CLI, is picked up without a restart
+  (`store_reloaded`). Two writers (broker and CLI) cannot lose each other's updates.
+- The decrypted document lives in memory only and is dropped after
+  `idle_timeout` seconds without use (`store_locked`); the next use reads the
+  key source again and decrypts.
+- A wrong or missing key, an unsupported version, or a damaged file raises a
+  `BackendUnavailable` (`StoreError`) with a short reason (`wrong_key`,
+  `key_missing`, `corrupt`, `unsupported`, `not_found`). The broker stays up with an empty
+  catalog and requests fail with that clear error; it retries on the next
+  refresh, so fixing the key needs no restart. A file that fails authentication
+  is never overwritten (the error points at the `.bak`).
+- Items are logins, secure notes or SSH keys, in the same shape as vault items
+  (`username`, `password`, `notes`, `uris`, custom `fields`, nested `broker`
+  metadata, `previous_value`). Items without `broker` metadata are adopted with
+  `approval: prompt`, exactly as with a vault.
+
+#### Admin CLI: `python -m secret_broker.localstore`
+
+Runs on the broker host. Name the store and the key with `--store PATH` plus
+`--key-file PATH` or `--key-env NAME`, or give `--config FILE` (a broker config
+whose `backend` block is type `local`). Every command prints only item names,
+shapes and counts, never a value; values are read from stdin or a hidden
+prompt, never from the command line. The store is created with mode 0600 and
+the CLI refuses to open one that group or others can read (key files only
+warn, because secret mounts are often 0444).
+
+| Command | What it does |
+|---|---|
+| `init` | Create the store. Generates a recovery key and prints it once (`--no-recovery` to skip). `--generate-key` creates `--key-file` with a fresh random key (it must not exist). Refuses an existing store without `--force` (the old file is kept as `.replaced`). |
+| `list` | Names and shapes (`note notes broker`, `login username password`, ...). |
+| `show NAME` | Kind, field names and the `broker` metadata; never values. |
+| `add NAME` | Add a note (text from stdin or a hidden prompt), a login (`--kind login`: prompts, or `--json` with an object on stdin), or custom fields (`--field NAME`, prompted). `--meta FILE` sets the metadata, `--uri URL` a login URL. Never overwrites. |
+| `set-meta NAME FILE` | Replace the item's `broker` metadata from a JSON file (`-` for stdin). |
+| `delete NAME` | Delete (needs `--yes`, or type the name at a terminal). |
+| `change-key` | Re-wrap the data key under a new passphrase or key (`--new-key-file`, `--new-key-env`, or a prompt). `--wrap recovery` replaces the recovery wrap instead. Update the broker's key source afterwards. |
+| `rotate-dek` | New data key; re-encrypts the contents. Other wraps are dropped unless you supply their keys (`--recovery-key-file/-env`), make a new recovery key (`--new-recovery`) or accept the loss (`--drop-other-wraps`). |
+| `import-bw` | One-time copy from the broker's Bitwarden/Vaultwarden collection (`--bw-config FILE`, a broker config with a `bw` backend). Copies every login, secure note and SSH key in the collection, plus any item carrying `broker` metadata anywhere, with custom text fields and the metadata parsed into a nested object. Reads every copied item back from the store and compares before reporting success. Never changes the source. `--dry-run`, `--skip-existing`, `--overwrite`. Rotation history (`previous_value`) is not copied. |
+| `import-env FILE` | One-time: each `KEY=value` line becomes a note named `KEY` with `approval: prompt` and a variable `KEY` (field `notes`). Prints a reminder to delete the file. |
+| `export-names` | Names only, one per line. |
+
+Day to day, `asb store` and `asb update` work unchanged against the local backend.
 
 ## The vault is the catalog
 
@@ -1672,7 +1743,8 @@ the decision".
 
 ## Vault session lifetime
 
-The vault is not kept open. With the `bw` backend it is unlocked on demand,
+The vault is not kept open (the local backend drops its decrypted contents after
+`idle_timeout` in the same way). With the `bw` backend it is unlocked on demand,
 kept for `idle_timeout` seconds (default 300) after its last use, then logged
 out (`backend_closed` in the audit log). With `prewarm` (default true) it is
 unlocked when a request is *created*, so the slow login/unlock overlaps with the
@@ -1688,6 +1760,163 @@ Approving or denying takes effect immediately: the decision is audited
 (`decided`) and the approver's page answers at once. Releasing the secret
 happens in the background; if that fails, the failure goes to the audit log and
 the requesting client, never to the approver.
+
+## Backend contract
+
+The broker core talks to its credential store only through the `VaultBackend`
+contract in `secret_broker/backends/base.py`. Bitwarden, the encrypted local
+store and the test backends are implementations of it; nothing outside a
+backend's own module knows about organizations, collections, item type numbers,
+a CLI or a server. A new store (another password manager, a cloud secret
+manager, a database) is one module plus one registry entry.
+
+### Package layout
+
+| Module | Contents |
+|---|---|
+| `backends/base.py` | `VaultBackend`, the error classes, `Item`, `CatalogRow`, `AutoShape`, `BackendSpec`, capability names, shared helpers |
+| `backends/registry.py` | `register()`, `build_backend(cfg)`, entry-point loading |
+| `backends/bitwarden.py` | `BwBackend`, `BwServeBackend` (everything Bitwarden-specific, including `organization`, `collection`, `serve`, `prewarm`) |
+| `backends/local.py`, `backends/localstore.py` | `LocalBackend` and the encrypted store it keeps |
+| `backends/file.py` | `FileBackend`: plaintext JSON, tests only |
+| `backends/memory.py` | `MemoryBackend`: the minimal reference implementation |
+
+`from secret_broker.backends import ...` exports the contract names and the bundled backends.
+
+### Vocabulary
+
+- **item**: a named record: a `login`, a `note` or an `ssh_key`. Names are
+  case-sensitive but looked up leniently (see `get`).
+- **field**: one value of an item: `password`, `username`, `notes`, `private_key`,
+  or a custom field name. `None`, `""` and `"auto"` mean the item's natural secret:
+  password for a login, notes for a note, private_key for an ssh_key.
+- **meta**: the item's broker metadata, a JSON object (nested objects allowed),
+  kept under the reserved field name `broker`.
+- Reserved names: `broker`, `previous_value`, `previous_replaced_at`. They can be
+  read (except `broker`) but never written through `put`, and never count as an
+  adoptable field.
+
+### Required methods
+
+| Method | Contract |
+|---|---|
+| `get(item, field) -> str` | The value (`""` if present but empty). Lookup: the exact name, else the one case-insensitive match; two case-insensitive matches raise `BackendInvalid`. `previous_value` / `previous_replaced_at` are readable after a `keep_previous` write. A note's `notes` value has surrounding whitespace removed. `BackendNotFound` for a missing item or field, `BackendInvalid` for `broker`. Opens the store on demand. |
+| `put(item, field, value, create=False, keep_previous=False, meta=None)` | `create=True` makes a new item in one atomic write: field `password` makes a login, `notes`/auto a note, `private_key` an ssh_key (needs `meta["ssh_public_key"]`), any other name a note with that custom field; `BackendConflict` if the item exists (also case-insensitively). `create=False` replaces the value of an existing field (`BackendNotFound` if the item or field is missing); `keep_previous` first copies a non-empty old value to `previous_value` and the time to `previous_replaced_at`. `meta`, when given, replaces the metadata. `value` must be a `str`; reserved field names raise `BackendInvalid`. |
+| `catalog() -> list[CatalogRow]` | One row per item with metadata: `{"item", "meta"}` (`meta` is None only if the stored text is not an object). With the `adopts` capability also one row per login, note or ssh_key without metadata and with something usable: `{"item", "meta": None, "auto": AutoShape}`. Shapes only, never values. Cards, identities and items outside the backend's own scope are never listed. Sees current state. |
+| `set_meta(item, meta)` | Replace the metadata with `meta` (nested objects preserved exactly). `BackendNotFound`, or `BackendInvalid` if `meta` is not an object. A backend that cannot persist metadata raises `NotSupported` and omits the `set_meta` capability; the broker then refuses policy edits ("Always allow", guidance, SSH rules) instead of failing late. |
+| `delete(item)` | Remove the item. A missing item is not an error. |
+
+`AutoShape` (what an item without metadata could offer; the broker derives
+the secret's name, variables and host policy from it):
+
+    login/note:  {"login": bool, "username": bool, "password": bool, "notes": bool,
+                  "fields": ["custom field names that hold a value"], "uris": ["https://..."]}
+    ssh_key:     {"ssh_public_key": "ssh-ed25519 AAAA..."}      (the public half only)
+
+An empty login, a note with no text, or an ssh key missing either half has no shape and is not adopted.
+
+### Optional capabilities
+
+`backend.capabilities` is a `frozenset` of these names. Each optional method has
+a default in the base class that raises `NotSupported`, and the core only ever
+asks `"name" in backend.capabilities` (it never probes attributes).
+
+| Capability | Method(s) | Used for |
+|---|---|---|
+| `set_meta` | `set_meta` works | Always-allow, standing approvals, SSH rules and hosts, guidance edits. |
+| `create_login` | `create_login(item, username, password, uri=None, notes=None, meta=None)` | `restructure` (real username/password/URL fields). |
+| `edit_item` | `edit_item(item, new_name=None, meta=None, drop_meta=False)` | `restructure`; rename or replace/remove metadata. |
+| `warm` | `warm()` | Unlock ahead of the first read, in the background, while a human picks up the phone. A backend whose `prewarm` setting is off omits it. |
+| `on_event` | `backend.on_event = fn` | Audit hook `fn(name, **fields)`; fields are names, counts and reasons only. A raising callback is ignored. |
+| `adopts` | `catalog()` returns adopted rows | Items without metadata become credentials with safe defaults. |
+| `export_items` | `export_items() -> list[Item]` | Migration: every login/note/ssh_key in scope WITH values (treat as secret). |
+| `import_items` | `import_items(items, overwrite=False) -> names` | Migration: write whole `Item`s atomically. |
+
+`close()` is part of every backend (the default does nothing): release helper
+processes and unlocked state; always safe to call, repeatedly, from any thread;
+the backend reopens on next use.
+
+### Rules every backend follows
+
+- **Thread safety.** Any method may be called from many threads at once. A write
+  is atomic, and a successful write is visible to the next read from any thread
+  and to a re-opened backend on the same storage.
+- **No secret in an exception.** Messages, `repr` and chained causes name items and
+  fields, never values, passwords, keys or tokens: the broker logs them.
+- **Typed errors.** Every failure is a `BackendError` subclass; never a bare
+  `KeyError` or `OSError`.
+- **No values in events or logs**, ever.
+
+### Error classes
+
+| Class | Meaning | Broker behavior |
+|---|---|---|
+| `BackendRateLimited` | The store throttled us (HTTP 429). | Guidance applies retry it with backoff. |
+| `BackendUnavailable` | Cannot be reached or opened now: server down, timeout, wrong or missing key, damaged file. | Broker stays up, keeps its last catalog, retries on the next refresh; guidance applies retry it. |
+| `BackendConflict` | Item already exists, or the store changed under us. | Create refused; guidance applies retry it. |
+| `BackendNotFound` | No such item or field. | Reported as invalid. |
+| `BackendInvalid` | Malformed or forbidden request: reserved field, non-string value, non-object metadata, ambiguous name. | Reported as invalid. |
+| `NotSupported` | The optional capability is not implemented. | Reported as invalid; the core checks capabilities first. |
+
+`backends.error_class(exc)` maps an exception to the coarse class the broker
+shows and audits (`rate_limited`, `backend_unavailable`, `conflict`, `invalid`,
+`other`). It decides by the exception class first; a plain `BackendError`, or a
+foreign exception, falls back to its text (`too many requests`, `timed out`,
+`409`, `not found`, ...). Only the class is kept or shown, never the text.
+
+### Configuration and the registry
+
+`backend.type` selects a registered `BackendSpec(name, build, validate, doc)`.
+`validate(cfg)` raises `BackendConfigError` naming the field (`backend.path: ...`)
+and never opens files or connects; `build(cfg)` makes the backend. An unknown
+`type` stops the broker at startup, naming `backend.type` and listing the known
+types. Bundled types: `bw`, `local`, `file`, `memory`.
+
+    from secret_broker.backends import BackendSpec, register
+    register(BackendSpec("mystore", build=lambda b: MyStore(b["url"]),
+                         validate=check_my_config, doc="My store. Keys: url."))
+
+A third-party package can ship a backend without touching the broker: expose a
+`BackendSpec` (or a zero-argument function returning one) in the
+`secret_broker.backends` entry-point group. A plugin that fails to load is
+logged and skipped, never fatal.
+
+### Writing a backend
+
+Subclass `VaultBackend`, set `kind` (the short type name `GET /v1/status`
+shows) and `capabilities`, implement the five required methods, and run the
+conformance suite. `secret_broker/backends/memory.py` is the minimal correct
+implementation (about 150 lines) and the model to copy. `Item` is the neutral
+record for adoption, import and export: `name`, `kind` (`login`, `note`,
+`ssh_key`), `username`, `password`, `notes`, `uris`, `fields`, `meta`,
+`private_key`/`public_key`; `auto_shape(item)` computes the `AutoShape`.
+
+### The conformance suite (acceptance test)
+
+`tests/backend_contract.py` defines `BackendContract`, a reusable mixin of about 100
+tests that exercises the whole contract: create/read/update semantics and
+error classes, `previous_value` and its timestamp, metadata round trips including
+nested objects, catalog rows (explicit, adopted logins, notes, custom fields and
+ssh keys, empty items, cards and identities ignored, disabled metadata), delete,
+the case-insensitive then unique lookup rule, reserved and aliased field names,
+unicode, multiline and 64 KiB values, "no secret value in any exception",
+concurrent creates, updates and reads, persistence across a re-opened backend,
+visibility of another instance's writes, idle lock and reopen, `close()`
+idempotence, and every optional capability (create_login, edit_item, warm,
+on_event, export/import, and `NotSupported` for what is not declared). Tests for
+a capability a backend does not declare are skipped, and tests for an
+undeclared optional method check that it raises `NotSupported`.
+
+    class MyBackendContract(BackendContract, unittest.TestCase):
+        persistent = True            # reopen() gives a fresh object over the same storage
+        def make(self, **kw):        # a NEW, EMPTY backend (idle_timeout=... if supports_idle)
+            return MyBackend(tempfile.mkdtemp())
+        def reopen(self, backend):
+            return MyBackend(backend.path)
+
+A backend is conformant when its subclass passes. `tests/test_backends.py` runs
+it for `MemoryBackend`, `FileBackend`, `LocalBackend` (file and env key sources),
+and `BwBackend` / `BwServeBackend` against the fake `bw` of `tests/test_e2e.py`.
 
 ## Audit
 
@@ -1810,6 +2039,11 @@ Whitelist (output field from the recorded field; every event also has `seq`, `ts
 | `discovery` | peer, host, found (names) |
 | `catalog_loaded` | count, invalid_count (not names) |
 | `backend_ready` | duration_ms |
+| `backend_closed` | idle_seconds (bw backend idle logout) |
+| `store_unlocked`, `store_reloaded`, `store_written` | items (a count) (local backend) |
+| `store_locked` | idle_seconds (local backend idle drop) |
+| `store_unlock_failed` | reason (`wrong_key`, `key_missing`, `corrupt`, `unsupported`, `not_found`) |
+| `store_rekeyed` | wraps (a count; `change-key` / `rotate-dek` while the broker runs) |
 | `catalog_error`, `backend_error` | envelope only (no fields) |
 
 Residual signals the agent can still infer: a decision with `channel` null is a policy

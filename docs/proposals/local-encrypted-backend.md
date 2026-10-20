@@ -1,7 +1,9 @@
 # Proposal: local encrypted backend (no Bitwarden required)
 
-Status: scoped for v1. Relates to issue #6 (file backend). Supersedes its
-`.env` idea: secrets are kept in an encrypted store, never a plaintext file.
+Status: **implemented** (store, backend, admin CLI, imports, backend contract and
+conformance suite). See "Implementation notes and deviations" at the end. Relates to
+issue #6 (file backend). Supersedes its `.env` idea: secrets are kept in an encrypted
+store, never a plaintext file.
 
 ## Goal
 
@@ -109,11 +111,12 @@ is the only place values live, and the importer says to delete the source.
 
 ## Backend contract
 
-Document in `docs/reference.md` the surface the broker uses: `get`,
-`put(create, keep_previous, meta)`, `catalog`, `set_meta`, `delete`, plus the
-optional `create_login`, `edit_item`, `warm`, `close` (checked with `hasattr`
-today). Errors are `BackendError` with a message safe to log; never put a value
-in an exception.
+Implemented as `secret_broker/backends/base.py` (`VaultBackend`) and documented in
+`docs/reference.md` ("Backend contract"): `get`, `put(create, keep_previous, meta)`,
+`catalog`, `set_meta`, `delete`, plus capabilities (`set_meta`, `create_login`,
+`edit_item`, `warm`, `on_event`, `adopts`, `export_items`, `import_items`) the core
+checks instead of probing with `hasattr`. Errors are `BackendError` subclasses with
+a message safe to log; never put a value in an exception.
 
 ## Audit
 
@@ -150,3 +153,23 @@ Names only, never values: `store_unlocked`, `store_locked` (idle), `store_unlock
 - Legacy plaintext `file` backend is kept for tests only.
 - Admin CLI is `python -m secret_broker.localstore`, no new entry point.
 - The `unlock` page is deferred with the other key sources.
+
+## Implementation notes and deviations
+
+- **Package, not a module.** `secret_broker/backends/` holds `base.py` (contract, error
+  classes, neutral `Item` model), `registry.py`, `bitwarden.py`, `local.py`,
+  `localstore.py`, `file.py`, `memory.py`. `secret_broker.localstore` remains as the
+  `python -m` entry and an import shim.
+- **Registry and plugins.** `type` -> `BackendSpec(name, build, validate, doc)`; third
+  parties register through the `secret_broker.backends` entry-point group.
+- **Admin CLI** (`secret_broker/localstore_cli.py`) adds `rotate-dek`, `export-names`,
+  `import-bw` with read-back verification, `--generate-key` and `--force` (old file kept
+  as `.replaced`). `add` takes values from stdin, `--json` or a hidden prompt only.
+  The CLI refuses a group/world-readable store; key files only warn (as decided).
+- **SSH keys.** The store also holds `ssh_key` items (private and public half), so the
+  SSH signing features work on the local backend as they do with Bitwarden type-5 items.
+- **Wrong key.** Verified at startup with `background_load` both off and on: the broker
+  starts, the catalog is empty, `store_unlock_failed` and `catalog_error` are audited,
+  requests for unknown names fail, and the next refresh recovers once the key is fixed.
+- **Not done (still deferred):** OS keychains, systemd-creds/TPM, an unlock page, SQLCipher,
+  multi-broker sync. Rotation history (`previous_value`) is not carried by `import-bw`.

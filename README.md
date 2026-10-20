@@ -21,6 +21,11 @@ push notification or the dashboard.
 - **The vault is the catalog.** Every login and secure note in the broker's
   Bitwarden/Vaultwarden collection is a credential, with safe defaults you can
   tune. No config file lists your secrets.
+- **Pluggable storage, vault optional.** The broker talks to its store through a
+  small, documented backend contract (Bitwarden/Vaultwarden, or a built-in
+  AES-256-GCM encrypted file with an admin CLI and a one-time Bitwarden import),
+  with a conformance test suite for writing your own:
+  [docs/reference.md](docs/reference.md#backend-contract).
 - **The agent never sees the value** in `http` mode: the broker makes the call and
   substitutes `{{VAR}}` placeholders itself.
 - **Every use is approved or explicitly allow-listed**, rated by a risk model, and

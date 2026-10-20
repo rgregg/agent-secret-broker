@@ -9,7 +9,7 @@ the command line for agents is in [cli.md](cli.md).
 
 | Piece | Why | Examples |
 |---|---|---|
-| A **vault** | Holds the credentials. The vault *is* the catalog: no separate list. | Bitwarden, or a self-hosted Vaultwarden |
+| A **vault** (or the built-in encrypted file) | Holds the credentials. The store *is* the catalog: no separate list. | Bitwarden, a self-hosted Vaultwarden, or the [local encrypted store](#alternative-no-vault-the-encrypted-local-store) |
 | An **SSO proxy** in front of the approval page | Proves it is you tapping Approve | authentik proxy outpost, oauth2-proxy, Authelia, Cloudflare Access |
 | A **notification path** | Tells you a request is waiting | Web Push (built in), Home Assistant, Telegram |
 | A host with **Docker** | Runs the broker | any small VM |
@@ -21,6 +21,25 @@ The broker publishes two ports. Treat them very differently:
   a process *create requests*, which still need your approval.
 - **8801, approval web app.** It trusts the username your SSO proxy puts in a
   header. **Never publish it directly**: only the proxy may reach it.
+
+## Choosing a backend
+
+The broker keeps its credentials in a **backend**, chosen by `backend.type`. The
+rest of the broker behaves the same either way.
+
+| | `bw` (Bitwarden / Vaultwarden) | `local` (encrypted file) |
+|---|---|---|
+| Needs | A vault account, an organization and collection, an API key, the `bw` CLI (in the image) | Nothing but a file and a key |
+| Edit credentials | In the vault's own apps and web UI, plus `asb store` / `asb update` | `python -m secret_broker.localstore` plus `asb store` / `asb update` |
+| Sync, sharing, mobile apps, vault audit trail | Yes (the vault's) | No: one file on the broker host |
+| Key to protect | The vault master password and API key | The store key (a file or an environment variable) |
+| Failure modes | Vault server down, rate limits, `bw` quirks | A lost key is unrecoverable (keep the recovery key) |
+
+Pick `bw` when you already run a vault or want your credentials usable from other
+devices. Pick `local` for a small self-contained install or to remove the vault
+as a dependency. You can move from one to the other later (see
+[Moving from Bitwarden to the local store](#moving-from-bitwarden-to-the-local-store)).
+The steps below describe `bw`; the local store has its own quick start after step 7.
 
 ## 1. Prepare the vault
 
@@ -211,6 +230,83 @@ still ask. You can list, add and revoke these rules on the **Policies** tab unde
 visible to agents, and a rule cannot override `allowed_hosts`. See
 [reference.md](reference.md#standing-per-host-rules-ssh_rules).
 
+## Alternative: no vault, the encrypted local store
+
+Skip steps 1 and the vault parts of 2 and 3. The credentials live in one
+AES-256-GCM encrypted file; the key comes from a file or an environment variable.
+
+1. **Create the key and the store** on the broker host, as the user that will run
+   the broker (or a user that can then hand the files to it):
+
+        mkdir -p /opt/stacks/asb/{data,secrets} && cd /opt/stacks/asb
+        python -m secret_broker.localstore init \
+            --store data/store.enc --key-file secrets/store_key --generate-key
+
+   This writes a random key to `secrets/store_key` (mode 600), creates
+   `data/store.enc` (mode 600) and prints a **recovery key once**. Store the
+   recovery key offline (a password manager, a safe): if both the key and the
+   recovery key are lost the store cannot be opened, by design. Use
+   `--no-recovery` to skip it, or give your own passphrase in the key file
+   instead of `--generate-key` (a passphrase goes through scrypt).
+2. **Add a credential** (the value comes from stdin or a hidden prompt, never
+   from the command line):
+
+        python -m secret_broker.localstore add "Example token" \
+            --store data/store.enc --key-file secrets/store_key
+        python -m secret_broker.localstore list \
+            --store data/store.enc --key-file secrets/store_key
+
+   Without `broker` metadata the item is adopted with safe defaults and
+   `approval: prompt`; `--meta FILE` or `set-meta` sets hosts, variables and policy.
+   Existing `.env` files import with `import-env FILE`; delete the file afterwards.
+3. **Configure the broker** (instead of the `bw` backend block):
+
+        "backend": {"type": "local", "path": "/data/store.enc",
+                    "key_source": {"type": "file", "path": "/run/secrets/store_key"},
+                    "idle_timeout": 300}
+
+   Mount `data/` (read-write, the broker writes the store and keeps a `.bak`) and
+   mount `secrets/store_key` as a secret. `{"type": "env", "name": "BROKER_STORE_KEY"}`
+   also works but is visible in `docker inspect` and `/proc`; prefer the file.
+   Steps 4 to 7 are unchanged.
+
+**Threat model.** Encryption at rest protects against a stolen disk, a leaked
+backup or snapshot, and other local users reading the file. It does not protect
+against anything that can read both the store and the key while the broker runs.
+Run the broker as its own user or container, mount the store and the key only
+into it, keep them on different volumes where you can, and keep the agent's
+account away from both. If the key is wrong or missing the broker still starts
+(catalog empty, requests fail with a clear error, `store_unlock_failed` audited)
+and recovers on the next refresh once the key is fixed.
+
+Other administration (`show`, `set-meta`, `delete`, `change-key`, `rotate-dek`,
+`export-names`) is in [reference.md](reference.md#admin-cli-python--m-secret_brokerlocalstore).
+
+## Moving from Bitwarden to the local store
+
+A copy, not a cutover: nothing is deleted in the vault, so `bw` stays your
+fallback. Do this when you can afford a short restart.
+
+1. `init` a store as above (on the broker host, or anywhere the broker's config and the
+   vault are reachable).
+2. Copy the vault's contents: `python -m secret_broker.localstore import-bw
+   --bw-config broker-config.json --store data/store.enc --key-file secrets/store_key`.
+   `broker-config.json` is the broker's existing config with the `bw` backend block.
+   It copies every login, secure note and SSH key in the broker's collection (and
+   any item carrying `broker` metadata), with custom fields and the metadata parsed
+   into a nested object, then reads each item back and compares before saying
+   it succeeded. Use `--dry-run` first. It prints names and counts only.
+3. Check: `list` shows the names you expect; `show NAME` shows metadata and field names.
+4. Switch: stop the broker, replace the `backend` block with the `local` one, supply the
+   key (file or environment variable) and start it. Check `asb status` (`backend` is
+   `local` and `ok`) and `asb list` against the old catalog (the same names,
+   `catalog.invalid` 0).
+5. Keep the `bw` block, the vault and its API key around until you trust the new
+   setup: rolling back is restoring the old `backend` block and restarting. New
+   credentials added afterwards exist only in whichever backend was live.
+   Rotation history (`previous_value`) is not copied.
+
+
 ## Upgrading
 
     cd /opt/stacks/asb
@@ -225,7 +321,10 @@ Images are built by CI on every push to `main` as
 ## Backups and recovery
 
 - The vault is the catalog, so backing up the vault backs up the credentials *and*
-  their policies.
+  their policies. With the local backend the store file is the catalog: back up
+  `store.enc` (the `.bak` next to it is only the previous write) and keep the key
+  and the recovery key somewhere else, because a backup without the key is useless
+  and a backup next to the key is not encrypted in any useful sense.
 - `data/audit.jsonl` is the audit trail: `python -m secret_broker.audit verify
   data/audit.jsonl` checks the hash chain. Keep a copy off the agent's host.
 - `data/webpush.json` and `data/vapid.pem` are push subscriptions and the sending
