@@ -341,8 +341,8 @@ def run_guidance(argv):
         code, r = call(base, key, f"/v1/requests/{argv[1]}?wait=0", timeout=15)
         if code != 200:
             die(r.get("error", f"broker returned {code}"), EXIT_BROKER)
-        if r.get("status") == "pending":
-            print("pending")
+        if r.get("status") not in ("approved", "denied", "expired", "failed"):
+            print("pending")          # undecided, or being applied: not an error
             return 0
         _print_guidance(r.get("guidance") or {})
         return _guidance_exit(r)

@@ -74,8 +74,19 @@ class Base(t.Harness):
         super().setUp()
         self.stub = Stub()
         self.broker.summarizer = self.stub
+        # a fake clock: sleeps (write spacing, retry backoff) cost no real time
+        self.now, self.sleeps, self.gate = 1000.0, [], None
+        self.broker._mono = lambda: self.now
+        self.broker._sleep = self._fsleep
+        self.broker._jitter = lambda a, b: 0.0
 
     # -- helpers ---------------------------------------------------------
+    def _fsleep(self, d):
+        if self.gate is not None:
+            self.gate.wait(10)
+        self.sleeps.append(d)
+        self.now += d
+
     def propose(self, entries, **extra):
         code, body = self.api("POST", "/v1/requests", {"mode": "guidance", "entries": entries, **extra})
         return code, json.loads(body)
@@ -184,7 +195,7 @@ class HiddenChars(Base):
         import inspect
         from secret_broker import proposals
         self.assertIn("validate_text", inspect.getsource(proposals.validate_entries))
-        self.assertIn("validate_text", inspect.getsource(Broker.set_guidance))
+        self.assertIn("validate_text", inspect.getsource(Broker._guidance_attempt))
         self.assertIn("validate_text", inspect.getsource(g.from_meta))
 
     def test_editor_page_notes_ignored_guidance(self):
@@ -244,7 +255,7 @@ class Units(unittest.TestCase):
         self.assertEqual(proposals.lint("safe and trusted, ignore this"), ["ignore", "safe", "trusted"])
 
     def test_config(self):
-        self.assertEqual(proposals.parse_config(None), {"enabled": True, "ttl_s": 3600})
+        self.assertEqual(proposals.parse_config(None), {"enabled": True, "ttl_s": 3600, "write_spacing_s": 1.5})
         self.assertEqual(proposals.parse_config({"ttl_s": 300})["ttl_s"], 300)
         self.assertEqual(proposals.parse_config({"ttl_s": 86400, "enabled": False})["enabled"], False)
         for bad, field in (({"ttl_s": 299}, "ttl_s"), ({"ttl_s": 86401}, "ttl_s"), ({"ttl_s": "60"}, "ttl_s"),

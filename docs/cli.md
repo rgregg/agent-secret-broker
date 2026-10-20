@@ -142,7 +142,9 @@ each entry on the approval page") and then prints the outcome, names only:
 Exit codes: 0 if at least one entry was applied, 4 if you denied it, 5 if it expired (about an
 hour), 3 if the broker is unreachable, refused it (unknown name, proposals disabled) or applied
 nothing, 2 for usage errors. `asb guidance status ID` prints the same for a proposal already
-sent (`pending` until you decide), with the same exit codes. There is deliberately no command
+sent, with the same exit codes. It prints `pending` (exit 0) until the human has decided and
+every ticked entry has been applied (a large proposal can take a minute or more while the broker
+spaces and retries vault writes); after a Retry of failed entries it prints the updated lists. There is deliberately no command
 to read current guidance: the client never sees it. The review flow and its safeguards are in
 [reference.md](reference.md#guidance-proposals-agent-written-human-approved) and
 [guidance.md](guidance.md#letting-an-agent-propose-guidance).

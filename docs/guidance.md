@@ -54,6 +54,19 @@ How review works:
   guidance, its text is a fresh draft: ask for edits as a new proposal rather than ticking a
   draft you do not fully agree with.
 
+Applying many entries is gentle on the vault: writes are serialized and spaced
+(`guidance_proposals.write_spacing_s`, default 1.5 s, 0 to 30), and a rate-limit or other
+transient vault error is retried after 5, 15 and 45 seconds before the entry is marked failed.
+This runs in the background: the approval returns at once ("Applying N entries...") and the
+agent's `asb guidance status` shows `pending` until every ticked entry is resolved. The
+history pop-over then shows, per entry, `applied`, `denied (not ticked)` or `failed: rate
+limited` (or `backend unavailable`, `conflict`, `invalid`, `other error`); the agent is told
+only the names. If any failed, the pop-over has **Retry failed (N)**, which applies just
+those entries again. The text of failed entries is kept in memory for one `ttl_s` after the
+proposal settled, then dropped. If the broker restarts while entries are being applied, the
+entries not yet written stay unapplied, the request is lost (the agent's poll gets "unknown
+request"; history shows `unknown`) and the retry text is gone, so propose them again.
+
 The agent never sees any guidance, current or proposed, in discovery, status, results or the
 audit API. The proposal text is shown only on the approval card and dropped once it is
 decided; the audit log keeps names, lengths and short hashes. Details and the audit events:

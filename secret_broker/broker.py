@@ -24,6 +24,7 @@ import ipaddress
 import json
 import os
 import queue
+import random
 import re
 import secrets
 import ssl
@@ -141,6 +142,7 @@ class Request:
         self._sent_to = None      # leaf transports that sent it; None = all (presence hold)
         self.offered = frozenset()  # action ids offered on any token-carrying transport
         self.apply = None         # guidance proposal: the entry indexes the approver ticked
+        self.gclasses = {}        # guidance proposal: failed entry name -> error class (approver only)
         self.done = threading.Event()
 
 
@@ -205,6 +207,13 @@ class Broker(sshrules_mod.SshRulesMixin):
             self.log("config_warning", warning=warn)
         self._default_auto_modes = risk_mod.parse_auto_modes(config.get("risk"), "risk")
         self.proposals_cfg = proposals_mod.parse_config(config.get("guidance_proposals"))
+        # guidance applies: vault writes are serialized and spaced; transient errors are retried.
+        # The clock, sleep and jitter are attributes so tests can drive them.
+        self._gwrite_lock = threading.Lock()
+        self._gwrite_last = None            # monotonic time the last proposal write finished
+        self._sleep, self._mono, self._jitter = time.sleep, time.monotonic, random.uniform
+        self._gretry_lock = threading.Lock()
+        self._gretry = {}                   # proposal id -> text of FAILED entries, in memory only
         self._init_grants(config)
         self._init_ssh_rules()
         if background_load:
@@ -677,29 +686,35 @@ class Broker(sshrules_mod.SshRulesMixin):
         self.backend.set_meta(sc["_item"], meta)
         sc["_meta"] = meta
 
-    def set_guidance(self, name, text, user, peer=None, client_ip=None, **audit_extra):
-        """Set (or, when empty, remove) a secret's risk guidance: vault first, then
-        memory. Returns True/False; raises ValueError for an unknown secret. The
-        audit events carry the length and hashes, never the text. `audit_extra` is
-        added to the events (a proposal passes via and proposal)."""
+    def _guidance_attempt(self, name, text, user, peer, client_ip, audit_extra, catch=None):
+        """One try at setting guidance -> (ok, error_class, error_text). Logs the refusal and
+        the success events; the caller logs a failure. Raises ValueError for an unknown secret
+        unless `catch` is set (then it is an `invalid` result)."""
         if name not in self.cfg["secrets"]:
+            if catch:
+                return False, "invalid", "unknown secret"
             raise ValueError("bad guidance change")
         who = dict(secret=name, user=user, peer=peer, client_ip=client_ip, **audit_extra)
         try:
             new = guidance_mod.validate_text(text)
         except ValueError as e:
             self.log("guidance_change_refused", reason=str(e)[:120], **who)
-            return False
+            return False, "invalid", None
         with self._cfg_lock:
-            sc = self.cfg["secrets"][name]
+            sc = self.cfg["secrets"].get(name)
+            if sc is None:
+                return False, "invalid", "unknown secret"
             old = sc.get("guidance") or ""
             if old == new:
-                return True
+                return True, None, None
             try:
                 self._persist_guidance(name, new, user)
             except (OSError, ValueError, KeyError, BackendError) as e:
-                self.log("guidance_change_failed", error=str(e)[:200], **who)
-                return False
+                return False, proposals_mod.classify(e), str(e)
+            except Exception as e:  # noqa: BLE001
+                if not catch:
+                    raise
+                return False, proposals_mod.classify(e), str(e)
             if new:
                 sc["guidance"] = new
             else:
@@ -707,7 +722,135 @@ class Broker(sshrules_mod.SshRulesMixin):
             sc.pop("guidance_invalid", None)
         self.log("guidance_changed", length=len(new), old_sha256=guidance_mod.digest(old),
                  new_sha256=guidance_mod.digest(new), **who)
-        return True
+        return True, None, None
+
+    def set_guidance(self, name, text, user, peer=None, client_ip=None, **audit_extra):
+        """Set (or, when empty, remove) a secret's risk guidance: vault first, then
+        memory. Returns True/False; raises ValueError for an unknown secret. The
+        audit events carry the length and hashes, never the text. `audit_extra` is
+        added to the events (a proposal passes via and proposal). One try, no retry:
+        the Policies editor shows the failure at once."""
+        ok, cls, err = self._guidance_attempt(name, text, user, peer, client_ip, audit_extra)
+        if not ok and err is not None:      # a refused text was already logged as such
+            self.log("guidance_change_failed", error=str(err)[:200], error_class=cls,
+                     secret=name, user=user, peer=peer, client_ip=client_ip, **audit_extra)
+        return ok
+
+    def _space_write(self):
+        """Hold until the minimum spacing since the last proposal write has passed."""
+        gap = self.proposals_cfg["write_spacing_s"]
+        if gap and self._gwrite_last is not None:
+            wait = self._gwrite_last + gap - self._mono()
+            if wait > 0:
+                self._sleep(wait)
+
+    def _apply_guidance_entry(self, name, text, approver, peer, client_ip, via, rid):
+        """Apply one proposal entry: vault writes are serialized across proposals with a
+        minimum spacing, and a transient error (rate limit, backend unavailable, conflict)
+        is retried with exponential backoff and jitter. Never holds the cfg or decision
+        lock while waiting. Returns (ok, error_class)."""
+        delays = proposals_mod.RETRY_DELAYS
+        extra = {"via": via, "proposal": rid}
+        for attempt in range(len(delays) + 1):
+            with self._gwrite_lock:
+                self._space_write()
+                try:
+                    ok, cls, err = self._guidance_attempt(name, text, approver, peer, client_ip,
+                                                          {**extra, "attempts": attempt + 1}, catch=True)
+                finally:
+                    self._gwrite_last = self._mono()
+            if ok:
+                return True, None
+            if cls not in proposals_mod.TRANSIENT or attempt == len(delays):
+                self.log("guidance_change_failed", error=str(err or "")[:200], error_class=cls, secret=name,
+                         user=approver, peer=peer, client_ip=client_ip, attempts=attempt + 1, **extra)
+                return False, cls
+            j = proposals_mod.RETRY_JITTER
+            delay = delays[attempt] * (1 + self._jitter(-j, j))
+            self.log("guidance_change_retry", secret=name, error_class=cls, attempt=attempt + 1,
+                     delay_s=round(delay, 1), proposal=rid)
+            self._sleep(delay)
+        return False, "other"       # not reached
+
+    def _apply_entries(self, rid, items, who, via):
+        """[(name, text)] one after another, each independent -> (applied, failed, classes)."""
+        applied, failed, classes = [], [], {}
+        for name, text in items:
+            try:
+                ok, cls = self._apply_guidance_entry(name, text, who["approver"], who["approver_peer"],
+                                                     who["approver_ip"], via, rid)
+            except Exception as e:  # noqa: BLE001 -- one entry never stops the others
+                ok, cls = False, proposals_mod.classify(e)
+            if ok:
+                applied.append(name)
+            else:
+                failed.append(name)
+                classes[name] = cls
+        return applied, failed, classes
+
+    def retry_count(self, rid):
+        """How many failed entries of a settled proposal can still be retried (0 when the
+        text is gone: dropped one proposal TTL after it settled, or the broker restarted)."""
+        self._gretry_sweep()
+        with self._gretry_lock:
+            st = self._gretry.get(rid)
+            return 0 if st is None or st["running"] else len(st["texts"])
+
+    def _gretry_sweep(self):
+        now = time.time()
+        with self._gretry_lock:
+            for rid in [k for k, v in self._gretry.items() if now > v["until"] and not v["running"]]:
+                del self._gretry[rid]
+
+    def retry_proposal(self, rid, actor, channel, peer=None, client_ip=None):
+        """Re-apply the FAILED entries of a settled proposal, from the approver. Only the
+        dashboard and approval-link channels (a human who can see the page) may; a token
+        channel never. Returns (http_status, count): 202 started, 403 channel, 410 nothing
+        to retry (never failed, text expired or lost in a restart), 409 already running."""
+        if channel not in ("dashboard", "link"):
+            self.log("guidance_retry_refused", reason="channel", channel=channel, user=actor,
+                     peer=peer, client_ip=client_ip, proposal=rid)
+            return 403, 0
+        self._gretry_sweep()
+        with self._gretry_lock:
+            st = self._gretry.get(rid)
+            if st is None or not st["texts"]:
+                return 410, 0
+            if st["running"]:
+                return 409, 0
+            st["running"] = True
+            n = len(st["texts"])
+        self.log("guidance_retry_requested", proposal=rid, count=n, channel=channel, user=actor,
+                 peer=peer, client_ip=client_ip)
+        who = {"approver": actor, "approver_peer": peer, "approver_ip": client_ip, "channel": channel}
+        threading.Thread(target=self._run_retry, args=(rid, who), daemon=True).start()
+        return 202, n
+
+    def _run_retry(self, rid, who):
+        with self._gretry_lock:
+            st = self._gretry[rid]
+            items, req = list(st["texts"].items()), st["req"]
+        try:
+            applied, failed, classes = self._apply_entries(rid, items, who, "proposal_retry")
+        except Exception:  # noqa: BLE001
+            applied, failed, classes = [], [n for n, _ in items], {n: "other" for n, _ in items}
+        with self._lock:
+            res = req.result or {"applied": [], "denied": [], "failed": []}
+            res["applied"] = res["applied"] + [n for n in applied if n not in res["applied"]]
+            res["failed"] = [n for n in res["failed"] if n not in applied]
+            req.result = res
+            req.gclasses = {n: c for n, c in req.gclasses.items() if n in res["failed"]}
+            req.gclasses.update(classes)
+        with self._gretry_lock:
+            for n in applied:
+                st["texts"].pop(n, None)
+            st["running"] = False
+            if not st["texts"]:
+                self._gretry.pop(rid, None)
+        self.audit("guidance_proposal_result", req, status=req.status, retry=True,
+                   applied=len(res["applied"]), denied=len(res["denied"]), failed=len(res["failed"]),
+                   applied_names=res["applied"], denied_names=res["denied"], failed_names=res["failed"],
+                   failed_classes=[req.gclasses.get(n, "other") for n in res["failed"]])
 
     def _persist_ssh_hosts(self, name, raw, user):
         """Write the key's `ssh_hosts` policy into its broker metadata in the vault
@@ -975,21 +1118,21 @@ class Broker(sshrules_mod.SshRulesMixin):
         return req
 
     def _apply_proposal(self, req, who):
-        """Apply ONLY the entries the approver ticked, each through set_guidance (the
-        Policies-editor path: vault first, then the live catalog, one guidance_changed
-        event). A failing entry is reported and the others still apply. Returns the
-        names-only result for the agent."""
-        applied, denied, failed = [], [], []
-        for i, ent in enumerate(req.spec["entries"]):
-            if i not in (req.apply or ()):
-                denied.append(ent["name"])
-                continue
-            try:
-                ok = self.set_guidance(ent["name"], ent["text"], who["approver"], who["approver_peer"],
-                                       who["approver_ip"], via="proposal", proposal=req.id)
-            except ValueError:          # no longer in the catalog
-                ok = False
-            (applied if ok else failed).append(ent["name"])
+        """Apply ONLY the entries the approver ticked, each through the robust path (see
+        _apply_guidance_entry: vault first, then the live catalog, one guidance_changed event
+        per entry; writes serialized and spaced, transient errors retried). A failing entry is
+        reported and the others still apply. Returns the names-only result for the agent; the
+        failure classes stay on the request for the approver, and the text of the failed
+        entries is kept in memory for a retry (see retry_proposal)."""
+        items = [(e["name"], e["text"]) for i, e in enumerate(req.spec["entries"]) if i in (req.apply or ())]
+        denied = [e["name"] for i, e in enumerate(req.spec["entries"]) if i not in (req.apply or ())]
+        applied, failed, classes = self._apply_entries(req.id, items, who, "proposal")
+        req.gclasses = classes
+        if failed:
+            texts = dict(items)
+            with self._gretry_lock:
+                self._gretry[req.id] = {"texts": {n: texts[n] for n in failed}, "running": False,
+                                        "until": time.time() + self.proposals_cfg["ttl_s"], "req": req}
         return {"applied": applied, "denied": denied, "failed": failed}
 
     def _proposal_settled(self, req, status):
@@ -1000,7 +1143,8 @@ class Broker(sshrules_mod.SshRulesMixin):
         res = req.result or {"applied": [], "denied": [], "failed": []}
         self.audit("guidance_proposal_result", req, status=status,
                    applied=len(res["applied"]), denied=len(res["denied"]), failed=len(res["failed"]),
-                   applied_names=res["applied"], denied_names=res["denied"], failed_names=res["failed"])
+                   applied_names=res["applied"], denied_names=res["denied"], failed_names=res["failed"],
+                   failed_classes=[req.gclasses.get(n, "other") for n in res["failed"]])
 
     def _validate_store(self, names, spec):
         """Validate (and fill defaults for) a request to create/update a credential."""
@@ -1499,6 +1643,7 @@ class Broker(sshrules_mod.SshRulesMixin):
         for rid in [k for k, r in self._by_id.items() if now > r.expires + 300]:
             r = self._by_id.pop(rid)
             self._by_nonce.pop(r.nonce, None)
+        self._gretry_sweep()
 
     def _finish(self, req, status, error=None, result=None, **extra):
         with self._lock:
@@ -2124,8 +2269,10 @@ class Broker(sshrules_mod.SshRulesMixin):
         if req.mode == "guidance":
             # names only, and repeatable: the agent may poll the outcome more than once
             with self._lock:
-                out = {"status": req.status, "error": req.error}
-                if req.status != "pending" and req.result is not None:
+                # while the entries are being applied (`deciding`) the agent still sees pending
+                st = "pending" if req.status == "deciding" else req.status
+                out = {"status": st, "error": req.error}
+                if st != "pending" and req.result is not None:
                     out["guidance"] = {k: list(v) for k, v in req.result.items()}
             return out
         with self._lock:
@@ -3339,6 +3486,13 @@ def _detail_html(r, evs, retained=""):
         ens = prop.get("entry_names") or []
         lens, shas = prop.get("entry_lengths") or [], prop.get("entry_sha256") or []
         outc = {n: k for k in ("applied", "denied", "failed") for n in (res.get(k + "_names") or [])}
+        fcls = dict(zip(res.get("failed_names") or [], res.get("failed_classes") or []))
+
+        def _says(n):
+            # the approver sees the class of a failure (never the vault's own words)
+            if outc[n] == "failed":
+                return "failed: " + proposals_mod.CLASS_LABEL.get(fcls.get(n), "other error")
+            return "denied (not ticked)" if outc[n] == "denied" and r["outcome"] == "approved" else outc[n]
         add("Proposed entries", len(ens) or len(r["names"]))
         if res:
             add("Applied / denied / failed", f"{res.get('applied', 0)} / {res.get('denied', 0)} / "
@@ -3347,7 +3501,7 @@ def _detail_html(r, evs, retained=""):
             f"<code>{e(str(n))}</code>: "
             f"{e(str(lens[i])) if i < len(lens) else '?'} chars, sha256 "
             f"<code>{e(str(shas[i]) if i < len(shas) else '')}</code>"
-            + (f", {e(outc[n])}" if n in outc else "") for i, n in enumerate(ens)), True)
+            + (f", {e(_says(n))}" if n in outc else "") for i, n in enumerate(ens)), True)
         add("Proposal text", "not retained after the decision")
     else:
         add("Signing", r.get("ssh_what"))
@@ -3622,7 +3776,12 @@ def approval_handler(broker):
 
         def _dashboard(self, user, fragment=False, note="", q=None):
             notes = {"approved": "Approved. Releasing now.", "denied": "Denied.",
-                     "gapplied": "Applying the selected guidance. Entries you did not tick were denied.",
+                     "gapplied": "Applying the selected guidance in the background (writes are spaced "
+                                 "and retried if the vault is busy). Entries you did not tick were denied.",
+                     "gretry": "Retrying the failed entries in the background.",
+                     "gbusy": "A retry for that proposal is already running.",
+                     "gstale": "Nothing to retry: the failed entries are gone (they are kept in memory "
+                               "for one proposal lifetime and lost on a broker restart).",
                      "always": "Approved, and always approved from now on (this kind of request only).",
                      "grant": "Approved, and further requests are approved for a while.",
                      "sshrule": "Approved, and this key is always approved for that account on that server.",
@@ -3663,6 +3822,9 @@ def approval_handler(broker):
                 return _page(self, 200, block + self._hist_list(a, pend_ids), nav=False)
             recent = self._recent_history(a, pend_ids)
             msg = notes.get(note, "")
+            n_ent = ((q or {}).get("n") or [""])[0]
+            if note == "gapplied" and n_ent.isdigit() and len(n_ent) < 4:
+                msg = f"Applying {n_ent} entr{'y' if n_ent == '1' else 'ies'}... " + msg
             _page(self, 200,
                   f"<div id=flash class=flash{'' if msg else ' hidden'}>{html.escape(msg)}</div>"
                   "<div id=offline class='flash offline' hidden>Cannot reach the broker. "
@@ -3781,11 +3943,23 @@ def approval_handler(broker):
                              badge=len(broker.pending()), user=user)
             broker.log("request_detail_viewed", peer=self.client_address[0],
                        client_ip=self._fwd(), request_id=rid)
-            body = _detail_html(row, evs, self._retained_html(row))
+            body = _detail_html(row, evs, self._retained_html(row) + self._retry_html(row, user))
             if fragment:
                 return self._fragment(200, body)
             _page(self, 200, "<h1>Request</h1><div class=card>" + body + "</div>",
                   tab="requests", badge=len(broker.pending()), user=user)
+
+        def _retry_html(self, row, user):
+            """For a settled guidance proposal with failed entries whose text is still held:
+            the Retry button (a POST form, CSRF token, approver pages only)."""
+            n = broker.retry_count(row["id"]) if row["mode"] == "guidance" else 0
+            if not n:
+                return ""
+            return ("<form method=post action='/request/retry' class=retry>"
+                    f"<input type=hidden name=id value='{html.escape(row['id'])}'>"
+                    f"<input type=hidden name=csrf value='{broker.csrf_token(user)}'>"
+                    f"<button class='btn approve' type=submit>Retry failed ({n})</button> "
+                    "<small class=muted>Applies only the entries that failed, the same way.</small></form>")
 
         def _retained_html(self, row):
             """Request details kept for a finished request (headers/body for http, script
@@ -4216,7 +4390,7 @@ def approval_handler(broker):
                 return _page(self, 413, "<h1>Too large</h1>")
             form = urllib.parse.parse_qs(
                 self.rfile.read(min(int(self.headers.get("Content-Length", 0)), limit)).decode())
-            if path in ("/decide", "/policies", "/policies/guidance", "/policies/ssh_hosts", "/grants/revoke",
+            if path in ("/decide", "/request/retry", "/policies", "/policies/guidance", "/policies/ssh_hosts", "/grants/revoke",
                         "/policies/ssh_rules/add", "/policies/ssh_rules/revoke", "/push/subscribe",
                         "/push/revoke", "/push/test") and not self._csrf_ok(user, form.get("csrf", [""])[0]):
                 broker.log("csrf_refused", path=path, peer=self.client_address[0],
@@ -4245,7 +4419,14 @@ def approval_handler(broker):
                        "sshrule" if done.ssh_rule in ("created", "exists") else
                        "always" if done.always in ("applied", "exists") else
                        "grant" if parsed[2] is not None else "approved")
+                if tag == "gapplied":
+                    tag += f"&n={len(done.apply or ())}"
                 return self._redirect(f"/?note={tag}")
+            if path == "/request/retry":
+                code, n = broker.retry_proposal(form.get("id", [""])[0][:64], user, "dashboard",
+                                                self.client_address[0], self._fwd())
+                return self._redirect("/?note=" + ("gretry" if code == 202 else
+                                                   "gbusy" if code == 409 else "gstale"))
             if path == "/grants/revoke":
                 gid = form.get("grant", [""])[0][:16]
                 done = broker.revoke_grant(gid, user, self.client_address[0], self._fwd())
@@ -4351,8 +4532,10 @@ def approval_handler(broker):
                 return _page(self, 404, "<h1>Request not found or already handled</h1>")
             if req.mode == "guidance":
                 return _page(self, 200, "<h1>Denied</h1><p>Nothing was changed.</p>" if not approve else
-                             "<h1>Applying the selected guidance</h1><p>Entries you did not tick were "
-                             "denied. You can close this page.</p>")
+                             f"<h1>Applying the selected guidance</h1><p>Applying {len(req.apply or ())} "
+                             f"entr{'y' if len(req.apply or ()) == 1 else 'ies'}... It runs in the background "
+                             "(vault writes are spaced and retried if the vault is busy). Entries you did not "
+                             "tick were denied. You can close this page.</p>")
             if not approve:
                 return _page(self, 200, "<h1>Denied</h1>")
             extra = ""

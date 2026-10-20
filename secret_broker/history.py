@@ -27,7 +27,7 @@ _EV_KEYS = ("reason", "reasons", "model", "risk", "error", "via", "channel", "de
             "rule_id", "account", "rule_host", "ssh_rule_requested", "decision_source",
             # guidance proposals: names, counts, lengths and hash prefixes; never text
             "entry_names", "entry_lengths", "entry_sha256", "applied", "denied", "failed",
-            "applied_names", "denied_names", "failed_names", "count")
+            "applied_names", "denied_names", "failed_names", "failed_classes", "count", "retry")
 _MAX_EVENTS = 60            # per request
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 

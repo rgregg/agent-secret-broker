@@ -1506,13 +1506,45 @@ Request (client API, agent key): `POST /v1/requests` with
 - The proposal waits `guidance_proposals.ttl_s` (default 3600, 300 to 86400) instead of
   the normal request TTL.
 - Config (validated at startup, naming the field):
-  `"guidance_proposals": {"enabled": true, "ttl_s": 3600}`. `enabled: false` refuses the
-  mode (403). `GET /v1/status` shows only `features.guidance_proposals` (a bool).
+  `"guidance_proposals": {"enabled": true, "ttl_s": 3600, "write_spacing_s": 1.5}`.
+  `enabled: false` refuses the mode (403). `write_spacing_s` (a number, 0 to 30, default 1.5)
+  is the minimum gap between vault writes while applying entries (see "Applying entries"
+  below). `GET /v1/status` shows only `features.guidance_proposals` (a bool).
 - Result: `GET /v1/requests/<id>` returns `{"status": "approved"|"denied"|"expired"|
   "failed", "error", "guidance": {"applied": [names], "denied": [names], "failed": [names]}}`.
   Names only. Unlike other modes the result is not consumed by the first read, so
   `asb guidance status` can repeat it. Nothing about current guidance is ever returned,
   and there is no client command or endpoint that reads it.
+
+### Applying entries (spacing, retry, failure classes, Retry)
+
+The vault (Vaultwarden through `bw serve`) rate-limits bursts of writes, so applying many
+ticked entries one after another used to fail the later ones. Now:
+
+- The decision POST returns at once ("Applying N entries..."). The entries are applied on a
+  worker thread that never holds the decision lock. The request stays `deciding` internally
+  and the agent's poll shows `pending` until every ticked entry is resolved, then `approved`
+  (as before) with the final lists. Entries are independent: one failure never stops the rest.
+- Vault writes of all proposals are serialized and at least `write_spacing_s` apart.
+- A transient error (`rate_limited`, `backend_unavailable`, `conflict`) is retried 3 times with
+  exponential backoff (5 s, 15 s, 45 s, each scaled by a random 0.75 to 1.25) before the entry
+  is `failed`. `invalid` and `other` errors fail at once. The class is derived from the
+  exception text (e.g. "Too many requests", "Rate limit exceeded", timeouts, refused
+  connections, 409); the vault's words are never kept or shown.
+- Approver only: the history pop-over (the settled result) lists each entry as `applied`,
+  `denied (not ticked)` or `failed: rate limited | backend unavailable | conflict | invalid |
+  other error`. The agent result stays names only (`applied`, `denied`, `failed`).
+- **Retry failed (N)**: on a settled proposal with failed entries the pop-over shows a button
+  (`POST /request/retry`, form fields `id` and `csrf`; same SSO, CSRF, Origin and trusted-peer
+  guards as `/decide`; only the dashboard or link channels, never push or HA). It re-applies
+  only the failed entries through the same spaced, retried path, audits `guidance_changed`
+  with `via: proposal_retry`, and updates the lists the agent polls (status stays `approved`).
+  The text of FAILED entries (never denied or applied ones) is held in memory only, for one
+  `ttl_s` after the proposal settled; after that, or after a broker restart, the button is
+  gone and the entries must be proposed again.
+- If the broker restarts while entries are being applied, entries not yet written stay
+  unapplied, the in-memory request is gone (the agent's poll gets 404 `unknown request`), and
+  the history row shows outcome `unknown`; propose the remaining entries again.
 
 ### Hidden characters are rejected
 
@@ -1599,8 +1631,11 @@ editor (`set_guidance`: vault first, then the live catalog, the `guidance_change
 | `assessed` | `risk: high`, `model: null` |
 | `guidance_proposed` | `id`, `count`, `ttl_s`, `entry_names`, `entry_lengths`, `entry_sha256` (12-char prefixes) |
 | `decided` | the usual fields (`channel` is `dashboard` or `link`) |
-| `guidance_changed` | per applied entry: `secret`, `user`, `peer`, `client_ip`, `length`, `old_sha256`, `new_sha256`, `via: proposal`, `proposal` (the request id). No event when the text did not change |
-| `guidance_proposal_result` | `id`, `status`, `applied`, `denied`, `failed` (counts), `applied_names`, `denied_names`, `failed_names` |
+| `guidance_changed` | per applied entry: `secret`, `user`, `peer`, `client_ip`, `length`, `old_sha256`, `new_sha256`, `via: proposal` (or `proposal_retry`), `attempts`, `proposal` (the request id). No event when the text did not change |
+| `guidance_proposal_result` | `id`, `status`, `applied`, `denied`, `failed` (counts), `applied_names`, `denied_names`, `failed_names`, `failed_classes` (aligned with `failed_names`); written again with `retry: true` after a Retry |
+| `guidance_change_retry` | hidden: `secret`, `proposal`, `error_class`, `attempt`, `delay_s` |
+| `guidance_change_failed` | hidden: `secret`, `proposal`, `via`, `error_class`, `attempts`, `error` (truncated) |
+| `guidance_retry_requested` / `guidance_retry_refused` | hidden: `proposal`, `count` / `reason`, `channel`, `user`, `peer`, `client_ip` |
 | `approved` / `denied` / `expired` / `failed` | as for any request |
 
 The agent audit API shows only the `requested` event (names and mode, never text); the

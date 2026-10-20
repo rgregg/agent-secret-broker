@@ -91,6 +91,7 @@ HIDDEN = frozenset({
     "startup", "assessed", "escalated", "notified", "decided",
     "policy_changed", "policy_change_refused", "policy_change_failed", "policies_viewed",
     "guidance_changed", "guidance_change_refused", "guidance_change_failed",
+    "guidance_change_retry", "guidance_retry_requested", "guidance_retry_refused",
     # an agent's guidance proposal: the `requested` event (names and mode only) is all it sees;
     # the entry hashes and the per-entry outcome are approval context
     "guidance_proposed", "guidance_proposal_result", "guidance_ignored",

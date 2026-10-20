@@ -27,8 +27,15 @@ from . import guidance as guidance_mod
 MAX_ENTRIES = 25
 MAX_PENDING = 3                 # open proposals at once
 BODY_CAP = 100 * 1024           # whole request body, bytes
-DEFAULTS = {"enabled": True, "ttl_s": 3600}
+DEFAULTS = {"enabled": True, "ttl_s": 3600, "write_spacing_s": 1.5}
 TTL_MIN, TTL_MAX = 300, 86400
+SPACING_MIN, SPACING_MAX = 0, 30
+RETRY_DELAYS = (5, 15, 45)      # seconds before retry 1, 2, 3 of a transient vault error (plus jitter)
+RETRY_JITTER = 0.25             # each delay is scaled by 1 +/- this fraction
+CLASSES = ("rate_limited", "backend_unavailable", "conflict", "invalid", "other")
+TRANSIENT = frozenset({"rate_limited", "backend_unavailable", "conflict"})
+CLASS_LABEL = {"rate_limited": "rate limited", "backend_unavailable": "backend unavailable",
+               "conflict": "conflict", "invalid": "invalid", "other": "other error"}
 INLINE_OPEN = 5                 # entries shown expanded; more are collapsed
 WARNING = ("This text tells the risk classifier how to rate requests made with these credentials. "
            "It can lower ratings. Review each one.")
@@ -40,7 +47,7 @@ def _int(v):
 
 
 def parse_config(raw, field="guidance_proposals"):
-    """Validate `guidance_proposals` -> {"enabled", "ttl_s"}. None means the defaults.
+    """Validate `guidance_proposals` -> {"enabled", "ttl_s", "write_spacing_s"}. None means the defaults.
     Raises ValueError naming the field."""
     if raw is None:
         raw = {}
@@ -54,7 +61,41 @@ def parse_config(raw, field="guidance_proposals"):
         raise ValueError(f"{field}.enabled must be true or false")
     if not _int(out["ttl_s"]) or not TTL_MIN <= out["ttl_s"] <= TTL_MAX:
         raise ValueError(f"{field}.ttl_s must be a whole number of seconds from {TTL_MIN} to {TTL_MAX}")
+    sp = out["write_spacing_s"]
+    if (isinstance(sp, bool) or not isinstance(sp, (int, float)) or sp != sp
+            or not SPACING_MIN <= sp <= SPACING_MAX):
+        raise ValueError(f"{field}.write_spacing_s must be a number of seconds from "
+                         f"{SPACING_MIN} to {SPACING_MAX}")
     return out
+
+
+def classify(exc):
+    """A coarse class for a failed vault write, from the exception type and text. Only the
+    class is ever kept or shown: the text may carry vault details."""
+    if isinstance(exc, (KeyError, ValueError)):
+        return "invalid"
+    msg = str(exc).lower()
+    if any(t in msg for t in ("too many requests", "rate limit", "rate-limit", "429", "throttl")):
+        return "rate_limited"
+    if (isinstance(exc, (TimeoutError, ConnectionError))
+            or any(t in msg for t in ("timed out", "timeout", "connection", "unavailable", "unreachable",
+                                      "502", "503", "504", "bad gateway", "temporarily", "not running",
+                                      "refused", "no route", "name resolution"))):
+        return "backend_unavailable"
+    if any(t in msg for t in ("conflict", "409", "out of date", "outdated", "revision", "modified")):
+        return "conflict"
+    if any(t in msg for t in ("not found", "invalid", "400", "bad request", "no rights", "ambiguous")):
+        return "invalid"
+    return "other"
+
+
+def entry_status(name, res, classes):
+    """The approver-facing words for one entry given the result lists and classes."""
+    if name in res.get("applied", ()):
+        return "applied"
+    if name in res.get("failed", ()):
+        return "failed: " + CLASS_LABEL.get((classes or {}).get(name), "other error")
+    return "denied (not ticked)"
 
 
 def validate_entries(entries, known):
