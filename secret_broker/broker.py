@@ -40,6 +40,7 @@ from . import notify as notify_mod
 from . import presence as presence_mod
 from .notify import NotifyError
 from . import grants as grants_mod
+from . import icon as icon_mod
 from . import standing as standing_mod
 from . import guidance as guidance_mod
 from . import sshhosts as sshhosts_mod
@@ -2132,15 +2133,25 @@ _CSS = """
 *{box-sizing:border-box}
 html{-webkit-text-size-adjust:100%}
 body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
-main{max-width:72rem;margin:0 auto;padding:1.25rem 1rem 3rem}
+main{max-width:72rem;margin:0 auto;padding:1.25rem max(1rem,env(safe-area-inset-right,0px)) calc(3rem + env(safe-area-inset-bottom,0px)) max(1rem,env(safe-area-inset-left,0px))}
 main.narrow>*{max-width:46rem}
-.top{background:var(--card);border-bottom:1px solid var(--line)}
+/* Safe areas (iOS home-screen app): the header is opaque and padded below the status bar and clear of the
+   notch, so the system glass blurs a solid colour. In a normal tab every inset is 0 and nothing changes. */
+.top{background:var(--card);border-bottom:1px solid var(--line);
+padding:env(safe-area-inset-top,0px) env(safe-area-inset-right,0px) 0 env(safe-area-inset-left,0px)}
 .bar{display:flex;align-items:center;gap:.65rem;max-width:72rem;margin:0 auto;padding:.7rem 1rem}
-.tabs{--edge:max(1rem,calc((100% - 72rem)/2 + 1rem))}
+.tabs{--edge:max(1rem,calc((100% - 72rem)/2 + 1rem));--edgel:max(var(--edge),env(safe-area-inset-left,0px));
+--edger:max(var(--edge),env(safe-area-inset-right,0px))}
 .logo{width:1.7rem;height:1.7rem;border-radius:.45rem;background:var(--accent);color:#fff;display:grid;
 place-items:center;font-weight:700}
 .brand{font-size:1.05rem}.who{margin-left:auto;color:var(--muted);font-size:.85rem}
-.tabs{background:var(--card);border-bottom:1px solid var(--line);display:flex;gap:1.4rem;padding:0 var(--edge);
+.rl{margin-left:auto;display:inline-grid;place-items:center;min-height:2.25rem;width:2.25rem;padding:0;border-radius:.5rem;
+color:var(--muted)}
+.who+.rl{margin-left:.4rem}
+.rl svg{width:1.15rem;height:1.15rem;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+.signedout{position:sticky;top:0;z-index:25;display:flex;flex-wrap:wrap;align-items:center;gap:.5rem .8rem;border-left-color:var(--warn)}
+.signedout .btn{margin-left:auto;min-height:2.75rem;padding-left:1.2rem;padding-right:1.2rem}
+.tabs{background:var(--card);border-bottom:1px solid var(--line);display:flex;gap:1.4rem;padding:0 var(--edger) 0 var(--edgel);
 overflow-x:auto}
 .tabs a{display:flex;align-items:center;gap:.4rem;padding:.7rem 0 .6rem;margin-bottom:-1px;
 border-bottom:2px solid transparent;color:var(--muted);text-decoration:none;font-weight:600;white-space:nowrap;
@@ -2232,7 +2243,7 @@ dialog.dlg[open]{display:flex;flex-direction:column}
 dialog.dlg::backdrop{background:rgba(0,0,0,.55)}
 .dhead{display:flex;align-items:center;gap:.8rem;padding:.7rem 1rem;border-bottom:1px solid var(--line)}
 .dhead h2{flex:1;font-size:1rem}
-.dbody{overflow:auto;padding:.4rem 1rem 1.2rem;overscroll-behavior:contain}
+.dbody{overflow:auto;padding:.4rem 1rem calc(1.2rem + env(safe-area-inset-bottom,0px));overscroll-behavior:contain}
 .dtitle{display:flex;flex-wrap:wrap;align-items:center;gap:.5rem;margin:.6rem 0 .2rem}
 .dtitle b{font-size:1.1rem;overflow-wrap:anywhere}
 dl.kv{display:grid;grid-template-columns:9rem minmax(0,1fr);gap:.35rem .9rem;margin:.6rem 0}
@@ -2264,8 +2275,9 @@ overflow:hidden}
 .tbl td[data-label=Time],.tbl td[data-label=Outcome],.tbl td[data-label=Risk],.tbl td[data-label=Took]
 {white-space:nowrap;overflow-wrap:normal}
 @media (max-width:42rem){
- main{padding:.9rem .75rem 2.5rem}
+ main{padding:.9rem max(.75rem,env(safe-area-inset-right,0px)) calc(2.5rem + env(safe-area-inset-bottom,0px)) max(.75rem,env(safe-area-inset-left,0px))}
  .who{display:none}
+ .who+.rl{margin-left:auto}
  .tbl thead{display:none}
  .tbl,.tbl tbody,.tbl tr,.tbl td{display:block;width:100%}
  .tbl tr{border-bottom:1px solid var(--line);padding:.4rem .7rem}
@@ -2360,19 +2372,75 @@ function asbOpenKeys(root){var o=[];asbDetailKeys(root,function(d,k){if(d.open)o
 function asbReopen(root,keys){asbDetailKeys(root,function(d,k){if(keys.indexOf(k)>=0)d.open=true;});}
 '''
 
+# Signed-out handling, on every page that has the header. The site sits behind single sign-on: once the
+# SSO session expires the proxy answers background requests with a redirect to the login page (or a
+# 401/403, or the login HTML), which a script cannot tell from "the network is down" unless it asks
+# for redirect:'manual'. window.asbAuth is the shared state: pollers and heartbeats ask expired(r),
+# call mark() on a signed-out answer, and stop while out is true. A reload starts over.
+_SESSION_JS = r'''
+(function(){
+  var cfg=window.ASB_PAGE||{}, LONG=300000, GAP=60000, hiddenAt=null, subs=[],
+      bar=document.getElementById('signedout'), btn=document.getElementById('so-btn'),
+      rl=document.getElementById('asb-reload'), A=window.asbAuth={out:false};
+  A.on=function(f){subs.push(f);};
+  A.standalone=function(){try{return navigator.standalone===true||
+    !!(window.matchMedia&&window.matchMedia('(display-mode: standalone)').matches);}catch(e){return false;}};
+  // html: an HTML body is what this request normally returns (a fragment), so only the status counts
+  A.expired=function(r,html){
+    if(!r)return false;
+    if(r.type==='opaqueredirect'||r.redirected||r.status===0||r.status===401||r.status===403)return true;
+    if(!html&&r.status>=200&&r.status<300&&r.status!==204){
+      var ct='';try{ct=r.headers.get('content-type')||'';}catch(e){}
+      if(ct.indexOf('text/html')>=0)return true;}
+    return false;};
+  A.mark=function(){
+    if(A.out)return;A.out=true;
+    if(bar)bar.hidden=false;
+    if(btn){try{btn.focus();}catch(e){}}
+    subs.forEach(function(f){try{f();}catch(e){}});};
+  // true when a menu, confirm step or dialog is open: never reload under the user's hands
+  A.busy=function(){try{return !!document.querySelector('dialog[open], details[open]');}catch(e){return true;}};
+  A.probe=function(){
+    return fetch('/?fragment=1',{credentials:'same-origin',cache:'no-store',redirect:'manual'}).then(function(r){
+      if(A.expired(r,true))return true;
+      if(!r.ok)return false;
+      return r.text().then(function(t){return t.indexOf('id=cards')<0;});},function(){return false;});};
+  function reload(){if(cfg.get===false)location.assign('/');else location.reload();}
+  // automatic reload: at most one per minute per tab, remembered across the reload itself
+  function auto(){
+    var now=Date.now(),last=0;
+    try{last=+sessionStorage.getItem('asb_auto_reload')||0;}catch(e){return false;}
+    if(now-last<GAP)return false;
+    try{sessionStorage.setItem('asb_auto_reload',String(now));}catch(e){return false;}
+    reload();return true;}
+  A.auto=auto;
+  if(btn)btn.addEventListener('click',function(){location.assign('/');});
+  if(rl){if(A.standalone())rl.hidden=false;rl.addEventListener('click',reload);}
+  document.addEventListener('visibilitychange',function(){
+    if(document.hidden){hiddenAt=Date.now();return;}
+    var gap=hiddenAt?Date.now()-hiddenAt:0;hiddenAt=null;
+    if(gap<LONG||A.out)return;
+    A.probe().then(function(bad){
+      if(!bad)return;
+      if(cfg.get!==false&&!A.busy()&&auto())return;
+      A.mark();});});
+})();
+'''
+
 # Presence heartbeat: POST /presence while this tab is visible (and focused, when the broker
 # is configured with require_focus). The config object is prepended by _page().
 _PRESENCE_JS = r'''
 (function(){
-  var cfg=window.ASB_PRESENCE||{}, every=cfg.every||10000, dead=false, was=false, timer=null,
+  var cfg=window.ASB_PRESENCE||{}, every=cfg.every||10000, dead=false, was=false, timer=null, A=window.asbAuth||{},
       tab=(Math.random().toString(36).slice(2,10)+Date.now().toString(36)).slice(0,24);
   function vis(){try{return document.visibilityState==='visible'&&(!cfg.focus||document.hasFocus());}
     catch(e){return false;}}
-  function beat(v){if(dead)return;try{
+  function beat(v){if(dead||A.out)return;try{
     fetch('/presence',{method:'POST',credentials:'same-origin',keepalive:true,redirect:'manual',
       headers:{'Content-Type':'application/json','X-Requested-With':'asb'},
       body:JSON.stringify({v:v,tab:tab})}).then(function(r){
-        if(r&&r.status===404)dead=true;}).catch(function(){});}catch(x){}}
+        if(A.expired&&A.expired(r))A.mark();
+        else if(r&&r.status===404)dead=true;}).catch(function(){});}catch(x){}}
   function sync(){var v=vis();if(v){beat(true);was=true;}else if(was){beat(false);was=false;}}
   function tick(){if(vis()){beat(true);was=true;}}
   document.addEventListener('visibilitychange',sync);
@@ -2384,13 +2452,15 @@ _PRESENCE_JS = r'''
 
 _DASH_JS = r'''
 (function(){
-  var lastRep={};
+  var lastRep={}, A=window.asbAuth||{out:false,expired:function(){return false;},mark:function(){},on:function(){}};
   function report(kind,extra,gap){try{
+    if(A.out)return;
     var now=Date.now();if(gap&&lastRep[kind]&&now-lastRep[kind]<gap)return;lastRep[kind]=now;
     var b=extra||{};b.kind=kind;
-    fetch('/push/event',{method:'POST',credentials:'same-origin',keepalive:true,
+    fetch('/push/event',{method:'POST',credentials:'same-origin',keepalive:true,redirect:'manual',
       headers:{'Content-Type':'application/json','X-Requested-With':'asb'},
-      body:JSON.stringify(b)}).catch(function(){});}catch(x){}}
+      body:JSON.stringify(b)}).then(function(r){if(A.expired(r))A.mark();}).catch(function(){});}catch(x){}}
+  A.on(function(){if(off)off.hidden=true;});
   report('page_load',{note:location.pathname,state:document.visibilityState});
   var cards=document.getElementById('cards'), flash=document.getElementById('flash'),
       off=document.getElementById('offline'), recent=document.getElementById('recent'),
@@ -2517,7 +2587,7 @@ _DASH_JS = r'''
         .then(swcheck);});},function(){swt('sw-caches','No caches');});
     else swt('sw-caches','No caches');
     // the server may have moved on since this page loaded: ask /sw.js itself
-    var live=fetch('/sw.js',{credentials:'same-origin',cache:'no-store'}).then(function(r){
+    var live=fetch('/sw.js',{credentials:'same-origin',cache:'no-store',redirect:'manual'}).then(function(r){
       return r.headers.get('X-SW-Version')||exp;},function(){return exp;});
     return live.then(function(e2){exp=e2;swt('sw-expected',swv(exp));
       return navigator.serviceWorker.getRegistration('/');}).then(function(reg){
@@ -2574,18 +2644,21 @@ _DASH_JS = r'''
       if(hs.limit>hmore)p.set('limit',hs.limit);}
     return p.toString();}
   function poll(){
-    if(!cards)return Promise.resolve();
+    if(!cards||A.out)return Promise.resolve();
     var seq=hseq,q=hq();
-    return fetch('/?fragment=1'+(q?'&'+q:''),{credentials:'same-origin',cache:'no-store'})
-      .then(function(r){if(!r.ok)throw 0;return r.text();})
-      .then(function(h){var d=parse(h),c=d.getElementById('cards'),nl=d.getElementById('hlist');
-        if(c&&c.getAttribute('data-version')!==last){
+    // redirect:'manual': an SSO login redirect must not look like a network error
+    return fetch('/?fragment=1'+(q?'&'+q:''),{credentials:'same-origin',cache:'no-store',redirect:'manual'})
+      .then(function(r){if(A.expired(r,true)){A.mark();return null;}if(!r.ok)throw 0;return r.text();})
+      .then(function(h){if(h===null)return;
+        var d=parse(h),c=d.getElementById('cards'),nl=d.getElementById('hlist');
+        if(!c){A.mark();return;}      // a 200 without the cards is the login page
+        if(c.getAttribute('data-version')!==last){
           last=c.getAttribute('data-version');var wasopen=asbOpenKeys(cards);
           cards.innerHTML=c.innerHTML;asbReopen(cards,wasopen);bind();
           track(ids(c));}
         if(hl&&nl&&seq===hseq&&nl.innerHTML!==hl.innerHTML)hl.innerHTML=nl.innerHTML;
         off.hidden=true;secs();title();})
-      .catch(function(){off.hidden=false;});}
+      .catch(function(){if(!A.out)off.hidden=false;});}
   function hload(){
     hseq++;if(hform)hform.hidden=!hs.all;
     try{var q=hq();history.replaceState(null,'',q?'/?'+q:'/');}catch(x){}
@@ -2606,10 +2679,12 @@ _DASH_JS = r'''
     var n=++dseq;dfor=id;dopener=btn;
     dbody.textContent='Loading...';
     if(!dlg.open)dlg.showModal();
-    fetch('/request/'+encodeURIComponent(id)+'?fragment=1',{credentials:'same-origin',cache:'no-store'})
-      .then(function(r){return r.text().then(function(t){return {s:r.status,t:t};});})
+    fetch('/request/'+encodeURIComponent(id)+'?fragment=1',{credentials:'same-origin',cache:'no-store',redirect:'manual'})
+      .then(function(r){if(A.expired(r,true)){A.mark();return {s:-1,t:''};}
+        return r.text().then(function(t){return {s:r.status,t:t};});})
       .then(function(o){if(n!==dseq)return;
-        if(o.s===200)dbody.innerHTML=o.t;
+        if(o.s===-1)dbody.textContent='Your session expired. Close this and sign in again.';
+        else if(o.s===200)dbody.innerHTML=o.t;
         else dbody.textContent=o.s===409?'This request is still waiting; decide it from its card.'
           :'This request is not in the history.';})
       .catch(function(){if(n===dseq)dbody.textContent='Could not load the details.';});}
@@ -2635,12 +2710,14 @@ _DASH_JS = r'''
       var body=new URLSearchParams(new FormData(f));
       body.append(e.submitter.name,e.submitter.value);
       f.querySelectorAll('button').forEach(function(b){b.disabled=true;});
+      // follows redirects (the broker answers with its own 303); an SSO redirect then fails as a network
+      // error, and the poll in the catch below tells "offline" from "signed out"
       fetch(f.action,{method:'POST',body:body,credentials:'same-origin'})
         .then(function(r){return r.text();})
         .then(function(h){var n=parse(h).getElementById('flash');
           if(n){flash.textContent=n.textContent;flash.hidden=!n.textContent;}
           last=null;return poll();})
-        .catch(function(){off.hidden=false;});});});}
+        .catch(function(){last=null;poll();});});});}
   seen=cards?ids(cards):{};nshow();pshow();
   bind();secs();title();if(cards){setInterval(secs,1000);setInterval(poll,3000);}
   document.addEventListener('visibilitychange',function(){
@@ -2828,6 +2905,25 @@ _ICON = ("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='
          "font-family='system-ui,Arial,sans-serif' font-size='20' font-weight='700' fill='white' "
          "text-anchor='middle'%3EA%3C/text%3E%3C/svg%3E")
 
+# Manual reload for the home-screen app (it has no browser chrome); shown by the page script in
+# standalone mode only, so a normal tab's header is unchanged.
+_RELOAD_BTN = ("<button type=button id=asb-reload class=rl hidden aria-label='Reload this page' "
+               "title='Reload this page'><svg viewBox='0 0 24 24' aria-hidden=true>"
+               "<path d='M20 11a8 8 0 1 0-2.3 5.7'/><path d='M20 4v7h-7'/></svg></button>")
+_SIGNED_OUT = ("<div id=signedout class='flash offline signedout' role=alert hidden>"
+               "<span>Your session expired. Sign in again.</span>"
+               "<button type=button id=so-btn class='btn approve'>Sign in again</button></div>")
+
+# Page colours for the status bar / address bar: the header surface (--card) in each scheme.
+_THEME_LIGHT, _THEME_DARK = "#ffffff", "#161b22"
+_MANIFEST = {
+    "name": "Agent Secret Broker", "short_name": "Secret Broker", "description": "Approve secret requests",
+    "start_url": "/", "scope": "/", "display": "standalone",
+    "background_color": _THEME_LIGHT, "theme_color": _THEME_LIGHT,
+    "icons": [{"src": "/apple-touch-icon.png", "sizes": "180x180", "type": "image/png", "purpose": "any"}],
+}
+_ICON_PNG_URI = "data:image/png;base64," + base64.b64encode(icon_mod.PNG).decode()
+
 _TABS = (("requests", "/", "Requests"), ("policies", "/policies", "Policies"),
          ("settings", "/settings", "Settings"))
 
@@ -2836,7 +2932,7 @@ def _chrome(tab, badge, user):
     who = f"<span class=who>{html.escape(user)}</span>" if user else ""
     head = ("<header class=top><div class=bar><span class=logo>A</span>"
             "<b class=brand>Agent Secret Broker</b><span class='pill ok'>&#9679; online</span>"
-            f"{who}</div></header>")
+            f"{who}{_RELOAD_BTN}</div></header>")
     if tab is None:
         return head
     links = "".join(
@@ -2849,17 +2945,28 @@ def _chrome(tab, badge, user):
 def _page(h, code, body, wide=False, nav=True, script=None, tab=None, badge=0, user=""):
     nonce = secrets.token_urlsafe(16)
     scr = f"<script nonce='{nonce}'>{script}</script>" if script else ""
+    if nav:             # signed-out handling + the reload button live on every page with the header
+        page = json.dumps({"get": getattr(h, "command", "GET") == "GET"})
+        scr = f"<script nonce='{nonce}'>window.ASB_PAGE={page};{_SESSION_JS}</script>" + scr
     pcfg = getattr(h, "presence_page_cfg", None) if nav else None
     if pcfg:            # enabled: every approval page sends the presence heartbeat
         scr += (f"<script nonce='{nonce}'>window.ASB_PRESENCE={json.dumps(pcfg)};{_PRESENCE_JS}</script>")
-    csp = ("default-src 'none'; style-src 'unsafe-inline'; img-src data:; form-action 'self'; connect-src 'self'; "
+    csp = ("default-src 'none'; style-src 'unsafe-inline'; img-src data:; form-action 'self'; connect-src 'self'; manifest-src 'self'; "
            f"base-uri 'none'; frame-ancestors 'none'; worker-src 'self'; script-src 'nonce-{nonce}'")
     raw = ("<!doctype html><html lang=en><meta charset=utf-8>"
-           "<meta name=viewport content='width=device-width,initial-scale=1'>"
-           "<meta name=color-scheme content='light dark'><title>Agent Secret Broker</title>"
+           "<meta name=viewport content='width=device-width,initial-scale=1,viewport-fit=cover'>"
+           "<meta name=color-scheme content='light dark'>"
+           f"<meta name=theme-color content='{_THEME_LIGHT}' media='(prefers-color-scheme: light)'>"
+           f"<meta name=theme-color content='{_THEME_DARK}' media='(prefers-color-scheme: dark)'>"
+           "<meta name=apple-mobile-web-app-capable content=yes><meta name=mobile-web-app-capable content=yes>"
+           "<meta name=apple-mobile-web-app-status-bar-style content=default>"
+           "<meta name=apple-mobile-web-app-title content='Secret Broker'>"
+           "<title>Agent Secret Broker</title>"
            f"<link rel=icon href=\"{_ICON}\">"
+           f"<link rel=apple-touch-icon sizes=180x180 href=\"{_ICON_PNG_URI}\">"
+           "<link rel=manifest href=/manifest.webmanifest crossorigin=use-credentials>"
            f"<style>{_CSS}{scripts_mod.CSS}{details_mod.CSS}</style><body>{_chrome(tab, badge, user) if nav else ''}"
-           f"<main class='{'wide' if wide else 'narrow'}'>{body}</main>{scr}</body></html>").encode()
+           f"<main class='{'wide' if wide else 'narrow'}'>{_SIGNED_OUT if nav else ''}{body}</main>{scr}</body></html>").encode()
     h.send_response(code)
     h.send_header("Content-Type", "text/html; charset=utf-8")
     h.send_header("Content-Length", str(len(raw)))
@@ -3386,8 +3493,8 @@ def approval_handler(broker):
             msg = notes.get(note, "")
             _page(self, 200,
                   f"<div id=flash class=flash{'' if msg else ' hidden'}>{html.escape(msg)}</div>"
-                  "<div id=offline class='flash offline' hidden>Cannot reach the broker (signed out?). "
-                  "Reload this page.</div><h3 style='margin-top:0'>Waiting for you</h3>"
+                  "<div id=offline class='flash offline' hidden>Cannot reach the broker. "
+                  "Retrying; reload this page if it does not recover.</div><h3 style='margin-top:0'>Waiting for you</h3>"
                   + block + recent + self._detail_dialog(), script=_DASH_JS, tab="requests",
                   badge=len(reqs), user=user)
 
@@ -3645,6 +3752,21 @@ def approval_handler(broker):
             self.end_headers()
             self.wfile.write(raw)
 
+        def _static(self, path):
+            """Manifest and home-screen icon: static, behind the same peer/identity check as every page
+            (the manifest link sends credentials; the icon is also inlined in each page as a data: URI)."""
+            if path == "/apple-touch-icon.png":
+                raw, ctype = icon_mod.PNG, "image/png"
+            else:
+                raw, ctype = json.dumps(_MANIFEST).encode(), "application/manifest+json; charset=utf-8"
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(raw)))
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(raw)
+
         def _redirect(self, where):
             self.send_response(303)
             self.send_header("Location", where)
@@ -3713,6 +3835,8 @@ def approval_handler(broker):
             u = urllib.parse.urlsplit(self.path)
             if u.path == "/sw.js" and broker.push is not None:
                 return self._service_worker()
+            if u.path in ("/manifest.webmanifest", "/apple-touch-icon.png"):
+                return self._static(u.path)
             if u.path == "/":
                 q = urllib.parse.parse_qs(u.query)
                 frag = q.get("fragment", [""])[0] == "1"

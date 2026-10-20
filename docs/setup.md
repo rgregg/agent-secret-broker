@@ -118,6 +118,32 @@ set `"notify_presence": {"enabled": false}`; to never send as a fallback set `"f
 Use Web Push *and* a phone transport if you can: a browser that is fully quit
 cannot receive a push until it starts again.
 
+### Using it as an iOS home-screen app
+
+Open the site in Safari, choose Share, then **Add to Home Screen**. It then runs full screen with the
+broker's icon, with an opaque status bar and a header that sits below it. Because the app has no address bar
+or reload button, the header shows a small refresh button in this mode.
+
+- **First launch.** The app opens `/`; your SSO proxy redirects to its login page, and after sign-in
+  you are returned to the Requests page. Whether iOS keeps that login inside the app window or hands it
+  to an in-app browser sheet depends on the identity provider's origin and the iOS version, and has not
+  been verified on a device here. If sign-in appears to finish but the app still shows the login or an
+  error, close the sheet and tap the refresh button.
+- **Session lifetime** is set by your SSO provider (for authentik, the session or token validity of the
+  provider), not by the broker. When it ends while the app is open, the page notices at its next poll, shows
+  "Your session expired. Sign in again." with a button, and stops polling until you sign in. After the app has
+  been in the background for more than 5 minutes it checks on return and, if signed out, reloads itself once
+  (at most once per minute) to start the login; if a menu or confirm step is open it shows the banner
+  instead.
+- **Notification taps** open `/` in the app, which goes through the same sign-in when the session has expired.
+  Approve and Deny buttons on the notification need a live session; when it has expired the follow-up says
+  "Could not approve - tap to review".
+- **Limits.** The page cannot refresh the SSO session itself, cannot control how iOS presents the login (in the
+  app window or a sheet), and cannot tell a login redirect from a blocked identity provider; in the latter case
+  you will see the provider's own error page and can use the refresh button once it is back. The web app
+  manifest `scope` and `start_url` are `/`; a login on another origin leaves that scope, which is
+  normal for SSO.
+
 ## 6. Start it and check
 
     docker compose up -d
