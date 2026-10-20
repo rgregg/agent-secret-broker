@@ -10,6 +10,7 @@ How the broker works, in detail. For installing and configuring it see
     asb which HOST|URL            is a credential available? (no approval, no push)
     asb http NAME METHOD URL [-H 'K: V']... [-d BODY | -d @file | -d @-]
     asb NAME[,NAME] -- command args...
+    asb guidance propose FILE|- | --from-dir DIR   propose risk guidance for a human to review
     asb help COMMAND              usage + example for one command
     asb guide                     manual for agents: workflow, {{VAR}}, approvals, exit codes
 
@@ -1480,6 +1481,110 @@ context. The history rows and pop-over say "Decided by: standing approval
 (always, reads only) (auto-approved), grant 9f2c41aa" or "standing approval (15
 min, any method) (auto-approved), 12 min left when used".
 
+## Guidance proposals (agent-written, human-approved)
+
+Risk guidance can lower ratings, so an agent must never write it: it would weaken its own
+approvals. Instead the agent may **propose** guidance, and you review and apply it on the
+approval page. The agent never writes guidance directly and you do not copy and paste.
+
+    asb guidance propose FILE|-          [{"name": "komodo", "text": "..."}, ...]
+    asb guidance propose --from-dir DIR  DIR/NAME.txt, one file per credential
+    asb guidance status ID               applied / denied / failed names (no approval)
+
+Request (client API, agent key): `POST /v1/requests` with
+
+    {"mode": "guidance", "entries": [{"name": "<credential>", "text": "<guidance>"}, ...]}
+
+- 1 to 25 entries. Every `name` must exist in the catalog; an unknown or duplicate name,
+  a `text` that is not a string of at most 2000 characters (the guidance metadata
+  validator: control characters other than newline and tab are stripped), an entry with
+  other keys, or a body over 100 KB is refused (400, 413 for the size). An empty `text`
+  proposes removing that credential's guidance. The request has no `names` field.
+- At most 3 proposals are pending at once (403 `too many pending guidance proposals`).
+  They do not count against the pending cap of ordinary requests and a denial starts no
+  deny cooldown on the credentials.
+- The proposal waits `guidance_proposals.ttl_s` (default 3600, 300 to 86400) instead of
+  the normal request TTL.
+- Config (validated at startup, naming the field):
+  `"guidance_proposals": {"enabled": true, "ttl_s": 3600}`. `enabled: false` refuses the
+  mode (403). `GET /v1/status` shows only `features.guidance_proposals` (a bool).
+- Result: `GET /v1/requests/<id>` returns `{"status": "approved"|"denied"|"expired"|
+  "failed", "error", "guidance": {"applied": [names], "denied": [names], "failed": [names]}}`.
+  Names only. Unlike other modes the result is not consumed by the first read, so
+  `asb guidance status` can repeat it. Nothing about current guidance is ever returned,
+  and there is no client command or endpoint that reads it.
+
+### Forced human review
+
+All of this is enforced in code (tests/test_guidance_proposals.py):
+
+- **Always high, no model.** `risk.assess` returns high for mode `guidance` before any
+  analyzer is touched. The proposal text is never sent to any model; the request carries
+  no guidance of its own, no summary and no description model call.
+- **Never auto-approved.** `create` returns right after the notification: it never reaches
+  `_auto_allowed`, the standing-approval claim (Always, timed grants), SSH rules or
+  `approval: allow` / `risk.auto_approve_max high` / `auto_modes`. `_release` raises for
+  the mode as a last guard. The card has no Always or Approve-for-a-while chips.
+- **Notification buttons cannot decide it.** The notification carries no action buttons
+  and no action token on any transport, and `decide_via` refuses the `push` and `ha`
+  channels for the mode (403, nothing spent). Only the dashboard (`POST /decide`) and the
+  link page (`POST /a/<nonce>`) can decide, with the same SSO, CSRF, Origin and
+  trusted-peer guards, after you viewed the text.
+- **Presence hold.** The notification is held while a page is open and released on the
+  fallback like any other. The text is the same names-only line either way:
+  `Guidance change proposed for N credentials`, with no guidance text.
+- **Text lives only on the card.** Never in notifications, the audit log, history rows,
+  discovery, status, results or the agent audit API. The text is dropped from memory as
+  soon as the request is decided or expires.
+
+### Review card
+
+The pending card (dashboard) and `/a/<nonce>` show a **Guidance proposal** header with the
+count and the warning "This text tells the risk classifier how to rate requests made with
+these credentials. It can lower ratings. Review each one.", then one collapsible block per
+entry (open for up to 5 entries, collapsed beyond that):
+
+- the credential name, the character count and flag pills in the summary;
+- the **current** guidance (or "none") and the **proposed** text side by side on a wide
+  screen, stacked on a phone, with a deterministic line diff (removed lines red, added
+  lines green, unchanged lines plain), all HTML-escaped;
+- a visible **Flagged:** note when the proposed text contains a phrase that looks like
+  lowering a rating or steering the classifier (case-insensitive, whole words): `always low`,
+  `never high`, `rate low` / `rate it low`, `ignore`, `disregard`, `override`, `approve`,
+  `safe`, `trusted`, `no risk`. A flag highlights; it never blocks;
+- **changed since proposed** when the credential's guidance is different from when the
+  agent wrote the proposal (the diff is against the new current text);
+- an unticked **Apply this one** box.
+
+Buttons: **Apply selected** (disabled by a little script until a box is ticked; the server
+refuses an approval with nothing ticked, 400, and the proposal stays pending) and
+**Deny all**. There is no approve-everything shortcut. Deny and expiry apply nothing.
+
+### Applying
+
+Apply selected sends `apply_<index>` for each ticked entry through the normal decision
+path. Only ticked entries are applied, each through the same code as the Policies-tab
+editor (`set_guidance`: vault first, then the live catalog, the `guidance_changed:
+{by, at}` marker in the item's metadata). An entry whose write fails is reported as
+`failed` and the others still apply. Entries you did not tick are `denied`.
+
+### Audit events
+
+| Event | Fields |
+| --- | --- |
+| `requested` | `id`, `mode: guidance`, `names`, `source`, `peer` (no text) |
+| `assessed` | `risk: high`, `model: null` |
+| `guidance_proposed` | `id`, `count`, `ttl_s`, `entry_names`, `entry_lengths`, `entry_sha256` (12-char prefixes) |
+| `decided` | the usual fields (`channel` is `dashboard` or `link`) |
+| `guidance_changed` | per applied entry: `secret`, `user`, `peer`, `client_ip`, `length`, `old_sha256`, `new_sha256`, `via: proposal`, `proposal` (the request id). No event when the text did not change |
+| `guidance_proposal_result` | `id`, `status`, `applied`, `denied`, `failed` (counts), `applied_names`, `denied_names`, `failed_names` |
+| `approved` / `denied` / `expired` / `failed` | as for any request |
+
+The agent audit API shows only the `requested` event (names and mode, never text); the
+other guidance events are hidden. The history pop-over for such a request shows the names,
+counts, per-entry outcome, lengths and hash prefixes, and "Proposal text: not retained after
+the decision".
+
 ## Vault session lifetime
 
 The vault is not kept open. With the `bw` backend it is unlocked on demand,
@@ -1540,6 +1645,8 @@ decision. Hidden on purpose:
 
 - Notification holding (`notify_held`, `notify_released`, `notify_dropped`): shows when the
   approver had a page open.
+- Guidance proposals: `guidance_proposed`, `guidance_proposal_result` and `guidance_changed`
+  (the `requested` event for mode `guidance` shows names and mode only, never text).
 - Policy and risk: `startup`, `assessed`, `escalated`, `policy_changed`,
   `policy_change_refused`, `policy_change_failed`, `policies_viewed`, `ha_hook_any_device`,
   `config_warning`.

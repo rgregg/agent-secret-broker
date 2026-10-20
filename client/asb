@@ -15,6 +15,8 @@
   asb fingerprint HOST[:PORT]                 print a server certificate's sha256 (for tls_fingerprint)
   asb http NAME METHOD URL [-H 'K: V']... [-d BODY | -d @file | -d @-]
                                               broker makes the call itself
+  asb guidance propose FILE|- | --from-dir DIR  propose risk guidance; the human reviews it
+  asb guidance status ID                      outcome of a proposal (no approval)
 
 Config: SECRET_BROKER_URL / SECRET_BROKER_KEY, or
 ~/.config/secret-broker/client.json {"url": ..., "key": ...}.
@@ -76,6 +78,20 @@ SSH keys
     asb ssh-agent -- git push          agent lives for that command; each login asks the human
     eval "$(asb ssh-agent)"            or: leave an agent running and set SSH_AUTH_SOCK
   Do not look for private keys on disk. `asb list` shows keys as NAME with no VARS.
+
+Proposing risk guidance (you cannot set it; the human decides)
+  Guidance tells the risk classifier how to rate requests for a credential and can
+  lower ratings, so only the human writes it. You may PROPOSE text; it reaches the
+  human on the approval page, entry by entry, and nothing changes unless they tick it.
+    asb guidance propose proposal.json     [{"name": "komodo", "text": "..."}, ...]
+    asb guidance propose --from-dir DIR    DIR/NAME.txt per credential
+    asb guidance status ID                 applied / denied / failed names
+  Up to 25 entries, 2000 characters each; empty text proposes removing the guidance.
+  Prints "applied:", "denied:" and "failed:" names; exit 0 if at least one was applied,
+  4 if denied, 5 if it expired (about an hour). You cannot read the current guidance and
+  there is no command for it; write proposals from what you know about the credential.
+  Never ask for broader trust than the credential's real use justifies, and do not
+  retry a denial.
 
 Storing and rotating (value ONLY on stdin, never as an argument)
   printf '%s' "$VALUE" | asb store NAME --hosts a.example.com[,b] [--field F] [--item I] [--var V]
@@ -185,6 +201,22 @@ example: asb ssh-agent -- git -C repo pull""",
 Print a server certificate's sha256 (default port 443), for tls_fingerprint in a
 credential's metadata. Check it is the device you mean before trusting it.
 example: asb fingerprint 10.0.0.1:8443""",
+    "guidance": """usage: asb guidance propose FILE|-
+       asb guidance propose --from-dir DIR
+       asb guidance status ID
+
+Propose per-credential risk guidance for the human to review. Guidance can lower
+the risk rating of requests made with a credential, so you can never set it: the
+human sees each entry beside the current text, ticks the ones to apply, and only
+those change. FILE is JSON, a list of {"name": ..., "text": ...} or
+{"entries": [...]} (- reads stdin); --from-dir reads DIR/NAME.txt, one file per
+credential. 1-25 entries, text up to 2000 characters, empty text proposes removing
+the guidance. Waits for the decision (the proposal lives about an hour), then prints
+"applied: ...", "denied: ..." and "failed: ..." (names only). Exit 0 if at least one
+entry was applied, 4 denied, 5 expired, 3 broker problem, 2 usage.
+`status ID` prints the same for a proposal you already sent (no approval); "pending"
+while the human has not decided. There is no command to read current guidance.
+example: asb guidance propose --from-dir ./guidance""",
     "guide": "usage: asb guide\n\nPrint the manual for agents.",
 }
 
@@ -254,6 +286,89 @@ def obtain(payload):
 
 
 MAX_BODY = 5_000_000
+MAX_GUIDANCE_BODY = 100 * 1024      # what the broker accepts for one proposal
+
+
+def _guidance_entries(argv):
+    """Entries from `propose` arguments: FILE|- (JSON list or {"entries": [...]}) or
+    --from-dir DIR (NAME.txt files)."""
+    if len(argv) == 2 and argv[0] == "--from-dir":
+        try:
+            files = sorted(f for f in os.listdir(argv[1]) if f.endswith(".txt")
+                           and os.path.isfile(os.path.join(argv[1], f)))
+        except OSError as e:
+            die(f"cannot read {argv[1]}: {e}")
+        entries = []
+        for f in files:
+            try:
+                with open(os.path.join(argv[1], f), encoding="utf-8") as fh:
+                    entries.append({"name": check_name(f[:-4]), "text": fh.read()})
+            except (OSError, UnicodeDecodeError) as e:
+                die(f"cannot read {f}: {e}")
+        if not entries:
+            die(f"no NAME.txt files in {argv[1]}")
+        return entries
+    if len(argv) != 1 or (argv[0].startswith("-") and argv[0] != "-"):
+        die(HELP["guidance"])
+    try:
+        raw = sys.stdin.read() if argv[0] == "-" else open(argv[0], encoding="utf-8").read()
+        data = json.loads(raw)
+    except (OSError, ValueError) as e:
+        die(f"cannot read the proposal: {e}")
+    entries = data.get("entries") if isinstance(data, dict) else data
+    if not isinstance(entries, list) or not entries:
+        die('the proposal must be a list of {"name", "text"} or {"entries": [...]}')
+    return entries
+
+
+def _print_guidance(res):
+    for k in ("applied", "denied", "failed"):
+        print(f"{k}: {', '.join(res.get(k) or []) or '-'}")
+
+
+def _guidance_exit(r):
+    """Exit code for a finished proposal: 0 if something was applied."""
+    if r.get("status") == "approved":
+        return 0 if (r.get("guidance") or {}).get("applied") else EXIT_BROKER
+    return status_exit(r.get("status"))
+
+
+def run_guidance(argv):
+    if len(argv) >= 1 and argv[0] == "status":
+        if len(argv) != 2 or not re.fullmatch(r"[A-Za-z0-9_-]{8,64}", argv[1]):
+            die(HELP["guidance"])
+        base, key = config()
+        code, r = call(base, key, f"/v1/requests/{argv[1]}?wait=0", timeout=15)
+        if code != 200:
+            die(r.get("error", f"broker returned {code}"), EXIT_BROKER)
+        if r.get("status") == "pending":
+            print("pending")
+            return 0
+        _print_guidance(r.get("guidance") or {})
+        return _guidance_exit(r)
+    if not argv or argv[0] != "propose":
+        die(HELP["guidance"])
+    entries = _guidance_entries(argv[1:])
+    payload = {"mode": "guidance", "entries": entries,
+               "source": f"{os.environ.get('USER', '?')}@{socket.gethostname()}"}
+    if len(json.dumps(payload).encode()) > MAX_GUIDANCE_BODY:
+        die(f"the proposal is larger than {MAX_GUIDANCE_BODY} bytes")
+    base, key = config()
+    code, r = call(base, key, "/v1/requests", payload)
+    if code != 202:
+        die(r.get("error", f"broker returned {code}"), EXIT_BROKER)
+    print(f"asb: proposal {r['id']} sent", file=sys.stderr)
+    if r["status"] in ("denied", "expired", "failed"):
+        die(r.get("error") or r["status"], status_exit(r["status"]))
+    print("asb: waiting for approval on your phone... review each entry on the approval page "
+          "(the human ticks the ones to apply)", file=sys.stderr)
+    deadline = time.time() + r["expires_in"] + 15
+    while time.time() < deadline:
+        code, r2 = call(base, key, f"/v1/requests/{r['id']}?wait=25")
+        if r2.get("status") in ("approved", "denied", "expired", "failed"):
+            _print_guidance(r2.get("guidance") or {})
+            return _guidance_exit(r2)
+    die("timed out waiting for approval", EXIT_EXPIRED)
 
 
 def read_body(arg):
@@ -1648,6 +1763,9 @@ def main(argv):
     if argv[0] == "audit":
         return run_audit(argv[1:])
 
+    if argv[0] == "guidance":
+        return run_guidance(argv[1:])
+
     if argv[0] == "which":
         if len(argv) != 2:
             die(HELP["which"])
@@ -1690,7 +1808,7 @@ def main(argv):
 
     if "--" not in argv:
         die(f"unknown command {argv[0]!r}.\ncommands: list, which, status, audit, http, store, update, "
-            "ssh-agent, fingerprint, help, guide; or: asb NAME -- command\n"
+            "guidance, ssh-agent, fingerprint, help, guide; or: asb NAME -- command\n"
             "start with `asb guide`")
     i = argv.index("--")
     names, cmd = argv[0].split(",") if i == 1 else None, argv[i + 1:]

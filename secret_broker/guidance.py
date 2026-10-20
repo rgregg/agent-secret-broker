@@ -47,9 +47,16 @@ def from_meta(meta):
     raw = meta.get("guidance")
     if raw is None:
         return None
+    return validate_text(raw) or None
+
+
+def validate_text(raw):
+    """The cleaned text for one guidance value (empty allowed: it means no guidance).
+    Raises ValueError unless `raw` is a string of at most MAX_LEN characters. The one
+    validator shared by catalog metadata, the Policies editor and agent proposals."""
     if not isinstance(raw, str) or len(raw) > MAX_LEN:
         raise ValueError(f"guidance must be a string of at most {MAX_LEN} characters")
-    return clean(raw) or None
+    return clean(raw)
 
 
 def digest(text):

@@ -13,7 +13,7 @@ import threading
 
 from .backends import BwBackend, BwServeBackend, FileBackend
 from .broker import Broker, serve
-from . import grants, notify, presence, request_details, risk, riskmodel
+from . import grants, notify, presence, proposals, request_details, risk, riskmodel
 
 
 def _read(path):
@@ -49,6 +49,7 @@ def main():
     risk.parse_auto_modes(cfg.get("risk"), "risk")          # fail at startup, naming the field
     grants.parse_config(cfg.get("timed_grants"))            # fail at startup, naming the field
     request_details.parse_config(cfg.get("request_details"))    # fail at startup, naming the field
+    proposals.parse_config(cfg.get("guidance_proposals"))   # fail at startup, naming the field
     backend = build_backend(cfg)
     notify.parse_action_policy(cfg.get("notify_actions"), "notify_actions")   # fail at startup
     if cfg.get("webpush") is not None:

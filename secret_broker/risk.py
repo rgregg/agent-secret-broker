@@ -13,6 +13,9 @@ the request is released without a prompt (see `risk.auto_approve_max`).
 One exception: creating a new credential (`store`) is always low. It cannot
 read or alter anything that exists, and it is never auto-approved. Updating an
 existing credential still takes the model's verdict (or high).
+
+Two more floors need no model: an SSH signature and an agent's guidance proposal are
+always high.
 """
 
 from . import guidance as guidance_mod
@@ -28,6 +31,12 @@ def rank(level):
 def assess(mode, names, spec, analyzer=None, guidance=None):
     """Return {"level", "model", "reasons", "summary", "summary_model",
     "summary_source", "summary_reason"}."""
+    if mode == "guidance":
+        # an agent's guidance proposal: high by code, and neither the proposal text nor
+        # the request ever reaches a model (see proposals.py)
+        return {"level": "high", "model": None, "summary": None, "summary_model": None,
+                "summary_source": None, "summary_reason": None,
+                "reasons": ["guidance proposals always need a human review; always high"]}
     summary, model_risk, summary_model, src, why = None, None, None, None, None
     if analyzer is not None:
         try:

@@ -123,6 +123,30 @@ Check it:
 - `asb help COMMAND` gives usage and an example for one command, and `asb guide`
   prints the manual written for agents.
 
+### Proposing risk guidance
+
+    asb guidance propose FILE|-            JSON: a list of {"name","text"} or {"entries": [...]}
+    asb guidance propose --from-dir DIR    DIR/NAME.txt, one file per credential
+    asb guidance status ID                 outcome of a proposal (no approval)
+
+Risk guidance tells the classifier how to rate a credential's requests and can lower ratings,
+so an agent cannot set it; it can only **propose** it. `propose` sends 1 to 25 entries (text up
+to 2000 characters, empty text proposes removing the guidance; the whole request is limited to
+100 KB), prints `asb: proposal ID sent`, waits ("waiting for approval on your phone... review
+each entry on the approval page") and then prints the outcome, names only:
+
+    applied: komodo
+    denied: grafana
+    failed: -
+
+Exit codes: 0 if at least one entry was applied, 4 if you denied it, 5 if it expired (about an
+hour), 3 if the broker is unreachable, refused it (unknown name, proposals disabled) or applied
+nothing, 2 for usage errors. `asb guidance status ID` prints the same for a proposal already
+sent (`pending` until you decide), with the same exit codes. There is deliberately no command
+to read current guidance: the client never sees it. The review flow and its safeguards are in
+[reference.md](reference.md#guidance-proposals-agent-written-human-approved) and
+[guidance.md](guidance.md#letting-an-agent-propose-guidance).
+
 ### Exit codes
 
 | Code | Meaning |

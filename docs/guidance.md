@@ -18,6 +18,44 @@ The texts below are starting points. Names of operations differ by version;
 adjust them to what you actually use. Paste one into the editor for the matching
 secret.
 
+## Letting an agent propose guidance
+
+An agent can never set guidance: it can lower ratings, so an agent that could write it
+would weaken its own approvals. It can only propose text, and you decide.
+
+    asb guidance propose proposal.json     # [{"name": "komodo", "text": "..."}, ...]
+    asb guidance propose --from-dir ./g    # g/komodo.txt, g/grafana.txt
+    asb guidance status ID                 # applied / denied / failed names
+
+The command prints the request id and waits ("review each entry on the approval page").
+A proposal shows up on the dashboard and as a notification that says only "Guidance change
+proposed for N credentials"; the notification has no Approve or Deny button and no Always
+or "for a while" option exists. Open the card (or the link) to review.
+
+How review works:
+
+- Each credential is a block with the **current** guidance and the **proposed** text side
+  by side, a line diff, a character count, and a **Flagged:** note if the new text contains
+  phrases like "always low", "never high", "rate it low", "ignore", "disregard", "override",
+  "approve", "safe", "trusted" or "no risk". Flags highlight, they do not block.
+- Nothing is ticked. Tick **Apply this one** on the entries you want, then **Apply
+  selected** (it stays disabled until something is ticked). **Deny all**, or letting it
+  expire (an hour by default, `guidance_proposals.ttl_s`), changes nothing.
+- If the current guidance changed after the agent wrote its proposal, that entry says
+  **changed since proposed**; check the diff before ticking it.
+- Only ticked entries are written, exactly as if you had saved them in the Policies editor
+  (same limits, same `guidance_changed` marker). The agent is told only the names that were
+  applied, denied or failed.
+- Treat every proposal like a pull request from someone with an interest in the outcome.
+  Read the whole text, not just the flagged words. Because the agent cannot read the current
+  guidance, its text is a fresh draft: ask for edits as a new proposal rather than ticking a
+  draft you do not fully agree with.
+
+The agent never sees any guidance, current or proposed, in discovery, status, results or the
+audit API. The proposal text is shown only on the approval card and dropped once it is
+decided; the audit log keeps names, lengths and short hashes. Details and the audit events:
+[reference.md](reference.md#guidance-proposals-agent-written-human-approved).
+
 ## Komodo
 
     Komodo executes actions through POST /execute with the action name in the path or body.

@@ -24,7 +24,10 @@ _EV_KEYS = ("reason", "reasons", "model", "risk", "error", "via", "channel", "de
             "item", "field", "key", "hosts", "grant_id", "scope", "secrets", "grant_minutes",
             "grant_left_s", "expires_at", "created_by", "max_risk", "risk_level",
             "host_bound", "host_fp", "host_type", "host_name", "claimed_dest", "forwarding", "host_lines",
-            "rule_id", "account", "rule_host", "ssh_rule_requested", "decision_source")
+            "rule_id", "account", "rule_host", "ssh_rule_requested", "decision_source",
+            # guidance proposals: names, counts, lengths and hash prefixes; never text
+            "entry_names", "entry_lengths", "entry_sha256", "applied", "denied", "failed",
+            "applied_names", "denied_names", "failed_names", "count")
 _MAX_EVENTS = 60            # per request
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 
@@ -40,7 +43,7 @@ def _clean(v, depth=0):
     if isinstance(v, (bool, int, float)) or v is None:
         return v
     if isinstance(v, (list, tuple)) and depth == 0:
-        return [_clean(x, 1) for x in v[:20]]
+        return [_clean(x, 1) for x in v[:30]]
     return None
 
 
