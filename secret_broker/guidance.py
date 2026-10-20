@@ -23,6 +23,7 @@ import html
 import inspect
 import re
 import threading
+import unicodedata
 import weakref
 
 MAX_LEN = 2000            # one secret's guidance
@@ -50,13 +51,65 @@ def from_meta(meta):
     return validate_text(raw) or None
 
 
+class HiddenCharsError(ValueError):
+    """The text holds characters a reader cannot see but a model still reads."""
+
+
+MAX_COMBINING_RUN = 3
+_FILLERS = frozenset(map(chr, (0x115F, 0x1160, 0x3164, 0xFFA0)))
+_BAD_CATS = {"Cf": "invisible format character", "Co": "private-use character",
+             "Cn": "unassigned code point", "Cs": "surrogate", "Zl": "line separator",
+             "Zp": "paragraph separator", "Cc": "control character"}
+
+
+def hidden_problem(text):
+    """(class, offset) of the first character in `text` that could hide from a human
+    reviewer but not from a model, or None. Nothing is normalized or stripped: the text is
+    rejected, so what is stored is byte-identical to what was reviewed."""
+    run = 0
+    for i, ch in enumerate(text):
+        o = ord(ch)
+        if ch in "\n\t ":
+            run = 0
+            continue
+        cat = unicodedata.category(ch)
+        if cat in _BAD_CATS:
+            return _BAD_CATS[cat], i
+        if ch.isspace() or cat == "Zs":
+            return "non-ASCII whitespace", i
+        if 0xFE00 <= o <= 0xFE0F or 0xE0100 <= o <= 0xE01EF:
+            return "variation selector", i
+        if 0xE0000 <= o <= 0xE007F:
+            return "tag character", i
+        if ch in _FILLERS:
+            return "filler character", i
+        if unicodedata.combining(ch) or cat in ("Mn", "Mc", "Me"):
+            run += 1
+            if run > MAX_COMBINING_RUN:
+                return "long run of combining marks", i
+        else:
+            run = 0
+    return None
+
+
 def validate_text(raw):
-    """The cleaned text for one guidance value (empty allowed: it means no guidance).
-    Raises ValueError unless `raw` is a string of at most MAX_LEN characters. The one
-    validator shared by catalog metadata, the Policies editor and agent proposals."""
+    """The text for one guidance value (empty allowed: it means no guidance). Raises
+    ValueError unless `raw` is a string of at most MAX_LEN characters, and HiddenCharsError
+    (a ValueError) when it contains hidden characters; the message names the class and the
+    offset, never the characters. CRLF becomes LF and the ends are trimmed of ASCII
+    whitespace; nothing else is changed. The one validator shared by catalog metadata, the
+    Policies editor and agent proposals."""
     if not isinstance(raw, str) or len(raw) > MAX_LEN:
         raise ValueError(f"guidance must be a string of at most {MAX_LEN} characters")
-    return clean(raw)
+    text = raw.replace("\r\n", "\n").replace("\r", "\n").strip(" \t\n")
+    bad = hidden_problem(text)
+    if bad:
+        raise HiddenCharsError(f"guidance contains hidden characters ({bad[0]} at offset {bad[1]})")
+    return text
+
+
+def non_ascii_count(text):
+    return sum(1 for ch in text if ord(ch) > 127)
 
 
 def digest(text):
@@ -178,7 +231,9 @@ def policies_section(secrets_cfg, csrf):
     rows = []
     for i, (name, sc) in enumerate(sorted(secrets_cfg.items())):
         cur = sc.get("guidance") or ""
-        badge = (f"<span class='pill ok'>Guidance set ({len(cur)} chars)</span>" if cur
+        ignored = ("<small class=muted>Stored guidance ignored: " + esc(sc["guidance_invalid"]) + "</small>"
+                   if sc.get("guidance_invalid") else "")
+        badge = ignored + (f"<span class='pill ok'>Guidance set ({len(cur)} chars)</span>" if cur
                  else "<span class='pill plain'>No guidance</span>")
         rows.append(
             f"<details class='card gbox'><summary><b>{esc(name)}</b> {badge}"

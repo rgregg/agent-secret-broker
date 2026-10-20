@@ -50,8 +50,18 @@ class Metadata(unittest.TestCase):
         return b, log
 
     def test_entry_carries_cleaned_guidance(self):
-        b, _ = self.make(guidance="  PullStack: low\r\n\tRestart: medium\x00\x07\x1b[31m  ")
-        self.assertEqual(b.cfg["secrets"]["komodo"]["guidance"], "PullStack: low\n\tRestart: medium[31m")
+        b, _ = self.make(guidance="  PullStack: low\r\n\tRestart: medium  ")
+        self.assertEqual(b.cfg["secrets"]["komodo"]["guidance"], "PullStack: low\n\tRestart: medium")
+
+    def test_hidden_characters_ignore_the_guidance_not_the_credential(self):
+        b, log = self.make(guidance="PullStack: low\x07")
+        sc = b.cfg["secrets"]["komodo"]
+        self.assertNotIn("guidance", sc)
+        self.assertIn("hidden characters", sc["guidance_invalid"])
+        self.assertEqual(b._catalog_stats["invalid"], 0)
+        with open(log) as f:
+            ev = [json.loads(x) for x in f]
+        self.assertEqual(next(e for e in ev if e["event"] == "guidance_ignored")["secret"], "komodo")
 
     def test_absent_empty_and_adopted_have_none(self):
         for kw in ({}, {"guidance": ""}, {"guidance": " \x00 "}):

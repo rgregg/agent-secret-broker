@@ -72,7 +72,11 @@ def validate_entries(entries, known):
         if name in seen:
             raise ValueError(f"duplicate entry for {name}")
         seen.add(name)
-        out.append({"name": name, "text": guidance_mod.validate_text(e["text"])})
+        try:
+            text = guidance_mod.validate_text(e["text"])
+        except guidance_mod.HiddenCharsError as ex:
+            raise ValueError(f"entry {name}: {ex}") from None
+        out.append({"name": name, "text": text})
     return out
 
 
@@ -162,6 +166,7 @@ max-height:22rem;overflow:auto}
 .gm{flex:none;width:.8rem;color:var(--muted)}
 .gadd{background:var(--okbg);color:var(--okfg)}
 .gdel{background:var(--badbg);color:var(--bad)}
+.gu{background:var(--wbg);color:var(--wfg);border-radius:.25rem;padding:0 .15rem}
 .gnone{padding:0 .5rem;color:var(--muted);font-style:italic}
 .gflag{margin:.5rem 0 0;padding:.4rem .6rem;border:1px solid var(--warn);border-radius:.5rem;background:var(--wbg);color:var(--wfg);font-size:.85rem}
 .gpick{display:flex;align-items:center;gap:.5rem;min-height:2.5rem;margin-top:.5rem;font-weight:600}
@@ -195,6 +200,14 @@ def describe_html(req):
             "Apply selected. Deny and expiry change nothing.")
 
 
+def _esc(line):
+    """HTML for one line where every non-ASCII character is shown as <U+XXXX> (the real
+    character in the tooltip), so a look-alike cannot pass for an ASCII letter."""
+    return "".join(
+        html.escape(ch) if ord(ch) < 128 else
+        f"<span class=gu title=\"{html.escape(ch)}\">&lt;U+{ord(ch):04X}&gt;</span>" for ch in line)
+
+
 def _col(lines, mark, cls, empty):
     if not lines:
         return f"<div class=gtext><div class=gnone>{html.escape(empty)}</div></div>"
@@ -203,7 +216,7 @@ def _col(lines, mark, cls, empty):
         flag = cls if op == mark else ""
         sign = {"-": "-", "+": "+"}.get(op, "") if op == mark else ""
         rows.append(f"<div class='gl {flag}'><span class=gm aria-hidden=true>{sign}</span>"
-                    f"<span>{html.escape(line) or '&nbsp;'}</span></div>")
+                    f"<span>{_esc(line) or '&nbsp;'}</span></div>")
     return f"<div class=gtext>{''.join(rows)}</div>"
 
 
@@ -217,6 +230,10 @@ def entry_html(broker, i, ent, total):
     pills = [f"<span class='pill plain'>{len(new)} chars</span>"]
     if not new:
         pills.append("<span class='pill warn'>removes guidance</span>")
+    na = guidance_mod.non_ascii_count(new)
+    if na:
+        pills.append(f"<span class='pill warn'>Non-ASCII characters: {na} "
+                     "(shown escaped as U+XXXX in the box below)</span>")
     if flags:
         pills.append(f"<span class='pill warn'>Flagged: {e(', '.join(flags))}</span>")
     if stale:

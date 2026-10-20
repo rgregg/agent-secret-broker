@@ -1496,8 +1496,8 @@ Request (client API, agent key): `POST /v1/requests` with
     {"mode": "guidance", "entries": [{"name": "<credential>", "text": "<guidance>"}, ...]}
 
 - 1 to 25 entries. Every `name` must exist in the catalog; an unknown or duplicate name,
-  a `text` that is not a string of at most 2000 characters (the guidance metadata
-  validator: control characters other than newline and tab are stripped), an entry with
+  a `text` that is not a string of at most 2000 characters or contains hidden characters (the
+  guidance metadata validator, see below), an entry with
   other keys, or a body over 100 KB is refused (400, 413 for the size). An empty `text`
   proposes removing that credential's guidance. The request has no `names` field.
 - At most 3 proposals are pending at once (403 `too many pending guidance proposals`).
@@ -1513,6 +1513,29 @@ Request (client API, agent key): `POST /v1/requests` with
   Names only. Unlike other modes the result is not consumed by the first read, so
   `asb guidance status` can repeat it. Nothing about current guidance is ever returned,
   and there is no client command or endpoint that reads it.
+
+### Hidden characters are rejected
+
+Text a model reads but a reviewer cannot see could differ from what you approve, so one strict
+validator (`guidance.validate_text`) is used by proposals, the Policies-tab editor and the
+catalog loader. It **rejects**, never strips or normalizes (stored text is byte-identical to
+what was reviewed; only CRLF becomes LF and the ends are trimmed of spaces, tabs and newlines),
+any of: control characters other than newline and tab; invisible format characters (zero-width
+space, joiner and non-joiner, word joiner, BOM, bidi overrides, isolates and marks); tag
+characters (U+E0000-E007F); variation selectors; private-use, unassigned and surrogate code
+points; line and paragraph separators; any whitespace other than ASCII space, tab and newline
+(NBSP, U+2000-200A, U+202F, U+205F, U+3000, U+1680, U+180E ...); the filler code points U+115F,
+U+1160, U+3164, U+FFA0; and more than 3 combining marks in a row. The error names the class
+and offset (`guidance contains hidden characters (invisible format character at offset 12)`)
+and never echoes the characters. A proposal gets 400; the editor re-renders with the error.
+In the catalog loader the credential stays valid but its guidance is ignored for
+classification, flagged `guidance_invalid` (a note on the Policies page) and reported in a
+hidden `guidance_ignored` audit event. Accented letters, curly quotes and dashes are allowed.
+
+On the review card, an entry whose proposed text contains any non-ASCII character shows
+**Non-ASCII characters: N (shown escaped as U+XXXX in the box below)**, and every non-ASCII
+character is displayed as a `<U+XXXX>` marker (the real character in its tooltip) in both
+columns, so a look-alike letter cannot pass for an ASCII one.
 
 ### Forced human review
 

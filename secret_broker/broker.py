@@ -319,11 +319,16 @@ class Broker(sshrules_mod.SshRulesMixin):
         standing = None
         if meta.get("standing") is not None:
             standing = standing_mod.parse(meta["standing"], name)
-        note = guidance_mod.from_meta(meta)      # policy context, never shown to agents
+        try:
+            note, ginvalid = guidance_mod.from_meta(meta), None   # policy context, never shown to agents
+        except guidance_mod.HiddenCharsError as e:
+            note, ginvalid = None, str(e)       # ignored for classification; the credential stays valid
         entry = {**meta, "vars": vars_, "allowed_hosts": [h.lower() for h in hosts],
                  "approval": approval, "_item": item, "_meta": meta,
                  "_tls": {"fingerprint": fp, "verify": verify}}
         entry.pop("guidance", None)
+        if ginvalid:
+            entry["guidance_invalid"] = ginvalid
         entry.pop("ssh_hosts", None)
         entry.pop("ssh_rules", None)
         entry.pop("standing", None)
@@ -456,11 +461,14 @@ class Broker(sshrules_mod.SshRulesMixin):
             self._backend_ok = True
             self._catalog_stats = {"count": len(out), "invalid": len(bad), "adopted": len(adopted),
                                    "loaded_at": _iso(self._catalog_at)}
-        sig = json.dumps([sorted(out), bad], sort_keys=True)
+        ginv = {n: e["guidance_invalid"] for n, e in sorted(out.items()) if e.get("guidance_invalid")}
+        sig = json.dumps([sorted(out), bad, ginv], sort_keys=True)
         if sig != self._catalog_sig:
             self._catalog_sig = sig
             self.log("catalog_loaded", count=len(out), names=sorted(out), invalid=bad,
                      adopted=sorted(adopted))
+            for n, why in ginv.items():
+                self.log("guidance_ignored", secret=n, reason=why)
 
     def status(self):
         """Deploy-verification summary for GET /v1/status. Counts and type names
@@ -696,6 +704,7 @@ class Broker(sshrules_mod.SshRulesMixin):
                 sc["guidance"] = new
             else:
                 sc.pop("guidance", None)
+            sc.pop("guidance_invalid", None)
         self.log("guidance_changed", length=len(new), old_sha256=guidance_mod.digest(old),
                  new_sha256=guidance_mod.digest(new), **who)
         return True
@@ -4296,11 +4305,17 @@ def approval_handler(broker):
                 name = form.get("name", [""])[0]
                 if name not in cfg["secrets"]:
                     return _page(self, 400, "<h1>Bad request</h1>")
-                done = broker.set_guidance(name, form.get("guidance", [""])[0], user,
-                                           self.client_address[0], self._fwd())
+                text = form.get("guidance", [""])[0]
+                done = broker.set_guidance(name, text, user, self.client_address[0], self._fwd())
+                why = ""
+                if not done:
+                    try:
+                        guidance_mod.validate_text(text)
+                    except ValueError as e:
+                        why = f" ({html.escape(str(e))})"
                 return self._policies_page(
                     user, f"<p>{'Guidance saved' if done else 'Could not save guidance'}: "
-                          f"{html.escape(name)}</p>")
+                          f"{html.escape(name)}{why}</p>", status=200 if done or not why else 400)
             if self.path.split("?")[0].rstrip("/") == "/policies":
                 name = form.get("name", [""])[0]
                 # this page can only *tighten*: granting happens in the context of a request

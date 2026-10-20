@@ -38,6 +38,9 @@ How review works:
   by side, a line diff, a character count, and a **Flagged:** note if the new text contains
   phrases like "always low", "never high", "rate it low", "ignore", "disregard", "override",
   "approve", "safe", "trusted" or "no risk". Flags highlight, they do not block.
+- Any non-ASCII character is flagged ("Non-ASCII characters: N") and shown as `<U+XXXX>`;
+  invisible characters (zero-width, bidi controls, tag characters, odd spaces) are rejected
+  outright, in proposals and in the editor, so what you read is what the classifier reads.
 - Nothing is ticked. Tick **Apply this one** on the entries you want, then **Apply
   selected** (it stays disabled until something is ticked). **Deny all**, or letting it
   expire (an hour by default, `guidance_proposals.ttl_s`), changes nothing.

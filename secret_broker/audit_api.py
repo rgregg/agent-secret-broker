@@ -93,7 +93,7 @@ HIDDEN = frozenset({
     "guidance_changed", "guidance_change_refused", "guidance_change_failed",
     # an agent's guidance proposal: the `requested` event (names and mode only) is all it sees;
     # the entry hashes and the per-entry outcome are approval context
-    "guidance_proposed", "guidance_proposal_result",
+    "guidance_proposed", "guidance_proposal_result", "guidance_ignored",
     "ssh_hosts_changed", "ssh_hosts_change_refused", "ssh_hosts_change_failed",
     "ha_hook_any_device", "config_warning",
     # time-boxed grants are approval policy context: a grant-approved request shows as plain "approved"

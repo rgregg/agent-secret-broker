@@ -121,6 +121,102 @@ class Base(t.Harness):
             return f.read()
 
 
+HIDDEN = {
+    "zero-width space": "\u200b", "zero-width joiner": "\u200d", "zero-width non-joiner": "\u200c",
+    "word joiner": "\u2060", "bom": "\ufeff", "bidi override": "\u202e", "bidi isolate": "\u2066",
+    "bidi mark": "\u200f", "tag character": "\U000e0041", "tag cancel": "\U000e007f",
+    "variation selector": "\ufe0f", "variation selector supplement": "\U000e0100",
+    "private use": "\ue000", "private use plane": "\U000f0000", "unassigned": "\u0378",
+    "nbsp": "\u00a0", "en space": "\u2002", "narrow nbsp": "\u202f", "medium math space": "\u205f",
+    "ideographic space": "\u3000", "ogham space": "\u1680", "mongolian vowel sep": "\u180e",
+    "line separator": "\u2028", "paragraph separator": "\u2029", "nul": "\x00", "escape": "\x1b",
+    "del": "\x7f", "c1 control": "\x85", "hangul choseong filler": "\u115f",
+    "hangul jungseong filler": "\u1160", "hangul filler": "\u3164", "halfwidth hangul filler": "\uffa0",
+    "long combining run": "e" + "\u0301" * 4, "surrogate-ish": "\ud800",
+}
+
+
+class HiddenChars(Base):
+    def test_validator_rejects_each_category_with_class_and_offset_not_the_char(self):
+        from secret_broker import guidance as g
+        for label, ch in HIDDEN.items():
+            text = "ab " + ch + " cd"
+            with self.assertRaises(g.HiddenCharsError, msg=label) as cm:
+                g.validate_text(text)
+            msg = str(cm.exception)
+            self.assertIn("guidance contains hidden characters", msg, label)
+            self.assertRegex(msg, r"at offset \d+", label)
+            self.assertNotIn(ch, msg, label)
+
+    def test_plain_accented_curly_quotes_and_short_combining_accepted(self):
+        from secret_broker import guidance as g
+        for ok in ("plain ASCII\nline\ttab", "caf\u00e9 na\u00efve", "\u201cquoted\u201d \u2019s",
+                   "e" + "\u0301" * 3, "\u2014 dash \u2026"):
+            self.assertEqual(g.validate_text(ok), ok)
+
+    def test_every_path_uses_the_same_validator(self):
+        from secret_broker import guidance as g
+        bad = "x\u200by"
+        # proposal path: 400, offset named, no text anywhere
+        code, r = self.propose([{"name": "alpha", "text": bad + CANARY}])
+        self.assertEqual(code, 400)
+        self.assertIn("hidden characters (invisible format character at offset 1)", r["error"])
+        self.assertNotIn("\u200b", r["error"])
+        self.assertEqual(self.broker.pending(), [])
+        self.assertNotIn(CANARY, self.all_text())
+        # editor path: refused, re-rendered with the error, nothing stored
+        status, body = self.post("/policies/guidance", name="alpha", guidance=bad,
+                                 csrf=self.broker.csrf_token("alice"))
+        self.assertEqual(status, 400)
+        self.assertIn("hidden characters", body)
+        self.assertIsNone(self.guid("alpha"))
+        self.assertNotIn("\u200b", self.all_text())
+        # loader path: guidance ignored, credential still valid
+        self.broker.backend.set_meta("Alpha", {**self.broker.cfg["secrets"]["alpha"]["_meta"], "guidance": bad})
+        self.broker.refresh_catalog()
+        sc = self.broker.cfg["secrets"]["alpha"]
+        self.assertNotIn("guidance", sc)
+        self.assertIn("hidden characters", sc["guidance_invalid"])
+        self.assertEqual(self.broker._catalog_stats["invalid"], 0)
+        # classification never sees it
+        self.assertEqual(g.for_names(self.broker.cfg["secrets"], ["alpha"]), {})
+        # all three share one function
+        import inspect
+        from secret_broker import proposals
+        self.assertIn("validate_text", inspect.getsource(proposals.validate_entries))
+        self.assertIn("validate_text", inspect.getsource(Broker.set_guidance))
+        self.assertIn("validate_text", inspect.getsource(g.from_meta))
+
+    def test_editor_page_notes_ignored_guidance(self):
+        self.broker.cfg["secrets"]["alpha"]["guidance_invalid"] = "guidance contains hidden characters (x at offset 1)"
+        self.assertIn("Stored guidance ignored", self.get("/policies")[1])
+
+    def test_card_warns_about_non_ascii_and_shows_escaped(self):
+        rid = self.one("caf\u00e9 \u201cquote\u201d <b>")
+        page = self.get("/")[1]
+        self.assertIn("Non-ASCII characters: 3 (shown escaped as U+XXXX in the box below)", page)
+        self.assertIn("&lt;U+00E9&gt;", page)
+        self.assertIn("&lt;U+201C&gt;", page)
+        self.assertIn("title=\"\u00e9\"", page)
+        self.assertNotIn("caf\u00e9", page)
+        self.assertIn("&lt;b&gt;", page)
+
+    def test_ascii_text_has_no_non_ascii_pill(self):
+        self.one("plain text")
+        self.assertNotIn("Non-ASCII characters", self.get("/")[1])
+
+    def test_homoglyph_cannot_hide(self):
+        self.one("p\u0430ssword")          # Cyrillic a
+        page = self.get("/")[1]
+        self.assertIn("p<span class=gu", page)
+        self.assertIn("&lt;U+0430&gt;", page)
+
+    def test_audit_never_has_the_text(self):
+        self.one("caf\u00e9 " + CANARY)
+        self.assertNotIn("caf\u00e9", self.all_text())
+        self.assertNotIn(CANARY, self.all_text())
+
+
 # ---------------------------------------------------------------------- units
 class Units(unittest.TestCase):
     def test_diff_cases(self):
@@ -206,9 +302,9 @@ class Validation(Base):
         self.assertEqual(self.propose([{"name": "alpha", "text": "x" * 2000}])[0], 202)
         self.assertEqual(self.propose([{"name": "beta", "text": ""}])[0], 202)
 
-    def test_text_is_cleaned_like_the_metadata_validator(self):
-        rid = self.one("  a\x00b\x07\r\nc\x1b  ")
-        self.assertEqual(self.broker._by_id[rid].spec["entries"][0]["text"], "ab\nc")
+    def test_text_is_normalized_like_the_metadata_validator(self):
+        rid = self.one("  a\r\nc\td  ")
+        self.assertEqual(self.broker._by_id[rid].spec["entries"][0]["text"], "a\nc\td")
 
     def test_body_cap(self):
         big = [{"name": "alpha", "text": "x" * 2000}] + [{"name": "pad" + str(i), "text": "y" * 2000}
