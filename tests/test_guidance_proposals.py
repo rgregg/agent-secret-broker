@@ -9,6 +9,7 @@ import html
 import json
 import os
 import re
+import select
 import subprocess
 import sys
 import tempfile
@@ -902,10 +903,21 @@ class Cli(Base):
         p.stdin.close()
         p.stdin = None
         rid = self.pending_rid()
+        seen = ""
         if decide:
+            # a person cannot decide before the command has read its creation response and
+            # printed its waiting line; deciding earlier races with that response (flaky)
+            end = time.time() + 20
+            fd = p.stderr.fileno()
+            while "waiting for approval" not in seen and time.time() < end:
+                if select.select([fd], [], [], 0.2)[0]:
+                    chunk = os.read(fd, 4096)       # raw read: the text wrapper's buffer would hide data
+                    if not chunk:
+                        break
+                    seen += chunk.decode("utf-8", "replace")
             decide(rid)
         out, err = p.communicate(timeout=60)
-        return p.returncode, out, err, rid
+        return p.returncode, out, seen + err, rid
 
     def test_propose_file_applied_exit_0(self):
         d = tempfile.mkdtemp()
@@ -927,7 +939,7 @@ class Cli(Base):
         body = json.dumps({"entries": [{"name": "alpha", "text": "A1"}]})
         rc, out, err, rid = self.run_propose(["-"], stdin=body, decide=lambda rid: self.decide(rid, "deny"))
         self.assertEqual(rc, 4, err)
-        self.assertEqual(out.splitlines(), ["applied: -", "denied: alpha", "failed: -"])
+        self.assertEqual(out.splitlines(), ["applied: -", "denied: alpha", "failed: -"], err)
         self.assertEqual(self.cli("guidance", "status", rid).returncode, 4)
         self.assertIsNone(self.guid("alpha"))
 
