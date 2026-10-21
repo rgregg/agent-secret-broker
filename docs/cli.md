@@ -149,6 +149,25 @@ to read current guidance: the client never sees it. The review flow and its safe
 [reference.md](reference.md#guidance-proposals-agent-written-human-approved) and
 [guidance.md](guidance.md#letting-an-agent-propose-guidance).
 
+### Asking the human for a credential
+
+    asb request-credential NAME --kind token|login --for "purpose" [--host H[,H]]... [--var VAR] [--mode http|env]
+
+When the agent needs a service the broker does not know, it runs this instead of asking in chat or
+reading a secret itself. A card appears on the approval site (and a notification that names only the
+credential); you open it, type the token (or username and password) into the form there, can edit the
+name, hosts, mode and variable, and press Store. `asb` prints `stored: NAME` and nothing secret: it never
+sees the value and never reads stdin. `--for` (one line, up to 300 characters) is shown to you as the agent's
+unverified claim. `--host` may repeat or be comma separated; `--mode http` (default) needs at least one,
+`--mode env` may have none. `--var` suggests the placeholder (for a login, the prefix of `NAME_USERNAME` and
+`NAME_PASSWORD`). The request waits about 15 minutes (`credential_requests.ttl_s`).
+
+Exit codes: 0 stored, 4 denied, 5 expired, 3 the broker refused it (the name exists: use `asb update`; invalid name;
+too many pending; disabled) or the vault write failed, 2 usage errors. After it succeeds the agent uses the
+credential through the normal flow, which still asks you on every use. Details, the safeguards and the
+prompt-injection stance are in
+[reference.md](reference.md#credential-requests-the-agent-asks-the-human-supplies-the-value).
+
 ### Exit codes
 
 | Code | Meaning |
@@ -189,9 +208,9 @@ Two further steps make it stick:
 - **Deny file access** to the old locations in the agent's own permission
   settings, where the tool supports it.
 
-When a new credential is needed, ask the agent to add it with `asb store`; the
-value goes through stdin and the audit log records the operation, never the
-value.
+When a new credential is needed, prefer `asb request-credential`: you type the value on the
+approval page and the agent never sees it. (`asb store` also works if the agent already holds the
+value; it goes through stdin and the audit log records the operation, never the value.)
 
 ## Several machines and several users
 

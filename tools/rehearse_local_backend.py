@@ -55,6 +55,9 @@ SECRETS = {
     "bw": "FAKE-bitwarden-value-c4e8a207",
     "passphrase": "correct horse battery rehearsal",
     "envkey": "FAKE-env-key-passphrase-88d3",
+    "credtoken": "FAKE-credreq-token-4d9a17c3",
+    "creduser": "FAKE-credreq-user-a07e52b9",
+    "credpw": "FAKE-credreq-pw-6e2c80d1",
 }
 
 
@@ -751,6 +754,127 @@ def scenario_C(rh):
     rh.check(g, "python -m secret_broker.audit verify (offline) ok", cp.returncode == 0, (cp.stdout + cp.stderr).strip()[:100])
     rh.check(g, "notifications went to the stub transport and carry no secret value",
              len(Aux.telegram) > 3 and not any(v in t for t in Aux.telegram for v in S.values()), f"{len(Aux.telegram)} messages")
+    credreq_scenario(rh, g)
+
+
+def credreq_scenario(rh, g):
+    """Agent-initiated credential requests (asb request-credential) on a fresh local store and its own
+    throwaway broker: the human types the value on the approval page; the agent never sees it."""
+    S = SECRETS
+    store = rh.data / "credreq.enc"
+    rc, _, _ = rh.lsc_k("init", store, None, None, "--no-recovery")
+    b = Broker(rh, "credreq", store, {"type": "file", "path": str(rh.sec / "pass_key")})
+    ok = rc == 0 and b.start()
+    rh.check(g, "credential requests: throwaway broker on a fresh local store starts", ok, f"rc={rc}")
+    if not ok:
+        return
+
+    def ask(args, human, timeout=60):
+        """Run asb request-credential; when its card appears call human(rid)."""
+        seen = set(b.ap.cards())
+        p = rh.asb_popen(b, "request-credential", *args)
+        p.stdin.close()
+        p.stdin = None
+        rid = b.ap.wait_card(seen, timeout=25, proc=p)
+        resp = human(rid) if rid else None
+        try:
+            out, err = p.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            out, err = p.communicate()
+        rh.outputs.append(("asb request-credential", out + err))
+        return p.returncode, out, err, rid, resp
+
+    purpose = "rehearsal: call the local echo service"
+    # 1. token: the card, the entry page, then Store
+    state = {}
+
+    def human_token(rid):
+        code, _, page = b.ap.get(f"/credential/{rid}")
+        state["page"] = (code, page)
+        _, _, dash = b.ap.get("/")
+        state["dash"] = dash
+        return b.ap.post("/credential", {"id": rid, "decision": "approve", "name": "credrehearse", "hosts": "127.0.0.1",
+                                         "cred_mode": "http", "var": "", "token": S["credtoken"]})
+    rc, out, err, rid, resp = ask(["credrehearse", "--kind", "token", "--for", purpose, "--host", "127.0.0.1"], human_token)
+    code, page = state.get("page", (0, ""))
+    rh.check(g, "credential request: entry page has password-type field, editable hosts, purpose; dashboard card has no secret field",
+             code == 200 and "type=password name=token" in page and "value='127.0.0.1'" in page and purpose in page
+             and "type=password name=" not in state.get("dash", "") and "Review and enter value" in state.get("dash", ""), f"http {code}")
+    rh.check(g, "credential request: CLI prints only the stored name, exit 0", rc == 0 and out.strip() == "stored: credrehearse"
+             and S["credtoken"] not in out + err, f"rc={rc} out={out.strip()[:60]} err={err.strip()[:80]}")
+    rh.check(g, "credential request: the submit response never echoes the value", resp is not None and resp[0] == 200
+             and S["credtoken"] not in resp[2] and "Stored" in resp[2], f"http {resp and resp[0]}")
+    rc, out, err = rh.asb(b, "list", "--json")
+    cat = {x["name"]: x for x in json.loads(out)} if rc == 0 else {}
+    rh.check(g, "credential request: catalog has the credential with the confirmed host and variable",
+             cat.get("credrehearse", {}).get("allowed_hosts") == ["127.0.0.1"] and cat["credrehearse"]["vars"] == ["CREDREHEARSE_TOKEN"],
+             json.dumps(cat.get("credrehearse")))
+    # 2. the normal request flow uses it (and still asks a human)
+    rc, out, err, rid2 = rh.asb_decided(b, ["http", "credrehearse", "GET", up_url(rh, "/credreq"),
+                                            "-H", "Authorization: Bearer {{CREDREHEARSE_TOKEN}}"])
+    h = last_hit(rh)
+    rh.check(g, "credential request: asb http with the new credential reaches the stub upstream (after a human approval)",
+             rc == 0 and rid2 is not None and h and h["headers"].get("Authorization") == "Bearer " + S["credtoken"], f"rc={rc}")
+    # 3. login
+    def human_login(rid):
+        return b.ap.post("/credential", {"id": rid, "decision": "approve", "name": "credsite", "hosts": "127.0.0.1",
+                                         "cred_mode": "http", "var": "", "username": S["creduser"],
+                                         "password": S["credpw"]})
+    rc, out, err, rid, resp = ask(["credsite", "--kind", "login", "--for", "rehearsal login", "--host", "127.0.0.1"], human_login)
+    rc2, out2, err2, _ = rh.asb_decided(b, ["http", "credsite", "GET", up_url(rh, "/credlogin"),
+                                            "-H", "X-U: {{CREDSITE_USERNAME}}", "-H", "X-P: {{CREDSITE_PASSWORD}}"])
+    h = last_hit(rh)
+    rh.check(g, "credential request: login (username+password) stored and usable through two variables",
+             rc == 0 and rc2 == 0 and h and h["headers"].get("X-U") == S["creduser"] and h["headers"].get("X-P") == S["credpw"],
+             f"rc={rc},{rc2}")
+    # 4. a refused form keeps the request pending and echoes no secret
+    seen = set(b.ap.cards())
+    p = rh.asb_popen(b, "request-credential", "credbad", "--kind", "token", "--for", "rehearsal refused form", "--mode", "env")
+    p.stdin.close()
+    p.stdin = None
+    rid = b.ap.wait_card(seen, timeout=25, proc=p)
+    bad = b.ap.post("/credential", {"id": rid, "decision": "approve", "name": "credbad", "hosts": "", "cred_mode": "http",
+                                    "var": "", "token": S["credtoken"]}) if rid else (0, None, "")
+    pending_after = rid in b.ap.cards() if rid else False
+    den = b.ap.post("/credential", {"id": rid, "decision": "deny"}) if rid else (0, None, "")
+    out, err = p.communicate(timeout=60)
+    rh.outputs.append(("asb request-credential (denied)", out + err))
+    rh.check(g, "credential request: no host in http mode is refused (422), the request stays pending, the page has no secret",
+             bad[0] == 422 and S["credtoken"] not in bad[2] and pending_after and "allowed hosts are required" in bad[2], f"http {bad[0]}")
+    rh.check(g, "credential request: deny exits 4 and stores nothing", p.returncode == 4 and "credbad" not in
+             {x["name"] for x in json.loads(rh.asb(b, "list", "--json")[1] or "[]")}, f"rc={p.returncode}")
+    # 5. collision and invalid name are refused by the broker (exit 3)
+    rc, out, err = rh.asb(b, "request-credential", "credrehearse", "--kind", "token", "--for", "again", "--host", "127.0.0.1")
+    rh.check(g, "credential request: an existing name is refused (exit 3) with the `asb update` hint", rc == 3 and "asb update credrehearse" in err, f"rc={rc}")
+    rc, out, err = rh.asb(b, "request-credential", "Bad Name", "--kind", "token", "--for", "x", "--host", "127.0.0.1")
+    rh.check(g, "credential request: an invalid name is refused (exit 3)", rc == 3, f"rc={rc}")
+    # 6. not stored in the clear, notification names only, audit without values, survives a restart
+    notes = [t for t in Aux.telegram if "Credential requested" in t]
+    rh.check(g, "credential request: notifications say 'Credential requested: NAME' and carry no purpose or value",
+             any("Credential requested: credrehearse" in t for t in notes) and not any(purpose in t or v in t for t in notes for v in S.values()),
+             f"{len(notes)} notifications")
+    recs = b.records()
+    ev = {r["event"] for r in recs}
+    rh.check(g, "credential request: audit has requested/credential_provided/stored and no value or purpose",
+             {"requested", "credential_provided", "stored"} <= ev and purpose not in open(b.audit).read()
+             and not any(v in open(b.audit).read() for v in S.values()), "")
+    rc, out, err = rh.asb(b, "audit", "--event", "stored,credential_provided", "--since", "30m")
+    rh.check(g, "credential request: asb audit shows the stored name, never the human's entry event", "stored" in out
+             and "credential_provided" not in out, out.strip()[:80])
+    b.stop()
+    ok = b.start()
+    rc, out, err = rh.asb(b, "list", "--json") if ok else (1, "[]", "")
+    for _ in range(20):
+        if rc == 0 and any(x.get("name") == "credrehearse" for x in json.loads(out or "[]")):
+            break
+        time.sleep(0.4)
+        rc, out, err = rh.asb(b, "list", "--json")
+    rh.check(g, "credential request: the credentials survive a broker restart",
+             ok and {x["name"] for x in json.loads(out or "[]")} >= {"credrehearse", "credsite"}, f"rc={rc}")
+    rh.check(g, "credential request: the encrypted store file holds no plaintext value",
+             not rh.scan_files([store]), "")
+    b.stop()
 
 
 # ================================================================ scenario D: policy writes persist

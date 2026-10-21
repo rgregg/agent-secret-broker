@@ -28,6 +28,9 @@ push notification or the dashboard.
   [docs/reference.md](docs/reference.md#backend-contract).
 - **The agent never sees the value** in `http` mode: the broker makes the call and
   substitutes `{{VAR}}` placeholders itself.
+- **The agent can ask for a credential without ever seeing it.** `asb request-credential` puts a card
+  on the approval site; you type the secret there and the broker stores it
+  ([docs](docs/reference.md#credential-requests-the-agent-asks-the-human-supplies-the-value)).
 - **Every use is approved or explicitly allow-listed**, rated by a risk model, and
   written to a hash-chained audit log.
 

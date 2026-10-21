@@ -82,11 +82,11 @@ def validate_purpose(raw):
     text = raw.strip(" ")
     if not text or len(text) > MAX_PURPOSE:
         raise ValueError(f"purpose must be 1 to {MAX_PURPOSE} characters")
-    if _PURPOSE_BAD.search(text):
-        raise ValueError("purpose must be a single line without control characters")
     bad = guidance_mod.hidden_problem(text)
     if bad:
         raise ValueError(f"purpose contains hidden characters ({bad[0]} at offset {bad[1]})")
+    if _PURPOSE_BAD.search(text):
+        raise ValueError("purpose must be a single line without control characters")
     return text
 
 

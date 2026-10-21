@@ -962,6 +962,9 @@ and useless without your SSO session).
 
 ## Storing and updating credentials
 
+(To have a **human** supply a brand-new secret so it never passes through the agent, see
+[Credential requests](#credential-requests-the-agent-asks-the-human-supplies-the-value).)
+
 An agent can add or rotate credentials. Rotating always needs a fresh approval;
 creating a new one does not unless `store.create` is `prompt` (below):
 
@@ -1744,6 +1747,87 @@ other guidance events are hidden. The history pop-over for such a request shows 
 counts, per-entry outcome, lengths and hash prefixes, and "Proposal text: not retained after
 the decision".
 
+## Credential requests (the agent asks, the human supplies the value)
+
+`asb store` needs the agent to already hold the secret, which means the value passed through its
+context. A credential request removes that step: the agent says it needs a credential for a service,
+**you type the value on the approval page**, and the broker stores it. The agent learns only the stored
+name.
+
+    asb request-credential NAME --kind token|login --for "what it is for" \
+        [--host H[,H]]... [--var VAR] [--mode http|env]
+
+Request (client API, agent key): `POST /v1/requests` with
+
+    {"mode": "credential", "names": ["NAME"], "kind": "token"|"login", "purpose": "...",
+     "hosts": ["api.example.com"], "var": "MY_TOKEN", "cred_mode": "http"|"env"}
+
+- `names` is exactly one valid name (`a-z 0-9 _ -`, 1 to 41). A name that already exists is refused (400,
+  with the hint to use `asb update NAME`), as is a second pending request for the same name (403).
+- `purpose` is one line of 1 to 300 characters with no control characters and none of the hidden
+  characters guidance text also refuses (400, the message names the class and offset, never the text).
+  It is the agent's own claim: the card marks it unverified and shows every non-ASCII character as
+  `<U+XXXX>`. It is never put in a notification, and the audit log keeps only its length and a hash prefix.
+- `hosts` (up to 10 plain host names), `var` and `cred_mode` are suggestions the human can edit. `var` must
+  look like `MY_TOKEN` and may not be a name that changes how processes run (`PATH`, `LD_*`, ...).
+- A request body with any of `value`, `secret`, `token`, `password`, `username`, `credential` is refused
+  (400): there is no way to send a secret through the client API, and no client endpoint accepts one.
+- Config (validated at startup): `"credential_requests": {"enabled": true, "ttl_s": 900}`. `ttl_s` is 120 to
+  3600 (default 900: finding a token takes longer than a tap). `enabled: false` refuses the mode (403).
+  `GET /v1/status` shows `features.credential_requests`.
+- Caps: at most 2 credential requests pending at once (403), counted in the general pending cap of 3 as
+  well, and a denial starts the usual 60 s deny cooldown for that name.
+- Result: `GET /v1/requests/<id>` returns `{"status": "approved", "stored": {"name", "op": "create", "item",
+  "field"}}` once, then `{"status": "released"}`. A failure returns `status: failed` with
+  `store failed: <ExceptionClassName>` and, when the backend gives one, its coarse class
+  (`conflict`, `rate_limited`, ...). **Never exception text**: the detail goes only to the hidden operator
+  audit event `credential_store_failed`, scrubbed of the value in its raw, JSON, URL-encoded and base64 forms.
+
+### What the human sees and does
+
+The card (dashboard, and the approval link the notification opens) shows the name, kind, purpose and the
+suggestions, and a **Review and enter value** button and **Deny**. The button opens `/credential/<id>`,
+a form with the name, allowed hosts, mode, variable name and the secret: one `type=password` field for a
+token, or username and password for a login. It is a separate page because the dashboard refreshes itself
+and must never hold a half-typed secret. **Store credential** posts to `/credential` on the approval
+listener only, with the per-user CSRF token and the same-origin check.
+
+- Hosts are required in http mode, so a token can only be sent where you intend. Env mode may have none, but
+  only if you tick "No host restriction" (such a credential can never be used by `asb http`).
+- A problem (bad name, existing name, missing host, dangerous variable, empty secret) re-renders the page
+  with the error (422) and **every field except the secret**; the request stays pending and nothing is stored.
+- The form claims the request once. A second or concurrent submit finds it handled; exactly one vault write
+  happens.
+- After a valid submit the page waits briefly for the vault write and says Stored, or Not stored with the
+  failure class. A failed write ends the request: ask the agent to request again.
+
+### What is stored
+
+One backend `put(create=True)` with the value and the broker metadata together (the same atomic create
+`asb store` uses), then the live catalog entry: item = name, `approval: prompt`, `allowed_hosts` as confirmed,
+`created: {by, at}`. A **token** is a Secure Note (field `notes`) with one variable (default `NAME_TOKEN`).
+A **login** is a Secure Note holding `{"username": ..., "password": ...}` as JSON, exposed as two variables by
+`key`: `NAME_USERNAME` and `NAME_PASSWORD` (`--var PORTAL` makes the prefix `PORTAL_`). The metadata is
+validated exactly as the catalog will read it back before anything is written. It works on every backend
+(Bitwarden, local, file); a backend that refuses the create fails the request with the class only.
+
+### Invariants (tests/test_credential_request.py)
+
+- Always HIGH by code (`assessed` reason: credential requests always need a human to supply the value). No
+  model call: there is no value at request time and the purpose is untrusted. Never auto-approved: not by
+  `approval: allow`, Always, timed grants or SSH rules; the card has none of those controls, and
+  `decide_via` refuses an approve without the human's validated entry (400, nothing claimed) and refuses
+  every token channel (push, Home Assistant). The notification has no buttons and carries only
+  `Credential requested: NAME`.
+- The value is held in memory from the form post until the vault write finished. It is never in the audit log,
+  history, request details, notifications, results, HTML, redirects, URLs or logs.
+- Audit: `requested` (mode, kind, suggested hosts, purpose length and hash), `assessed`, `notified`,
+  `decided`, `credential_provided` (kind, hosts, variable names, which fields the human edited, value size),
+  `stored` (names only) and `approved`/`denied`/`expired`/`failed`; `credential_refused` for a refused form
+  (a problem count). The agent's `asb audit` sees `requested` (name, mode, kind), `stored` and the outcome;
+  `credential_provided`, `credential_refused` and `credential_store_failed` are hidden approver activity.
+  History shows the request, follows a rename, and the detail view says the purpose is not retained.
+
 ## Vault session lifetime
 
 The vault is not kept open (the local backend drops its decrypted contents after
@@ -1964,6 +2048,8 @@ decision. Hidden on purpose:
   approver had a page open.
 - Guidance proposals: `guidance_proposed`, `guidance_proposal_result` and `guidance_changed`
   (the `requested` event for mode `guidance` shows names and mode only, never text).
+- Credential requests: `credential_provided`, `credential_refused` and `credential_store_failed` (the
+  human's entry, refused forms and the scrubbed operator detail of a failed write).
 - Policy and risk: `startup`, `assessed`, `escalated`, `policy_changed`,
   `policy_change_refused`, `policy_change_failed`, `policies_viewed`, `ha_hook_any_device`,
   `config_warning`.
@@ -2065,6 +2151,12 @@ or `expired` mean a human was asked (the agent also learns that from its own req
   (default `auto_modes` includes `env`), an env request that is rated within
   `risk.auto_approve_max` and has visible scripts is released to the requesting
   machine without a prompt; an Always or timed env standing approval does the same.
+- **Credential requests are a prompt-injection surface.** A page or document an agent reads can talk it into
+  asking you for a credential. The design assumes that: the request carries no value; its purpose is shown as
+  untrusted text; the entry form exists only behind your SSO, CSRF and same-origin checks, so you always
+  start the paste; hosts are required so a pasted token cannot be sent anywhere; the stored item still asks
+  on every use; nothing is stored without your submit. It cannot stop you typing a secret you should not.
+  Treat an unexpected card as a possible injection and deny it.
 - Output masking is exact-match; a program that transforms a secret before
   printing it (base64, splitting) defeats it.
 
