@@ -62,6 +62,7 @@ dark setting and works on a phone.
 | [docs/deploy.md](docs/deploy.md) | Deploy through Komodo's API and verify with `asb status`, no host shell needed |
 | [docs/cli.md](docs/cli.md) | Install `asb`, use it, and set up agents; exit codes; troubleshooting |
 | [docs/guidance.md](docs/guidance.md) | Per-credential risk guidance: how it works and starter texts for common services |
+| [docs/rehearsal.md](docs/rehearsal.md) | `tools/rehearse_local_backend.py`: an end-to-end rehearsal of the encrypted local backend (real broker, real CLI, Docker) before you rely on it |
 | [docs/reference.md](docs/reference.md) | How it works: catalog format, policy and risk, notifications, storing credentials, audit, threat model |
 
 ## Threat model, in one paragraph

@@ -279,6 +279,10 @@ account away from both. If the key is wrong or missing the broker still starts
 (catalog empty, requests fail with a clear error, `store_unlock_failed` audited)
 and recovers on the next refresh once the key is fixed.
 
+Before relying on it, run the end-to-end rehearsal (`tools/rehearse_local_backend.py`,
+[rehearsal.md](rehearsal.md)): it drives a throwaway broker on a scratch store through
+requests, restarts, key changes, corruption and Docker.
+
 Other administration (`show`, `set-meta`, `delete`, `change-key`, `rotate-dek`,
 `export-names`) is in [reference.md](reference.md#admin-cli-python--m-secret_brokerlocalstore).
 
