@@ -9,7 +9,8 @@ step.
 
 This assumes the broker runs as a Komodo stack (compose file in the stack, image
 `ghcr.io/rgregg/agent-secret-broker:latest` or a pinned tag). CI builds the image
-on every push to `main` and stamps it with the commit sha (see below).
+on every push to `main` (tags `latest` and `sha-<short>`) and stamps it with the commit sha
+(see below). Pushing a `vX.Y.Z` git tag also publishes `X.Y.Z` and `X.Y` image tags.
 
 Use a Komodo API key and secret (created in Komodo under your user settings). Send
 them as `X-Api-Key` and `X-Api-Secret` headers. Each call is a POST to `/execute`
