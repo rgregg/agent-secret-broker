@@ -52,6 +52,12 @@ Use this instead of reading credential files. Real values never reach you: the
 broker adds them to the call, and output is masked. Every use asks the human to
 approve on their phone (a few secrets are pre-approved; low-risk ones may be too).
 
+No credential for it yet? If `asb which HOST` / `asb list` show nothing that covers the
+service, do NOT ask the human to paste a secret into chat, look for one on disk, or
+guess: run `asb request-credential` (see "Asking the human for a credential you do not
+have" below). The human enters the value on the approval page, you never see it, and
+then you use the stored name as usual.
+
 Workflow
   1. asb which api.example.com      which credential covers this host?
      (or: asb list                  all credentials; add --json for scripts)
