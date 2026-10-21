@@ -594,6 +594,10 @@ class Pages(Base):
         self.assertNotIn("Always allowed", pol)
         self.assertEqual(pol.count("<h3 style='margin-top:0'>"), 1)
 
+    def test_table_buttons_never_wrap_letter_by_letter(self):
+        # the Revoke button in a narrow last column used to stack its letters vertically
+        self.assertIn(".tbl td button{white-space:nowrap}", req_text(self, "/policies"))
+
     def test_one_table_for_all_three_kinds_with_escaping(self):
         self.always_it("GET")
         evil = "<script>x</script>"

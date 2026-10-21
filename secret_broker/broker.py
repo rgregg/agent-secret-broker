@@ -2816,6 +2816,7 @@ overflow:hidden}
 .tbl th{text-align:left;font-size:.75rem;color:var(--muted);padding:.55rem .8rem;border-bottom:1px solid var(--line)}
 .tbl td{padding:.6rem .8rem;border-bottom:1px solid var(--line);vertical-align:top}
 .tbl tr:last-child td{border-bottom:0}
+.tbl td button{white-space:nowrap}
 .tbl td[data-label=Time],.tbl td[data-label=Outcome],.tbl td[data-label=Risk],.tbl td[data-label=Took]
 {white-space:nowrap;overflow-wrap:normal}
 @media (max-width:42rem){
