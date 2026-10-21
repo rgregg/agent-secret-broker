@@ -691,6 +691,11 @@ class UnlockableStoreAtStartup(Base):
                                                        "argv": ["echo", "hi"]})
         self.assertGreaterEqual(code, 400)
         self.assertNotIn(VAL, body)
+        # the error says the backend is unhealthy instead of blaming the secret name
+        self.assertIn("backend is not healthy", json.loads(body)["error"])
+        code, body = self.api("POST", "/v1/requests", {"mode": "store", "op": "update", "names": ["svc"], "value": "x"})
+        self.assertGreaterEqual(code, 400)
+        self.assertIn("backend is not healthy", json.loads(body)["error"])
         # a read through the backend fails with a classified error, never partial data
         with self.assertRaises(StoreError) as cm:
             self.broker.backend.get("Svc", "notes")

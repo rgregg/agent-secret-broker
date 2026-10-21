@@ -963,6 +963,11 @@ class Broker(sshrules_mod.SshRulesMixin):
                 self._validate_store(names, spec)
             else:
                 if not names or any(n not in secrets_cfg for n in names):
+                    if not self._backend_ok:
+                        # the catalog could not be (re)loaded: do not blame the agent's spelling
+                        raise ValueError("unknown secret name, but the credential backend is not "
+                                         "healthy (the catalog may be empty or stale): ask the "
+                                         "operator to check `asb status` and the store key")
                     raise ValueError("unknown secret name")
                 if mode == "ssh_sign":
                     self._validate_ssh_sign(names, spec)
@@ -1198,6 +1203,10 @@ class Broker(sshrules_mod.SshRulesMixin):
                         raise ValueError(f"vault item {spec['item']!r} is already used by {other}")
         elif op == "update":
             if name not in secrets_cfg:
+                if not self._backend_ok:
+                    raise ValueError("unknown secret name, but the credential backend is not "
+                                     "healthy (the catalog may be empty or stale): ask the "
+                                     "operator to check `asb status` and the store key")
                 raise ValueError("unknown secret name")
             for k in ("allowed_hosts", "item"):
                 if spec.get(k):
