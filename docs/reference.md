@@ -1780,8 +1780,10 @@ Request (client API, agent key): `POST /v1/requests` with
 - Result: `GET /v1/requests/<id>` returns `{"status": "approved", "stored": {"name", "op": "create", "item",
   "field"}}` once, then `{"status": "released"}`. A failure returns `status: failed` with
   `store failed: <ExceptionClassName>` and, when the backend gives one, its coarse class
-  (`conflict`, `rate_limited`, ...). **Never exception text**: the detail goes only to the hidden operator
-  audit event `credential_store_failed`, scrubbed of the value in its raw, JSON, URL-encoded and base64 forms.
+  (`conflict`, `rate_limited`, ...). **Never exception text**, anywhere: not in the result, the approval page,
+  history, the audit log or the broker log, because an exception could embed the value in a form no scrubber
+  would catch. To investigate a failed store, reproduce it against the backend (for example with
+  `asb store` of a throwaway value, or the backend's own tooling).
 
 ### What the human sees and does
 
@@ -1825,7 +1827,7 @@ validated exactly as the catalog will read it back before anything is written. I
   `decided`, `credential_provided` (kind, hosts, variable names, which fields the human edited, value size),
   `stored` (names only) and `approved`/`denied`/`expired`/`failed`; `credential_refused` for a refused form
   (a problem count). The agent's `asb audit` sees `requested` (name, mode, kind), `stored` and the outcome;
-  `credential_provided`, `credential_refused` and `credential_store_failed` are hidden approver activity.
+  `credential_provided` and `credential_refused` are hidden approver activity.
   History shows the request, follows a rename, and the detail view says the purpose is not retained.
 
 ## Vault session lifetime
@@ -2048,8 +2050,7 @@ decision. Hidden on purpose:
   approver had a page open.
 - Guidance proposals: `guidance_proposed`, `guidance_proposal_result` and `guidance_changed`
   (the `requested` event for mode `guidance` shows names and mode only, never text).
-- Credential requests: `credential_provided`, `credential_refused` and `credential_store_failed` (the
-  human's entry, refused forms and the scrubbed operator detail of a failed write).
+- Credential requests: `credential_provided` and `credential_refused` (the human's entry and refused forms).
 - Policy and risk: `startup`, `assessed`, `escalated`, `policy_changed`,
   `policy_change_refused`, `policy_change_failed`, `policies_viewed`, `ha_hook_any_device`,
   `config_warning`.

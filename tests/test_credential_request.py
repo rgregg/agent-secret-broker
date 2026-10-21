@@ -793,8 +793,7 @@ class Failures(H):
 
     def test_exception_text_never_reaches_the_agent_whatever_form_the_value_takes(self):
         """Fail closed: the agent-visible error is the exception class (and coarse backend class) only.
-        The operator detail is scrubbed of the value raw, JSON-escaped/quoted, URL-encoded, base64 and
-        as the whole serialized login, and lives in a hidden audit event."""
+        No exception text is kept anywhere (audit, history, UI, logs), so no encoding of the value can survive."""
         import base64
         r = self.ask("site", kind="login")
         login = json.dumps({"username": USR, "password": PW})
@@ -822,11 +821,10 @@ class Failures(H):
             self.assertNotIn(f, everything)
         for c in ALL_CANARIES:
             self.assertNotIn(c, everything)
-        detail = self.events("credential_store_failed")[0]
-        self.assertEqual(detail["exception"], "RuntimeError")
-        self.assertIn("vault exploded", detail["detail"])
-        self.assertNotIn("credential_store_failed", agent_audit)
-        self.assertNotIn("vault exploded", agent_audit + frag + hist + body)
+        # no exception text anywhere, not even for the operator: only the class name and category
+        self.assertNotIn("vault exploded", everything)
+        self.assertEqual(self.events("credential_store_failed"), [])
+        self.assertEqual(self.events("failed")[0]["error"], "store failed: RuntimeError")
 
     def test_a_backend_that_cannot_create(self):
         r = self.ask()

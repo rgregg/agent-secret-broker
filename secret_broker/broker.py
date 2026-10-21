@@ -2353,9 +2353,7 @@ class Broker(sshrules_mod.SshRulesMixin):
             try:
                 result = self._credential_store(req, who)
             except Exception as e:  # noqa: BLE001 -- the request must always settle; never repeat the value
-                public, detail = self._credential_error(req, e)
-                self.audit("credential_store_failed", req, exception=type(e).__name__, detail=detail)
-                self._finish(req, "failed", error=public, **who)
+                self._finish(req, "failed", error=self._credential_error(e), **who)
                 return
             self._finish(req, "approved", result=result, **who)
             return
@@ -2426,34 +2424,13 @@ class Broker(sshrules_mod.SshRulesMixin):
         return {"stored": {"name": name, "op": sp["op"], "item": sp["item"], "field": sp["field"]}}
 
     @staticmethod
-    def _credential_variants(secret, value=None):
-        """Every form of the entered value an exception text might embed: raw, JSON-escaped and
-        quoted, URL-encoded, base64, and the whole serialized value in those forms."""
-        raws = [v for v in (secret or {}).values() if isinstance(v, str) and v]
-        if value:
-            raws.append(value)
-        if secret and len(secret) > 1:
-            raws.append(json.dumps(secret))
-        out = set()
-        for v in raws:
-            out.update({v, json.dumps(v), json.dumps(v)[1:-1], json.dumps(v, ensure_ascii=False)[1:-1],
-                        urllib.parse.quote(v, safe=""), urllib.parse.quote_plus(v), urllib.parse.quote(v),
-                        base64.b64encode(v.encode()).decode(), base64.urlsafe_b64encode(v.encode()).decode(),
-                        repr(v)[1:-1]})
-        return sorted((x for x in out if x), key=len, reverse=True)
-
-    def _credential_error(self, req, exc):
-        """(public, detail) for a failed credential write. FAIL CLOSED: `public` is what the agent,
-        the approval page, history and the `failed` audit event carry, and it never contains
-        exception text, only the exception class name and the coarse backend class. `detail` is
-        the exception text scrubbed of the entered value in every form, for the operator audit
-        (`credential_store_failed`, never shown to an agent) only."""
+    def _credential_error(exc):
+        """The ONLY failure text a credential request ever carries (agent, approval page, history,
+        audit, logs): the exception class name and the coarse backend class. FAIL CLOSED: exception
+        text is never kept anywhere, because it could embed the entered value in a form no scrubber
+        would catch. An operator who needs more reproduces against the backend."""
         cls = backend_base.error_class(exc)
-        public = f"store failed: {type(exc).__name__}" + (f" ({cls})" if cls and cls != "other" else "")
-        detail = str(exc)
-        for v in self._credential_variants(req.spec.get("secret")):
-            detail = detail.replace(v, "***")
-        return public, detail[:300]
+        return f"store failed: {type(exc).__name__}" + (f" ({cls})" if cls and cls != "other" else "")
 
     def _credential_store(self, req, who):
         """Create the vault item for a credential request: ONE atomic backend create holding

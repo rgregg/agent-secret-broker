@@ -115,7 +115,7 @@ HIDDEN = frozenset({
     "ssh_sign_refused",
     # a credential request: the human's entry and any refused submission are approver activity;
     # the agent sees `requested` (name, mode, kind) and `stored` (the name) and the outcome
-    "credential_provided", "credential_refused", "credential_store_failed",
+    "credential_provided", "credential_refused",
     # notification holding while the approver has a page open: presence is approval context
     "notify_held", "notify_released", "notify_dropped",
     # standing per-host SSH rules are approval policy: a rule-approved request shows as plain "approved",
