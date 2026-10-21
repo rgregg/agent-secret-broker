@@ -325,6 +325,14 @@ def cmd_export_names(args):
     return 0
 
 
+def _bak_notice(path, removed):
+    """The previous generation (.bak) still opens with the key that was just replaced, so the
+    store removes it; copies made elsewhere are the operator's to deal with."""
+    if removed:
+        print(f"removed {path}.bak: it was the previous file and still opened with the old key")
+    print("note: backups or snapshots of the store made earlier still open with the old key")
+
+
 def cmd_change_key(args):
     path, ks = _open(args)
     store = LocalStore(path, ks, idle_timeout=0)
@@ -333,10 +341,12 @@ def cmd_change_key(args):
         if args.wrap not in store.wrap_ids():
             raise CliError(f"the store has no wrap {args.wrap!r} (it has {store.wrap_ids()})")
         store.rewrap(args.wrap, new)
+        removed = getattr(store, "bak_removed", False)
     finally:
         store.close()
     print(f"wrap {args.wrap!r} now opens with the new key; update the broker's key source, "
           "then restart or wait for its next unlock")
+    _bak_notice(path, removed)
     return 0
 
 
@@ -358,9 +368,11 @@ def cmd_rotate_dek(args):
                            "needs their keys: give --recovery-key-file/--recovery-key-env, "
                            "--new-recovery, or --drop-other-wraps")
         store.rotate_dek(keys)
+        removed = getattr(store, "bak_removed", False)
     finally:
         store.close()
     print("data key rotated; all contents re-encrypted")
+    _bak_notice(path, removed)
     if new_recovery:
         print("NEW RECOVERY KEY (shown once; the old one no longer works):")
         print(new_recovery)

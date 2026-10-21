@@ -301,6 +301,47 @@ class KeyManagement(CliBase):
             self.assertEqual(LocalBackend(self.store, ls.EnvKeySource("R"), 0).get("Svc", "notes"), SECRET)
         self.assertNoSecrets()
 
+    def test_change_key_removes_the_bak_that_the_old_key_still_opens(self):
+        self.init("--no-recovery")
+        self.run_cli("add", "Svc", stdin=SECRET)
+        self.run_cli("add", "Other", stdin=SECRET2)             # second write: a .bak now exists
+        self.assertTrue(os.path.exists(self.store + ".bak"))
+        out, _ = self.run_cli("change-key", "--new-key-file", self.newkey("a brand new passphrase"))
+        self.assertFalse(os.path.exists(self.store + ".bak"))
+        self.assertIn("removed", out)
+        self.assertIn("still open with the old key", out)
+        self.assertNoSecrets()
+
+    def test_rotate_dek_removes_the_bak(self):
+        self.init("--no-recovery")
+        self.run_cli("add", "Svc", stdin=SECRET)
+        self.run_cli("add", "Other", stdin=SECRET2)
+        self.assertTrue(os.path.exists(self.store + ".bak"))
+        out, _ = self.run_cli("rotate-dek")
+        self.assertFalse(os.path.exists(self.store + ".bak"))
+        self.assertIn("removed", out)
+
+    def test_a_write_after_a_rotation_makes_a_new_bak_that_the_new_key_opens(self):
+        self.init("--no-recovery")
+        self.run_cli("add", "Svc", stdin=SECRET)
+        nk = self.newkey("a brand new passphrase")
+        self.run_cli("change-key", "--new-key-file", nk)
+        b = LocalBackend(self.store, ls.FileKeySource(nk), 0)
+        b.put("Other", "notes", "x", create=True)
+        bak = LocalBackend(self.store + ".bak", ls.FileKeySource(nk), 0)
+        self.assertEqual([r["item"] for r in bak.catalog()], ["Svc"])
+        with self.assertRaises(ls.StoreError):
+            LocalBackend(self.store + ".bak", ls.FileKeySource(self.keyfile), 0).catalog()
+
+    def test_adding_a_wrap_keeps_the_bak(self):
+        self.init("--no-recovery")
+        self.run_cli("add", "Svc", stdin=SECRET)
+        self.run_cli("add", "Other", stdin=SECRET2)
+        st = ls.LocalStore(self.store, ls.FileKeySource(self.keyfile), 0)
+        st.rewrap("recovery", ls.Key("a recovery passphrase"))
+        st.close()
+        self.assertTrue(os.path.exists(self.store + ".bak"))
+
     def test_change_key_by_prompt(self):
         self.init("--no-recovery")
         self.run_cli("change-key", tty=True, getpass_values=["new pass", "new pass"])

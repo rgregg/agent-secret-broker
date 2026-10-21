@@ -403,7 +403,9 @@ every write. A random 256-bit data key encrypts the body; each wrap holds that
 key encrypted under a key derived from one passphrase (scrypt, `n` at least
 2^15, 16-byte salt) or used directly (a raw 32-byte key, as base64). Changing
 the passphrase or adding a recovery key re-wraps the data key only; rotating
-the data key re-encrypts the body. Item names and metadata are inside the
+the data key re-encrypts the body. Both remove the `.bak` generation, which
+the replaced key would otherwise still open; backups and snapshots you made
+earlier are yours to destroy. Item names and metadata are inside the
 encrypted body.
 
 - Writes take an exclusive `flock` on `<store>.lock`, re-read the file, apply the
@@ -445,8 +447,8 @@ warn, because secret mounts are often 0444).
 | `add NAME` | Add a note (text from stdin or a hidden prompt), a login (`--kind login`: prompts, or `--json` with an object on stdin), or custom fields (`--field NAME`, prompted). `--meta FILE` sets the metadata, `--uri URL` a login URL. Never overwrites. |
 | `set-meta NAME FILE` | Replace the item's `broker` metadata from a JSON file (`-` for stdin). |
 | `delete NAME` | Delete (needs `--yes`, or type the name at a terminal). |
-| `change-key` | Re-wrap the data key under a new passphrase or key (`--new-key-file`, `--new-key-env`, or a prompt). `--wrap recovery` replaces the recovery wrap instead. Update the broker's key source afterwards. |
-| `rotate-dek` | New data key; re-encrypts the contents. Other wraps are dropped unless you supply their keys (`--recovery-key-file/-env`), make a new recovery key (`--new-recovery`) or accept the loss (`--drop-other-wraps`). |
+| `change-key` | Re-wrap the data key under a new passphrase or key (`--new-key-file`, `--new-key-env`, or a prompt). `--wrap recovery` replaces the recovery wrap instead. Update the broker's key source afterwards. Replacing a key removes the `.bak` (the previous file, which the old key still opens); earlier backups and snapshots still open with the old key. |
+| `rotate-dek` | New data key; re-encrypts the contents. Other wraps are dropped unless you supply their keys (`--recovery-key-file/-env`), make a new recovery key (`--new-recovery`) or accept the loss (`--drop-other-wraps`). Removes the `.bak` too, because it holds the old data key and wraps. |
 | `import-bw` | One-time copy from the broker's Bitwarden/Vaultwarden collection (`--bw-config FILE`, a broker config with a `bw` backend). Copies every login, secure note and SSH key in the collection, plus any item carrying `broker` metadata anywhere, with custom text fields and the metadata parsed into a nested object. Reads every copied item back from the store and compares before reporting success. Never changes the source. `--dry-run`, `--skip-existing`, `--overwrite`. Rotation history (`previous_value`) is not copied. |
 | `import-env FILE` | One-time: each `KEY=value` line becomes a note named `KEY` with `approval: prompt` and a variable `KEY` (field `notes`). Prints a reminder to delete the file. |
 | `export-names` | Names only, one per line. |

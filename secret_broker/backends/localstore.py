@@ -431,12 +431,14 @@ class LocalStore:
     def rewrap(self, wid, key, kdf=None):
         """Replace (or add) the wrap `wid` so that `key` opens it. The data key and
         the other wraps are unchanged; the body is re-encrypted because the header is
-        its associated data."""
+        its associated data. Replacing a wrap revokes its old key, so the `.bak` (the
+        previous file, which the old key still opens) is removed."""
         with self._lock, _flock(self.path + ".lock"):
             self._load()
+            replaced = any(w.get("id") == wid for w in self._wraps)
             wraps = [w for w in self._wraps if w.get("id") != wid]
             wraps.append(make_wrap(wid, self._dek, key, kdf))
-            self._write_header(wraps, self._dek)
+            self._write_header(wraps, self._dek, revoke=replaced)
 
     def drop_wrap(self, wid):
         with self._lock, _flock(self.path + ".lock"):
@@ -444,21 +446,31 @@ class LocalStore:
             wraps = [w for w in self._wraps if w.get("id") != wid]
             if len(wraps) == len(self._wraps) or not wraps:
                 raise StoreError(f"cannot remove wrap {wid!r}", "error")
-            self._write_header(wraps, self._dek)
+            self._write_header(wraps, self._dek, revoke=True)
 
     def rotate_dek(self, keys, kdf=None):
         """New data key; every wrap named in `keys` ({wid: Key}) is rebuilt under it
-        and all other wraps are dropped (they could not open the new key)."""
+        and all other wraps are dropped (they could not open the new key). The `.bak`
+        holds the old data key and wraps, so it is removed."""
         if not keys:
             raise StoreError("rotate_dek needs at least one key", "error")
         with self._lock, _flock(self.path + ".lock"):
             self._load()
             dek = os.urandom(32)
-            self._write_header([make_wrap(wid, dek, k, kdf) for wid, k in keys.items()], dek)
+            self._write_header([make_wrap(wid, dek, k, kdf) for wid, k in keys.items()], dek, revoke=True)
 
-    def _write_header(self, wraps, dek):
+    def _write_header(self, wraps, dek, revoke=False):
         header = {"v": FORMAT_VERSION, "cipher": CIPHER, "wraps": wraps}
         atomic_write(self.path, encrypt_store(header, dek, self._doc))
         self._dek, self._wraps, self._sig = dek, wraps, self._signature()
         self._touch()
-        self._emit("store_rekeyed", wraps=len(wraps))
+        removed = False
+        if revoke:
+            # atomic_write just made the previous file the .bak; it still opens with the
+            # key(s) this change was meant to revoke, and holds every item
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(self.path + ".bak")
+                removed = True
+            _fsync_dir(os.path.dirname(os.path.abspath(self.path)))
+        self.bak_removed = removed
+        self._emit("store_rekeyed", wraps=len(wraps), bak_removed=removed)
