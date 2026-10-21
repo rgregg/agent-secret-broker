@@ -11,8 +11,9 @@ It matters most for secrets set to `approval: allow`: there it decides whether
 the request is released without a prompt (see `risk.auto_approve_max`).
 
 One exception: creating a new credential (`store`) is always low. It cannot
-read or alter anything that exists, and it is never auto-approved. Updating an
-existing credential still takes the model's verdict (or high).
+read or alter anything that exists, so it needs no tap unless `store.create` is
+`prompt` (see broker._auto_allowed). Updating an existing credential still takes
+the model's verdict (or high) and always needs a human.
 
 Two more floors need no model: an SSH signature and an agent's guidance proposal are
 always high.
@@ -57,7 +58,7 @@ def assess(mode, names, spec, analyzer=None, guidance=None):
         # adding a credential cannot read or change an existing one, and a human
         # always approves it, so it is low whatever the model thinks
         return {"level": "low", "model": model_risk, **out,
-                "reasons": ["adds a new credential (a human approves every store)"]}
+                "reasons": ["adds a new credential (it cannot read or change an existing one)"]}
     if mode == "ssh_sign":
         # a signature authenticates as the user to a server: high whatever the model says
         return {"level": "high", "model": model_risk, **out,

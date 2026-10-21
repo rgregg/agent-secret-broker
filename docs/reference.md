@@ -962,7 +962,8 @@ and useless without your SSO session).
 
 ## Storing and updating credentials
 
-An agent can add or rotate credentials, always with a fresh approval:
+An agent can add or rotate credentials. Rotating always needs a fresh approval;
+creating a new one does not unless `store.create` is `prompt` (below):
 
     printf '%s' "$NEW_TOKEN" | asb store myapi --hosts api.example.com [--field notes] [--item "Vault item"]
     printf '%s' "$NEW_TOKEN" | asb update myapi
