@@ -13,7 +13,7 @@ import threading
 
 from .backends import BackendConfigError, registry
 from .broker import Broker, serve
-from . import grants, notify, presence, proposals, request_details, risk, riskmodel
+from . import credreq, grants, notify, presence, proposals, request_details, risk, riskmodel
 
 
 def _read(path):
@@ -47,6 +47,7 @@ def main():
     grants.parse_config(cfg.get("timed_grants"))            # fail at startup, naming the field
     request_details.parse_config(cfg.get("request_details"))    # fail at startup, naming the field
     proposals.parse_config(cfg.get("guidance_proposals"))   # fail at startup, naming the field
+    credreq.parse_config(cfg.get("credential_requests"))    # fail at startup, naming the field
     try:
         backend = build_backend(cfg)
     except BackendConfigError as e:

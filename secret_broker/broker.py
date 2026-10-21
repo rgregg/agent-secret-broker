@@ -47,6 +47,7 @@ from . import icon as icon_mod
 from . import standing as standing_mod
 from . import guidance as guidance_mod
 from . import proposals as proposals_mod
+from . import credreq as credreq_mod
 from . import sshhosts as sshhosts_mod
 from . import sshrules as sshrules_mod
 from . import risk as risk_mod
@@ -119,7 +120,7 @@ class Request:
     def __init__(self, mode, names, spec, source, ttl, peer=None):
         self.id = secrets.token_urlsafe(16)
         self.nonce = secrets.token_urlsafe(24)
-        self.mode = mode          # "env" | "http" | "store" | "ssh_sign" | "guidance"
+        self.mode = mode          # "env" | "http" | "store" | "ssh_sign" | "guidance" | "credential"
         self.names = names
         self.spec = spec
         self.source = source      # client-claimed
@@ -208,6 +209,7 @@ class Broker(sshrules_mod.SshRulesMixin):
             self.log("config_warning", warning=warn)
         self._default_auto_modes = risk_mod.parse_auto_modes(config.get("risk"), "risk")
         self.proposals_cfg = proposals_mod.parse_config(config.get("guidance_proposals"))
+        self.credreq_cfg = credreq_mod.parse_config(config.get("credential_requests"))
         # guidance applies: vault writes are serialized and spaced; transient errors are retried.
         # The clock, sleep and jitter are attributes so tests can drive them.
         self._gwrite_lock = threading.Lock()
@@ -503,7 +505,8 @@ class Broker(sshrules_mod.SshRulesMixin):
                          "webpush_actions": "webpush" in notifiers and self.push is not None,
                          "auto_approve_max": self._auto_max,
                          "timed_grants": bool(self.grants_cfg["enabled"]),
-                         "guidance_proposals": bool(self.proposals_cfg["enabled"])},
+                         "guidance_proposals": bool(self.proposals_cfg["enabled"]),
+                         "credential_requests": bool(self.credreq_cfg["enabled"])},
         }
 
     def _refresh_if(self, stale_after, wait=True):
@@ -553,6 +556,12 @@ class Broker(sshrules_mod.SshRulesMixin):
                        hosts=sp.get("allowed_hosts"), value_bytes=sp.get("value_bytes"))
         elif req.mode == "guidance":
             pass                # names and mode only; the proposal text is never logged
+        elif req.mode == "credential":
+            sp = req.spec       # kind, suggestions and the purpose's length and hash; never the purpose or a value
+            for k, v in (("cred_kind", sp["kind"]), ("cred_mode", sp["cred_mode"]), ("hosts", sp.get("hosts")),
+                         ("purpose_length", len(sp["purpose"])),
+                         ("purpose_sha256", credreq_mod.purpose_digest(sp["purpose"]))):
+                rec.setdefault(k, v)    # an event's own extra fields (the final hosts) win
         elif req.mode == "ssh_sign":
             sp = req.spec
             rec.update(ssh_kind=sp["ssh"]["kind"], ssh_what=sp["ssh"]["text"],
@@ -949,7 +958,8 @@ class Broker(sshrules_mod.SshRulesMixin):
     # -- request lifecycle ------------------------------------------------
     def create(self, mode, names, spec, source, peer=None):
         try:
-            self._refresh_if(0 if (mode != "store" and any(n not in self.cfg["secrets"] for n in names))
+            self._refresh_if(0 if (mode not in ("store", "credential")
+                                   and any(n not in self.cfg["secrets"] for n in names))
                              else self.CATALOG_TTL)
             secrets_cfg = self.cfg["secrets"]
             if mode == "env":
@@ -961,6 +971,8 @@ class Broker(sshrules_mod.SshRulesMixin):
                 self._validate_proposal(names, spec)
             elif mode == "store":
                 self._validate_store(names, spec)
+            elif mode == "credential":
+                self._validate_credential(names, spec)
             else:
                 if not names or any(n not in secrets_cfg for n in names):
                     if not self._backend_ok:
@@ -1002,11 +1014,17 @@ class Broker(sshrules_mod.SshRulesMixin):
                 if sum(r.status == "pending" and r.mode != "guidance"
                        for r in self._by_id.values()) >= MAX_PENDING:
                     err = "too many pending requests"
+                if mode == "credential":
+                    open_cr = [r for r in self._by_id.values() if r.status == "pending" and r.mode == "credential"]
+                    if len(open_cr) >= credreq_mod.MAX_PENDING:
+                        err = "too many pending credential requests"
+                    elif any(names[0] in r.names for r in open_cr):
+                        err = f"a request for {names[0]} is already waiting for the human"
                 now = time.time()
                 for n in names:
                     if now - self._denied_at.get(n, 0) < DENY_COOLDOWN:
                         err = f"{n} was denied recently; try again later"
-                ttl = self.cfg.get("ttl_seconds", 120)
+                ttl = self.credreq_cfg["ttl_s"] if mode == "credential" else self.cfg.get("ttl_seconds", 120)
             if err is None:
                 req = Request(mode, names, spec, source, ttl, peer)
                 self._by_id[req.id] = req
@@ -1021,6 +1039,8 @@ class Broker(sshrules_mod.SshRulesMixin):
         self.warm_backend()
         if mode == "guidance":
             return self._propose(req)
+        if mode == "credential":
+            return self._credential_pending(req)
         # ssh_sign never reaches a model, so it carries no guidance either
         notes = {} if mode == "ssh_sign" else guidance_mod.for_names(self.cfg["secrets"], names)
         a = risk_mod.assess(mode, names, spec, self.summarizer, guidance=notes or None)
@@ -1148,6 +1168,171 @@ class Broker(sshrules_mod.SshRulesMixin):
                    applied=len(res["applied"]), denied=len(res["denied"]), failed=len(res["failed"]),
                    applied_names=res["applied"], denied_names=res["denied"], failed_names=res["failed"],
                    failed_classes=[req.gclasses.get(n, "other") for n in res["failed"]])
+
+    def _validate_credential(self, names, spec):
+        """Validate an agent's credential request and rewrite `spec` to what the card shows.
+        There is no value here by design: the human types it on the approval page."""
+        if not self.credreq_cfg["enabled"]:
+            raise PermissionError("credential requests are disabled")
+        if len(names) != 1 or not isinstance(names[0], str) or not _NAME_RE.match(names[0]):
+            raise ValueError("secret name must be 1-41 chars of a-z 0-9 _ - ")
+        bad = [k for k in credreq_mod.FORBIDDEN_KEYS if k in spec]
+        if bad:
+            raise ValueError("a credential request never carries a value: the human enters it on the "
+                             "approval page")
+        name = names[0]
+        if name in self.cfg["secrets"]:
+            raise ValueError(f"{name} already exists; to replace its value use `asb update {name}`")
+        kind = spec.get("kind")
+        if kind not in credreq_mod.KINDS:
+            raise ValueError("kind must be token or login")
+        mode = spec.get("cred_mode") or "http"
+        if mode not in credreq_mod.MODES:
+            raise ValueError("mode must be http or env")
+        purpose = credreq_mod.validate_purpose(spec.get("purpose"))
+        hosts = spec.get("hosts") or []
+        if (not isinstance(hosts, list) or len(hosts) > 10
+                or not all(isinstance(h, str) and _HOST_RE.match(h) for h in hosts)):
+            raise ValueError("hosts must be up to 10 plain hostnames")
+        var = spec.get("var")
+        if var is not None and (not isinstance(var, str) or not _VAR_RE.match(var)
+                                or _DANGEROUS_VAR_RE.match(var)):
+            raise ValueError("variable must look like MY_TOKEN")
+        for v in credreq_mod.default_vars(name, kind, var).values():
+            if not _VAR_RE.match(v) or _DANGEROUS_VAR_RE.match(v):
+                raise ValueError("variable must look like MY_TOKEN")
+        spec.clear()
+        spec.update(kind=kind, cred_mode=mode, purpose=purpose,
+                    hosts=sorted(set(h.lower() for h in hosts)), var=var)
+
+    def _credential_pending(self, req):
+        """Hand a validated request to the human. High by code with no model call, never
+        auto-approved, notified by name only with no action buttons: only the approval page
+        can decide it, after the human typed the value there."""
+        a = risk_mod.assess("credential", req.names, {}, None)
+        req.risk = {k: a[k] for k in ("level", "model", "reasons")}
+        self.audit("assessed", req, model=None, reasons=a["reasons"], summary_source=None,
+                   summary_reason=None)
+        try:
+            self._push(req)
+        except (NotifyError, OSError) as e:
+            self._finish(req, "failed", error=f"could not notify: {e}")
+        return req
+
+    def _credential_check(self, req, form):
+        """The human's submission -> (final, secret, errors). `form` maps field -> str. Nothing
+        is stored or claimed here; on any error the request stays pending and the page is shown
+        again WITHOUT the secret. `final` is the non-secret outcome (name, item, field, hosts,
+        vars, kind, mode); `secret` is {"token": ..} or {"username": .., "password": ..}."""
+        errs, sp = [], req.spec
+        one = lambda k: form.get(k) if isinstance(form.get(k), str) else ""  # noqa: E731
+        name = one("name").strip()
+        if not _NAME_RE.match(name):
+            errs.append("name must be 1-41 chars of a-z 0-9 _ -")
+        elif name in self.cfg["secrets"]:
+            errs.append(f"{name} already exists; choose another name (to replace a value use `asb update`)")
+        mode = one("cred_mode") or sp["cred_mode"]
+        if mode not in credreq_mod.MODES:
+            errs.append("mode must be http or env")
+            mode = sp["cred_mode"]
+        hosts, raw_hosts = [], re.split(r"[,\s]+", one("hosts").strip().lower())
+        for h in raw_hosts:
+            if not h:
+                continue
+            if "://" in h:
+                h = urllib.parse.urlsplit(h).hostname or ""
+            if not _HOST_RE.match(h):
+                errs.append("hosts must be plain host names, separated by commas or spaces")
+                break
+            hosts.append(h)
+        hosts = sorted(set(hosts))
+        if len(hosts) > 10:
+            errs.append("at most 10 hosts")
+        no_hosts = one("no_hosts") == "1"
+        if not hosts and not (mode == "env" and no_hosts):
+            errs.append("allowed hosts are required, so the credential can only be sent where you intend "
+                        "(or choose mode env and tick the no-host-restriction box)")
+        if hosts and no_hosts:
+            errs.append("either list hosts or tick no host restriction, not both")
+        var = one("var").strip() or None
+        var = var.upper() if var else None
+        if var is not None and (not _VAR_RE.match(var) or _DANGEROUS_VAR_RE.match(var)):
+            errs.append("variable must look like MY_TOKEN (and not a name that changes how processes run)")
+            var = None
+        kind = sp["kind"]
+        secret = {}
+        if kind == "login":
+            user, pw = one("username").strip(), one("password").rstrip("\r\n")
+            if not user or not pw:
+                errs.append("enter both the username and the password")
+            secret = {"username": user, "password": pw}
+        else:
+            tok = one("token").strip()
+            if not tok:
+                errs.append("enter the token")
+            secret = {"token": tok}
+        for k, v in secret.items():
+            if "\x00" in v or len(v) > credreq_mod.MAX_SECRET_CHARS or (
+                    k != "password" and re.search(r"[\x00-\x1f\x7f]", v)):
+                errs.append(f"the {k} is too long or contains control characters")
+                secret[k] = ""
+        item = name
+        vars_ = credreq_mod.default_vars(name, kind, var) if _NAME_RE.match(name) else {}
+        for v in vars_.values():
+            if not _VAR_RE.match(v) or _DANGEROUS_VAR_RE.match(v):
+                errs.append("variable must look like MY_TOKEN")
+                break
+        for other, sc in self.cfg["secrets"].items():
+            for ref in sc["vars"].values():
+                if ref["item"] == item:
+                    errs.append(f"vault item {item!r} is already used by {other}")
+                    break
+        final = {"name": name, "item": item, "field": "notes", "kind": kind, "cred_mode": mode,
+                 "hosts": hosts, "no_hosts": bool(no_hosts and not hosts), "vars": vars_,
+                 "var_input": var}
+        if not errs:
+            # dry-run the metadata exactly as the catalog will read it back
+            try:
+                self._entry(item, self._credential_meta(final, "check"))
+            except ValueError as e:
+                errs.append(str(e)[:160])
+        values = {"name": name, "hosts": ", ".join(hosts), "var": one("var").strip(),
+                  "cred_mode": mode, "no_hosts": "1" if no_hosts else ""}
+        return final, secret, errs, values
+
+    @staticmethod
+    def _credential_meta(final, by):
+        """The broker metadata for a new credential-request item (the catalog entry)."""
+        field = final["field"]
+        vars_ = ({v: {"field": field, "key": role} for role, v in final["vars"].items()}
+                 if final["kind"] == "login" else {v: {"field": field} for v in final["vars"].values()})
+        return {"name": final["name"], "vars": vars_, "allowed_hosts": final["hosts"], "approval": "prompt",
+                "created": {"by": by, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}}
+
+    def submit_credential(self, rid, form, actor, *, peer=None, client_ip=None):
+        """The human pressed Store. Validates the submission and, only if it is complete and
+        valid, decides the request (approve) with the value; the vault write then runs in the
+        background like any release. Returns (code, req, errors, values): 200 accepted; 422 a
+        problem the human can fix (request still pending, nothing claimed, errors and the
+        non-secret values to show again); 404/410 unknown or already handled. The secret is
+        never logged or returned."""
+        with self._lock:
+            self._expire_locked()
+            req = self._by_id.get(rid)
+            if req is None or req.mode != "credential":
+                return 404, None, [], {}
+            if req.status != "pending":
+                return 410, req, [], {}
+        final, secret, errs, values = self._credential_check(req, form)
+        if errs:
+            self.audit("credential_refused", req, approver=actor, approver_ip=client_ip,
+                       problems=len(errs))
+            return 422, req, errs, values
+        code, done = self.decide_via("dashboard", rid, "approve", actor, peer=peer, client_ip=client_ip,
+                                     credential=(final, secret))
+        if done is None:
+            return (410 if code in (404, 410) else code), req, [], values
+        return 200, done, [], values
 
     def _validate_store(self, names, spec):
         """Validate (and fill defaults for) a request to create/update a credential."""
@@ -1364,6 +1549,8 @@ class Broker(sshrules_mod.SshRulesMixin):
         elif req.mode == "guidance":
             k = len(req.names)
             what = f"Guidance change proposed for {k} credential{'' if k == 1 else 's'}"
+        elif req.mode == "credential":
+            what = f"Credential requested: {req.names[0]}"
         elif req.mode == "ssh_sign":
             what = "\n".join([f"SSH key {req.spec['fingerprint']}: {req.spec['ssh']['text']}"]
                              + sshkey.host_lines(req.spec.get("host")))
@@ -1376,12 +1563,15 @@ class Broker(sshrules_mod.SshRulesMixin):
         if req.mode == "guidance":      # names only: no proposal text, no model-written summary
             msg = f"{what}\nFrom {req.source}. Review each entry on the approval page."
             title = "Guidance proposal [HIGH]"
+        elif req.mode == "credential":  # name only: no purpose (untrusted agent text), never a value
+            msg = f"{what}\nFrom {req.source}. Open the approval page to enter the value or deny."
+            title = "Credential requested [HIGH]"
         n = notify_mod.make_notification(
             rid=req.id, tag=f"secret-{req.id[:8]}", title=title, text=msg, names=req.names,
             risk=req.risk["level"] if req.risk else None, url=url, source=req.source,
             summary=req.summary, expires_at=req.expires, transport=self.notifier,
             default_policy=self.action_policy)
-        if req.mode == "guidance":
+        if req.mode in ("guidance", "credential"):
             # no buttons on any transport: only the dashboard or the link page can decide
             n = dataclasses.replace(n, actions=[], action_token=None, transport_actions={
                 id(leaf): [] for leaf in notify_mod.leaves(self.notifier)})
@@ -1639,6 +1829,7 @@ class Broker(sshrules_mod.SshRulesMixin):
                 r.status = "expired"
                 if r.mode == "store":
                     r.spec["value"] = None
+                r.spec.pop("secret", None)
                 self.audit("expired", r)
                 if r.mode == "guidance":
                     r.result = proposals_mod.outcome(r, "expired")
@@ -1657,6 +1848,7 @@ class Broker(sshrules_mod.SshRulesMixin):
             req.status, req.error, req.result = status, error, result
             if req.mode == "store":
                 req.spec["value"] = None        # never keep a credential longer than needed
+            req.spec.pop("secret", None)
             if req.mode == "guidance" and req.result is None:
                 req.result = proposals_mod.outcome(req, status)
         if status == "denied" and req.mode != "guidance":
@@ -1757,7 +1949,7 @@ class Broker(sshrules_mod.SshRulesMixin):
 
     def decide_via(self, channel, rid, decision, actor, *, token=None, always=False,
                    nonce=None, peer=None, client_ip=None, grant_minutes=None, ssh_rule=None,
-                   apply=None, **audit_extra):
+                   apply=None, credential=None, **audit_extra):
         """The single entry for every decision. Returns (http_status, req):
         200 decided; 403 wrong/missing token; 404 unknown; 410 already decided,
         expired or token spent (no state change). `decision` is "approve" or
@@ -1820,7 +2012,8 @@ class Broker(sshrules_mod.SshRulesMixin):
                             match = r
                     if match is None:
                         code, refused_log = (403 if cands else 410), True
-                    elif ch.token_required and (decision not in match.offered or match.mode == "guidance"):
+                    elif ch.token_required and (decision not in match.offered
+                                                or match.mode in ("guidance", "credential")):
                         # Token is valid but this action was never offered (action
                         # policy): refuse like a bad token and do NOT spend it.
                         code, refused_log, unoffered = 403, True, match
@@ -1838,6 +2031,16 @@ class Broker(sshrules_mod.SshRulesMixin):
                         req, code = None, 400   # nothing is claimed or changed
                     else:
                         req.apply = sel
+                if req is not None and req.mode == "credential":
+                    # approval needs the human's validated entry (see submit_credential) and carries
+                    # no Always, grant or SSH rule; a denial needs nothing
+                    if always or grant_minutes is not None or ssh_rule is not None or (
+                            approve and credential is None):
+                        req, code = None, 400   # nothing is claimed or changed
+                    elif approve:
+                        req.spec["final"], req.spec["secret"] = credential
+                elif req is not None and credential is not None:
+                    req, code = None, 400
                 if req is not None and ssh_rule is not None:
                     ok_r, cls_r = self.ssh_rule_eligibility(req)
                     if not ok_r:
@@ -2146,6 +2349,14 @@ class Broker(sshrules_mod.SshRulesMixin):
                                token=token or "", peer=peer, client_ip=client_ip)
 
     def _release_and_finish(self, req, who):
+        if req.mode == "credential":
+            try:
+                result = self._credential_store(req, who)
+            except Exception as e:  # noqa: BLE001 -- the request must always settle; never repeat the value
+                self._finish(req, "failed", error=self._credential_error(req, e), **who)
+                return
+            self._finish(req, "approved", result=result, **who)
+            return
         if req.mode == "guidance":
             try:
                 result = self._apply_proposal(req, who)
@@ -2212,7 +2423,51 @@ class Broker(sshrules_mod.SshRulesMixin):
         self.audit("stored", req, duration_ms=int((time.time() - t0) * 1000))
         return {"stored": {"name": name, "op": sp["op"], "item": sp["item"], "field": sp["field"]}}
 
+    def _credential_error(self, req, exc):
+        """A short error for a failed credential write: the exception text with any entered
+        value removed (backends never put a value in an error; this is the second belt)."""
+        text = f"{type(exc).__name__}: {exc}"
+        for v in (req.spec.get("secret") or {}).values():
+            if v:
+                text = text.replace(v, "***")
+        if isinstance(exc, backend_base.BackendConflict):
+            text = "the vault item already exists (nothing was stored)"
+        elif isinstance(exc, backend_base.NotSupported):
+            text = "this backend cannot create credentials (nothing was stored)"
+        return "store failed: " + text[:160]
+
+    def _credential_store(self, req, who):
+        """Create the vault item for a credential request: ONE atomic backend create holding
+        the value and its broker metadata, then the live catalog entry. A login keeps its
+        two values as one JSON note (see structured.py), exposed as two variables by key."""
+        fin, sec = req.spec["final"], req.spec["secret"]
+        name = fin["name"]
+        by = req.approver or "unknown"
+        t0 = time.time()
+        meta = self._credential_meta(fin, by)
+        value = (json.dumps({"username": sec["username"], "password": sec["password"]})
+                 if fin["kind"] == "login" else sec["token"])
+        if len(value.encode()) > MAX_STORE_VALUE:
+            raise ValueError(f"value is larger than {MAX_STORE_VALUE} bytes")
+        self.audit("credential_provided", req, approver=by, cred_kind=fin["kind"], cred_mode=fin["cred_mode"],
+                   hosts=fin["hosts"], no_hosts=fin["no_hosts"], var_names=sorted(fin["vars"].values()),
+                   requested_name=req.names[0], edited=sorted(
+                       k for k, same in (("name", name == req.names[0]),
+                                         ("hosts", fin["hosts"] == req.spec.get("hosts")),
+                                         ("cred_mode", fin["cred_mode"] == req.spec["cred_mode"])) if not same),
+                   value_bytes=len(value.encode()), **{k: v for k, v in who.items() if k == "channel"})
+        self.backend.put(fin["item"], fin["field"], value, create=True, meta=meta)
+        _, entry = self._entry(fin["item"], meta)
+        with self._cfg_lock:
+            self.cfg["secrets"][name] = entry
+        req.names = [name]
+        self.audit("stored", req, op="create", item=fin["item"], field=fin["field"], hosts=fin["hosts"],
+                   value_bytes=len(value.encode()), duration_ms=int((time.time() - t0) * 1000))
+        return {"stored": {"name": name, "op": "create", "item": fin["item"], "field": fin["field"]}}
+
     def _release(self, req):
+        if req.mode == "credential":    # stored only by _credential_store, after a human decision
+            raise BackendError("credential requests are stored only by a human decision")
         if req.mode == "guidance":      # applied only by _apply_proposal, after a human decision
             raise BackendError("guidance proposals are applied only by a human decision")
         if req.mode == "store":
@@ -2291,7 +2546,8 @@ class Broker(sshrules_mod.SshRulesMixin):
             else:
                 delivered = False
         if delivered:
-            self.audit("delivered", req, to_peer=peer, kind={"env": "env", "ssh_sign": "ssh_signature"}.get(req.mode, "http_response"))
+            self.audit("delivered", req, to_peer=peer, kind={"env": "env", "ssh_sign": "ssh_signature",
+                                                             "credential": "stored"}.get(req.mode, "http_response"))
             return {"status": "approved", **(out or {})}
         if req.status == "released":
             return {"status": "released"}
@@ -3257,7 +3513,7 @@ def _page(h, code, body, wide=False, nav=True, script=None, tab=None, badge=0, u
            f"<link rel=icon href=\"{_ICON}\">"
            f"<link rel=apple-touch-icon sizes=180x180 href=\"{_ICON_PNG_URI}\">"
            "<link rel=manifest href=/manifest.webmanifest crossorigin=use-credentials>"
-           f"<style>{_CSS}{scripts_mod.CSS}{details_mod.CSS}{proposals_mod.CSS}</style><body>{_chrome(tab, badge, user) if nav else ''}"
+           f"<style>{_CSS}{scripts_mod.CSS}{details_mod.CSS}{proposals_mod.CSS}{credreq_mod.CSS}</style><body>{_chrome(tab, badge, user) if nav else ''}"
            f"<main class='{'wide' if wide else 'narrow'}'>{_SIGNED_OUT if nav else ''}{body}</main>{scr}</body></html>").encode()
     h.send_response(code)
     h.send_header("Content-Type", "text/html; charset=utf-8")
@@ -3286,6 +3542,8 @@ def _describe(req):
                 "previous_value field. This will not run without your approval.")
     if req.mode == "guidance":
         return proposals_mod.describe_html(req)
+    if req.mode == "credential":
+        return credreq_mod.describe_html(req)
     if req.mode == "ssh_sign":
         host = "".join("<br>" + html.escape(x) for x in sshkey.host_lines(req.spec.get("host")))
         return (f"SSH signature with key <code>{html.escape(req.spec['fingerprint'])}</code><br>"
@@ -3333,7 +3591,7 @@ def _iso(t):
 _CHANNEL_LABEL = {"dashboard": "web dashboard", "push": "browser push notification",
                   "ha": "Home Assistant", "link": "approval link"}
 _MODE_LABEL = {"http": "web", "env": "run-with-secret", "ssh_sign": "ssh signing",
-               "guidance": "guidance proposal"}
+               "guidance": "guidance proposal", "credential": "credential request"}
 _AUTO_LABEL = {"none": "off (every request asks a human)", "low": "up to low risk",
                "medium": "up to medium risk",
                "high": "any risk level, including requests with no model verdict"}
@@ -3346,6 +3604,8 @@ def _approve_actions(broker, req):
     when the request is eligible; the form values are unchanged."""
     if req.mode == "guidance":      # no Always, no timed grant, no approve-everything button
         return proposals_mod.actions_html(broker, req)
+    if req.mode == "credential":    # open the entry page, or deny; never an Approve button here
+        return credreq_mod.card_actions_html(req)
     e = html.escape
     names = e(", ".join(req.names))
     row1 = ("<div class=decide-row><button class='btn approve' name=decision value=approve>"
@@ -3488,6 +3748,21 @@ def _detail_html(r, evs, retained=""):
         add("Allowed hosts", ", ".join(r["hosts"] or []))
         if (last("stored") or {}).get("value_bytes") is not None:
             add("Value size", f"{last('stored')['value_bytes']} bytes (never recorded)")
+    elif r["mode"] == "credential":
+        # kind, hosts, variable names and sizes only: the purpose text and the value are not retained
+        req_ev, prov, st = first("requested") or {}, last("credential_provided") or {}, last("stored") or {}
+        add("Operation", "credential request (agent asked, a human supplied the value)")
+        add("Kind", req_ev.get("cred_kind"))
+        add("Requested name", prov.get("requested_name") or (r["names"][0] if r["names"] else None))
+        add("Stored as", ", ".join(r["names"]) if st else None)
+        add("Purpose", f"not retained ({req_ev.get('purpose_length', '?')} characters, sha256 "
+            f"<code>{e(str(req_ev.get('purpose_sha256') or ''))}</code>)", True)
+        add("Suggested hosts", ", ".join(req_ev.get("hosts") or []))
+        add("Allowed hosts", ", ".join(st.get("hosts") or []) if st else None)
+        add("Variables", ", ".join(prov.get("var_names") or []))
+        add("Edited by the human", ", ".join(prov.get("edited") or []) or ("none" if prov else None))
+        if st.get("value_bytes") is not None:
+            add("Value size", f"{st['value_bytes']} bytes (never recorded)")
     elif r["mode"] == "guidance":
         # names, counts, lengths and hash prefixes only: the proposed text is not retained
         prop, res = first("guidance_proposed") or {}, last("guidance_proposal_result") or {}
@@ -3658,8 +3933,11 @@ def client_handler(broker, client_key):
         def do_POST(self):
             if self.path.split("?")[0] == "/v1/hooks/ha/decide":
                 return self._ha_decide()
-            if not self._authed() or self.path != "/v1/requests":
+            if not self._authed():
                 return
+            if self.path != "/v1/requests":
+                # the client API has exactly one POST endpoint, and it takes no secret value
+                return _json(self, 404, {"error": "not found"})
             try:
                 n = int(self.headers.get("Content-Length", 0))
                 if n > MAX_REQUEST_BYTES:
@@ -3686,6 +3964,14 @@ def client_handler(broker, client_key):
                             "field": body.get("field"), "item": body.get("item"),
                             "var": body.get("var"), "allowed_hosts": body.get("allowed_hosts"),
                             "ssh": body.get("ssh") is True}
+                elif mode == "credential":
+                    if any(k in body for k in credreq_mod.FORBIDDEN_KEYS):
+                        # the human types the value on the approval page; never accept one here
+                        raise ValueError("a credential request never carries a value: the human enters "
+                                         "it on the approval page")
+                    spec = {"kind": body.get("kind"), "purpose": body.get("purpose"),
+                            "hosts": body.get("hosts"), "var": body.get("var"),
+                            "cred_mode": body.get("cred_mode")}
                 elif mode == "ssh_sign":
                     spec = {"data_b64": body.get("data_b64"), "flags": body.get("flags", 0),
                             "binds": body.get("binds"), "claimed_dest": body.get("claimed_dest"),
@@ -3704,6 +3990,12 @@ def client_handler(broker, client_key):
                 return _json(self, 403, {"error": str(e)})
             _json(self, 202, {"id": req.id, "status": req.status, "error": req.error,
                               "expires_in": int(req.expires - time.time())})
+
+        def _no_write(self):
+            if self._authed():
+                _json(self, 405, {"error": "method not allowed"})
+
+        do_PUT = do_PATCH = do_DELETE = _no_write
 
         def do_GET(self):
             if not self._authed():
@@ -3851,7 +4143,7 @@ def approval_handler(broker):
                 if arg("outcome") in OUTCOMES + ("unknown",) and arg("outcome") != "pending":
                     a["outcome"] = arg("outcome")
                 a["secret"] = arg("secret")
-                if arg("mode") in ("http", "env", "store", "ssh_sign", "guidance"):
+                if arg("mode") in ("http", "env", "store", "ssh_sign", "guidance", "credential"):
                     a["mode"] = arg("mode")
             try:
                 n = int(arg("limit") or HIST_PAGE)
@@ -3877,6 +4169,8 @@ def approval_handler(broker):
                     what = f"{r['op'] or 'store'} credential"
                 elif r["mode"] == "ssh_sign":
                     what = r.get("ssh_what") or "ssh signature"
+                elif r["mode"] == "credential":
+                    what = "credential request"
                 elif r["mode"] == "guidance":
                     what = f"guidance proposal ({len(r['names'])} credential{'' if len(r['names']) == 1 else 's'})"
                 else:
@@ -3925,7 +4219,7 @@ def approval_handler(broker):
                     f"<select name=secret aria-label=Secret>"
                     f"{opt(broker.history.secrets_seen(), a['secret'], 'any secret')}</select>"
                     f"<select name=mode aria-label=Mode>"
-                    f"{opt(('http', 'env', 'store', 'ssh_sign', 'guidance'), a['mode'], 'any mode')}</select>"
+                    f"{opt(('http', 'env', 'store', 'ssh_sign', 'guidance', 'credential'), a['mode'], 'any mode')}</select>"
                     "<noscript><button>Filter</button></noscript></form>")
             return ("<section id=recent><h3>History</h3><div class='card flush'>"
                     f"{form}{self._hist_list(a, pend_ids)}</div></section>")
@@ -3987,6 +4281,61 @@ def approval_handler(broker):
             msg = (f"Details are kept for {days} day{'' if days == 1 else 's'} and have expired."
                    if state == "expired" else "Request details are not available for this request.")
             return f"<p class=muted><small>{html.escape(msg)}</small></p>"
+
+        def _credential_page(self, req, user, status=200, values=None, errors=()):
+            """The credential entry page. Served only to the authenticated approver. The secret
+            fields are never filled in, so an error re-render cannot echo the value."""
+            body = credreq_mod.form_html(req, broker.csrf_token(user), values, errors)
+            _page(self, status, body, tab="requests", badge=len(broker.pending()), user=user)
+
+        def _credential_get(self, user, rid):
+            r = broker._by_id.get(rid)
+            if r is None or r.mode != "credential" or r.status != "pending" or time.time() > r.expires:
+                return _page(self, 404, "<h1>Request not found or already handled</h1>", tab="requests",
+                             badge=len(broker.pending()), user=user)
+            broker.log("approval_viewed", user=user, peer=self.client_address[0], client_ip=self._fwd(),
+                       request_id=r.id, found=True)
+            self._credential_page(r, user)
+
+        def _credential_post(self, user, form):
+            """POST /credential (CSRF already checked): deny, or store what the human typed."""
+            rid = form.get("id", [""])[0][:64]
+            decision = form.get("decision", [""])[0]
+            peer, fwd = self.client_address[0], self._fwd()
+            r = broker._by_id.get(rid)
+            if r is None or r.mode != "credential" or decision not in ("approve", "deny"):
+                return self._redirect("/?note=stale")
+            if decision == "deny":
+                code, done = broker.decide_via("dashboard", rid, "deny", user, peer=peer, client_ip=fwd)
+                if done is None:
+                    return self._redirect("/?note=stale")
+                return _page(self, 200, "<h1>Denied</h1><p>Nothing was stored.</p>", tab="requests",
+                             badge=len(broker.pending()), user=user)
+            one = {k: v[0] for k, v in form.items() if k in (
+                "name", "hosts", "cred_mode", "no_hosts", "var", "token", "username", "password")}
+            code, done, errs, values = broker.submit_credential(rid, one, user, peer=peer, client_ip=fwd)
+            one.clear()
+            form.pop("token", None)
+            form.pop("password", None)
+            form.pop("username", None)
+            if code == 422:
+                return self._credential_page(r, user, 422, values, errs)
+            if done is None or code != 200:
+                return _page(self, 410 if code == 410 else 404,
+                             "<h1>Request not found or already handled</h1>", tab="requests",
+                             badge=len(broker.pending()), user=user)
+            done.done.wait(15)          # the vault write runs in the background; say how it ended
+            if done.status in ("approved", "released"):
+                return _page(self, 200, f"<h1>Stored</h1><p>The credential <b>{html.escape(done.names[0])}</b> "
+                             "is in the vault. The agent was told only its name. You can close this page.</p>",
+                             tab="requests", badge=len(broker.pending()), user=user)
+            if done.status == "failed":
+                return _page(self, 500, "<h1>Not stored</h1><p>The vault refused the write, so nothing "
+                             f"was stored: {html.escape(done.error or 'unknown error')}. The request has "
+                             "ended; ask the agent to request it again.</p>", tab="requests",
+                             badge=len(broker.pending()), user=user)
+            _page(self, 202, "<h1>Storing...</h1><p>The vault write is still running. Check the history "
+                  "on the Requests tab.</p>", tab="requests", badge=len(broker.pending()), user=user)
 
         def _fragment(self, code, body):
             raw = body.encode()
@@ -4205,6 +4554,8 @@ def approval_handler(broker):
                 keep = [("view", "all")] + [(k, (q.get(k) or [""])[0][:60])
                                             for k in ("outcome", "secret", "mode") if (q.get(k) or [""])[0]]
                 return self._redirect("/?" + urllib.parse.urlencode(keep))
+            if u.path.startswith("/credential/"):
+                return self._credential_get(user, u.path[len("/credential/"):][:64])
             if u.path.startswith("/request/"):
                 q = urllib.parse.parse_qs(u.query)
                 return self._request_detail(user, u.path[len("/request/"):],
@@ -4223,6 +4574,8 @@ def approval_handler(broker):
                 found=bool(req and req.status == "pending" and time.time() <= req.expires))
             if req is None or req.status != "pending" or time.time() > req.expires:
                 return _page(self, 404, "<h1>Request not found or already handled</h1>")
+            if req.mode == "credential":
+                return self._credential_page(req, user)
             what, note = _describe(req)
             summary_html = _risk_html(req)
             _page(self, 200, f"""
@@ -4392,13 +4745,14 @@ def approval_handler(broker):
                 return self._push_decide(user)
             path = self.path.split("?")[0].rstrip("/")
             # a guidance form can hold 2000 characters of percent-encoded text
-            limit = {"/policies/guidance": 40000, "/policies/ssh_hosts": sshhosts_mod.FORM_LIMIT}.get(path, 8192)
+            limit = {"/policies/guidance": 40000, "/policies/ssh_hosts": sshhosts_mod.FORM_LIMIT,
+                     "/credential": credreq_mod.FORM_LIMIT}.get(path, 8192)
             if (int(self.headers.get("Content-Length", 0)) > limit
-                    and path in ("/policies/guidance", "/policies/ssh_hosts")):
+                    and path in ("/policies/guidance", "/policies/ssh_hosts", "/credential")):
                 return _page(self, 413, "<h1>Too large</h1>")
             form = urllib.parse.parse_qs(
                 self.rfile.read(min(int(self.headers.get("Content-Length", 0)), limit)).decode())
-            if path in ("/decide", "/request/retry", "/policies", "/policies/guidance", "/policies/ssh_hosts", "/grants/revoke",
+            if path in ("/decide", "/credential", "/request/retry", "/policies", "/policies/guidance", "/policies/ssh_hosts", "/grants/revoke",
                         "/policies/ssh_rules/add", "/policies/ssh_rules/revoke", "/push/subscribe",
                         "/push/revoke", "/push/test") and not self._csrf_ok(user, form.get("csrf", [""])[0]):
                 broker.log("csrf_refused", path=path, peer=self.client_address[0],
@@ -4407,6 +4761,8 @@ def approval_handler(broker):
                 return _page(self, 403, "<h1>Forbidden</h1><p>Reload the page and try again.</p>")
             if path.startswith("/push/"):
                 return self._push_post(path, form, user)
+            if path == "/credential":
+                return self._credential_post(user, form)
             if path == "/decide":
                 rid = form.get("id", [""])[0]
                 decision = form.get("decision", [""])[0]
@@ -4525,6 +4881,10 @@ def approval_handler(broker):
                                            peer=self.client_address[0], client_ip=self._fwd())
                          if nonce and rule is not False else (404, None))
             held = broker._by_nonce.get(nonce) if nonce else None
+            if code == 400 and held is not None and held.mode == "credential":
+                return _page(self, 400, "<h1>Enter the value on the credential page</h1>"
+                             "<p>A credential request can only be approved by typing the value into its "
+                             "form. The request is still waiting.</p>")
             if code == 400 and held is not None and held.mode == "guidance":
                 return _page(self, 400, "<h1>Nothing selected</h1>"
                              "<p>Go back, tick at least one entry to apply (or press Deny all). "

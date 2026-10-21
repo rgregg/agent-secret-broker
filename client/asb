@@ -6,6 +6,8 @@
   asb store NAME --hosts H[,H] [--field F] [--item I] [--var V]  < value
   asb store NAME --ssh < private_key          move an SSH private key into the broker
   asb update NAME [--var V]                   < value
+  asb request-credential NAME --kind token|login --for "purpose" [--host H]... [--var V] [--mode http|env]
+                                              ask the human to enter a NEW credential (you never see it)
   asb which HOST|URL                          is a credential available? (no approval)
   asb status [--json]                         broker version, uptime, catalog health (no approval)
   asb audit [--request ID] [--event E[,E]] [--secret NAME] [--since 15m] [--tail] [--json]
@@ -93,6 +95,18 @@ Proposing risk guidance (you cannot set it; the human decides)
   Never ask for broader trust than the credential's real use justifies, and do not
   retry a denial.
 
+Asking the human for a credential you do not have (you never see the value)
+  asb request-credential myapi --kind token --for "read the Example API for the report" \\
+      --host api.example.com
+  asb request-credential mysite --kind login --for "log in to the admin portal" --host admin.example.com
+  The human gets a card on the approval page (and a phone notification with just the name),
+  types the secret there, can edit the name, hosts, variable and mode, and presses Store.
+  The broker stores it with approval on every use. You get only the stored name; then use it
+  as usual (asb list shows its variables): asb http NAME GET https://... -H 'Authorization: Bearer {{VAR}}'.
+  Exit 0 stored; 4 denied; 5 expired (about 15 minutes); 3 broker refused (name exists: use
+  `asb update`; invalid name; too many pending; disabled); 2 usage. Never put a secret in --for or
+  any argument, and do not retry a denial. A request is always high risk and always needs the human.
+
 Storing and rotating (value ONLY on stdin, never as an argument)
   printf '%s' "$VALUE" | asb store NAME --hosts a.example.com[,b] [--field F] [--item I] [--var V]
   printf '%s' "$VALUE" | asb update NAME [--var V]
@@ -176,6 +190,20 @@ Create a new credential. The value is read from stdin (or a hidden prompt on a
 terminal), never from an argument. --hosts is required: where it may be used.
 example: printf '%s' "$TOKEN" | asb store myapi --hosts api.example.com
 SSH key: asb store NAME --ssh < unencrypted_private_key   (no --hosts; use with asb ssh-agent)""",
+    "request-credential": """usage: asb request-credential NAME --kind token|login --for "purpose"
+                              [--host H[,H]]... [--var VAR] [--mode http|env]
+
+Ask the human to supply a credential the broker does not have yet. You never see the value:
+they type it on the approval page, which stores it in the vault. --kind token is one API
+token or key; login is a username and password. --for says what it is for (one line, up to
+300 characters; the human sees it as your unverified claim). --host (repeatable, or comma
+separated) suggests the hosts it may be used against; the human confirms or edits them.
+--var suggests the placeholder name (for a login, the prefix of NAME_USERNAME and
+NAME_PASSWORD). --mode http (default) needs hosts; env may be used without hosts.
+Waits for the human (about 15 minutes), then prints "stored: NAME". Exit 0 stored, 4 denied,
+5 expired, 3 refused (the name exists: use `asb update`), 2 usage. Never reads stdin; never
+put a secret in an argument.
+example: asb request-credential myapi --kind token --for "read the Example API" --host api.example.com""",
     "update": """usage: asb update NAME [--var V]   < value
 
 Replace the value of an existing credential (asks for approval). Value on stdin.
@@ -265,7 +293,7 @@ def check_name(name, what="NAME"):
     return name
 
 
-def obtain(payload):
+def obtain(payload, waiting="waiting for approval on your phone..."):
     base, key = config()
     payload["source"] = f"{os.environ.get('USER', '?')}@{socket.gethostname()}"
     code, r = call(base, key, "/v1/requests", payload)
@@ -273,7 +301,7 @@ def obtain(payload):
         die(r.get("error", f"broker returned {code}"), EXIT_BROKER)
     if r["status"] in ("denied", "expired", "failed"):
         die(r.get("error") or r["status"], status_exit(r["status"]))
-    print("asb: waiting for approval on your phone...", file=sys.stderr)
+    print(f"asb: {waiting}", file=sys.stderr)
     deadline = time.time() + r["expires_in"] + 15
     while time.time() < deadline:
         code, r2 = call(base, key, f"/v1/requests/{r['id']}?wait=25")
@@ -369,6 +397,48 @@ def run_guidance(argv):
             _print_guidance(r2.get("guidance") or {})
             return _guidance_exit(r2)
     die("timed out waiting for approval", EXIT_EXPIRED)
+
+
+def run_request_credential(argv):
+    """asb request-credential NAME --kind token|login --for TEXT [--host H]... [--var V] [--mode M].
+    Nothing secret is read or sent: the human types the value on the approval page."""
+    if not argv:
+        die(HELP["request-credential"])
+    name, rest = check_name(argv[0]), argv[1:]
+    opts, hosts, i = {}, [], 0
+    while i < len(rest):
+        k = rest[i]
+        if k not in ("--kind", "--for", "--host", "--var", "--mode") or i + 1 >= len(rest):
+            die(f"unexpected argument {k!r}\n" + HELP["request-credential"])
+        v = rest[i + 1]
+        if k == "--host":
+            hosts += [h for h in v.split(",") if h]
+        elif k in opts:
+            die(f"{k} given twice")
+        else:
+            opts[k] = v
+        i += 2
+    if opts.get("--kind") not in ("token", "login"):
+        die("--kind must be token or login\n" + HELP["request-credential"])
+    if not opts.get("--for", "").strip():
+        die('--for "what it is for" is required\n' + HELP["request-credential"])
+    if len(opts["--for"]) > 300:
+        die("--for is limited to 300 characters")
+    mode = opts.get("--mode", "http")
+    if mode not in ("http", "env"):
+        die("--mode must be http or env")
+    if mode == "http" and not hosts:
+        die("--mode http needs at least one --host (use --mode env for a credential with no host)\n"
+            + HELP["request-credential"])
+    payload = {"mode": "credential", "names": [name], "kind": opts["--kind"], "purpose": opts["--for"],
+               "hosts": hosts, "cred_mode": mode}
+    if opts.get("--var"):
+        payload["var"] = opts["--var"]
+    r = obtain(payload, "waiting for the human to enter the credential on the approval page "
+                        "(you will not see the value)...")["stored"]
+    print(f"stored: {r['name']}")
+    print("asb: see `asb list` for its variables and hosts", file=sys.stderr)
+    return 0
 
 
 def read_body(arg):
@@ -1699,6 +1769,9 @@ def main(argv):
         print(f"stored: {r['name']} ({r['op']}) -> item {r['item']!r} field {r['field']}")
         return 0
 
+    if argv[0] == "request-credential":
+        return run_request_credential(argv[1:])
+
     if argv[0] == "fingerprint":
         if len(argv) != 2:
             die(HELP["fingerprint"])
@@ -1808,7 +1881,7 @@ def main(argv):
 
     if "--" not in argv:
         die(f"unknown command {argv[0]!r}.\ncommands: list, which, status, audit, http, store, update, "
-            "guidance, ssh-agent, fingerprint, help, guide; or: asb NAME -- command\n"
+            "request-credential, guidance, ssh-agent, fingerprint, help, guide; or: asb NAME -- command\n"
             "start with `asb guide`")
     i = argv.index("--")
     names, cmd = argv[0].split(",") if i == 1 else None, argv[i + 1:]

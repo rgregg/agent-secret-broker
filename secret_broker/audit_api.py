@@ -51,6 +51,7 @@ WHITELIST = {
                   "peer": ("peer", _S), "method": ("method", _S), "url": ("url", _S),
                   "argv": ("argv", _L), "op": ("op", _S), "field": ("field", _S),
                   "ssh_kind": ("ssh_kind", _S), "fingerprint": ("ssh_fingerprint", _S),
+                  "cred_kind": ("cred_kind", _S),
                   # env mode scripts the client reported: paths, hashes, sizes and marker
                   # classes describe the agent's own request; script text is never logged
                   "script_paths": ("script_paths", _L), "script_sha256": ("script_sha256", _L),
@@ -112,6 +113,9 @@ HIDDEN = frozenset({
     "push_test", "ha_decide_dropped",
     # server-identity policy (a key's allowed_hosts) is approval context
     "ssh_sign_refused",
+    # a credential request: the human's entry and any refused submission are approver activity;
+    # the agent sees `requested` (name, mode, kind) and `stored` (the name) and the outcome
+    "credential_provided", "credential_refused",
     # notification holding while the approver has a page open: presence is approval context
     "notify_held", "notify_released", "notify_dropped",
     # standing per-host SSH rules are approval policy: a rule-approved request shows as plain "approved",

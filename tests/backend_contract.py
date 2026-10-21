@@ -341,6 +341,26 @@ class BackendContract:
         self.b.put("Svc", "notes", "v", create=True, meta=meta)
         self.assertEqual(self.row("Svc"), {"item": "Svc", "meta": meta})
 
+    def test_credential_request_item_shapes_round_trip(self):
+        """What a human-supplied credential (docs/reference.md, credential requests) stores: a token
+        in `notes`, and a login as ONE JSON note read back by key. Value and metadata survive exactly."""
+        tok = {"name": "tokcred", "allowed_hosts": ["api.example.com"], "approval": "prompt",
+               "vars": {"TOKCRED_TOKEN": {"field": "notes"}},
+               "created": {"by": "alice", "at": "2026-01-02T03:04:05Z"}}
+        self.b.put("tokcred", "notes", SECRET, create=True, meta=tok)
+        self.assertEqual(self.b.get("tokcred", "notes"), SECRET)
+        self.assertEqual(self.row("tokcred"), {"item": "tokcred", "meta": tok})
+        login = json.dumps({"username": "u s\u00e9r", "password": 'p"w\\ \n' + OTHER})
+        lm = {"name": "logcred", "allowed_hosts": ["x.example.com"], "approval": "prompt",
+              "vars": {"LOGCRED_USERNAME": {"field": "notes", "key": "username"},
+                       "LOGCRED_PASSWORD": {"field": "notes", "key": "password"}}}
+        self.b.put("logcred", "notes", login, create=True, meta=lm)
+        self.assertEqual(json.loads(self.b.get("logcred", "notes")), json.loads(login))
+        self.assertEqual(self.row("logcred")["meta"], lm)
+        with self.assertRaises(BackendConflict):
+            self.b.put("logcred", "notes", "again", create=True, meta=lm)
+        self.assertEqual(json.loads(self.b.get("logcred", "notes")), json.loads(login))
+
     def test_nested_meta_round_trips_exactly(self):
         meta = {"vars": {"T": {"field": "notes", "key": "a.b"}}, "ssh_hosts": {"allowed": ["fp1"]},
                 "list": [1, 2.5, True, None, {"x": ["y"]}], "text": "caf\u00e9 \"quoted\" \\ n",

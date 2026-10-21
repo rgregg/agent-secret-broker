@@ -27,7 +27,10 @@ _EV_KEYS = ("reason", "reasons", "model", "risk", "error", "via", "channel", "de
             "rule_id", "account", "rule_host", "ssh_rule_requested", "decision_source",
             # guidance proposals: names, counts, lengths and hash prefixes; never text
             "entry_names", "entry_lengths", "entry_sha256", "applied", "denied", "failed",
-            "applied_names", "denied_names", "failed_names", "failed_classes", "count", "retry")
+            "applied_names", "denied_names", "failed_names", "failed_classes", "count", "retry",
+            # credential requests: kind, hosts and counts; never the purpose text or any value
+            "cred_kind", "cred_mode", "purpose_length", "purpose_sha256", "edited", "requested_name",
+            "var_names", "no_hosts")
 _MAX_EVENTS = 60            # per request
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 
@@ -135,6 +138,8 @@ class History:
         if ev == "assessed":
             row["risk_reasons"], row["risk_model"] = _clean(rec.get("reasons")), rec.get("model")
             row["summary_source"] = rec.get("summary_source")
+        if ev == "stored" and row["mode"] == "credential" and rec.get("names"):
+            row["names"] = rec["names"]     # the human may have renamed it on the card
         if rec.get("risk"):
             row["risk"] = rec["risk"]
         if rec.get("summary"):
