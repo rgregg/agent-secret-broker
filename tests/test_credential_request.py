@@ -250,7 +250,8 @@ class Happy(H):
     def test_login_is_stored_as_one_json_note_with_two_variables(self):
         r = self.ask("site", kind="login", hosts=["127.0.0.1"])
         _, form, _ = self.get(f"/credential/{r['id']}")
-        self.assertIn("type=password name=username", form)
+        self.assertIn("type=text name=username", form)
+        self.assertNotIn("type=password name=username", form)
         self.assertIn("type=password name=password", form)
         self.assertNotIn("name=token", form)
         status, body, _ = self.submit(r["id"], name="site", username=USR, password=PW, token="")

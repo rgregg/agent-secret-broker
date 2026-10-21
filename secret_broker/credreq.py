@@ -173,7 +173,7 @@ def form_html(req, csrf, values=None, errors=()):
     if kind == "login":
         secret = ("<label for=username>Username<span class=hint>Stored in the vault with the password; "
                   "never shown again.</span></label>"
-                  "<input id=username type=password name=username autocomplete=off required "
+                  "<input id=username type=text name=username autocomplete=off required "
                   "spellcheck=false autocapitalize=off>"
                   "<label for=password>Password</label>"
                   "<input id=password type=password name=password autocomplete=new-password required "

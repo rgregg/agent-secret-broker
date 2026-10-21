@@ -1790,7 +1790,7 @@ Request (client API, agent key): `POST /v1/requests` with
 The card (dashboard, and the approval link the notification opens) shows the name, kind, purpose and the
 suggestions, and a **Review and enter value** button and **Deny**. The button opens `/credential/<id>`,
 a form with the name, allowed hosts, mode, variable name and the secret: one `type=password` field for a
-token, or username and password for a login. It is a separate page because the dashboard refreshes itself
+token, or a plain text username plus a `type=password` password for a login (the username is cleared on a form error, like the secrets). It is a separate page because the dashboard refreshes itself
 and must never hold a half-typed secret. **Store credential** posts to `/credential` on the approval
 listener only, with the per-user CSRF token and the same-origin check.
 
