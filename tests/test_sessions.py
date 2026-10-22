@@ -100,7 +100,7 @@ class Unifi(BaseHTTPRequestHandler):
             return None
         if path == "/json":
             return self._send(200, {"a": {"b": [{"c": "deep-value-1234"}], "n": 7, "t": True, "o": {"x": 1},
-                                          "crlf": "x\r\ny", "uni": "caf\u00e9", "s3": "abc", "s4": "wxyz"}})
+                                          "crlf": "x\r\ny", "uni": "caf\u00e9", "s3": "abc", "s4": "wxyz", "poison": "x_method=1"}})
         return self._send(404, {"error": "no"})
 
     do_HEAD = do_GET
@@ -1018,7 +1018,7 @@ class Scope(SBase):
 
     def test_a_call_that_never_left_the_broker_is_not_charged(self):
         sid = self.open()
-        for headers in ({"X-A": "a\r\nInjected: 1"}, {"X-A": "caf\u00e9"}, {"bad name": "v"}, {"X-A": "a\x00b"}):
+        for headers in ({"X-A": "a\r\nInjected: 1"}, {"X-A": "caf\u00e9"}, {"X-A": "a\x00b"}):
             code, r = self.call(sid, "GET", "/", headers=headers)
             self.assertEqual(r["error"], "upstream call failed (invalid_request)", headers)
         self.assertEqual(self.sess(sid).calls, 0)
@@ -1856,6 +1856,222 @@ class EnvSession(CliBase):
         for args in (("help", "http"), ("guide",)):
             rc, out, err = self.run_cli_env({}, *args)
             self.assertIn("ASB_SESSION", out)
+
+
+# ------------------------------------------------------------------------- review round 3
+class RawUpstream:
+    """A raw-socket upstream that records exactly what arrives on the wire: per connection the request
+    line, headers, the body as framed by Content-Length, and any bytes left over (a pipelined second request)."""
+
+    def __init__(self):
+        import socket
+        self.sock = socket.socket()
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(8)
+        self.port = self.sock.getsockname()[1]
+        self.conns = []
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self):
+        while True:
+            try:
+                c, _ = self.sock.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._one, args=(c,), daemon=True).start()
+
+    def _one(self, c):
+        c.settimeout(1.0)
+        buf = b""
+        try:
+            while b"\r\n\r\n" not in buf:
+                d = c.recv(65536)
+                if not d:
+                    break
+                buf += d
+            head, _, rest = buf.partition(b"\r\n\r\n")
+            lines = head.decode("latin-1").split("\r\n")
+            hdrs = {k.lower(): v.strip() for k, _, v in (ln.partition(":") for ln in lines[1:])}
+            n = int(hdrs.get("content-length", "0") or 0)
+            while len(rest) < n:
+                d = c.recv(65536)
+                if not d:
+                    break
+                rest += d
+            body, extra = rest[:n], rest[n:]
+            try:                       # wait briefly for pipelined bytes
+                more = c.recv(65536)
+                extra += more
+            except OSError:
+                pass
+            self.conns.append({"line": lines[0], "headers": hdrs, "body": body, "extra": extra})
+            c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+        except OSError:
+            pass
+        finally:
+            c.close()
+
+    def close(self):
+        self.sock.close()
+
+
+class Review3(SBase):
+    def setUp(self):
+        super().setUp()
+        self.raw_up = RawUpstream()
+        self.addCleanup(self.raw_up.close)
+
+    def rsid(self, **kw):
+        return self.open(hosts=[self.hp(), f"127.0.0.1:{self.raw_up.port}"], **kw)
+
+    def rcall(self, sid, method="POST", path="/w", **kw):
+        return self.call(sid, method, path, url=f"http://127.0.0.1:{self.raw_up.port}{path}", **kw)
+
+    def test_a_hostile_content_length_is_refused_and_nothing_reaches_the_wire(self):
+        sid = self.rsid()
+        smuggle = "AAAA\r\n\r\nDELETE /x HTTP/1.1\r\nHost: x\r\nAuthorization: {{UNIFI_PASSWORD}}\r\n\r\n"
+        for hdr in ({"Content-Length": "4"}, {"content-length": "4"}, {"Content-Length": "999999"},
+                    {"Content-Length": "4", "Content-Type": "text/plain"}):
+            code, r = self.rcall(sid, headers=hdr, body=smuggle)
+            self.assertEqual((code, r["code"]), (403, "session_refused"), hdr)
+        time.sleep(0.3)
+        self.assertEqual(self.raw_up.conns, [])
+        self.assertEqual(self.sess(sid).calls, 0)
+
+    def test_the_wire_carries_exactly_one_request_with_the_right_length(self):
+        sid = self.rsid()
+        body = "AAAA\r\n\r\nDELETE /x HTTP/1.1\r\nAuthorization: Bearer {{UNIFI_PASSWORD}}\r\n\r\n"
+        code, r = self.rcall(sid, body=body)
+        self.assertEqual(r["http"]["status"], 200, r)
+        (conn,) = self.raw_up.conns
+        want = body.replace("{{UNIFI_PASSWORD}}", PASSWORD).encode()
+        self.assertEqual(conn["body"], want)                         # the substituted body, whole
+        self.assertEqual(conn["headers"]["content-length"], str(len(want)))
+        self.assertEqual(conn["extra"], b"")                         # no second, pipelined request
+        self.assertTrue(conn["line"].startswith("POST /w "))
+
+    def test_binary_and_b64_bodies_are_framed_by_what_is_sent(self):
+        import base64
+        sid = self.rsid()
+        raw = b"\x00\x01AAAA\r\n\r\nGET /y HTTP/1.1\r\n\r\n"
+        code, text = self.as_client(KEY, "POST", "/v1/requests", {
+            "mode": "http", "names": ["unifi"], "method": "POST", "url": f"http://127.0.0.1:{self.raw_up.port}/b",
+            "headers": {}, "session": sid, "body_b64": base64.b64encode(raw).decode()})
+        self.assertEqual(code, 202, text)
+        self.result(json.loads(text)["id"])
+        (conn,) = self.raw_up.conns
+        self.assertEqual((conn["body"], conn["headers"]["content-length"], conn["extra"]),
+                         (raw, str(len(raw)), b""))
+
+    def test_header_allowlist(self):
+        sid = self.rsid()
+        bad = [{"Connection": "keep-alive"}, {"Expect": "100-continue"}, {"TE": "trailers"}, {"Upgrade": "h2c"},
+               {"Trailer": "X"}, {"Transfer-Encoding": "chunked"}, {"Content-Encoding": "gzip"}, {"Host": "x"},
+               {"Cookie": "a=b"}, {"Proxy-Authorization": "x"}, {"Proxy-Connection": "x"}, {"Forwarded": "for=1"},
+               {"X-Forwarded-For": "1.2.3.4"}, {"X-Forwarded-Host": "x"}, {"X-Original-URL": "/admin"},
+               {"X-Original-Verb": "DELETE"}, {"X-Rewrite-URL": "/x"}, {"X-HTTP-Method-Override": "GET"},
+               {"X-Real-IP": "1.1.1.1"}, {"Referer": "x"}, {"Origin": "x"}, {"Range": "bytes=0-1"}, {"Via": "x"},
+               {"Keep-Alive": "x"}, {"Content-Length": "0"},
+               {"Content-Type": "text/plain", "content-type": "text/html"},            # two Content-Types
+               {"Content-Type": "text/plain, text/html"}, {"Content-Type": "a b"}, {"Content-Type": "text"},
+               {"Content-Type": "{{UNIFI_PASSWORD}}"}, {"X-": "v"}, {"X-" + "a" * 50: "v"}, {"Bad Name": "v"},
+               {"Api-Key": "plain value"}]
+        for hdr in bad:
+            code, r = self.rcall(sid, headers=hdr, body="x")
+            self.assertEqual((code, r.get("code")), (403, "session_refused"), hdr)
+            self.assertEqual(self.events("session_refused")[-1]["reason_class"] in ("header", "method"), True, hdr)
+        good = [{"Accept": "application/json"}, {"Accept-Language": "en"}, {"User-Agent": "t"},
+                {"Authorization": "Bearer {{UNIFI_PASSWORD}}"}, {"X-CSRF-Token": "t"}, {"X-Updated-CSRF-Token": "t"},
+                {"If-None-Match": "abc"}, {"If-Modified-Since": "Wed, 21 Oct 2015 07:28:00 GMT"},
+                {"X-Api-Key": "k"}, {"Api-Key": "{{UNIFI_PASSWORD}}"},
+                {"Content-Type": "application/json; charset=utf-8"}, {"content-type": "text/plain"}]
+        for hdr in good:
+            code, r = self.rcall(sid, headers=hdr, body="x")
+            self.assertEqual(r.get("http", {}).get("status"), 200, (hdr, r))
+        time.sleep(0.3)
+        self.assertEqual(len(self.raw_up.conns), len(good))
+        self.assertTrue(all(c["extra"] == b"" for c in self.raw_up.conns))
+
+    def test_the_whole_url_and_every_header_value_are_scanned(self):
+        sid = self.rsid()
+        for url in ("/x;_method=DELETE", "/_method/DELETE", "/%5Fmethod/x", "/%255Fmethod/x", "/x#method",
+                    "/a/&#109;ethod", "/a/=6Dethod", "/a/\\x6dethod"):
+            code, r = self.call(sid, "GET", "/", url=self.url(url))
+            self.assertEqual((code, r["code"]), (403, "session_refused"), url)
+        for url in (f"http://user:pw@127.0.0.1:{self.port}/", f"http://@127.0.0.1:{self.port}/"):
+            code, r = self.call(sid, "GET", "/", url=url)
+            self.assertEqual((code, r["code"]), (403, "session_refused"), url)
+        for hdr in ({"X-Foo": "_method=DELETE"}, {"X-Foo": "x%5Fmethod"}, {"Accept": "&#x6d;ethod"},
+                    {"X-Foo": "{{session.NOPE}}_method"}):
+            code, r = self.call(sid, "GET", "/", headers=hdr)
+            self.assertEqual((code, r["code"]), (403, "session_refused"), hdr)
+        self.assertEqual(self.st["seen"], [])
+        self.assertEqual(self.sess(sid).calls, 0)
+        code, r = self.call(sid, "GET", "/json")                    # ordinary urls and headers still work
+        self.assertEqual(r["http"]["status"], 200)
+
+    def test_decode_forms(self):
+        yes = ["&#109;ethod", "&#x6d;ethod", "&#X6D;ethod", "\\x6dethod", "\\u006dethod", "=6Dethod", "=6dethod",
+               "\uff4dethod", "\uff4d\uff45thod", "%26%23109%3Bethod", "%6dethod", "M%65THOD", "m-e-t-h-o-d",
+               "me\x00th\x00od", "x_method", "payment_method"]
+        for text in yes:
+            self.assertTrue(S._has_method_text(text), text)
+        enc = "%6dethod"
+        for _ in range(4):
+            enc = enc.replace("%", "%25")
+        self.assertTrue(S._has_method_text(enc))                       # five rounds of percent-encoding
+        self.assertTrue(S._has_method_text(enc.encode()))
+        for text in ("", "hello", "metho", "mmeethhood", "name=value&x=1"):
+            self.assertFalse(S._has_method_text(text), text)
+
+    def test_multipart_with_a_transfer_encoding_is_refused(self):
+        sid = self.rsid()
+        ct = {"Content-Type": "multipart/form-data; boundary=b"}
+        plain = '--b\r\nContent-Disposition: form-data; name="a"\r\n\r\nhello\r\n--b--\r\n'
+        for cte in ("Content-Transfer-Encoding: base64", "content-transfer-encoding: quoted-printable",
+                    "Content-Transfer-%45ncoding: 7bit"):
+            body = f'--b\r\nContent-Disposition: form-data; name="a"\r\n{cte}\r\n\r\nhello\r\n--b--\r\n'
+            code, r = self.rcall(sid, headers=ct, body=body)
+            self.assertEqual((code, r["code"]), (403, "session_refused"), cte)
+        code, r = self.rcall(sid, headers=ct, body=plain)
+        self.assertEqual(r["http"]["status"], 200)
+
+    def test_a_captured_value_containing_method_is_not_stored(self):
+        sid = self.open()
+        code, r = self.call(sid, "GET", "/json", capture=["P=json:$.a.poison", "A=json:$.a.n"])
+        self.assertEqual((r["session"]["captured"], r["session"]["missing"]), (["A"], ["P"]))
+        self.assertNotIn("P", self.sess(sid).captures)
+
+    def test_the_free_refusal_budget_ends_the_session(self):
+        sid = self.open()
+        s = self.sess(sid)
+        s.captures["Q"] = "a method"                                   # as if poisoned some other way
+        for i in range(S.MAX_FREE_REFUSALS):
+            code, r = self.call(sid, "GET", "/echo?x={{session.Q}}")
+            self.assertEqual((code, r["code"]), (403, "session_refused"), i)
+        self.assertFalse(s.dead)
+        self.assertEqual(s.calls, 0)                                   # none were charged
+        code, r = self.call(sid, "GET", "/echo?x={{session.Q}}")      # one more than the budget ends it
+        self.assertEqual(code, 403)
+        self.assertTrue(s.dead)
+        ev = self.events("session_ended")
+        self.assertEqual((len(ev), ev[0]["reason"], ev[0]["session"]), (1, "refusal_budget", sid[:8]))
+        code, r = self.call(sid, "GET", "/")
+        self.assertEqual((code, r["code"]), (410, "session_expired"))
+        self.assertIn("too many refused calls", r["error"])
+        self.assertEqual((len(s.jar), s.captures), (0, {}))
+        self.assertEqual(self.st["seen"], [])
+
+    def test_scope_refusals_before_the_vault_read_are_not_metered(self):
+        sid = self.open()
+        for _ in range(S.MAX_FREE_REFUSALS + 3):
+            self.call(sid, "DELETE", "/")                              # refused up front: cheap, no vault read
+        self.assertFalse(self.sess(sid).dead)
+
+    def test_session_ended_is_in_the_agents_audit_view_without_policy_fields(self):
+        out = audit_api.redact({"seq": 1, "ts": 1.0, "event": "session_ended", "session": "abcd1234", "calls": 0,
+                                "reason": "refusal_budget", "approver": "alice", "hosts": ["POISON"]})
+        self.assertEqual(set(out) - {"seq", "ts", "event", "request"}, {"session", "calls", "reason"})
 
 
 if __name__ == "__main__":

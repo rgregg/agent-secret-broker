@@ -90,6 +90,7 @@ WHITELIST = {
                      "max_calls": ("max_calls", _I)},
     "session_refused": {"session": ("session", _S), "reason": ("reason_class", _S), "method": ("method", _S),
                         "host": ("host", _S)},
+    "session_ended": {"session": ("session", _S), "calls": ("calls", _I), "reason": ("reason", _S)},
     "session_closed": {"session": ("session", _S), "calls": ("calls", _I)},
     "session_expired": {"session": ("session", _S), "calls": ("calls", _I)},
     "session_revoked": {"session": ("session", _S), "calls": ("calls", _I)},
