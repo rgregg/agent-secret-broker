@@ -1446,7 +1446,7 @@ def _esc(text):
     """Escaped HTML of agent-written text with every non-ASCII character shown as <U+XXXX>."""
     return "".join(
         html.escape(ch) if ord(ch) < 128 else
-        f"<span class=gu title=\"{html.escape(ch)}\">&lt;U+{ord(ch):04X}&gt;</span>" for ch in text)
+        f"<span class=gu>&lt;U+{ord(ch):04X}&gt;</span>" for ch in text)
 
 
 def _hm(s):
