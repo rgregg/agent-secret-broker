@@ -43,9 +43,9 @@ push notification or the dashboard.
 1. **Run the broker** (Docker, a vault account, an SSO proxy): [docs/setup.md](docs/setup.md).
 2. **Install the CLI** on the agent's machine and point it at the broker:
    [docs/cli.md](docs/cli.md).
-3. **Tell the agent about it** with a short paragraph in its instructions
-   (copy-paste text in [docs/cli.md](docs/cli.md#teaching-an-agent-to-use-it)). The CLI
-   documents itself: `asb guide`.
+3. **Tell the agent about it**: `asb agent-setup` writes a short, marked block into the
+   instruction files of Claude Code, Codex and Copilot
+   ([docs/cli.md](docs/cli.md#teaching-an-agent-to-use-it)). The CLI documents itself: `asb guide`.
 
 Then:
 
