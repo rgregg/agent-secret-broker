@@ -48,6 +48,7 @@ from . import standing as standing_mod
 from . import guidance as guidance_mod
 from . import proposals as proposals_mod
 from . import credreq as credreq_mod
+from . import clients as clients_mod
 from . import sshhosts as sshhosts_mod
 from . import sshrules as sshrules_mod
 from . import risk as risk_mod
@@ -117,8 +118,11 @@ _CLAIM_RE = re.compile(r"[A-Za-z0-9@._:\[\]%,()+ -]{1,200}")
 
 
 class Request:
-    def __init__(self, mode, names, spec, source, ttl, peer=None):
+    def __init__(self, mode, names, spec, source, ttl, peer=None, client=None):
         self.id = secrets.token_urlsafe(16)
+        # who authenticated this request: {"id", "name", "legacy"}. Verified (it comes from the
+        # credential presented), unlike `source`, which is the client's own user@host claim.
+        self.client = client or dict(clients_mod.ClientStore.LEGACY_VIEW)
         self.nonce = secrets.token_urlsafe(24)
         self.mode = mode          # "env" | "http" | "store" | "ssh_sign" | "guidance" | "credential"
         self.names = names
@@ -148,7 +152,7 @@ class Request:
         self.done = threading.Event()
 
 
-class Broker(sshrules_mod.SshRulesMixin):
+class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin):
     def __init__(self, config, backend, notifier, audit=None, summarizer=None,
                  background_load=False, push=None):
         self.push = push                # PushStore when the webpush transport is configured
@@ -217,6 +221,7 @@ class Broker(sshrules_mod.SshRulesMixin):
         self._sleep, self._mono, self._jitter = time.sleep, time.monotonic, random.uniform
         self._gretry_lock = threading.Lock()
         self._gretry = {}                   # proposal id -> text of FAILED entries, in memory only
+        self._init_clients(config)
         self._init_grants(config)
         self._init_ssh_rules()
         if background_load:
@@ -506,7 +511,9 @@ class Broker(sshrules_mod.SshRulesMixin):
                          "auto_approve_max": self._auto_max,
                          "timed_grants": bool(self.grants_cfg["enabled"]),
                          "guidance_proposals": bool(self.proposals_cfg["enabled"]),
-                         "credential_requests": bool(self.credreq_cfg["enabled"])},
+                         "credential_requests": bool(self.credreq_cfg["enabled"]),
+                         "client_enrollment": bool(self.clients_cfg["enrollment"]["enabled"]),
+                         "legacy_client_key": self.clients_cfg["legacy"]},
         }
 
     def _refresh_if(self, stale_after, wait=True):
@@ -540,8 +547,8 @@ class Broker(sshrules_mod.SshRulesMixin):
         self._audit.log(event, **fields)
 
     def audit(self, event, req, **extra):
-        rec = {"id": req.id, "mode": req.mode, "names": req.names,
-               "source": req.source, "peer": req.peer, **extra}
+        rec = {"id": req.id, "mode": req.mode, "names": req.names, "client_id": req.client["id"],
+               "client_name": req.client["name"], "source": req.source, "peer": req.peer, **extra}
         if req.summary:
             rec["summary"] = req.summary
             if req.summary_model:
@@ -584,17 +591,24 @@ class Broker(sshrules_mod.SshRulesMixin):
                 "host_lines": sshkey.host_lines(host)}
 
     # -- policy -----------------------------------------------------------
-    def _effective_auto_modes(self, sc):
-        """The credential's own `auto_modes`, else `risk.auto_modes` (an SSH key can
-        only ever be used to sign, so that is its default mode)."""
-        return list(sc.get("auto_modes", ["ssh_sign"] if sc.get("ssh") else self._default_auto_modes))
+    def _client_fields(self, client):
+        """client_id / client_name audit fields for a client view (the legacy client when none)."""
+        c = client or clients_mod.ClientStore.LEGACY_VIEW
+        return {"client_id": c["id"], "client_name": c["name"]}
 
-    def _auto_modes(self, sc):
+    def _effective_auto_modes(self, sc, cid=None):
+        """The credential's own `auto_modes`, else the client's `auto_modes` override, else
+        `risk.auto_modes` (an SSH key can only ever be used to sign, so that is its default
+        mode)."""
+        default = self.auto_modes_default_for(cid) if cid else self._default_auto_modes
+        return list(sc.get("auto_modes", ["ssh_sign"] if sc.get("ssh") else default))
+
+    def _auto_modes(self, sc, cid=None):
         if sc.get("approval", "prompt") != "allow":
             return []
-        return self._effective_auto_modes(sc)
+        return self._effective_auto_modes(sc, cid)
 
-    def _auto_allowed(self, mode, names, spec=None):
+    def _auto_allowed(self, mode, names, spec=None, cid=None):
         if mode == "store":
             # Creating a credential is low risk (it cannot read or change anything
             # that exists, and the new secret still prompts on every use), so it
@@ -602,7 +616,7 @@ class Broker(sshrules_mod.SshRulesMixin):
             # overwrites a live credential and always needs a human.
             return (bool(spec) and spec.get("op") == "create"
                     and self.cfg.get("store", {}).get("create", "auto") != "prompt")
-        return all(mode in self._auto_modes(self.cfg["secrets"][n]) for n in names)
+        return all(mode in self._auto_modes(self.cfg["secrets"][n], cid) for n in names)
 
     # -- standing policy changes (approver-initiated, persisted) ------------
     def always_allow_eligibility(self, req):
@@ -624,14 +638,17 @@ class Broker(sshrules_mod.SshRulesMixin):
         sc = self.cfg["secrets"][name]
         if sc.get("approval", "prompt") == "allow":
             return False, "already always-allowed"
-        if req.mode not in self._effective_auto_modes(sc):
+        cid = req.client["id"]
+        if self.client_never_auto(cid):
+            return False, "this client is set to never auto-approve"
+        if req.mode not in self._effective_auto_modes(sc, cid):
             return False, (f"{_MODE_LABEL.get(req.mode, req.mode)} requests are not enabled "
                            "for auto-approval (auto_modes)")
         if not self._backend_can("set_meta"):
             return False, "the vault backend cannot record this"
         if req.risk:
             lvl = req.risk["level"]
-            if lvl == "high" or not risk_mod.auto_ok(lvl, self._auto_max):
+            if lvl == "high" or not risk_mod.auto_ok(lvl, self.auto_max_for(cid)):
                 return False, f"this request is rated {lvl}; such requests always prompt"
         if self._script_not_visible(req.mode, req.spec):
             return False, "the script text is not visible, so env requests like this always prompt"
@@ -645,11 +662,12 @@ class Broker(sshrules_mod.SshRulesMixin):
                                                                 (spec or {}).get("scripts"),
                                                                 (spec or {}).get("cwd"))
 
-    def auto_approve_max(self):
+    def auto_approve_max(self, cid=None):
         """Highest risk level at which an auto-eligible request is released
         unprompted: none|low|medium|high (default low; see risk.auto_approve_max).
-        A missing model verdict counts as high."""
-        return self._auto_max
+        A missing model verdict counts as high. With a client id: that client's own
+        override if it has one."""
+        return self.auto_max_for(cid) if cid else self._auto_max
 
     def _persist_approval(self, name, value, user):
         """Write the new policy into the item's broker metadata in the vault."""
@@ -956,7 +974,7 @@ class Broker(sshrules_mod.SshRulesMixin):
         return out
 
     # -- request lifecycle ------------------------------------------------
-    def create(self, mode, names, spec, source, peer=None):
+    def create(self, mode, names, spec, source, peer=None, client=None):
         try:
             self._refresh_if(0 if (mode not in ("store", "credential")
                                    and any(n not in self.cfg["secrets"] for n in names))
@@ -994,10 +1012,12 @@ class Broker(sshrules_mod.SshRulesMixin):
                 if mode == "http":
                     self._validate_http(names, spec)
         except SshRefused as e:
-            self.log("ssh_sign_refused", reason=e.reason, names=names, source=source, peer=peer, **e.fields)
+            self.log("ssh_sign_refused", reason=e.reason, names=names, source=source, peer=peer,
+                     **self._client_fields(client), **e.fields)
             raise
         except (ValueError, PermissionError) as e:
             self.log("rejected", reason=str(e), names=names, mode=mode, source=source, peer=peer,
+                     **self._client_fields(client),
                      url=spec.get("url") if isinstance(spec, dict) and mode == "http" else None)
             raise
         with self._lock:
@@ -1026,11 +1046,12 @@ class Broker(sshrules_mod.SshRulesMixin):
                         err = f"{n} was denied recently; try again later"
                 ttl = self.credreq_cfg["ttl_s"] if mode == "credential" else self.cfg.get("ttl_seconds", 120)
             if err is None:
-                req = Request(mode, names, spec, source, ttl, peer)
+                req = Request(mode, names, spec, source, ttl, peer, client)
                 self._by_id[req.id] = req
                 self._by_nonce[req.nonce] = req
         if err:
-            self.log("rejected", reason=err, names=names, mode=mode, source=source, peer=peer)
+            self.log("rejected", reason=err, names=names, mode=mode, source=source, peer=peer,
+                     **self._client_fields(client))
             raise PermissionError(err)
         self.audit("requested", req)
         self._retain_details(req)
@@ -1049,10 +1070,15 @@ class Broker(sshrules_mod.SshRulesMixin):
         req.summary_source = a.get("summary_source")
         self.audit("assessed", req, model=a["model"], reasons=a["reasons"],
                    summary_source=a.get("summary_source"), summary_reason=a.get("summary_reason"))
-        if self._ssh_rule_claim(req):       # standing per-host rule: explicit policy, any risk limit
+        cid = req.client["id"]
+        never = self.client_never_auto(cid)
+        if not never and self._ssh_rule_claim(req):   # standing per-host rule: explicit policy, any risk limit
             return req
-        auto = self._auto_allowed(mode, names, spec)
-        auto_max = self._auto_max
+        auto = self._auto_allowed(mode, names, spec, cid)
+        if never and auto:
+            self.audit("escalated", req, auto_max="none", reason="this client is set to never auto-approve")
+            auto = False
+        auto_max = self.auto_max_for(cid)
         if auto and self._script_not_visible(mode, spec):
             self.audit("escalated", req, auto_max=auto_max, reason="script_not_visible")
             auto = False
@@ -1072,7 +1098,7 @@ class Broker(sshrules_mod.SshRulesMixin):
             else:
                 self._finish(req, "approved", result=result, via="policy", auto_max=auto_max)
             return req
-        if self._standing_claim(req):       # Always (auto_approve_max ceiling), then timed (none)
+        if not never and self._standing_claim(req):   # Always (auto_approve_max ceiling), then timed (none)
             return req
         try:
             self._push(req)
@@ -1851,7 +1877,7 @@ class Broker(sshrules_mod.SshRulesMixin):
             req.spec.pop("secret", None)
             if req.mode == "guidance" and req.result is None:
                 req.result = proposals_mod.outcome(req, status)
-        if status == "denied" and req.mode != "guidance":
+        if status == "denied" and req.mode != "guidance" and extra.get("via") != "client_revoked":
             now = time.time()
             for n in req.names:
                 self._denied_at[n] = now
@@ -1940,6 +1966,10 @@ class Broker(sshrules_mod.SshRulesMixin):
         one user's page cannot be replayed by another session."""
         return hmac.new(self._csrf_key, ("csrf:" + user).encode(), hashlib.sha256).hexdigest()
 
+    def attention(self):
+        """What is waiting for the human: open requests plus pending client enrollments."""
+        return len(self.pending()) + len(self.clients.pending())
+
     def pending(self):
         """Open requests, oldest first."""
         with self._lock:
@@ -1949,7 +1979,7 @@ class Broker(sshrules_mod.SshRulesMixin):
 
     def decide_via(self, channel, rid, decision, actor, *, token=None, always=False,
                    nonce=None, peer=None, client_ip=None, grant_minutes=None, ssh_rule=None,
-                   apply=None, credential=None, **audit_extra):
+                   apply=None, credential=None, rule_scope="client", **audit_extra):
         """The single entry for every decision. Returns (http_status, req):
         200 decided; 403 wrong/missing token; 404 unknown; 410 already decided,
         expired or token spent (no state change). `decision` is "approve" or
@@ -1959,7 +1989,9 @@ class Broker(sshrules_mod.SshRulesMixin):
         and the audit fields. A guidance proposal (mode "guidance") can only be decided
         on a channel without a token (dashboard, link), after a human saw it: an approval
         needs `apply`, the entry indexes the approver ticked (none, or one out of range,
-        is 400 and nothing is claimed), and carries no Always, grant or SSH rule. `ssh_rule` ({"days": n|None}) asks to also create a
+        is 400 and nothing is claimed), and carries no Always, grant or SSH rule.
+        `rule_scope` ("client", the default, or "any") says whom an Always, timed grant or SSH
+        rule created by this decision applies to: only the requesting client, or every client. `ssh_rule` ({"days": n|None}) asks to also create a
         standing per-host SSH rule from this request: only channels that may, and
         only an eligible request; otherwise ssh_rule_refused is audited and the
         request is left pending (403 for a channel that may not, 409 otherwise).
@@ -2077,12 +2109,14 @@ class Broker(sshrules_mod.SshRulesMixin):
         if not approve:
             self._finish(req, "denied", **who)
             return 200, req
+        rscope = "any" if rule_scope == "any" else "client"
         if always:
-            self._always_create(req, actor, channel, who)
+            self._always_create(req, actor, channel, who, rscope)
         if grant_minutes is not None:
-            self._grant_create(req, grant_minutes, actor, channel, who)
+            self._grant_create(req, grant_minutes, actor, channel, who, rscope)
         if ssh_rule is not None:
-            req.ssh_rule = self._ssh_rule_create(req, ssh_rule["days"], actor, channel, who)
+            req.ssh_rule = self._ssh_rule_create(req, ssh_rule["days"], actor, channel, who,
+                                                 self._rule_client(req, rscope))
         self._resolved(req, "approved")
         # Releasing can take seconds (vault unlock, upstream call). It runs off
         # the request thread: the approver's page has already been answered, the
@@ -2143,7 +2177,8 @@ class Broker(sshrules_mod.SshRulesMixin):
         rows = []
         for g in self.active_grants():
             rows.append({"kind": "timed", "id": g["id"], "secrets": g["secrets"], "mode": g["mode"],
-                         "scope": g["scope"], "covers": standing_mod.covers_label(g["mode"], g["scope"]),
+                         "client": g["client"], "scope": g["scope"],
+                         "covers": standing_mod.covers_label(g["mode"], g["scope"]),
                          "expires_at": g["expires_at"], "left_s": g["left_s"],
                          "created_by": g["created_by"], "created_at": _utc(g["created_at"]),
                          "minutes": g["minutes"]})
@@ -2151,9 +2186,10 @@ class Broker(sshrules_mod.SshRulesMixin):
             secrets_now = sorted(self.cfg["secrets"].items())
         for name, sc in secrets_now:
             for e in sc.get("standing") or []:
-                off = e["mode"] not in self._effective_auto_modes(sc)
+                off = e["mode"] not in self._effective_auto_modes(sc, e.get("client") if e.get("client", clients_mod.ANY) != clients_mod.ANY
+                                                                   else None)
                 rows.append({"kind": "always", "id": e["id"], "secrets": [name], "mode": e["mode"],
-                             "scope": e["scope"], "covers": standing_mod.covers_label(e["mode"], e["scope"])
+                             "client": e.get("client", clients_mod.ANY), "scope": e["scope"], "covers": standing_mod.covers_label(e["mode"], e["scope"])
                              + (" (not active: mode not enabled)" if off else ""),
                              "expires_at": None, "left_s": None, "created_by": e["created_by"],
                              "created_at": e["created_at"].replace("T", " ").replace("Z", " UTC")})
@@ -2164,7 +2200,7 @@ class Broker(sshrules_mod.SshRulesMixin):
             at = ch.get("at") or ""
             modes = ", ".join(_MODE_LABEL.get(m, m) for m in self._auto_modes(sc)) or "none"
             rows.append({"kind": "legacy", "id": "", "name": name, "secrets": [name], "mode": None,
-                         "scope": "any", "covers": f"whole credential, any method, any covered mode ({modes})",
+                         "client": clients_mod.ANY, "scope": "any", "covers": f"whole credential, any method, any covered mode ({modes})",
                          "expires_at": None, "left_s": None, "created_by": ch.get("by") or "",
                          "created_at": at.replace("T", " ").replace("Z", " UTC")})
         rows.sort(key=lambda r: (r["kind"] != "timed", r["expires_at"] or 0))
@@ -2177,7 +2213,7 @@ class Broker(sshrules_mod.SshRulesMixin):
         sc = self.cfg["secrets"][name]
         meta = {**sc["_meta"], "standing_changed": {"by": user, "at": standing_mod.iso(time.time())}}
         if entries:
-            meta["standing"] = [dict(e) for e in entries]
+            meta["standing"] = standing_mod.serialize(entries)
         else:
             meta.pop("standing", None)
         self.backend.set_meta(sc["_item"], meta)
@@ -2187,17 +2223,20 @@ class Broker(sshrules_mod.SshRulesMixin):
         else:
             sc.pop("standing", None)
 
-    def _add_always(self, name, mode, scope, by):
-        """Create (or find) an Always approval. Returns (status, entry): created |
-        exists | cap | backend | failed. One entry per (credential, mode): a broader
-        scope replaces a narrower one; a narrower one is already covered."""
+    def _add_always(self, name, mode, scope, by, client=clients_mod.ANY):
+        """Create (or find) an Always approval for one client (or `*` = any client). Returns
+        (status, entry): created | exists | cap | backend | failed. One entry per (credential,
+        mode, client): a broader method scope replaces a narrower one; a narrower one is
+        already covered. A rule for any client also covers a client-scoped request."""
         with self._cfg_lock:
             sc = self.cfg["secrets"][name]
             entries = [dict(e) for e in sc.get("standing") or []]
             for e in entries:
-                if e["mode"] == mode and (e["scope"] == "any" or e["scope"] == scope):
+                if (e["mode"] == mode and (e["scope"] == "any" or e["scope"] == scope)
+                        and e.get("client", clients_mod.ANY) in (client, clients_mod.ANY)):
                     return "exists", e
-            kept = [e for e in entries if e["mode"] != mode]
+            kept = [e for e in entries if not (e["mode"] == mode
+                                               and e.get("client", clients_mod.ANY) == client)]
             if len(kept) >= standing_mod.MAX_STANDING:
                 return "cap", None
             if not self._backend_can("set_meta"):
@@ -2208,13 +2247,20 @@ class Broker(sshrules_mod.SshRulesMixin):
                 sid = secrets.token_hex(4)
             entry = {"id": sid, "secrets": [name], "mode": mode, "scope": scope, "expires_at": None,
                      "created_by": by, "created_at": standing_mod.iso(time.time())}
+            if client != clients_mod.ANY:
+                entry["client"] = client
             try:
                 self._persist_standing(name, kept + [entry], by)
             except (OSError, ValueError, KeyError, BackendError):
                 return "failed", None
         return "created", entry
 
-    def _always_create(self, req, actor, channel, who):
+    def _rule_client(self, req, rule_scope):
+        """The client scope a rule made from this request's card gets: only the requesting
+        client unless the approver explicitly chose any client."""
+        return clients_mod.ANY if rule_scope == "any" else req.client["id"]
+
+    def _always_create(self, req, actor, channel, who, rule_scope="client"):
         """Create the Always approval a human asked for on this request's card. Never
         raises; sets req.always: applied | exists | not applied: <why>. The request
         itself is approved whatever happens here."""
@@ -2224,10 +2270,11 @@ class Broker(sshrules_mod.SshRulesMixin):
             self.audit("policy_change_refused", req, reason=why, **who)
             return
         scope = grants_mod.scope_for(req.mode, req.spec)
-        status, e = self._add_always(req.names[0], req.mode, scope, actor)
+        rc = self._rule_client(req, rule_scope)
+        status, e = self._add_always(req.names[0], req.mode, scope, actor, rc)
         if status == "created":
             req.always = "applied"
-            self.audit("grant_created", req, kind="always", grant_id=e["id"], scope=scope,
+            self.audit("grant_created", req, kind="always", grant_id=e["id"], scope=scope, rule_client=rc,
                        grant_mode=req.mode, expires_at=None, created_by=actor, channel=channel,
                        approver_peer=who.get("approver_peer"), approver_ip=who.get("approver_ip"))
         elif status == "exists":
@@ -2241,14 +2288,15 @@ class Broker(sshrules_mod.SshRulesMixin):
                           if status == "cap" else "not applied: the vault backend cannot record this")
             self.audit("grant_refused", req, kind="always", reason=status, **who)
 
-    def _grant_create(self, req, minutes, actor, channel, who):
+    def _grant_create(self, req, minutes, actor, channel, who, rule_scope="client"):
         ok, why = self.grant_eligibility(req)
         if not ok:
             self.audit("grant_refused", req, kind="timed", reason=why, **who)
             return
         g = self.grants.add(req.names, minutes, grants_mod.scope_for(req.mode, req.spec), actor,
-                            channel, req.id, mode=req.mode)
+                            channel, req.id, mode=req.mode, client=self._rule_client(req, rule_scope))
         self.audit("grant_created", req, kind="timed", grant_id=g["id"], scope=g["scope"],
+                   rule_client=g["client"],
                    grant_minutes=minutes, expires_at=g["expires_at"], created_by=actor, channel=channel,
                    approver_peer=who.get("approver_peer"), approver_ip=who.get("approver_ip"))
 
@@ -2264,8 +2312,9 @@ class Broker(sshrules_mod.SshRulesMixin):
             return False
         level = req.risk["level"] if req.risk else "high"
         hidden = self._script_not_visible(req.mode, req.spec)
+        cid = req.client["id"]
         for kind in ("always", "timed"):
-            ceiling = self._auto_max if kind == "always" else self.grants_cfg["max_risk"]
+            ceiling = self.auto_max_for(cid) if kind == "always" else self.grants_cfg["max_risk"]
             g = self._standing_find(req, kind)
             if g is None:
                 continue
@@ -2274,7 +2323,7 @@ class Broker(sshrules_mod.SshRulesMixin):
                 if hidden:
                     skip = "script_not_visible"
                 elif kind == "always" and req.mode not in self._effective_auto_modes(
-                        self.cfg["secrets"][req.names[0]]):
+                        self.cfg["secrets"][req.names[0]], cid):
                     skip = "auto_modes"
                 elif not grants_mod.covers(g, req.mode, req.spec):
                     skip = "method"
@@ -2307,11 +2356,16 @@ class Broker(sshrules_mod.SshRulesMixin):
         """The standing approval of `kind` for exactly this request's secrets and
         mode, preferring one that covers it by scope; None when there is none."""
         if kind == "timed":
-            return self.grants.find(req.names, req.mode) if self.grants_cfg["enabled"] else None
+            return (self.grants.find(req.names, req.mode, req.client["id"])
+                    if self.grants_cfg["enabled"] else None)
         if len(req.names) != 1 or req.mode not in standing_mod.ALWAYS_MODES:
             return None
         sc = self.cfg["secrets"].get(req.names[0]) or {}
-        mine = [e for e in sc.get("standing") or [] if e["mode"] == req.mode]
+        # only this client's rules and rules for any client; this client's own are preferred
+        mine = sorted((e for e in sc.get("standing") or []
+                       if e["mode"] == req.mode
+                       and e.get("client", clients_mod.ANY) in (req.client["id"], clients_mod.ANY)),
+                      key=lambda e: e.get("client", clients_mod.ANY) == clients_mod.ANY)
         return next((e for e in mine if grants_mod.covers(e, req.mode, req.spec)), mine[0] if mine else None)
 
     def revoke_grant(self, grant_id, user, peer=None, client_ip=None):
@@ -3470,7 +3524,7 @@ _MANIFEST = {
 _ICON_PNG_URI = "data:image/png;base64," + base64.b64encode(icon_mod.PNG).decode()
 
 _TABS = (("requests", "/", "Requests"), ("policies", "/policies", "Policies"),
-         ("settings", "/settings", "Settings"))
+         ("clients", "/clients", "Clients"), ("settings", "/settings", "Settings"))
 
 
 def _chrome(tab, badge, user):
@@ -3510,7 +3564,7 @@ def _page(h, code, body, wide=False, nav=True, script=None, tab=None, badge=0, u
            f"<link rel=icon href=\"{_ICON}\">"
            f"<link rel=apple-touch-icon sizes=180x180 href=\"{_ICON_PNG_URI}\">"
            "<link rel=manifest href=/manifest.webmanifest crossorigin=use-credentials>"
-           f"<style>{_CSS}{scripts_mod.CSS}{details_mod.CSS}{proposals_mod.CSS}{credreq_mod.CSS}</style><body>{_chrome(tab, badge, user) if nav else ''}"
+           f"<style>{_CSS}{scripts_mod.CSS}{details_mod.CSS}{proposals_mod.CSS}{credreq_mod.CSS}{clients_mod.CSS}</style><body>{_chrome(tab, badge, user) if nav else ''}"
            f"<main class='{'wide' if wide else 'narrow'}'>{_SIGNED_OUT if nav else ''}{body}</main>{scr}</body></html>").encode()
     h.send_response(code)
     h.send_header("Content-Type", "text/html; charset=utf-8")
@@ -3589,6 +3643,12 @@ _CHANNEL_LABEL = {"dashboard": "web dashboard", "push": "browser push notificati
                   "ha": "Home Assistant", "link": "approval link"}
 _MODE_LABEL = {"http": "web", "env": "run-with-secret", "ssh_sign": "ssh signing",
                "guidance": "guidance proposal", "credential": "credential request"}
+_CLIENT_NOTES = {"renamed": "Client renamed.", "revoked": "Client revoked. Its next request fails.",
+                 "revokedmem": "Client revoked in memory, but the client list could not be saved; it is "
+                               "retried, and the revoke is lost on a restart until it is saved.",
+                 "removed": "Removed from the list.", "taken": "That name is taken or not allowed.",
+                 "nosave": "Could not save the client list.", "missing": "No such client.",
+                 "active": "Only a revoked client can be removed."}
 _AUTO_LABEL = {"none": "off (every request asks a human)", "low": "up to low risk",
                "medium": "up to medium risk",
                "high": "any risk level, including requests with no model verdict"}
@@ -3625,10 +3685,11 @@ def _approve_actions(broker, req):
             f"for {label}{env_note}'>{label}</button>")
     if ok_a:
         what = standing_mod.scope_phrase(req.mode, scope)
+        mx = broker.auto_approve_max(req.client["id"])
         tip = (f"Approve this request and approve future requests for this secret without asking: "
-               f"{what}, when the request is rated {broker.auto_approve_max()} or lower. "
-               "Revoke any time under Policies.")
-        ask = standing_mod.confirm_text(req.names[0], req.mode, scope, broker.auto_approve_max())
+               f"{what}, when the request is rated {mx} or lower. "
+               "Applies to the client chosen above. Revoke any time under Policies.")
+        ask = standing_mod.confirm_text(req.names[0], req.mode, scope, mx)
         chips.append(
             f"<details class=alw><summary class='chip always' data-tip='{e(tip)}' "
             f"aria-label='Always approve {e(req.names[0])}: {e(tip)}'>Always</summary>"
@@ -3641,18 +3702,28 @@ def _approve_actions(broker, req):
                      f"aria-label='{e(tip)}'>Always</span>")
     if rule_chip:
         chips.append(sshrules_mod.chip_html(*rule_chip))
+    cname = req.client["name"]
     out = ("<div class=auto><span class=lbl>Automatically approve...</span>"
+           "<label class=rscope>Applies to <select name=rule_scope aria-label='Whom a standing approval applies to'>"
+           f"<option value=client selected>only this client ({e(cname)})</option>"
+           "<option value=any>any client (every machine)</option></select></label>"
            f"<div class=chips>{''.join(chips)}</div>")
     if mins and req.mode == "env":
         out += (f"<p class=scope><small class=muted>Applies to exactly: {names}, run-with-secret "
                 "requests only. The secret value will be released to the requesting machine for "
                 "the chosen time without asking. Requests whose script text is not visible "
                 "still ask. Revoke any time under Policies.</small></p>")
-    elif mins:
+    if mins and req.mode != "env":
         out += (f"<p class=scope><small class=muted>Applies to exactly: {names}. "
                 f"{'Reads only (GET, HEAD, OPTIONS)' if scope == 'read' else 'Any method'}. "
                 "Revoke any time under Policies.</small></p>")
     return row1 + out + "</div>"
+
+
+def _rule_scope(form):
+    """Whom a standing approval made from a card applies to: 'client' (the default, also for a
+    missing or unrecognised value) or, only when the approver chose it, 'any'."""
+    return "any" if (form.get("rule_scope") or [""])[0] == "any" else "client"
 
 
 def _apply_set(form):
@@ -3790,7 +3861,11 @@ def _detail_html(r, evs, retained=""):
         for line in ev.get("host_lines") or []:
             k, sep, v = str(line).partition(": ")
             add(k if sep else "Server", v if sep else line)
-    add("Source (claimed by the client)", r["source"])
+    if r.get("client_name"):
+        add("Client", f"{e(r['client_name'])} <small class=muted>({e(str(r.get('client_id') or ''))}"
+            + (", authenticated with the legacy shared key" if r.get("client_id") == "legacy" else "")
+            + ")</small>", True)
+    add("Source (claimed by the client, unverified)", r["source"])
     add("Peer", r["peer"])
     if r["summary"]:
         add("Summary", f"{e(r['summary'])} {_info_icon(r.get('summary_model'), r.get('summary_source'))}", True)
@@ -3863,19 +3938,58 @@ def _detail_html(r, evs, retained=""):
 
 def client_handler(broker, client_key):
     audit_view = audit_api.AuditApi(broker._audit._path, Broker.rate_map_make_room)
-    key_id = hashlib.sha256(client_key.encode()).hexdigest()[:16]
 
     class H(BaseHTTPRequestHandler):
         def log_message(self, *a):
             pass
 
+        client = None           # who this request authenticated as: {"id", "name", "legacy"}
+
+        _AUTH_MSG = {"revoked": "this client has been revoked; run `asb enroll` to enroll it again",
+                     "legacy_denied": "the shared client key is no longer accepted; run `asb enroll`",
+                     "bad_key": "bad client key"}
+
         def _authed(self):
-            if not secrets.compare_digest(self.headers.get("X-Client-Key", ""), client_key):
-                broker.log("auth_failed", peer=self.client_address[0], method=self.command,
-                           path=self.path.split("?")[0])
-                _json(self, 401, {"error": "bad client key"})
+            view, why = broker.client_auth(self.headers.get("X-Client-Key", ""), client_key,
+                                           self.client_address[0], self.command, self.path.split("?")[0])
+            if view is None:
+                _json(self, 401, {"error": self._AUTH_MSG.get(why, "bad client key")})
                 return False
+            self.client = view
             return True
+
+        # -- enrollment: the ONLY unauthenticated client-API paths. They create or read nothing but
+        # one pending enrollment (see clients.py); every body is bounded and every reply is a
+        # fixed string.
+        def _enroll_post(self):
+            peer = self.client_address[0]
+            try:
+                n = int(self.headers.get("Content-Length", ""))
+            except ValueError:
+                n = -1
+            if n < 0 or n > clients_mod.BODY_LIMIT:
+                self.close_connection = True
+                return _json(self, 413 if n > 0 else 411, {"error": "invalid enrollment request"})
+            if not broker.clients.rate_ok("enroll", peer, clients_mod.SUBMIT_MIN):
+                self.close_connection = True
+                if broker.clients.fail_should_log(peer)[0]:
+                    broker.log("enroll_refused", peer=peer, status=429, reason="rate_limited")
+                return _json(self, 429, {"error": "too many enrollment requests; try again later"},
+                             {"Retry-After": "60"})
+            try:
+                body = json.loads(self.rfile.read(n).decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                body = None
+            code, out = broker.enroll_submit(body, peer)
+            _json(self, code, out)
+
+        def _enroll_get(self, path):
+            peer = self.client_address[0]
+            if not broker.clients.rate_ok("enrollpoll", peer, clients_mod.POLL_MIN):
+                self.close_connection = True
+                return _json(self, 429, {"error": "slow down"}, {"Retry-After": "10"})
+            code, out = broker.enroll_poll(path[len("/v1/enroll/"):], peer)
+            _json(self, code, out)
 
         def _ha_decide(self):
             """POST /v1/hooks/ha/decide, authenticated by the dedicated hook key
@@ -3930,6 +4044,8 @@ def client_handler(broker, client_key):
         def do_POST(self):
             if self.path.split("?")[0] == "/v1/hooks/ha/decide":
                 return self._ha_decide()
+            if self.path.split("?")[0] == "/v1/enroll":
+                return self._enroll_post()
             if not self._authed():
                 return
             if self.path != "/v1/requests":
@@ -3978,7 +4094,7 @@ def client_handler(broker, client_key):
                 if mode != "env" and body.get("scripts") is not None:
                     raise ValueError("scripts are only allowed for env requests")
                 req = broker.create(mode, names, spec, str(body.get("source", self.client_address[0]))[:80],
-                                    peer=self.client_address[0])
+                                    peer=self.client_address[0], client=self.client)
             except (ValueError, KeyError, TypeError, json.JSONDecodeError) as e:
                 if not str(e) or not isinstance(e, ValueError) or isinstance(e, json.JSONDecodeError):
                     broker.log("bad_request", peer=self.client_address[0], error=str(e)[:200])
@@ -3995,13 +4111,15 @@ def client_handler(broker, client_key):
         do_PUT = do_PATCH = do_DELETE = _no_write
 
         def do_GET(self):
+            u = urllib.parse.urlsplit(self.path)
+            if u.path.startswith("/v1/enroll/"):
+                return self._enroll_get(u.path)
             if not self._authed():
                 return
-            u = urllib.parse.urlsplit(self.path)
             if u.path == "/v1/status":
                 return _json(self, 200, broker.status())
             if u.path in ("/v1/audit", "/v1/audit/verify"):
-                code, body, hdrs = audit_view.handle(u.path, u.query, key_id)
+                code, body, hdrs = audit_view.handle(u.path, u.query, self.client["id"])
                 return _json(self, code, body, hdrs)
             if u.path == "/v1/secrets":
                 q = urllib.parse.parse_qs(u.query)
@@ -4017,7 +4135,8 @@ def client_handler(broker, client_key):
             q = urllib.parse.parse_qs(u.query)
             timeout = min(float(q.get("wait", ["25"])[0]), 30)
             req = broker.wait(u.path.rsplit("/", 1)[1], timeout)
-            if req is None:
+            if req is None or req.client["id"] != self.client["id"]:
+                # another client's request id is as unknown to this client as a made-up one
                 return _json(self, 404, {"error": "unknown request"})
             _json(self, 200, broker.take_result(req, self.client_address[0]))
 
@@ -4085,6 +4204,10 @@ def approval_handler(broker):
                      "norule": "No standing rule was created; the request is still waiting.",
                      "revoked": "Grant revoked.",
                      "stale": "That request was already handled or has expired.",
+                     "enrolled": "Client enrolled. It starts with no rules of its own.",
+                     "enrolldeny": "Enrollment denied.",
+                     "enrollname": "That name is taken or not allowed; choose another name and approve again.",
+                     "enrollsave": "Could not save the client list, so nothing was enrolled.",
                      "push_removed": "Device removed.",
                      "push_test_ok": "Test push sent. It should arrive even with the browser closed.",
                      "push_failed": "The test push was not delivered to any device.",
@@ -4092,6 +4215,10 @@ def approval_handler(broker):
             reqs = broker.pending()
             token = broker.csrf_token(user)
             cards = []
+            enrolls = broker.clients.pending()
+            now = time.time()
+            for e in enrolls:       # a new client waits above the requests: a human-only decision
+                cards.append(clients_mod.enroll_card_html(e, token, now, broker.clients.name_in_use(e["name"])))
             for r in reqs:
                 what, rnote = _describe(r)
                 cards.append(
@@ -4100,7 +4227,7 @@ def approval_handler(broker):
                     f"{'Guidance proposal' if r.mode == 'guidance' else html.escape(', '.join(r.names))}</h2>"
                     f"<time data-exp='{int(r.expires)}'>expires in "
                     f"{max(0, int(r.expires - time.time()))}s</time></div>{_risk_html(r)}"
-                    f"<div class=box>From: {html.escape(r.source)}<br>{what}</div>"
+                    f"<div class=box>{clients_mod.from_html(r)}<br>{what}</div>"
                     f"{details_mod.html(broker.details_view(r))}"
                     f"<p><small>{rnote}</small></p>"
                     "<form method=post action='/decide' class=decide>"
@@ -4109,7 +4236,8 @@ def approval_handler(broker):
                     f"{_approve_actions(broker, r)}</form></article>")
             # the card must refresh when its assessment arrives, not only when requests come and go
             version = hashlib.sha256(
-                "|".join(f"{r.id}:{1 if r.risk else 0}" for r in reqs).encode()).hexdigest()[:16]
+                "|".join([f"{r.id}:{1 if r.risk else 0}" for r in reqs]
+                         + [f"enroll:{e['id']}" for e in enrolls]).encode()).hexdigest()[:16]
             inner = ("".join(cards) if cards else
                      "<div class='card empty'>Nothing is waiting for approval.</div>")
             block = f"<div id=cards class=cards data-version='{version}'>{inner}</div>"
@@ -4239,14 +4367,14 @@ def approval_handler(broker):
                 if fragment:
                     return self._fragment(code, f"<p class=muted>{msg}</p>")
                 return _page(self, code, f"<h1>{msg}</h1>", tab="requests",
-                             badge=len(broker.pending()), user=user)
+                             badge=broker.attention(), user=user)
             broker.log("request_detail_viewed", peer=self.client_address[0],
                        client_ip=self._fwd(), request_id=rid)
             body = _detail_html(row, evs, self._retained_html(row) + self._retry_html(row, user))
             if fragment:
                 return self._fragment(200, body)
             _page(self, 200, "<h1>Request</h1><div class=card>" + body + "</div>",
-                  tab="requests", badge=len(broker.pending()), user=user)
+                  tab="requests", badge=broker.attention(), user=user)
 
         def _retry_html(self, row, user):
             """For a settled guidance proposal with failed entries whose text is still held:
@@ -4283,13 +4411,13 @@ def approval_handler(broker):
             """The credential entry page. Served only to the authenticated approver. The secret
             fields are never filled in, so an error re-render cannot echo the value."""
             body = credreq_mod.form_html(req, broker.csrf_token(user), values, errors)
-            _page(self, status, body, tab="requests", badge=len(broker.pending()), user=user)
+            _page(self, status, body, tab="requests", badge=broker.attention(), user=user)
 
         def _credential_get(self, user, rid):
             r = broker._by_id.get(rid)
             if r is None or r.mode != "credential" or r.status != "pending" or time.time() > r.expires:
                 return _page(self, 404, "<h1>Request not found or already handled</h1>", tab="requests",
-                             badge=len(broker.pending()), user=user)
+                             badge=broker.attention(), user=user)
             broker.log("approval_viewed", user=user, peer=self.client_address[0], client_ip=self._fwd(),
                        request_id=r.id, found=True)
             self._credential_page(r, user)
@@ -4307,7 +4435,7 @@ def approval_handler(broker):
                 if done is None:
                     return self._redirect("/?note=stale")
                 return _page(self, 200, "<h1>Denied</h1><p>Nothing was stored.</p>", tab="requests",
-                             badge=len(broker.pending()), user=user)
+                             badge=broker.attention(), user=user)
             one = {k: v[0] for k, v in form.items() if k in (
                 "name", "hosts", "cred_mode", "no_hosts", "var", "token", "username", "password")}
             code, done, errs, values = broker.submit_credential(rid, one, user, peer=peer, client_ip=fwd)
@@ -4320,19 +4448,47 @@ def approval_handler(broker):
             if done is None or code != 200:
                 return _page(self, 410 if code == 410 else 404,
                              "<h1>Request not found or already handled</h1>", tab="requests",
-                             badge=len(broker.pending()), user=user)
+                             badge=broker.attention(), user=user)
             done.done.wait(15)          # the vault write runs in the background; say how it ended
             if done.status in ("approved", "released"):
                 return _page(self, 200, f"<h1>Stored</h1><p>The credential <b>{html.escape(done.names[0])}</b> "
                              "is in the vault. The agent was told only its name. You can close this page.</p>",
-                             tab="requests", badge=len(broker.pending()), user=user)
+                             tab="requests", badge=broker.attention(), user=user)
             if done.status == "failed":
                 return _page(self, 500, "<h1>Not stored</h1><p>The vault refused the write, so nothing "
                              f"was stored: {html.escape(done.error or 'unknown error')}. The request has "
                              "ended; ask the agent to request it again.</p>", tab="requests",
-                             badge=len(broker.pending()), user=user)
+                             badge=broker.attention(), user=user)
             _page(self, 202, "<h1>Storing...</h1><p>The vault write is still running. Check the history "
-                  "on the Requests tab.</p>", tab="requests", badge=len(broker.pending()), user=user)
+                  "on the Requests tab.</p>", tab="requests", badge=broker.attention(), user=user)
+
+        def _clients_post(self, path, form, user):
+            """POST /enroll/decide, /clients/rename|revoke|remove (CSRF already checked). Only
+            this authenticated approver listener can reach them: no notification button, link,
+            token or hook decides an enrollment."""
+            peer, fwd = self.client_address[0], self._fwd()
+            one = lambda k: (form.get(k) or [""])[0]  # noqa: E731
+            if path == "/enroll/decide":
+                status, _e = broker.decide_enrollment(one("id")[:40], one("decision"), one("name")[:40],
+                                                      user, peer, fwd)
+                return self._redirect("/?note=" + {
+                    "approved": "enrolled", "denied": "enrolldeny", "name_taken": "enrollname",
+                    "name_invalid": "enrollname", "not_saved": "enrollsave", "full": "enrollsave"
+                }.get(status, "stale"))
+            cid = one("id")[:12]
+            if path == "/clients/rename":
+                res = broker.rename_client(cid, one("name")[:40], user, peer, fwd)
+                tag = {"renamed": "renamed", "name_taken": "taken", "name_invalid": "taken",
+                       "not_saved": "nosave", "missing": "missing"}.get(res, "missing")
+            elif path == "/clients/revoke":
+                res = broker.revoke_client(cid, user, peer, fwd)
+                tag = {"revoked": "revoked", "memory_only": "revokedmem", "already": "revoked"}.get(res, "missing")
+            elif path == "/clients/remove":
+                res = broker.remove_client(cid, user, peer, fwd)
+                tag = {"removed": "removed", "active": "active", "not_saved": "nosave"}.get(res, "missing")
+            else:
+                return _page(self, 404, "<h1>Not found</h1>", nav=False)
+            return self._redirect("/clients?note=" + tag)
 
         def _fragment(self, code, body):
             raw = body.encode()
@@ -4485,8 +4641,14 @@ def approval_handler(broker):
                   + guidance_mod.policies_section(cfg["secrets"], broker.csrf_token(user))
                   + sshhosts_mod.policies_section(cfg["secrets"], broker.csrf_token(user), ssh_state)
                   + sshrules_mod.policies_section(cfg["secrets"], broker.csrf_token(user),
-                                                  broker.ssh_rule_usage, state=rule_state),
-                  script=_GRANTS_JS + guidance_mod.JS + sshhosts_mod.JS, tab="policies", badge=len(broker.pending()), user=user)
+                                                  broker.ssh_rule_usage, state=rule_state,
+                                                  client_names=broker.clients.names(),
+                                                  client_choices=broker.clients.active_choices()),
+                  script=_GRANTS_JS + guidance_mod.JS + sshhosts_mod.JS, tab="policies", badge=broker.attention(), user=user)
+
+        def _clients_page(self, user, note="", status=200):
+            _page(self, status, clients_mod.clients_section(broker, broker.csrf_token(user), flash=note),
+                  tab="clients", badge=broker.attention(), user=user)
 
         def _standing_section(self, user):
             """'Standing approvals' on the Policies tab: every timed grant, Always
@@ -4502,6 +4664,7 @@ def approval_handler(broker):
             if not broker.grants_cfg["enabled"]:
                 head += "<p><small class=muted>Time-boxed grants are turned off.</small></p>"
             rows = []
+            cnames = broker.clients.names()
             for r in broker.standing_rows():
                 if r["expires_at"] is None:
                     exp = "never"
@@ -4524,11 +4687,13 @@ def approval_handler(broker):
                     f"<tr><td data-label=Secrets><b>{e(', '.join(r['secrets']))}</b></td>"
                     f"<td data-label=Covers>{e(r['covers'])}</td>"
                     f"<td data-label=Expires>{exp}</td>"
-                    f"<td data-label='Created by'>{who}</td><td>{form}</td></tr>")
+                    f"<td data-label='Created by'>{who}</td>"
+                    f"<td data-label='Applies to'>{e(clients_mod.scope_label(r['client'], cnames))}</td>"
+                    f"<td>{form}</td></tr>")
             if not rows:
                 return head + "<div class='card empty'>No standing approvals</div>"
             return (head + "<table class=tbl><thead><tr><th>Secrets</th><th>Covers</th><th>Expires</th>"
-                    "<th>Created by</th><th></th></tr></thead><tbody>" + "".join(rows) + "</tbody></table>")
+                    "<th>Created by</th><th>Applies to</th><th></th></tr></thead><tbody>" + "".join(rows) + "</tbody></table>")
 
         def do_GET(self):
             user = self._user()
@@ -4563,6 +4728,9 @@ def approval_handler(broker):
             if self.path.split("?")[0].rstrip("/") == "/policies":
                 broker.log("policies_viewed", peer=self.client_address[0], client_ip=self._fwd())
                 return self._policies_page(user)
+            if self.path.split("?")[0].rstrip("/") == "/clients":
+                q = urllib.parse.parse_qs(u.query)
+                return self._clients_page(user, _CLIENT_NOTES.get((q.get("note") or [""])[0][:12], ""))
             nonce = self._nonce()
             req = broker._by_nonce.get(nonce) if nonce else None
             broker.log("approval_viewed", user=self.headers.get(
@@ -4579,7 +4747,7 @@ def approval_handler(broker):
 <h1>{'Guidance proposal' if req.mode == 'guidance' else 'Secret request'}</h1>
 <p><b>{html.escape(', '.join(req.names))}</b></p>
 {summary_html}
-<div class=box>From: {html.escape(req.source)}<br>{what}</div>
+<div class=box>{clients_mod.from_html(req)}<br>{what}</div>
 {details_mod.html(broker.details_view(req))}
 <p><small>{note}</small></p>
 <p><small>Expires in {int(req.expires - time.time())}s</small></p>
@@ -4750,6 +4918,7 @@ def approval_handler(broker):
             form = urllib.parse.parse_qs(
                 self.rfile.read(min(int(self.headers.get("Content-Length", 0)), limit)).decode())
             if path in ("/decide", "/credential", "/request/retry", "/policies", "/policies/guidance", "/policies/ssh_hosts", "/grants/revoke",
+                        "/enroll/decide", "/clients/rename", "/clients/revoke", "/clients/remove",
                         "/policies/ssh_rules/add", "/policies/ssh_rules/revoke", "/push/subscribe",
                         "/push/revoke", "/push/test") and not self._csrf_ok(user, form.get("csrf", [""])[0]):
                 broker.log("csrf_refused", path=path, peer=self.client_address[0],
@@ -4760,6 +4929,8 @@ def approval_handler(broker):
                 return self._push_post(path, form, user)
             if path == "/credential":
                 return self._credential_post(user, form)
+            if path.startswith("/clients/") or path == "/enroll/decide":
+                return self._clients_post(path, form, user)
             if path == "/decide":
                 rid = form.get("id", [""])[0]
                 decision = form.get("decision", [""])[0]
@@ -4770,7 +4941,7 @@ def approval_handler(broker):
                     return self._redirect("/?note=stale")
                 code, done = broker.decide_via(
                     "dashboard", rid, parsed[0], user, always=parsed[1], grant_minutes=parsed[2],
-                    ssh_rule=rule, apply=_apply_set(form),
+                    ssh_rule=rule, apply=_apply_set(form), rule_scope=_rule_scope(form),
                     peer=self.client_address[0], client_ip=self._fwd())
                 if done is None:
                     return self._redirect("/?note=" + ("bad" if code == 400 else
@@ -4812,7 +4983,8 @@ def approval_handler(broker):
                     return _page(self, 400, "<h1>Bad request</h1>")
                 one = lambda k: form.get(k, [""])[0]  # noqa: E731
                 res = broker.add_ssh_rule(name, one("host") or one("fp"), one("account"), one("expires"),
-                                          one("confirm") == "1", user, self.client_address[0], self._fwd())
+                                          one("confirm") == "1", user, self.client_address[0], self._fwd(),
+                                          client=one("client") or clients_mod.ANY)
                 if res["status"] in ("created", "exists"):
                     return self._policies_page(
                         user, f"<p>{'SSH rule added' if res['status'] == 'created' else res['message']}: "
@@ -4875,6 +5047,7 @@ def approval_handler(broker):
             code, req = (broker.decide_via("link", None, parsed[0], user, nonce=nonce,
                                            always=parsed[1], grant_minutes=parsed[2],
                                            ssh_rule=rule or None, apply=_apply_set(form),
+                                           rule_scope=_rule_scope(form),
                                            peer=self.client_address[0], client_ip=self._fwd())
                          if nonce and rule is not False else (404, None))
             held = broker._by_nonce.get(nonce) if nonce else None

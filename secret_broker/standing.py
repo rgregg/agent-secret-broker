@@ -24,10 +24,11 @@ never reveal which secrets have one.
 import re
 import time
 
+from . import clients as clients_mod
 from . import grants as grants_mod
 
 MAX_STANDING = 50                       # Always approvals per credential
-KEYS = ("id", "secrets", "mode", "scope", "expires_at", "created_by", "created_at")
+KEYS = ("id", "secrets", "mode", "scope", "expires_at", "created_by", "created_at", "client")
 ALWAYS_MODES = ("http", "env")          # SSH keeps its own per-host rules (sshrules.py)
 _ID = re.compile(r"[A-Za-z0-9_-]{4,16}")
 _TIME = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ")
@@ -80,9 +81,25 @@ def parse(raw, name, field="standing"):
         when = r["created_at"]
         if not isinstance(when, str) or not _TIME.fullmatch(when):
             raise ValueError(f"{at}.created_at must be a UTC time like 2026-10-19T12:00:00Z")
-        out.append({"id": sid, "secrets": [name], "mode": r["mode"], "scope": r["scope"],
-                    "expires_at": None, "created_by": _CTRL.sub(" ", by).strip(),
-                    "created_at": when})
+        client = clients_mod.parse_scope(r.get("client"), f"{at}.client")
+        entry = {"id": sid, "secrets": [name], "mode": r["mode"], "scope": r["scope"],
+                 "expires_at": None, "created_by": _CTRL.sub(" ", by).strip(), "created_at": when}
+        if client != clients_mod.ANY:       # a global rule has exactly the shape it always had
+            entry["client"] = client
+        out.append(entry)
+    return out
+
+
+def serialize(entries):
+    """The vault form of parsed Always approvals. A global rule (`client` is `*`) is written
+    exactly as before this field existed, so existing data and older brokers are untouched;
+    only a client-scoped rule carries `client`."""
+    out = []
+    for e in entries:
+        d = {k: v for k, v in e.items() if k != "client"}
+        if e.get("client", clients_mod.ANY) != clients_mod.ANY:
+            d["client"] = e["client"]
+        out.append(d)
     return out
 
 

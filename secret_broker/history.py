@@ -30,7 +30,9 @@ _EV_KEYS = ("reason", "reasons", "model", "risk", "error", "via", "channel", "de
             "applied_names", "denied_names", "failed_names", "failed_classes", "count", "retry",
             # credential requests: kind, hosts and counts; never the purpose text or any value
             "cred_kind", "cred_mode", "purpose_length", "purpose_sha256", "edited", "requested_name",
-            "var_names", "no_hosts")
+            "var_names", "no_hosts",
+            # per-client credentials: whose request it was and whom a rule created from it applies to
+            "client_id", "client_name", "rule_client")
 _MAX_EVENTS = 60            # per request
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 
@@ -123,6 +125,7 @@ class History:
                 "op": rec.get("op"), "item": rec.get("item"), "field": rec.get("field"),
                 "key": rec.get("key"), "hosts": rec.get("hosts"), "final_seq": -1,
                 "ssh_what": rec.get("ssh_what"), "peer": rec.get("peer"),
+                "client_id": rec.get("client_id"), "client_name": rec.get("client_name"),
                 "argv": _clean(rec.get("argv")), "scripts": _scripts(rec), "risk_reasons": None, "risk_model": None,
             }
             self._events[rid] = []
@@ -198,7 +201,7 @@ class History:
             rows = [r for r in rows if q in " ".join(
                 str(x) for x in (r["id"], ", ".join(r["names"]), r["method"], r["url"], r["source"],
                                  r["summary"], r["approver"], r["error"], r["ssh_what"], r["op"],
-                                 r["mode"], " ".join(r["argv"] or ()))
+                                 r["mode"], r.get("client_name"), " ".join(r["argv"] or ()))
                 if x).lower()]
         return rows
 

@@ -30,6 +30,7 @@ import secrets
 import threading
 import time
 
+from . import clients as clients_mod
 from . import risk as risk_mod
 
 ELIGIBLE_MODES = ("http", "ssh_sign", "env")
@@ -108,10 +109,11 @@ def describe(cfg, auto_max="low"):
 
 
 class GrantStore:
-    """In-memory grants keyed by the exact SET of secret names, mirrored to a
-    small JSON file. A request is covered only by a grant whose set equals its
-    own (a subset or superset does not match). Granting again for the same set
-    replaces (and so restarts) the grant, whatever its scope was.
+    """In-memory grants keyed by the exact SET of secret names, the mode and the CLIENT
+    scope (`*` = any client, else one client id), mirrored to a small JSON file. A request
+    is covered only by a grant whose set equals its own (a subset or superset does not
+    match) and whose client scope is the requesting client or `*`. Granting again for the
+    same set, mode and client replaces (and so restarts) the grant, whatever its scope was.
     `on_event(name, **fields)` receives audit records; it must not call back in.
     """
 
@@ -121,7 +123,7 @@ class GrantStore:
         self._clock = clock
         self._max_s = max_minutes * 60
         self._lock = threading.Lock()
-        self._by_set = {}       # (frozenset(names), mode) -> grant
+        self._by_set = {}       # (frozenset(names), mode, client) -> grant
 
     # -- persistence -------------------------------------------------------
     def load(self):
@@ -135,6 +137,12 @@ class GrantStore:
             items = data["grants"]
             if not isinstance(items, list):
                 raise ValueError("grants is not a list")
+            # client-scoped grants live under their own key, so a broker from before client
+            # scoping (which reads only "grants") drops them instead of widening them to everyone
+            scoped = data.get("client_grants", [])
+            if not isinstance(scoped, list):
+                raise ValueError("client_grants is not a list")
+            items = items + scoped
         except (OSError, ValueError, KeyError, TypeError) as e:
             self._log("grants_file_corrupt", warning="grants file ignored: no grants loaded",
                       error=str(e)[:120])
@@ -151,7 +159,8 @@ class GrantStore:
                          "expires_at": float(g["expires_at"]), "created_by": str(g["created_by"])[:120],
                          "channel": str(g.get("channel") or "")[:20],
                          "request_id": str(g.get("request_id") or "")[:64],
-                         "mode": g.get("mode") if g.get("mode") in ELIGIBLE_MODES else LEGACY}
+                         "mode": g.get("mode") if g.get("mode") in ELIGIBLE_MODES else LEGACY,
+                         "client": clients_mod.parse_scope(g.get("client"))}
                 except (KeyError, TypeError, ValueError):
                     self._log("grants_file_corrupt", warning="skipped a malformed grant entry")
                     continue
@@ -163,12 +172,14 @@ class GrantStore:
                     self._log("grant_dropped", grant_id=g["id"], secrets=g["secrets"],
                               reason="deadline is further out than max_minutes allows")
                 else:
-                    self._by_set[(frozenset(g["secrets"]), g["mode"])] = g
+                    self._by_set[(frozenset(g["secrets"]), g["mode"], g["client"])] = g
 
     def _save_locked(self):
         if not self._path:
             return
-        data = {"version": 3, "grants": sorted(self._by_set.values(), key=lambda g: g["id"])}
+        every = sorted(self._by_set.values(), key=lambda g: g["id"])
+        data = {"version": 4, "grants": [g for g in every if g["client"] == clients_mod.ANY],
+                "client_grants": [g for g in every if g["client"] != clients_mod.ANY]}
         tmp = f"{self._path}.tmp"
         try:
             fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -184,8 +195,9 @@ class GrantStore:
         now = self._clock()
         gone = [g for g in self._by_set.values() if g["expires_at"] <= now]
         for g in gone:
-            del self._by_set[(frozenset(g["secrets"]), g["mode"])]
+            del self._by_set[(frozenset(g["secrets"]), g["mode"], g["client"])]
             self._log("grant_expired", grant_id=g["id"], secrets=g["secrets"], mode=g["mode"],
+                      client_id=g["client"],
                       expires_at=g["expires_at"], created_by=g["created_by"])
         if gone:
             self._save_locked()
@@ -195,10 +207,11 @@ class GrantStore:
         with self._lock:
             return self._expire_locked()
 
-    def add(self, names, minutes, scope, created_by, channel, request_id, mode=None):
+    def add(self, names, minutes, scope, created_by, channel, request_id, mode=None, client=clients_mod.ANY):
         now = self._clock()
-        key = (frozenset(names), mode or LEGACY)
+        key = (frozenset(names), mode or LEGACY, client)
         g = {"id": secrets.token_hex(4), "secrets": sorted(key[0]), "scope": scope, "mode": key[1],
+             "client": client,
              "minutes": int(minutes), "created_at": now, "expires_at": now + minutes * 60,
              "created_by": created_by, "channel": channel, "request_id": request_id or ""}
         with self._lock:
@@ -207,23 +220,40 @@ class GrantStore:
             self._save_locked()
         return dict(g)
 
-    def find(self, names, mode=None):
-        """The active grant for exactly this set of names and mode, or None.
+    def find(self, names, mode=None, client=None):
+        """The active grant for exactly this set of names and mode that applies to `client`,
+        or None. A grant scoped to that client wins over one for any client. A grant scoped
+        to another client never applies. With no client, only a grant for any client.
         With no mode, any grant for the set (a legacy grant has no mode)."""
+        scopes = [client, clients_mod.ANY] if client and client != clients_mod.ANY else [clients_mod.ANY]
         with self._lock:
             self._expire_locked()
-            if mode is None:
-                g = next((g for (k, _), g in self._by_set.items() if k == frozenset(names)), None)
-            else:
-                g = self._by_set.get((frozenset(names), mode))
-                if g is None and mode in ("http", "ssh_sign"):
-                    g = self._by_set.get((frozenset(names), LEGACY))
-            return dict(g) if g else None
+            for sc in scopes:
+                if mode is None:
+                    g = next((g for (k, _, c), g in self._by_set.items()
+                              if k == frozenset(names) and c == sc), None)
+                else:
+                    g = self._by_set.get((frozenset(names), mode, sc))
+                    if g is None and mode in ("http", "ssh_sign"):
+                        g = self._by_set.get((frozenset(names), LEGACY, sc))
+                if g:
+                    return dict(g)
+            return None
 
     def active(self):
         with self._lock:
             self._expire_locked()
             return sorted((dict(g) for g in self._by_set.values()), key=lambda g: g["expires_at"])
+
+    def revoke_client(self, client):
+        """Remove every grant scoped to one client; returns them."""
+        with self._lock:
+            gone = [g for g in self._by_set.values() if g["client"] == client]
+            for g in gone:
+                del self._by_set[(frozenset(g["secrets"]), g["mode"], g["client"])]
+            if gone:
+                self._save_locked()
+            return [dict(g) for g in gone]
 
     def revoke(self, grant_id):
         """Remove a grant by id; returns it, or None when not active."""

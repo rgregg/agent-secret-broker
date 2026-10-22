@@ -31,6 +31,7 @@ import html
 import re
 import time
 
+from . import clients as clients_mod
 from . import guidance as guidance_mod
 
 KINDS = ("token", "login")
@@ -188,7 +189,7 @@ def form_html(req, csrf, values=None, errors=()):
                 else "The placeholder name agents use, as in {{NAME}}.")
     return (
         "<h1>Credential request</h1>"
-        f"<div class=box>From: {e(req.source)}<br>{what}</div>"
+        f"<div class=box>{clients_mod.from_html(req)}<br>{what}</div>"
         f"<p><small>{e(note)}</small></p>"
         f"<p><small>Expires in {max(0, int(req.expires - time.time()))}s</small></p>"
         f"{errs}"

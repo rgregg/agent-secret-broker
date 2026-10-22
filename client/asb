@@ -19,6 +19,7 @@
                                               broker makes the call itself
   asb guidance propose FILE|- | --from-dir DIR  propose risk guidance; the human reviews it
   asb guidance status ID                      outcome of a proposal (no approval)
+  asb enroll [--name NAME] [--url URL] [--force]  get this machine its own credential; a human approves
 
 Config: SECRET_BROKER_URL / SECRET_BROKER_KEY, or
 ~/.config/secret-broker/client.json {"url": ..., "key": ...}.
@@ -28,6 +29,7 @@ asb guide           the manual for agents: workflow, placeholders, approvals, ex
 """
 import base64
 import hashlib
+import shutil
 import shlex
 import json
 import os
@@ -251,8 +253,43 @@ entry was applied, 4 denied, 5 expired, 3 broker problem, 2 usage.
 `status ID` prints the same for a proposal you already sent (no approval); "pending"
 while the human has not decided. There is no command to read current guidance.
 example: asb guidance propose --from-dir ./guidance""",
+    "enroll": """usage: asb enroll [--name NAME] [--url URL] [--force]
+
+Give THIS machine its own broker credential instead of a copied shared key. asb makes a random
+256-bit secret locally, sends the broker only a hash of it, prints a confirmation code and waits
+for the human to approve the card with the same code on the approval page. On approval it writes
+~/.config/secret-broker/client.json (the url, and the new secret as "key", mode 0600). The secret
+is never printed, never sent while enrolling and never an argument.
+--name sets the client's name (lowercase letters, digits, - _ . up to 32 characters; default: this
+host name; the human may change it). --url is the broker's client URL (default: SECRET_BROKER_URL
+or the url in client.json). An existing client.json that already has a key is replaced only with
+--force, and is first copied to client.json.bak-<time>.
+Exit 0 enrolled, 4 denied, 5 expired or timed out, 3 the broker refused or is unreachable, 2 usage.
+Only the human who started this should approve it: refuse any card whose code you do not recognise.
+example: asb enroll --name build-box""",
     "guide": "usage: asb guide\n\nPrint the manual for agents.",
 }
+
+
+ENROLL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,31}$")
+CLIENT_SECRET_PREFIX = "asbc1_"
+
+
+def enroll_hash(secret):
+    """sha256 of the secret, domain separated. Must equal secret_broker.clients.hash_secret."""
+    return hashlib.sha256(b"asb-client-secret-v1\0" + secret.encode()).hexdigest()
+
+
+def enroll_code(secret_hash):
+    """The confirmation code (XXXX-XXXX) both this terminal and the approval card show; derived
+    from the hash. Must equal secret_broker.clients.confirm_code."""
+    s = base64.b32encode(hashlib.sha256(b"asb-enroll-code-v1\0" + secret_hash.encode()).digest()).decode()[:8]
+    return s[:4] + "-" + s[4:]
+
+
+def _safe_text(text, n=160):
+    """Server-supplied text shown on a terminal: printable ASCII only."""
+    return "".join(c if 32 <= ord(c) < 127 else "?" for c in str(text))[:n]
 
 
 def die(msg, code=EXIT_USAGE):
@@ -403,6 +440,144 @@ def run_guidance(argv):
             _print_guidance(r2.get("guidance") or {})
             return _guidance_exit(r2)
     die("timed out waiting for approval", EXIT_EXPIRED)
+
+
+CLIENT_JSON = os.path.join("~", ".config", "secret-broker", "client.json")
+
+
+def _enroll_http(base, path, body=None):
+    """(status, dict) from the unauthenticated enrollment endpoints. Network failures are
+    reported by class only (never exception text); the secret is not involved."""
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(base + path, data=data, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return r.status, json.load(r)
+    except urllib.error.HTTPError as e:
+        try:
+            out = json.load(e)
+            return e.code, out if isinstance(out, dict) else {}
+        except (ValueError, OSError):
+            return e.code, {}
+    except (OSError, ValueError) as e:
+        return None, {"_net": type(e).__name__}
+
+
+def _write_client_json(path, cfg):
+    d = os.path.dirname(path)
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    tmp = f"{path}.tmp{os.getpid()}"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(cfg, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def run_enroll(argv):
+    """asb enroll [--name NAME] [--url URL] [--force]"""
+    name = url = None
+    force = False
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--force":
+            force, i = True, i + 1
+        elif a in ("--name", "--url") and i + 1 < len(argv):
+            if a == "--name":
+                name = argv[i + 1]
+            else:
+                url = argv[i + 1]
+            i += 2
+        else:
+            die(f"unexpected argument {a!r}\n" + HELP["enroll"])
+    path = os.path.expanduser(CLIENT_JSON)
+    old = None
+    try:
+        with open(path) as f:
+            old = json.load(f)
+        if not isinstance(old, dict):
+            old = None
+    except (OSError, ValueError):
+        old = None
+    url = (url or os.environ.get("SECRET_BROKER_URL") or (old or {}).get("url") or "").rstrip("/")
+    if not url.startswith(("http://", "https://")):
+        die("no broker url: pass --url https://broker.example/ or set SECRET_BROKER_URL\n" + HELP["enroll"])
+    if name is None:
+        name = re.sub(r"[^a-z0-9_.-]+", "-", socket.gethostname().split(".")[0].lower()).strip("-.")[:32]
+        name = name if ENROLL_NAME_RE.match(name or "") else "client"
+    if not ENROLL_NAME_RE.match(name):
+        die("--name must be 1-32 lowercase letters, digits, - _ . and start with a letter or digit")
+    if (old or {}).get("key") and not force:
+        die(f"{CLIENT_JSON} already holds a key; enrolling would replace it. Run with --force to do it "
+            "(the old file is first copied to client.json.bak-<time>), or use another HOME.")
+    secret = CLIENT_SECRET_PREFIX + base64.urlsafe_b64encode(os.urandom(32)).decode().rstrip("=")
+    h = enroll_hash(secret)
+    code = enroll_code(h)
+    claim = re.sub(r"[^A-Za-z0-9@._:+()\[\]-]", "_", f"{os.environ.get('USER', '?')}@{socket.gethostname()}")[:120]
+    status, r = _enroll_http(url, "/v1/enroll", {"name": name, "hash": h, "claim": claim})
+    if status is None:
+        die(f"cannot reach the broker ({r.get('_net', 'error')})", EXIT_BROKER)
+    if status != 202 or not isinstance(r.get("id"), str):
+        die("the broker refused the enrollment: " + _safe_text(r.get("error") or f"HTTP {status}"), EXIT_BROKER)
+    if r.get("code") != code:
+        die("the broker returned a different confirmation code; not continuing", EXIT_BROKER)
+    print(f"asb: enrollment requested as {name!r}.", file=sys.stderr)
+    print(f"asb: confirmation code: {code}", file=sys.stderr)
+    print("asb: waiting for the human to approve the card with this same code on the approval page "
+          "(deny it if the code differs or you did not start this)...", file=sys.stderr)
+    deadline = time.time() + int(r.get("expires_in") or 600) + 15
+    errors = 0
+    while time.time() < deadline:
+        time.sleep(max(1, min(int(r.get("interval") or 2), 10)))
+        st, p = _enroll_http(url, f"/v1/enroll/{urllib.parse.quote(r['id'], safe='')}")
+        if st is None or st in (429, 500, 502, 503, 504):
+            errors += 1
+            if errors > 15:
+                die("lost contact with the broker while waiting", EXIT_BROKER)
+            continue
+        errors = 0
+        if st != 200:
+            die("the broker no longer knows this enrollment", EXIT_BROKER)
+        if p.get("status") == "denied":
+            die("enrollment denied", EXIT_DENIED)
+        if p.get("status") == "expired":
+            die("enrollment expired before anyone approved it", EXIT_EXPIRED)
+        if p.get("status") == "approved":
+            break
+    else:
+        die("timed out waiting for approval", EXIT_EXPIRED)
+    backup = None
+    if old is not None:
+        backup = f"{path}.bak-{time.strftime('%Y%m%d%H%M%S')}"
+        fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(old, f, indent=2)
+            f.write("\n")
+    new = dict(old or {})
+    new["url"], new["key"] = url, secret
+    _write_client_json(path, new)
+    # prove the new credential works before calling this done; otherwise put the old file back
+    req = urllib.request.Request(url + "/v1/status", headers={"X-Client-Key": secret})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            ok = resp.status == 200
+    except (urllib.error.URLError, OSError, ValueError):
+        ok = False
+    if not ok:
+        if backup:
+            shutil.copyfile(backup, path)
+            os.chmod(path, 0o600)
+        else:
+            os.unlink(path)
+        die("the broker approved the enrollment but rejected the new key; client.json was not changed", EXIT_BROKER)
+    print(f"enrolled: {_safe_text(p.get('name') or name, 40)} ({_safe_text(p.get('client_id') or '?', 16)})")
+    print(f"asb: wrote {CLIENT_JSON}" + (f" (the previous file is saved as {os.path.basename(backup)})" if backup else "")
+          + ". Nothing was printed that you need to keep.", file=sys.stderr)
+    if os.environ.get("SECRET_BROKER_KEY"):
+        print("asb: the SECRET_BROKER_KEY environment variable is set and overrides client.json; unset it "
+              "to use this machine's own credential.", file=sys.stderr)
+    return 0
 
 
 def run_request_credential(argv):
@@ -1778,6 +1953,9 @@ def main(argv):
     if argv[0] == "request-credential":
         return run_request_credential(argv[1:])
 
+    if argv[0] == "enroll":
+        return run_enroll(argv[1:])
+
     if argv[0] == "fingerprint":
         if len(argv) != 2:
             die(HELP["fingerprint"])
@@ -1887,7 +2065,7 @@ def main(argv):
 
     if "--" not in argv:
         die(f"unknown command {argv[0]!r}.\ncommands: list, which, status, audit, http, store, update, "
-            "request-credential, guidance, ssh-agent, fingerprint, help, guide; or: asb NAME -- command\n"
+            "request-credential, guidance, enroll, ssh-agent, fingerprint, help, guide; or: asb NAME -- command\n"
             "start with `asb guide`")
     i = argv.index("--")
     names, cmd = argv[0].split(",") if i == 1 else None, argv[i + 1:]

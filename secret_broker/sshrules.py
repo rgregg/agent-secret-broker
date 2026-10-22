@@ -33,13 +33,14 @@ import secrets
 import threading
 import time
 
+from . import clients as clients_mod
 from . import sshkey
 from .backends import BackendError
 
 MAX_RULES = 100
 MAX_LABEL = 100
 EXPIRY_CHOICES = ("never", "30", "90")          # days; the card and the Policies form offer these
-RULE_KEYS = ("id", "fp", "user", "host", "by", "at", "expires_at")
+RULE_KEYS = ("id", "fp", "user", "host", "by", "at", "expires_at", "client")
 _FP = re.compile(r"SHA256:[A-Za-z0-9+/]{43}=?")
 _ID = re.compile(r"[A-Za-z0-9_-]{4,16}")
 _TIME = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ")
@@ -132,7 +133,23 @@ def parse(raw, field="ssh_rules"):
             except ValueError as e:
                 raise ValueError(f"{at}.{k}: {e}") from None
             times[k] = v
-        out.append({"id": rid, "fp": fp, "user": user, "host": host or None, "by": by, **times})
+        client = clients_mod.parse_scope(r.get("client"), f"{at}.client")
+        rule = {"id": rid, "fp": fp, "user": user, "host": host or None, "by": by, **times}
+        if client != clients_mod.ANY:       # a global rule has exactly the shape it always had
+            rule["client"] = client
+        out.append(rule)
+    return out
+
+
+def serialize(rules):
+    """The vault form of parsed rules: a global rule (`client` is `*`) is written exactly as
+    before the field existed; only a client-scoped rule carries `client`."""
+    out = []
+    for r in rules:
+        d = {k: v for k, v in r.items() if k != "client"}
+        if r.get("client", clients_mod.ANY) != clients_mod.ANY:
+            d["client"] = r["client"]
+        out.append(d)
     return out
 
 
@@ -140,26 +157,36 @@ def is_expired(rule, now):
     return bool(rule.get("expires_at")) and to_epoch(rule["expires_at"]) <= now
 
 
-def find(rules, fp, user, now):
-    """The active rule for exactly this host key and account, or (None, expired_hit).
+def find(rules, fp, user, now, client=None):
+    """The active rule for exactly this host key and account that applies to `client`, or
+    (None, expired_hit). A rule scoped to that client wins over one for any client; a rule
+    scoped to another client never applies; with no client only a rule for any client does.
     Account compare is exact (case-sensitive)."""
     expired = False
+    best = None
     for r in rules or ():
         if r["fp"] == fp and r["user"] == user:
+            scope = r.get("client", clients_mod.ANY)
+            if scope != clients_mod.ANY and scope != client:
+                continue
             if is_expired(r, now):
                 expired = True
                 continue
-            return r, expired
-    return None, expired
+            if best is None or (scope != clients_mod.ANY and best.get("client", clients_mod.ANY) == clients_mod.ANY):
+                best = r
+    return best, expired
 
 
-def new_rule(fp, user, label, by, days, now, taken_ids=()):
+def new_rule(fp, user, label, by, days, now, taken_ids=(), client=clients_mod.ANY):
     rid = secrets.token_hex(4)
     while rid in taken_ids:
         rid = secrets.token_hex(4)
-    return {"id": rid, "fp": valid_fp(fp), "user": valid_account(user), "host": clean_label(label),
+    rule = {"id": rid, "fp": valid_fp(fp), "user": valid_account(user), "host": clean_label(label),
             "by": str(by)[:120] or "unknown", "at": iso(now),
             "expires_at": iso(now + days * 86400) if days else None}
+    if client != clients_mod.ANY:
+        rule["client"] = client
+    return rule
 
 
 def expiry_days(choice):
@@ -293,7 +320,7 @@ class SshRulesMixin:
         sc = self.cfg["secrets"][name]
         meta = {**sc["_meta"], "ssh_rules_changed": {"by": user, "at": iso(time.time())}}
         if rules:
-            meta["ssh_rules"] = rules
+            meta["ssh_rules"] = serialize(rules)
         else:
             meta.pop("ssh_rules", None)
         self.backend.set_meta(sc["_item"], meta)
@@ -328,7 +355,7 @@ class SshRulesMixin:
         if not self._host_allowed_now(sc, fp):
             return False, "not_eligible"
         if len(sc.get("ssh_rules") or []) >= MAX_RULES and find(
-                sc["ssh_rules"], fp, _account, time.time())[0] is None:
+                sc["ssh_rules"], fp, _account, time.time(), req.client["id"])[0] is None:
             return False, "cap"
         return True, ""
 
@@ -340,29 +367,31 @@ class SshRulesMixin:
         fp, account, _ = identity(req.spec)
         return account, server_name(req.spec.get("host")), fp
 
-    def _add_rule(self, name, fp, account, label, by, days):
-        """Create (or find) a rule. Returns (status, rule): created | exists | cap |
-        backend | failed."""
+    def _add_rule(self, name, fp, account, label, by, days, client=clients_mod.ANY):
+        """Create (or find) a rule for one client (or `*` = any). Returns (status, rule):
+        created | exists | cap | backend | failed. A rule that already covers this client
+        (its own, or one for any client) counts as existing."""
         with self._cfg_lock:
             sc = self.cfg["secrets"][name]
             rules = [dict(r) for r in sc.get("ssh_rules") or []]
             now = time.time()
-            have, _ = find(rules, fp, account, now)
+            have, _ = find(rules, fp, account, now, client)
             if have is not None:
                 return "exists", have
-            rules = [r for r in rules if not (r["fp"] == fp and r["user"] == account)]
+            rules = [r for r in rules if not (r["fp"] == fp and r["user"] == account
+                                              and r.get("client", clients_mod.ANY) == client)]
             if len(rules) >= MAX_RULES:
                 return "cap", None
             if "set_meta" not in self.backend.capabilities:
                 return "backend", None
-            rule = new_rule(fp, account, label, by, days, now, {r["id"] for r in rules})
+            rule = new_rule(fp, account, label, by, days, now, {r["id"] for r in rules}, client)
             try:
                 self._persist_ssh_rules(name, rules + [rule], by)
             except (OSError, ValueError, KeyError, BackendError):
                 return "failed", None
         return "created", rule
 
-    def _ssh_rule_create(self, req, days, actor, channel, who):
+    def _ssh_rule_create(self, req, days, actor, channel, who, scope=clients_mod.ANY):
         """Create the rule a human asked for on this request's card. Never raises;
         returns a short status for the approval page."""
         name = req.names[0]
@@ -372,10 +401,11 @@ class SshRulesMixin:
             return "refused"
         fp, account, _ = identity(req.spec)
         status, rule = self._add_rule(name, fp, account, ", ".join(req.spec["host"].get("names") or []),
-                                      actor, days)
+                                      actor, days, scope)
         if status == "created":
             self.audit("ssh_rule_created", req, credential=name, account=account, rule_id=rule["id"],
                        rule_host=rule["host"], expires_at=rule["expires_at"], created_by=actor,
+                       rule_client=scope,
                        **{k: v for k, v in who.items() if k in ("channel", "approver_peer", "approver_ip")})
         elif status == "exists":
             return "exists"
@@ -386,9 +416,11 @@ class SshRulesMixin:
             self.audit("ssh_rule_refused", req, credential=name, reason=status, **who)
         return status
 
-    def add_ssh_rule(self, name, fp, account, expiry, confirm, user, peer=None, client_ip=None):
-        """Policies-page 'Add rule'. Returns {"status": created|exists|refused|failed,
-        "message"}; raises ValueError for an unknown or non-ssh secret."""
+    def add_ssh_rule(self, name, fp, account, expiry, confirm, user, peer=None, client_ip=None,
+                     client=clients_mod.ANY):
+        """Policies-page 'Add rule' for one client (or `*` = any client). Returns {"status":
+        created|exists|refused|failed, "message"}; raises ValueError for an unknown or non-ssh
+        secret."""
         sc = self.cfg["secrets"].get(name)
         if not sc or not sc.get("ssh"):
             raise ValueError("bad ssh rule change")
@@ -401,15 +433,18 @@ class SshRulesMixin:
             fp, account, days = valid_fp(fp), valid_account(account), expiry_days(expiry)
         except ValueError as e:
             return refused("invalid", str(e))
+        if client != clients_mod.ANY and not (clients_mod.SCOPE_RE.fullmatch(str(client))
+                                              and self.clients.is_active(client)):
+            return refused("invalid", "Pick an enrolled client, or any client.")
         if not confirm:
             return refused("not_confirmed", "Tick the box to confirm that this key may then sign for "
                                             "this server and account without asking.")
         known = (sc.get("ssh_hosts") or {}).get("known") or {}
-        status, rule = self._add_rule(name, fp, account, ", ".join(known.get(fp, [])), user, days)
+        status, rule = self._add_rule(name, fp, account, ", ".join(known.get(fp, [])), user, days, client)
         if status == "exists":
             return {"status": "exists", "message": "That rule already exists."}
         if status == "created":
-            self.log("ssh_rule_created", host_fp=fp, account=account, rule_id=rule["id"],
+            self.log("ssh_rule_created", host_fp=fp, account=account, rule_id=rule["id"], rule_client=client,
                      rule_host=rule["host"], expires_at=rule["expires_at"], created_by=user,
                      **{k: v for k, v in who.items() if k != "user"}, approver_peer=peer, approver_ip=client_ip)
             return {"status": "created", "message": ""}
@@ -484,7 +519,9 @@ class SshRulesMixin:
         if why:
             return False
         now = time.time()
-        rule, saw_expired = find(sc["ssh_rules"], fp, account, now)
+        if self.client_never_auto(req.client["id"]):
+            return False            # a client set to never auto-approve always prompts
+        rule, saw_expired = find(sc["ssh_rules"], fp, account, now, req.client["id"])
         if saw_expired:
             threading.Thread(target=self.expire_ssh_rules, args=(req.names[0],), daemon=True).start()
         if rule is None:
@@ -542,12 +579,13 @@ def _when(t):
         return ""
 
 
-def policies_section(secrets_cfg, csrf, usage, now=None, state=None):
+def policies_section(secrets_cfg, csrf, usage, now=None, state=None, client_names=None, client_choices=()):
     """'SSH host rules' for the Policies tab: per SSH key a table of its rules with
     Revoke and an 'Add rule' form. `state` maps a secret name to {"error", "open"}."""
     e = html.escape
     now = time.time() if now is None else now
     state = state or {}
+    client_names = client_names or {}
     keys = [(n, sc) for n, sc in sorted(secrets_cfg.items()) if sc.get("ssh")]
     head = ("<h3>SSH host rules</h3><p><small class=muted>Standing approvals: a key may sign "
             "logins to one verified server as one account without asking, whatever the auto-approve "
@@ -574,6 +612,7 @@ def policies_section(secrets_cfg, csrf, usage, now=None, state=None):
                 f"<tr><td data-label=Host>{e(r['host'] or '(no name)')}{warn}</td>"
                 f"<td data-label=Fingerprint><span class=fp title='{e(r['fp'], quote=True)}'>{e(short_fp(r['fp']))}...</span></td>"
                 f"<td data-label=Account><code>{e(r['user'])}</code></td>"
+                f"<td data-label=Client>{e(clients_mod.scope_label(r.get('client', clients_mod.ANY), client_names))}</td>"
                 f"<td data-label=Created>{e(r['by'])}<br><small class=muted>{e(r['at'])}</small></td>"
                 f"<td data-label=Expires>{exp}</td>"
                 f"<td data-label='Last used'>{e(_when(u['last_used']) or 'never')}"
@@ -583,7 +622,7 @@ def policies_section(secrets_cfg, csrf, usage, now=None, state=None):
                 f"<input type=hidden name=secret value='{e(name, quote=True)}'>"
                 f"<input type=hidden name=rule value='{e(r['id'], quote=True)}'>"
                 "<button>Revoke</button></form></td></tr>")
-        table = ("<table class=tbl><thead><tr><th>Host</th><th>Fingerprint</th><th>Account</th>"
+        table = ("<table class=tbl><thead><tr><th>Host</th><th>Fingerprint</th><th>Account</th><th>Client</th>"
                  "<th>Created</th><th>Expires</th><th>Last used</th><th></th></tr></thead><tbody>"
                  + "".join(rows) + "</tbody></table>") if rows else "<div class='card empty'>No standing SSH rules</div>"
         opts = "<option value=''>Enter a fingerprint below</option>" + "".join(
@@ -601,6 +640,10 @@ def policies_section(secrets_cfg, csrf, usage, now=None, state=None):
             f"<label for='srf{i}'>or a SHA256: fingerprint</label>"
             f"<input id='srf{i}' name=fp placeholder='SHA256:...' autocomplete=off>"
             f"<label for='sra{i}'>Account</label><input id='sra{i}' name=account maxlength=64 autocomplete=off>"
+            f"<label for='src{i}'>Applies to</label><select id='src{i}' name=client>"
+            "<option value='*' selected>Any client (every machine)</option>"
+            + "".join(f"<option value='{e(cid, quote=True)}'>Only {e(cn)}</option>" for cid, cn in client_choices)
+            + "</select>"
             f"<label for='sre{i}'>Expires</label><select id='sre{i}' name=expires>"
             "<option value=never selected>Never expires (default)</option><option value=30>30 days</option>"
             "<option value=90>90 days</option></select>"

@@ -57,7 +57,9 @@ WHITELIST = {
                   "script_paths": ("script_paths", _L), "script_sha256": ("script_sha256", _L),
                   "script_sizes": ("script_sizes", _IL), "script_markers": ("script_markers", _L),
                   "host_fp": ("host_fp", _S), "host_name": ("host_name", _S),
-                  "claimed_dest": ("claimed_dest", _S)},
+                  "claimed_dest": ("claimed_dest", _S),
+                  # the authenticated client's NAME (the agent's own; never ids, hashes or other clients' rules)
+                  "client": ("client_name", _S)},
     "rejected": {"names": ("names", _L), "mode": ("mode", _S), "source": ("source", _S),
                  "peer": ("peer", _S), "url": ("url", _S), "reason": ("reason", _S)},
     # Decision outcomes. channel/approver are ALWAYS present (null when there was
@@ -122,6 +124,11 @@ HIDDEN = frozenset({
     # and the agent must never learn which servers have rules
     "ssh_rule_created", "ssh_rule_used", "ssh_rule_revoked", "ssh_rule_expired", "ssh_rule_refused",
     "ssh_rule_change_failed", "ssh_rules_state_corrupt", "ssh_rules_state_write_failed",
+    # per-client credentials: enrolling, renaming and revoking clients is approver activity, and an
+    # authentication failure can name a revoked client; none of it is the agent's business
+    "enroll_requested", "enroll_decided", "enroll_refused", "enroll_notify_failed",
+    "client_revoked", "client_renamed", "client_rename_refused", "client_removed",
+    "client_auth_failed", "clients_file_corrupt", "clients_file_write_failed",
 })
 
 def error_class(text):
