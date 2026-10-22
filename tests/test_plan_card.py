@@ -368,14 +368,14 @@ class Pages(CardBase):
     def test_active_plans_table_with_revoke(self):
         pid = self.approve(self.manifest(task=TASK_CANARY))
         self.call(pid, body=self.ok_note())
-        st, h, _ = self.get("/policies")
+        st, h, _ = self.get("/clients")
         self.assertEqual(st, 200)
         for frag in ("Active plans", TASK_CANARY, "build-box", "ledger, svc", "1 / 10", "active",
                      "action='/plans/revoke'", f"value='{pid}'", self.broker.csrf_token("alice"), "Revoke"):
             self.assertIn(frag, h, frag)
-        self.assertLess(h.index("Active plans"), h.index("Standing approvals"))
+        self.assertNotIn("Active plans", self.get("/policies")[1])      # plans and sessions live under Clients
         self.post("/plans/revoke", {"plan": pid})
-        self.assertIn("No active plans", self.get("/policies")[1])
+        self.assertIn("No active plans", self.get("/clients")[1])
 
     def test_the_clients_tab_lists_the_clients_active_plans(self):
         self.approve()

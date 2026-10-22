@@ -1604,7 +1604,7 @@ def card_actions_html(req):
 
 
 def active_table_html(rows, token, names=None):
-    """The Policies tab 'Active plans' table with Revoke."""
+    """The Clients tab 'Active plans' table with Revoke."""
     e = html.escape
     body = []
     for r in rows:
@@ -1619,7 +1619,7 @@ def active_table_html(rows, token, names=None):
             "<td><form method=post action='/plans/revoke' class=inline>"
             f"<input type=hidden name=csrf value='{e(token)}'><input type=hidden name=plan value='{e(r['id'])}'>"
             "<button>Revoke</button></form></td></tr>")
-    head = ("<h3>Active plans</h3><p><small class=muted>A plan lets one client make exactly the listed "
+    head = ("<h2 style='margin-top:1.6rem'>Active plans</h2><p><small class=muted>A plan lets one client make exactly the listed "
             "calls without asking, until its deadline. Revoke ends it before the next call. Plans live in "
             "memory only: a broker restart ends every plan.</small></p>")
     if not body:

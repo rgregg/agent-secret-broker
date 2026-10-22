@@ -35,6 +35,10 @@ push notification or the dashboard.
 - **The agent can ask for a credential without ever seeing it.** `asb request-credential` puts a card
   on the approval site; you type the secret there and the broker stores it
   ([docs](docs/reference.md#credential-requests-the-agent-asks-the-human-supplies-the-value)).
+- **Multi-step API flows stay in the safe mode.** `asb session open` asks you once for a time-boxed,
+  host- and method-limited session (it cannot be extended); `asb http --session` then logs in, keeps the cookies and
+  CSRF values inside the broker, and never shows them to the agent
+  ([docs](docs/reference.md#http-sessions-multi-step-flows-with-one-approval)).
 - **Every use is approved or explicitly allow-listed**, rated by a risk model, and
   written to a hash-chained audit log.
 

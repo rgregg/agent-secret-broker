@@ -2714,7 +2714,10 @@ class StatusEndpoint(Harness):
                                          "auto_approve_max": "low", "timed_grants": True,
                                          "guidance_proposals": True, "credential_requests": True,
                                          "plans": True, "client_enrollment": True, "legacy_client_key": "allow",
-                                         "client_list": "ok"})
+                                         "client_list": "ok",
+                                         "http_sessions": {"enabled": True, "default_ttl_s": 900,
+                                                           "max_ttl_s": 3600, "max_calls": 200,
+                                                           "max_per_client": 3}})
 
     def test_leaks_no_names_hosts_or_config(self):
         _, body = self.status()

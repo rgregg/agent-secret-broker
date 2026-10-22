@@ -170,6 +170,8 @@ prompt-injection stance are in
 
 ### Plans for unattended jobs
 
+A plan approves an exact list of calls for an unattended job; a session (below) approves hosts and methods for a login-style flow. Use one or the other for a call (`--plan` or `--session`, never both); both are refused, never prompted, outside what you approved, and neither follows redirects.
+
     asb plan submit FILE|- [--no-wait]      the manifest; waits for you (about 15 minutes), prints the plan id
     asb http NAME METHOD URL ... --plan ID  (or ASB_PLAN=ID) one call under the plan
     asb plan status ID [--json]             state, rules, uses used/max, time left (your own plans)
@@ -192,6 +194,38 @@ Plan exit codes: 7 the plan has ended or is not usable (`kind` is `ended`, `exha
 `wrong_policy`): do not retry it; 9 slow down (`rate_limited` or `inflight_limit`), retry after the printed
 seconds. These match the http-sessions exit codes.
 
+### HTTP sessions: login and cookie flows without a script
+
+    asb session open NAME --for "purpose" --host H [--host H2]... [--methods GET,HEAD,POST] [--ttl 15m] [--max-calls N]
+    asb http NAME METHOD URL ... [--session ID] [--capture NAME=header:X|cookie:NAME|json:$.a.b]...
+    asb session status ID
+    asb session close ID
+
+Use plain `asb http` for one call or a few independent ones, **`--session` for a multi-step HTTP flow** (log in, reuse the
+cookie, carry a CSRF token, log out), and env mode only when a program needs the secret itself (an official CLI, a
+library). Do not write a script around `curl` or `requests` to do an HTTP flow.
+
+`open` shows you a card (credential, hosts, methods, time limit, call cap, client) and prints a session id when you
+approve. Hosts are required (`HOST` for ports 80 and 443, or `HOST:PORT` for exactly that port) and the host must be inside the credential's `allowed_hosts`; methods default to GET and HEAD
+(declare POST, PUT, PATCH, DELETE or OPTIONS); the default is 15 minutes and 200 calls, and the broker has a
+maximum. The deadline is absolute: it is never extended or renewed, however much the session is used. Then every call
+is made with `--session ID` (preferred: `export ASB_SESSION=ID`, which keeps the id out of the process list; the flag wins over it; unset it when the flow is over) and needs no further approval: the broker keeps the cookies (and removes `Set-Cookie` from what
+the agent sees) and `--capture` stores a response value for later `{{session.NAME}}` use in the URL, headers and body. A
+UniFi-style flow:
+
+    SID=$(asb session open unifi --for "list clients and rename one" --host unifi.local:443 --methods GET,HEAD,POST,PUT)
+    asb http unifi POST https://unifi.local/api/auth/login --session $SID -H 'Content-Type: application/json' \
+        -d '{"username":"{{UNIFI_USERNAME}}","password":"{{UNIFI_PASSWORD}}"}' --capture CSRF=header:X-CSRF-Token
+    asb http unifi GET  https://unifi.local/proxy/network/api/s/default/stat/sta --session $SID
+    asb http unifi PUT  https://unifi.local/proxy/network/api/s/default/rest/user/ID --session $SID \
+        -H 'X-CSRF-Token: {{session.CSRF}}' -d '{"name":"x"}'
+    asb session close $SID
+
+Redirects are never followed (you get the 3xx and its `Location` and make a new call). A call outside the session's hosts, ports or methods, or past its cap, is refused (exit 8), not prompted: open a new session. When the
+session has expired, been closed or revoked, or was never yours, the call exits 7. Only the client that opened a session can use
+it. Details, limits, the threat model and the audit events are in
+[reference.md](reference.md#http-sessions-multi-step-flows-with-one-approval).
+
 ### Exit codes
 
 | Code | Meaning |
@@ -203,9 +237,9 @@ seconds. These match the http-sessions exit codes.
 | 4 | Denied by you or by policy |
 | 5 | Expired or timed out waiting for approval |
 | 6 | Env mode: a script changed between the request and the run (`asb: script PATH changed after it was reviewed`); nothing was executed |
-| 7 | `plan` / `http --plan`: the plan has ended or is not usable (`ended`, `exhausted`, `closed`, `revoked`, `unknown`); submit a new plan |
-| 8 | `http --plan`: the call is outside the approved plan (reason printed); never turned into a prompt |
-| 9 | `http --plan`: rate or in-flight limit; retry after the printed seconds |
+| 7 | **Ended** (sessions and plans share this): the session or plan expired, was closed, revoked, used up, or is unknown (also: lost to a broker restart). `asb` prints the kind. Stop; a new one needs the human again |
+| 8 | **Refused by the approved scope** (sessions and plans share this): a call outside the session's hosts, methods or call cap, a missing `{{session.NAME}}`, or a plan call that matches no rule. Never turned into a prompt; do not retry it as is |
+| 9 | **Retry later** (plans): rate or in-flight limit; `asb` prints `retry_after_s` |
 | 22 | `http`: the upstream answered with status 400 or more (body still printed) |
 | other | Env mode returns the wrapped command's own exit code |
 

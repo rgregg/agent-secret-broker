@@ -102,19 +102,28 @@ session rule runs through that session automatically. The checks are an **inters
 rule must match **and** the session's own in-scope check, client binding and cookie host rules must
 pass. A plan never loosens a session.
 
-- **Redirects: plans override the sessions design.** The sessions design follows up to 5 redirects
-  to hosts inside the session. **Plan calls never follow redirects, in any mode, including inside a
-  plan session.** A 3xx is returned to the agent (masked, `Set-Cookie` stripped) and a follow-up
-  is a new call that needs its own matching rule. Reason: a rule approves one request shape; a
-  followed redirect is an unapproved second request.
+- **Redirects.** Neither feature follows redirects: the shipped sessions (secret_broker/sessions.py,
+  `run_http`) return a 3xx as it is (masked) and the agent makes a new in-scope, counted call, and plan
+  calls do exactly the same (a 3xx comes back masked, `Set-Cookie` stripped, and a follow-up is a new call that
+  needs its own matching rule). A plan session step therefore needs no special redirect rule.
 - A plan longer than the session cap: session steps fail closed after the session ends
   (`plan_miss` reason `session_ended`), non-session rules keep working, and the card says so
   ("session steps end after 60 min; this plan lasts 8 h").
 - Placeholders: v1 refuses `{{...}}` in URL and body (section 5). Phase 2 revisits this for
-  `{{session.NAME}}` with value validation.
-- Integration surface (sessions code was not available when this was written; reconcile names):
-  `SessionStore.open_for_plan(client_id, secret, hosts, deadline, plan_id) -> session_id`,
-  `SessionStore.close_for_plan(plan_id)`, `session.run(spec)`.
+  `{{session.NAME}}` with value validation (sessions already restrict captured values).
+- **Integration surface, matched to the real sessions code.** A session is `sessions.Session` (public id
+  prefix `pid`, secret id kept only as `sha256`, `client`, credential, `hosts`, `methods`, `max_calls`, a
+  cookie `Jar`, `expires` as a reading of the monotonic `broker.sessions_clock`, which is `clock.mono`);
+  it lives in `SessionsMixin._sess` and ends through `_sess_end_locked(s, reason, now, actor)`.
+  Phase 2 adds: (1) `SessionsMixin._session_open_for_plan(plan, name, rule)` building a `Session` from the plan's
+  rule (same client, hosts inside the credential's `allowed_hosts` and the rule host, a deadline of
+  `min(plan deadline, now + sessions.max_ttl_s)`, a `plan_id` attribute) without a second card, called from
+  `_plan_activate`; (2) a `PlanStore` end hook (deadline, close, revoke, revoke_client, restart) that calls
+  `_sess_end_locked(..., "plan_ended")` for every session carrying that `plan_id`; (3) in `_plan_call`, after
+  `try_use` matches a rule that names a session, delegating to the session call path
+  (`scope_problem`, `override_problem`, `run_http`) so the plan rule and the session's own scope check must
+  **both** pass. Both features already share status `running` for in-flight calls, the clock module, the
+  exit-code contract (7 ended, 8 refused by the approved scope; plans add 9 retry later) and the Clients tab.
 - Options A/B/C of issue #18: a session alone is A; a plan with session steps is B; C follows.
 
 ### CLI
@@ -654,11 +663,10 @@ document, read by default); global rate ceiling only (no `min_interval_s`, no ma
 
 ## Open questions
 
-All earlier open questions were decided (see "Decisions"). One remains:
+All earlier open questions were decided (see "Decisions"). The last one is resolved:
 
-1. **Sessions code coordination.** The session record and in-scope check did not exist when this
-   was written; the integration names in section 2 (`open_for_plan`, `close_for_plan`,
-   `session.run`) and the redirect override must be reconciled with that code before phase 2.
+1. **Sessions code coordination.** Resolved by the merge of the sessions work (see the integration surface in
+   section 2); the phase-2 names above are the ones to build.
 
 ## Deviations in the v1 implementation
 
@@ -704,3 +712,8 @@ Everything above holds except the following, each decided while building it.
     `kind`), **8 outside the approved plan** (was 3), **9 retry later** (was 8).
 12. Plan cards expire through the same request expiry; the plan record follows its card (denied, expired,
     failed all end it).
+14. **Stacked on the shipped http sessions.** In-flight calls of both features use status `running` (no nonce,
+    never listed, counted, decidable or expirable); both read time through `clock.py` (sessions keep their
+    injectable `sessions_clock`, now `clock.mono`, and the monotonic deadline semantics); the Active plans
+    table moved from the Policies tab to the Clients tab, above Active sessions; exit codes 7/8 are one
+    contract (plans add 9); a plan call that also names a session is refused (phase 2).

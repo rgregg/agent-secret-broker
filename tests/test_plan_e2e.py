@@ -292,15 +292,15 @@ class Lifecycle(PBase):
     def test_revoke_by_the_human_before_the_next_call(self):
         pid = self.approve()
         self.assertEqual(self.call(pid, body=self.ok_note())[0], 202)
-        st, body, _ = self.post("/plans/revoke", {"plan": pid})
-        self.assertEqual(st, 200)
-        self.assertIn("Plan revoked", body)
+        st, body, hdr = self.post("/plans/revoke", {"plan": pid})
+        self.assertEqual((st, hdr["Location"]), (303, "/clients?note=planrevoked"))
+        self.assertIn("Plan revoked", self.get(hdr["Location"])[1])
         code, r = self.call(pid, body=self.ok_note())
         self.assertEqual((code, r), (404, {"error": "plan not usable", "kind": "revoked"}))
         ev = self.events("plan_revoked")[0]
         self.assertEqual((ev["by"], ev["cause"], ev["plan_id"]), ("alice", "human", pid))
-        st, body, _ = self.post("/plans/revoke", {"plan": pid})
-        self.assertIn("no longer active", body)
+        st, body, hdr = self.post("/plans/revoke", {"plan": pid})
+        self.assertIn("no longer active", self.get(hdr["Location"])[1])
         self.assertEqual(self.post("/plans/revoke", {"plan": pid}, csrf="bad")[0], 403)
         self.assertEqual(self.post("/plans/revoke", {"plan": pid}, user="mallory")[0], 403)
 
@@ -479,8 +479,9 @@ class RunningCalls(PBase):
             st, _, hdr = self.post("/decide", {"id": rid, "decision": decision})
             self.assertEqual(st, 303)
             self.assertIn("note=stale", hdr["Location"], decision)
-        self.assertEqual(self.broker.decide_via("dashboard", rid, "approve", "alice"), (404, None))
-        self.assertEqual(self.broker.decide_via("dashboard", rid, "deny", "alice"), (404, None))
+        self.assertEqual(self.broker.decide_via("dashboard", rid, "approve", "alice"), (410, None))
+        self.assertEqual(self.broker.decide_via("dashboard", rid, "deny", "alice"), (410, None))
+        self.assertEqual(self.broker._by_id[rid].status, "running")
         req = self.card(self.events("requested")[-1]["id"]) if False else None
         Stub.gate.set()
         [t.join() for t in ths]
@@ -519,7 +520,7 @@ class RunningCalls(PBase):
     def test_a_plan_call_is_not_swept_as_expired_while_it_runs(self):
         pid = self.approve(self.manifest(rules=[self.rule(max_uses=50)]))
         ths, out = self.run_slow(pid, 1)
-        self.tick(10_000)           # far past any request expiry; the plan itself is still inside its hour? no: just the call
+        self.tick(200)              # past the request's own ttl (a pending request would expire)
         with self.broker._lock:
             self.broker._expire_locked()
         Stub.gate.set()
@@ -587,6 +588,47 @@ class Hardening(PBase):
         for tail in ("%EF%BC%8F", "%E2%82%AC", "%25", "%252e%252e", "%2e", "%2F", "%C0%AF", "a%e2"):
             code, r = self.call(pid, body=self.ok_note(), url=base + tail)
             self.assertEqual((code, r["why"]), (403, "path"), tail)
+
+
+class WithSessions(PBase):
+    """Plans stacked on the shipped http sessions: one contract, one tab, no mixing."""
+
+    def test_a_plan_call_that_names_a_session_is_refused_and_nothing_is_sent(self):
+        pid = self.approve()
+        code, r = self.call(pid, body=self.ok_note(), extra={"session": "S" * 22, "capture": ["A=header:X"]})
+        self.assertEqual((code, r["reason"], r["why"]), (403, "no_rule", "request"))
+        self.assertEqual(self.upstream(), [])
+
+    def test_the_cli_refuses_both_a_plan_and_a_session(self):
+        rc, out, err, _ = self.cli("http", "ledger", "GET", "http://127.0.0.1:1/", "--plan", "0" * 32,
+                                   "--session", "S" * 22)
+        self.assertEqual(rc, 2, err)
+        self.assertIn("not both", err)
+
+    def test_one_exit_code_contract(self):
+        import importlib.machinery
+        import importlib.util
+        from plan_base import CLI
+        loader = importlib.machinery.SourceFileLoader("asb_codes", CLI)
+        mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("asb_codes", loader))
+        loader.exec_module(mod)
+        self.assertEqual((mod.EXIT_ENDED, mod.EXIT_REFUSED, mod.EXIT_SLOW_DOWN), (7, 8, 9))
+        self.assertEqual((mod.EXIT_SESSION_ENDED, mod.EXIT_SESSION_REFUSED, mod.EXIT_PLAN_GONE, mod.EXIT_OUTSIDE), (7, 8, 7, 8))
+
+    def test_features_shape_has_both(self):
+        f = self.api("GET", "/v1/status")[1]["features"]
+        self.assertIs(f["plans"], True)
+        self.assertTrue(f["http_sessions"]["enabled"])
+
+    def test_the_clients_tab_lists_plans_above_sessions(self):
+        self.approve()
+        h = self.get("/clients")[1]
+        self.assertLess(h.index("Active plans"), h.index("Active sessions"))
+
+    def test_both_features_share_the_running_status_and_the_clock(self):
+        from secret_broker import clock as clock_mod
+        self.assertIs(self.broker.sessions_clock, clock_mod.mono)
+        self.assertIs(self.broker.plans.mono, clock_mod.mono)
 
 
 class Submission(PBase):
@@ -835,8 +877,8 @@ class Cli(PBase):
             self.assertIn(frag.lower(), out.lower(), frag)
         self.assertEqual(self.cli("plan", "--help")[1], out)
         rc, out, err, _ = self.cli("guide")
-        for frag in ("Plans:", "do not submit a plan for one call", "asb plan submit", "kind:", "7 plan not usable",
-                     "8 plan call refused"):
+        for frag in ("Plans:", "do not submit a plan for one call", "asb plan submit", "kind:", "7 ended", "8 refused by the approved scope",
+                     "9 retry later"):
             self.assertIn(frag, out, frag)
         self.assertIn("--plan", self.cli("help", "http")[1])
         self.assertIn("asb plan", self.cli()[1] if False else self.cli("--help")[1])

@@ -19,6 +19,12 @@
                                               broker makes the call itself (--plan: under an approved plan)
   asb plan submit FILE|- [--no-wait] | status ID | list | close ID
                                               plan mode: one human approval for an unattended job's calls
+  asb session open NAME --for "purpose" --host H [--host H2]... [--methods GET,HEAD,POST] [--ttl 15m] [--max-calls N]
+                                              a time-boxed multi-call permission (login + cookie flows); a human approves
+  asb session close ID | asb session status ID
+  asb http ... [--session ID] [--capture NAME=header:X|cookie:N|json:$.a.b]
+                                              http call inside a session (no new prompt, cookies kept by the broker);
+                                              prefer export ASB_SESSION=ID, which keeps the id out of `ps`
   asb guidance propose FILE|- | --from-dir DIR  propose risk guidance; the human reviews it
   asb guidance status ID                      outcome of a proposal (no approval)
   asb enroll [--name NAME] [--url URL] [--force]  get this machine its own credential; a human approves
@@ -53,7 +59,11 @@ import urllib.request
 # Exit codes (also in `asb guide`).
 EXIT_NOT_FOUND, EXIT_USAGE, EXIT_BROKER, EXIT_DENIED, EXIT_EXPIRED = 1, 2, 3, 4, 5
 EXIT_SCRIPT_CHANGED = 6
-EXIT_PLAN_GONE, EXIT_OUTSIDE, EXIT_SLOW_DOWN = 7, 8, 9   # plan ended; call outside the approved plan; rate or in-flight limit
+# One contract for plans and sessions: 7 = ended (kind says why), 8 = refused by the approved scope,
+# 9 = retry later (plans: rate or in-flight limit, with retry_after_s).
+EXIT_ENDED, EXIT_REFUSED, EXIT_SLOW_DOWN = 7, 8, 9
+EXIT_SESSION_ENDED, EXIT_SESSION_REFUSED = EXIT_ENDED, EXIT_REFUSED
+EXIT_PLAN_GONE, EXIT_OUTSIDE = EXIT_ENDED, EXIT_REFUSED
 EXIT_HTTP_ERROR = 22
 
 GUIDE = """asb guide (for agents)
@@ -85,6 +95,40 @@ Workflow
      running, asb re-checks the script; if it changed after approval it does not run
      (exit 6). Advisory: asb cannot prove what finally runs. Scripts piped on stdin
      cannot be shown and make the request look more opaque.
+
+Which command? (decision rule)
+  HTTP API, one call or a few independent ones   asb http
+  Multi-step HTTP flow (log in, reuse the cookie, carry a CSRF token, log out)
+                                                 asb session open ... then asb http ... --session ID
+  A program that needs the secret itself (an official CLI, a library)   env mode: asb NAME -- command
+  Do not write a script around curl or requests to do an HTTP flow: use a session. The broker keeps
+  the cookies and tokens, so the secret and the session never reach you.
+
+HTTP sessions (multi-step flows; one human approval for a bounded unit of work)
+  asb session open unifi --for "list clients and rename one" --host unifi.local:443 --methods GET,HEAD,POST,PUT
+  prints the session id; the human approves a card showing the credential, hosts, methods, time limit
+  and call cap. Defaults: methods GET,HEAD; 15 minutes; 200 calls (--ttl 20m, --max-calls 50).
+  Prefer `export ASB_SESSION=ID` (keeps the id out of the process list; --session ID does the same and wins).
+  Unset it when the flow is over. Then use it, with no further prompts:
+    asb http unifi POST https://unifi.local/api/auth/login --session ID \
+        -H 'Content-Type: application/json' \
+        -d '{"username":"{{UNIFI_USERNAME}}","password":"{{UNIFI_PASSWORD}}"}' \
+        --capture CSRF=header:X-CSRF-Token
+    asb http unifi GET  https://unifi.local/proxy/network/api/s/default/stat/sta --session ID
+    asb http unifi PUT  https://unifi.local/proxy/network/api/s/default/rest/user/ID --session ID \
+        -H 'X-CSRF-Token: {{session.CSRF}}' -d '{"name":"x"}'
+    asb session close ID
+  The broker stores cookies from responses (and removes Set-Cookie from what you see) and sends them
+  on later calls to the same host. --capture saves a value (header:NAME, cookie:NAME or json:$.a.b[0])
+  for later use as {{session.NAME}} in the URL, headers and body; you never see it.
+  --host is HOST (ports 80 and 443 only) or HOST:PORT (exactly that port). Redirects are never followed:
+  you get the 3xx and its Location, and make a new call yourself.
+  Rules you cannot change: the session ends at its deadline (it is NEVER extended or renewed, however
+  much you use it), after --max-calls, on `asb session close`, or when the human revokes it; it only
+  works for the client that opened it. A call outside its hosts or methods is refused, not prompted:
+  open a new session if you really need more. Do not retry a denied or revoked session.
+  Exit 7: session expired, closed, revoked or unknown. Exit 8: refused (host, method, call cap, missing
+  {{session.NAME}}). Never put a secret in --for.
 
 Approval
   The command blocks, printing "waiting for approval", for up to about 5 minutes.
@@ -175,9 +219,11 @@ Exit codes
   3 broker unreachable or refused the request
   4 denied by the human (or the policy)            5 expired or timed out waiting
   6 env: a script changed between the request and the run (nothing was executed)
-  7 plan not usable (ended, exhausted, closed, revoked, unknown): stop, submit a new plan
-  8 plan call refused: outside the approved plan (reason printed); do not retry, ask the human or stop
-  9 plan call refused for now (rate or in-flight limit): wait the printed seconds and retry
+  7 ended: a session or plan is over or unusable (expired, closed, revoked, exhausted, unknown or lost to a
+    broker restart): stop; a new one needs the human again
+  8 refused by the approved scope: a session or plan call outside what was approved (reason printed); it is
+    never turned into a prompt; do not retry it
+  9 retry later: a plan call over its rate or in-flight limit; wait the printed retry_after_s
   22 http: the upstream answered with status >= 400 (body is still printed)
   other: env mode returns the wrapped command's own exit code
 """
@@ -253,15 +299,41 @@ broker's response. `verify` checks the log's hash chain (exit 1 if it is broken)
 Exit 1 when nothing matches, 2 usage, 3 broker unreachable or refused.
 example: asb audit --request AbC123
          asb audit --event failed --since 1h""",
-    "http": """usage: asb http NAME[,NAME] METHOD URL [-H 'K: V']... [-d BODY | -d @file | -d @-] [--plan ID]
+    "http": """usage: asb http NAME[,NAME] METHOD URL [-H 'K: V']... [-d BODY | -d @file | -d @-]
+                [--session ID | $ASB_SESSION | --plan ID | $ASB_PLAN] [--capture NAME=header:X|cookie:N|json:$.a.b]...
 
 The broker makes the HTTP call itself and replaces {{VAR}} in the URL, headers and
 body with the credential. Waits for the human's approval (up to ~5 min).
 Prints "HTTP <status>" on stderr and the response body on stdout; exit 22 if status >= 400.
---plan ID (or ASB_PLAN=ID) makes the call under an approved plan: no prompt if it matches a rule,
-refused (exit 8) if not, exit 7 if the plan is not usable, exit 9 to slow down. See `asb help plan`.
+With --session ID the call runs inside an approved session (see `asb help session`): no new prompt,
+the broker keeps cookies, --capture saves a response value as {{session.NAME}}. One credential only.
+Preferred: export ASB_SESSION=ID once (it keeps the id out of the process list); the flag overrides it.
+Unset ASB_SESSION when the flow is over: while it is set every `asb http` is a session call.
+--plan ID (or ASB_PLAN=ID) makes the call under an approved plan instead (see `asb help plan`): no prompt if it
+matches a rule, refused (exit 8) if not, exit 7 if the plan is not usable, exit 9 to slow down. A call uses a
+session or a plan, never both.
 example: asb http grafana GET https://grafana.example.com/api/health \\
              -H 'Authorization: Bearer {{GRAFANA_TOKEN}}'""",
+    "session": """usage: asb session open NAME --for "purpose" --host H [--host H2]... [--methods GET,HEAD,POST]
+                        [--ttl 15m] [--max-calls N]
+       asb session close ID
+       asb session status ID
+
+Ask the human for a time-boxed permission to make several related calls with credential NAME (an
+http credential; env and ssh credentials are refused). Use it for multi-step flows (log in, reuse a
+cookie, carry a CSRF token); use plain `asb http` for single calls and env mode only when a program
+needs the secret itself. --host (required, repeatable or comma separated) is HOST (only ports 80 and 443,
+by scheme) or HOST:PORT (exactly that port); the host must be inside the credential's allowed hosts: a
+session only narrows. Redirects are never followed: you get the 3xx and make a new call. --methods defaults to GET,HEAD; declare POST, PUT,
+PATCH, DELETE or OPTIONS if you need them (the human sees them). --ttl is s, m or h (default 15m, the
+broker has a maximum). --max-calls defaults to 200. --for is one line, up to 300 characters; the human
+sees it as your unverified claim.
+open waits for the human (about 2 minutes), then prints the session id on stdout. Pass it to
+`asb http ... --session ID`. The deadline is absolute: it never moves, whatever you do, and there is
+no renewal. `status` prints time and calls left; `close` ends it now. Only the client that opened a
+session can use it. Exit 0 ok, 4 denied, 5 open expired unanswered, 3 refused (too many sessions,
+disabled, bad credential or host), 2 usage, 7 session expired/closed/revoked/unknown (ended), 8 call refused (outside the approved scope).
+example: asb session open unifi --for "read stats and rename a client" --host unifi.local --methods GET,HEAD,POST,PUT --ttl 10m""",
     "run": """usage: asb NAME[,NAME] -- command [args...]
 
 Run a command with the credential's variables in its environment. Waits for
@@ -436,11 +508,21 @@ def check_name(name, what="NAME"):
     return name
 
 
+def session_die(r):
+    """Exit for a broker answer that carries a session error code; returns normally if it has none."""
+    c = r.get("code") if isinstance(r, dict) else None
+    if c in ("session_unknown", "session_expired"):
+        die(_safe_text(r.get("error") or "session ended"), EXIT_SESSION_ENDED)
+    if c == "session_refused":
+        die(_safe_text(r.get("error") or "session call refused"), EXIT_SESSION_REFUSED)
+
+
 def obtain(payload, waiting="waiting for approval on your phone..."):
     base, key = config()
     payload["source"] = f"{os.environ.get('USER', '?')}@{socket.gethostname()}"
     code, r = call(base, key, "/v1/requests", payload)
     if code != 202:
+        session_die(r)
         die(r.get("error", f"broker returned {code}"), EXIT_BROKER)
     if r["status"] in ("denied", "expired", "failed"):
         die(r.get("error") or r["status"], status_exit(r["status"]))
@@ -719,6 +801,101 @@ def run_request_credential(argv):
                         "(you will not see the value)...")["stored"]
     print(f"stored: {r['name']}")
     print("asb: see `asb list` for its variables and hosts", file=sys.stderr)
+    return 0
+
+
+SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{32}$")
+CAPTURE_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,31}$")
+SESSION_METHODS = ("GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE")
+
+
+def check_capture(text):
+    """Validate a --capture expression locally (the broker checks again): NAME=header:X | cookie:NAME |
+    json:$.a.b[0] (dotted keys and array indexes only). Anything else is a usage error."""
+    name, _, expr = text.partition("=")
+    kind, _, arg = expr.partition(":")
+    ok = bool(CAPTURE_NAME_RE.match(name))
+    if kind == "header":
+        ok = ok and bool(re.fullmatch(r"[A-Za-z0-9-]{1,64}", arg))
+    elif kind == "cookie":
+        ok = ok and bool(re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", arg))
+    elif kind == "json":
+        ok = ok and bool(re.fullmatch(r"\$(\.[A-Za-z0-9_-]{1,64}|\[[0-9]{1,4}\]){1,12}", arg))
+    else:
+        ok = False
+    if not ok:
+        die("bad --capture: use NAME=header:X-CSRF-Token, NAME=cookie:NAME or NAME=json:$.a.b[0] "
+            "(only dotted keys and array indexes)")
+    return text
+
+
+def parse_ttl(text):
+    m = re.fullmatch(r"(\d{1,6})([smh])", text or "")
+    if not m:
+        die("--ttl must be a number with a unit: 90s, 15m or 1h")
+    return int(m.group(1)) * {"s": 1, "m": 60, "h": 3600}[m.group(2)]
+
+
+def run_session(argv):
+    """asb session open|close|status. Nothing secret is read or sent."""
+    if not argv or argv[0] not in ("open", "close", "status"):
+        die(HELP["session"])
+    sub, rest = argv[0], argv[1:]
+    if sub in ("close", "status"):
+        if len(rest) != 1 or not SESSION_ID_RE.match(rest[0]):
+            die("usage: asb session " + sub + " ID\n" + HELP["session"])
+        base, key = config()
+        if sub == "close":
+            code, r = call(base, key, "/v1/requests", {"mode": "session_close", "session": rest[0]})
+            if code == 200:
+                print("closed")
+                return 0
+        else:
+            code, r = call(base, key, "/v1/sessions/" + rest[0], timeout=15)
+            if code == 200:
+                print(f"time left: {r['expires_in']}s, calls left: {r['calls_left']} of {r['max_calls']}")
+                print(f"hosts: {','.join(r['hosts'])}  methods: {','.join(r['methods'])}")
+                return 0
+        session_die(r)
+        die(r.get("error", f"broker returned {code}"), EXIT_BROKER)
+    if not rest:
+        die(HELP["session"])
+    name, rest = check_name(rest[0]), rest[1:]
+    opts, hosts, i = {}, [], 0
+    while i < len(rest):
+        k = rest[i]
+        if k not in ("--for", "--host", "--methods", "--ttl", "--max-calls") or i + 1 >= len(rest):
+            die(f"unexpected argument {k!r}\n" + HELP["session"])
+        v = rest[i + 1]
+        if k == "--host":
+            hosts += [h for h in v.split(",") if h]
+        elif k in opts:
+            die(f"{k} given twice")
+        else:
+            opts[k] = v
+        i += 2
+    if not opts.get("--for", "").strip():
+        die('--for "what it is for" is required\n' + HELP["session"])
+    if len(opts["--for"]) > 300:
+        die("--for is limited to 300 characters")
+    if not hosts:
+        die("at least one --host is required (a session is limited to specific hosts)\n" + HELP["session"])
+    payload = {"mode": "session", "names": [name], "purpose": opts["--for"], "hosts": hosts}
+    if "--methods" in opts:
+        ms = [m.strip().upper() for m in opts["--methods"].split(",") if m.strip()]
+        if not ms or any(m not in SESSION_METHODS for m in ms):
+            die("--methods must be some of " + ",".join(SESSION_METHODS))
+        payload["methods"] = ms
+    if "--ttl" in opts:
+        payload["ttl_s"] = parse_ttl(opts["--ttl"])
+    if "--max-calls" in opts:
+        if not opts["--max-calls"].isdigit() or not 1 <= int(opts["--max-calls"]) <= 100000:
+            die("--max-calls must be a whole number of at least 1")
+        payload["max_calls"] = int(opts["--max-calls"])
+    s = obtain(payload, "waiting for the human to approve the session...")["session"]
+    print(s["id"])
+    print(f"asb: session open for {s['expires_in']}s (fixed: no extension or renewal), up to {s['max_calls']} calls, "
+          f"hosts {','.join(s['hosts'])}, methods {','.join(s['methods'])}", file=sys.stderr)
     return 0
 
 
@@ -2508,6 +2685,9 @@ def main(argv):
     if argv[0] == "request-credential":
         return run_request_credential(argv[1:])
 
+    if argv[0] == "session":
+        return run_session(argv[1:])
+
     if argv[0] == "enroll":
         return run_enroll(argv[1:])
 
@@ -2602,9 +2782,17 @@ def main(argv):
             die(HELP["http"])
         check_name(argv[1])
         names, method, url, rest = argv[1].split(","), argv[2], argv[3], argv[4:]
-        headers, body, plan = {}, {}, os.environ.get("ASB_PLAN") or None
+        headers, body, session, caps, plan = {}, {}, None, [], None
         while rest:
-            if rest[0] == "-H" and len(rest) > 1:
+            if rest[0] == "--session" and len(rest) > 1:
+                session = rest[1]
+                if not SESSION_ID_RE.match(session):
+                    die("--session needs the session id printed by `asb session open`")
+                rest = rest[2:]
+            elif rest[0] == "--capture" and len(rest) > 1:
+                caps.append(check_capture(rest[1]))
+                rest = rest[2:]
+            elif rest[0] == "-H" and len(rest) > 1:
                 k, _, v = rest[1].partition(":")
                 headers[k.strip()] = v.strip()
                 rest = rest[2:]
@@ -2614,20 +2802,43 @@ def main(argv):
                 plan, rest = rest[1], rest[2:]
             else:
                 die(f"unexpected argument {rest[0]!r}")
+        if plan is None and not session and os.environ.get("ASB_PLAN"):
+            plan = os.environ["ASB_PLAN"].strip()
+        if plan and session:
+            die("a call uses a session or a plan, not both (unset ASB_SESSION or ASB_PLAN)")
+        if plan and caps:
+            die("--capture needs --session; a plan call has no captured values")
         if plan:
             # a plan call: the method goes as typed in ASCII uppercase (the broker matches it exactly)
             r = run_plan_http({"mode": "http", "names": names, "method": method.upper() if method.isascii() else method,
                                "url": url, "headers": headers, **body}, plan)
         else:
-            r = obtain({"mode": "http", "names": names, "method": method, "url": url,
-                        "headers": headers, **body})["http"]
+            if plan is None and not session and os.environ.get("ASB_SESSION"):
+                session = os.environ["ASB_SESSION"].strip()      # keeps the id out of the process list
+                if not SESSION_ID_RE.match(session):
+                    die("ASB_SESSION is not a session id (the one `asb session open` printed)")
+            if caps and not session:
+                die("--capture needs --session (or ASB_SESSION)")
+            payload = {"mode": "http", "names": names, "method": method, "url": url, "headers": headers, **body}
+            if session:
+                if len(names) != 1:
+                    die("a session uses exactly one credential")
+                payload["session"], payload["capture"] = session, caps
+            full = obtain(payload, "calling inside the session...")
+            r = full["http"]
+            if full.get("session"):
+                si = full["session"]
+                note = (f"asb: session: {si['calls_left']} calls left, {si['expires_in']}s left"
+                        + (f"; captured {','.join(si['captured'])}" if si.get("captured") else "")
+                        + (f"; NOT captured (not found) {','.join(si['missing'])}" if si.get("missing") else ""))
+                print(note, file=sys.stderr)
         print(f"HTTP {r['status']}", file=sys.stderr)
         sys.stdout.write(r["body"])
         return 0 if r["status"] < 400 else EXIT_HTTP_ERROR
 
     if "--" not in argv:
-        die(f"unknown command {argv[0]!r}.\ncommands: list, which, status, audit, http, store, update, "
-            "request-credential, guidance, plan, enroll, ssh-agent, fingerprint, help, guide; or: asb NAME -- command\n"
+        die(f"unknown command {argv[0]!r}.\ncommands: list, which, status, audit, http, session, plan, store, update, "
+            "request-credential, guidance, enroll, ssh-agent, fingerprint, help, guide; or: asb NAME -- command\n"
             "start with `asb guide`")
     i = argv.index("--")
     names, cmd = argv[0].split(",") if i == 1 else None, argv[i + 1:]

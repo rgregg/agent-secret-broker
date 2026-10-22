@@ -270,6 +270,9 @@ class PlansMixin:
         client = client or dict(clients_mod.ClientStore.LEGACY_VIEW)
         cid = client["id"]
         plan_id = spec.pop("plan")
+        if spec.get("session") is not None or spec.get("capture") is not None:
+            # a plan call never runs in a session (plan session steps are phase 2): refused, fixed class
+            self._plan_miss(client, plan_id, plans_mod.Miss("no_rule", why="request"))
         miss = lambda reason, **kw: self._plan_miss(client, plan_id, plans_mod.Miss(reason, **kw))  # noqa: E731
         if not self.plans_cfg["enabled"]:
             miss("unusable", kind="unknown")
@@ -288,10 +291,14 @@ class PlansMixin:
             req = Request("http", list(names), spec, clean_source(source, peer), self.cfg.get("ttl_seconds", 120),
                           peer, client)
             req.frozen = frozen
-            # A plan call is never "pending": nothing asks a human, so it is not listed, counted,
-            # decidable or expirable while it runs. It is registered (for the agent's poll) only
-            # once it has settled.
-            req.status = "deciding"
+            # Same mechanism as a session call: status "running", never "pending". Nothing asks a
+            # human, so it is not listed, counted against MAX_PENDING, decidable (decide_via and
+            # /decide refuse anything not pending) or expirable while it runs. No nonce: there is
+            # no approval link for it.
+            req.status = "running"
+            with self._lock:
+                self._expire_locked()
+                self._by_id[req.id] = req
             self.audit("requested", req)
             self._retain_details(req)
             self.log("plan_used", id=req.id, plan_id=m.plan_id, rule=m.rule_index,
@@ -306,10 +313,6 @@ class PlansMixin:
                 self._finish(req, "failed", error=_RELEASE_TEXT[cat], **extra)
             else:
                 self._finish(req, "approved", result=result, **extra)
-            with self._lock:
-                self._expire_locked()
-                self._by_id[req.id] = req
-                self._by_nonce[req.nonce] = req
             return req
         finally:
             m.release()

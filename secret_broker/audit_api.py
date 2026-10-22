@@ -83,6 +83,16 @@ WHITELIST = {
     "discovery": {"peer": ("peer", _S), "host": ("host", _S), "found": ("found", _L)},
     "catalog_loaded": {"count": ("count", _I), "invalid_count": ("invalid", "count")},
     "catalog_error": {}, "backend_error": {},
+    # http sessions (the agent's own: client-scoped like every event). No approver, no policy.
+    "session_requested": {"names": ("names", _L), "ttl_s": ("ttl_s", _I), "max_calls": ("max_calls", _I)},
+    "session_opened": {"session": ("session", _S), "ttl_s": ("ttl_s", _I), "max_calls": ("max_calls", _I)},
+    "session_used": {"session": ("session", _S), "host": ("host", _S), "calls": ("calls", _I),
+                     "max_calls": ("max_calls", _I)},
+    "session_refused": {"session": ("session", _S), "reason": ("reason_class", _S), "method": ("method", _S),
+                        "host": ("host", _S)},
+    "session_closed": {"session": ("session", _S), "calls": ("calls", _I)},
+    "session_expired": {"session": ("session", _S), "calls": ("calls", _I)},
+    "session_revoked": {"session": ("session", _S), "calls": ("calls", _I)},
     "backend_ready": {"duration_ms": ("duration_ms", _I)},
     # plans (the agent's own, scoped by client id like every event). The agent sees that its plan
     # was issued, ended, revoked, used or missed: the plan id, the rule index, the uses left and a

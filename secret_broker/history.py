@@ -36,7 +36,10 @@ _EV_KEYS = ("reason", "reasons", "model", "risk", "error", "via", "channel", "de
             # plans: ids, counts, lengths and hash prefixes; never the task, description or any rule text
             "plan_id", "plan_rules", "plan_tier", "plan_left_s", "manifest_hash", "rules_hash", "requested_s",
             "task_length", "task_sha256", "description_length", "description_sha256", "granted_s", "rules",
-            "names", "rule", "uses_left_rule", "uses_left_plan", "left_s", "cause", "suppressed")
+            "names", "rule", "uses_left_rule", "uses_left_plan", "left_s", "cause", "suppressed",
+            # http sessions: public prefix, manifest and counters; never an id, cookie or value
+            "session", "methods", "ttl_s", "max_calls", "calls", "left_s", "reason_class", "lifetime_s",
+            "unused", "shortened", "revoked_by")
 _MAX_EVENTS = 60            # per request
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 
