@@ -86,7 +86,7 @@ prompted**.
   prompts that train the human to tap. Refusing is deterministic: the agent opens a new session,
   which a human reads in full.
 - The deviation from #5's grants is that a session has no path/body rules in v1; its manifest is
-  hosts + methods + cap. The shape is chosen so #5 can add rules (see below).
+  hosts (with ports) + methods + cap. The shape is chosen so #5 can add rules (see below).
 
 Opening always needs a human: always HIGH by code (no model call), never auto-approved (policy
 `allow`, Always, timed grants, SSH rules cannot apply), no Always/timed chips, no notification
@@ -105,15 +105,16 @@ A plan-mode feature builds on sessions rather than beside them:
 
 - **Manifest rules.** The session record carries `hosts` and `methods`. Add a `rules` list
   (method, host, path_prefix, max_uses, optional body match) to the open request and to the card.
-  The record already stores the approved manifest; rules extend the same record.
+  The record already stores the approved manifest (hosts as `host` or `host:port`); rules extend the same record.
 - **Max uses.** `max_calls` is the session-wide counter (`Session.calls`, incremented under the
   session lock before the call runs). Per-rule counters live beside it.
 - **The session record.** `secret_broker/sessions.py: Session` (id, public prefix, client, credential,
   hosts, methods, ttl, expiry, calls, jar, captures). Expiry is read only from `Session.expires`.
 - **The in-scope check function.** `SessionsMixin._session_call` calls one pure function,
   `scope_problem(session, secret_cfg, names, method, spec)` (spec holds url, headers, body), returning None or
-  a (reason_class, message) pair. A manifest rule check is added there. It runs under the store lock
-  so the counter increment and the check are atomic.
+  a (reason_class, message) pair. A manifest rule check is added there. It runs WITHOUT the store lock (it reads only
+  fields that never change); the cap check and the counter increment happen afterwards under the lock, atomically.
+  Per-rule counters must be charged in that same locked step.
 - **Audit events.** `session_requested`, `session_opened`, `session_used`, `session_refused`
   (reason class), `session_closed`, `session_expired`, `session_revoked`. A plan feature can add
   rule ids to `session_used`/`session_refused`; the redaction whitelist is deny-by-default, so any
@@ -135,7 +136,8 @@ A plan-mode feature builds on sessions rather than beside them:
   16 values of 4096 bytes, scalars without control characters (they are later placed in headers).
   Used as `{{session.NAME}}` in URL, headers and body (single-pass substitution), never returned.
 - Masking: credential values, cookie values and captured values are masked in response body and
-  headers using the broker's existing masking (values of 6+ characters).
+  headers by exact match, for values of 4 or more characters (shorter ones are not masked: that would corrupt
+  ordinary words and numbers; the card says so). Captured values must be printable ASCII.
 
 ## API and CLI surface
 
@@ -159,8 +161,7 @@ CLI:
 
 Hosts are required and must sit inside the credential's `allowed_hosts`. Methods default to
 GET,HEAD; others are declared on open and shown on the card. Only http credentials: ssh and
-no-`allowed_hosts` (env-only) credentials are refused. Redirects are followed (at most 5) only to
-hosts inside the session's hosts, never from https to http; otherwise the 3xx is returned.
+no-`allowed_hosts` (env-only) credentials are refused. Redirects are never followed: the 3xx is returned with its (masked) Location and the agent makes a new in-scope, counted call.
 
 Decision rule for agents: use `asb http` for HTTP APIs, `--session` for multi-step flows (login +
 cookie), env mode only when a program needs the secret itself.
@@ -203,10 +204,8 @@ shows them. Active sessions appear on the Clients tab with a live countdown and 
   human gave: read the card's methods and hosts as the worst case). It cannot widen hosts or methods,
   cannot exceed the cap or the deadline, and out-of-scope calls are refused rather than prompted, so
   it cannot create approval fatigue. The purpose text is untrusted and shown escaped.
-- **Malicious upstream redirect.** Followed only to hosts inside the session's hosts (and the
-  credential's allowed hosts), never https to http; other redirects are returned unfollowed.
-  Cookies are host-scoped, so a redirect to another allowed host does not carry the first host's
-  cookies. TLS verification is as for plain http (pinning/verify rules unchanged).
+- **Malicious upstream redirect.** Not followed at all, so a redirect cannot move the credential or cookies, change the
+  method or port, or cause an uncounted hop. Cookies are host-scoped. TLS verification is as for plain http.
 - **Cookie leakage.** Set-Cookie is stripped, cookie and captured values are masked if echoed, never
   logged. Not covered: an upstream that echoes a value in a transformed form (encoded, split) can
   show it to the agent; and a response header the agent did not capture (for example a CSRF header)
@@ -217,8 +216,7 @@ shows them. Active sessions appear on the Clients tab with a live countdown and 
 
 15 min default, 60 min configurable maximum (absolute ceiling 24 h), 30 s minimum; 200 calls
 default and cap (configurable, ceiling 10000); 3 sessions per client (configurable), 20 total; 2
-pending open requests per client plus the general pending cap and deny cooldown; 5 hosts; 5
-redirects; 50 cookies; 16 captures; 1 MB response read.
+pending open requests per client plus the general pending cap and deny cooldown; 5 hosts; no redirects; 8192-character urls and header values, 50 headers, 100 placeholders of up to 64 characters; 50 cookies; 16 captures; 1 MB response read.
 
 ## Failure modes
 
@@ -265,5 +263,15 @@ against a throwaway broker for the end-to-end flow. Rehearsal scenario in
 - `features.http_sessions` in `/v1/status` is an object (the config values), not a bool.
 - Not done: the `asb agent-setup` instruction block (#14) is unchanged; the decision rule is in `asb guide` and
   `asb help session`. Per-credential `modes`, batch requests and automatic CSRF rotation are out of scope.
+- Review round 1 (all fixed, each with regression tests in `tests/test_sessions.py`, class `Hardening` and others):
+  linear placeholder scan with size caps and no scope check under the store lock (a cubic regex under the global lock froze
+  every session for seconds); in-flight calls are re-checked after the upstream answers (revoke, close, client revoke, deadline
+  discard the response and the jar changes); session calls have status `running`, not `pending`, so they cannot be decided or
+  counted as pending; method-override headers, `_method` fields and bodies on GET/HEAD are refused; redirects are never
+  followed (replacing the earlier follow-inside-hosts design: simpler, and no hop can change method, port or count);
+  the manifest and card carry the port and calls are scope-checked on it; deadlines use `time.monotonic()` (an injectable
+  clock for tests, wall time for display only); captured values must be printable ASCII and a call that never left the
+  broker is not charged; masking threshold lowered to 4; refused-host logging capped at 255 characters; `ASB_SESSION`
+  supported and preferred over `--session` (keeps the id out of the process list).
 - The cookie jar is deliberately simpler than a browser's: every cookie is host-only, `Domain` and `SameSite` are
   ignored, `__Host-` and `__Secure-` prefixes get no special handling.

@@ -171,7 +171,7 @@ prompt-injection stance are in
 ### HTTP sessions: login and cookie flows without a script
 
     asb session open NAME --for "purpose" --host H [--host H2]... [--methods GET,HEAD,POST] [--ttl 15m] [--max-calls N]
-    asb http NAME METHOD URL ... --session ID [--capture NAME=header:X|cookie:NAME|json:$.a.b]...
+    asb http NAME METHOD URL ... [--session ID] [--capture NAME=header:X|cookie:NAME|json:$.a.b]...
     asb session status ID
     asb session close ID
 
@@ -180,14 +180,14 @@ cookie, carry a CSRF token, log out), and env mode only when a program needs the
 library). Do not write a script around `curl` or `requests` to do an HTTP flow.
 
 `open` shows you a card (credential, hosts, methods, time limit, call cap, client) and prints a session id when you
-approve. Hosts are required and must be inside the credential's `allowed_hosts`; methods default to GET and HEAD
+approve. Hosts are required (`HOST` for ports 80 and 443, or `HOST:PORT` for exactly that port) and the host must be inside the credential's `allowed_hosts`; methods default to GET and HEAD
 (declare POST, PUT, PATCH, DELETE or OPTIONS); the default is 15 minutes and 200 calls, and the broker has a
 maximum. The deadline is absolute: it is never extended or renewed, however much the session is used. Then every call
-is made with `--session ID` and needs no further approval: the broker keeps the cookies (and removes `Set-Cookie` from what
+is made with `--session ID` (preferred: `export ASB_SESSION=ID`, which keeps the id out of the process list; the flag wins over it; unset it when the flow is over) and needs no further approval: the broker keeps the cookies (and removes `Set-Cookie` from what
 the agent sees) and `--capture` stores a response value for later `{{session.NAME}}` use in the URL, headers and body. A
 UniFi-style flow:
 
-    SID=$(asb session open unifi --for "list clients and rename one" --host unifi.local --methods GET,HEAD,POST,PUT)
+    SID=$(asb session open unifi --for "list clients and rename one" --host unifi.local:443 --methods GET,HEAD,POST,PUT)
     asb http unifi POST https://unifi.local/api/auth/login --session $SID -H 'Content-Type: application/json' \
         -d '{"username":"{{UNIFI_USERNAME}}","password":"{{UNIFI_PASSWORD}}"}' --capture CSRF=header:X-CSRF-Token
     asb http unifi GET  https://unifi.local/proxy/network/api/s/default/stat/sta --session $SID
@@ -195,7 +195,7 @@ UniFi-style flow:
         -H 'X-CSRF-Token: {{session.CSRF}}' -d '{"name":"x"}'
     asb session close $SID
 
-A call outside the session's hosts or methods, or past its cap, is refused (exit 8), not prompted: open a new session. When the
+Redirects are never followed (you get the 3xx and its `Location` and make a new call). A call outside the session's hosts, ports or methods, or past its cap, is refused (exit 8), not prompted: open a new session. When the
 session has expired, been closed or revoked, or was never yours, the call exits 7. Only the client that opened a session can use
 it. Details, limits, the threat model and the audit events are in
 [reference.md](reference.md#http-sessions-multi-step-flows-with-one-approval).

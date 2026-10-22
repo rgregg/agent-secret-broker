@@ -772,7 +772,7 @@ def sessions_scenario(rh, g):
     b = rh.main
     S = SECRETS
     seen = set(b.ap.cards())
-    p = rh.asb_popen(b, "session", "open", "stub", "--for", "rehearse a login flow", "--host", "127.0.0.1",
+    p = rh.asb_popen(b, "session", "open", "stub", "--for", "rehearse a login flow", "--host", f"127.0.0.1:{rh.up_port}",
                      "--methods", "GET,POST", "--ttl", "10m", "--max-calls", "6")
     p.stdin.close()
     p.stdin = None
@@ -821,7 +821,7 @@ def sessions_scenario(rh, g):
              and S["sesscsrf"] not in open(b.audit).read(), "")
     # a second session: closed by the agent, then another revoked by the human on the Clients tab
     def open_one():
-        return rh.asb_decided(b, ["session", "open", "stub", "--for", "second", "--host", "127.0.0.1", "--ttl", "5m"])
+        return rh.asb_decided(b, ["session", "open", "stub", "--for", "second", "--host", f"127.0.0.1:{rh.up_port}", "--ttl", "5m"])
     rc, o, e, rid2 = open_one()
     sid2 = o.strip()
     rc2, o2, e2 = rh.asb(b, "session", "close", sid2)

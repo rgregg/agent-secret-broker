@@ -149,6 +149,7 @@ class Request:
         self._sent_to = None      # leaf transports that sent it; None = all (presence hold)
         self.offered = frozenset()  # action ids offered on any token-carrying transport
         self.apply = None         # guidance proposal: the entry indexes the approver ticked
+        self.sess_state = None    # session call: {"sent": bool}, whether the request left the broker
         self.session = None       # http session this call runs in (sessions.py); None for a normal request
         self.gclasses = {}        # guidance proposal: failed entry name -> error class (approver only)
         self.done = threading.Event()
@@ -1916,7 +1917,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
 
     def _finish(self, req, status, error=None, result=None, **extra):
         with self._lock:
-            if req.status not in ("pending", "deciding"):
+            if req.status not in ("pending", "deciding", "running"):
                 return False
             req.status, req.error, req.result = status, error, result
             if req.mode == "store":
@@ -2021,7 +2022,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         """Open requests, oldest first."""
         with self._lock:
             self._expire_locked()
-            rows = [r for r in self._by_id.values() if r.status == "pending"]
+            rows = [r for r in self._by_id.values() if r.status == "pending" and r.session is None]
         return sorted(rows, key=lambda r: r.created)
 
     def decide_via(self, channel, rid, decision, actor, *, token=None, always=False,
@@ -2069,13 +2070,13 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             self._expire_locked()
             if nonce is not None:
                 cands = [r for r in [self._by_nonce.get(nonce)] if r is not None]
-                if not cands or cands[0].status != "pending":
+                if not cands or cands[0].status != "pending" or cands[0].session is not None:
                     code, stale_log = 404 if not cands else 410, True
             elif rid:
                 r = self._by_id.get(rid)
                 if r is None:
                     code, cands = 404, []
-                elif r.status != "pending":
+                elif r.status != "pending" or r.session is not None:
                     code, cands, stale_log = 410, [], not check
                 else:
                     cands = [r]
@@ -4381,7 +4382,7 @@ def approval_handler(broker):
             inner = ("".join(cards) if cards else
                      "<div class='card empty'>Nothing is waiting for approval.</div>")
             block = f"<div id=cards class=cards data-version='{version}'>{inner}</div>"
-            pend_ids = {r.id for r in broker._by_id.values() if r.status == "pending"}
+            pend_ids = {r.id for r in broker._by_id.values() if r.status in ("pending", "running")}
             a = self._hist_args(q or {})
             if fragment:
                 return _page(self, 200, block + self._hist_list(a, pend_ids), nav=False)
@@ -4501,7 +4502,7 @@ def approval_handler(broker):
             """GET /request/<id>: everything the audit log holds about one finished
             request, as server-escaped HTML. Pending requests are refused (they
             have cards); an unknown or malformed id is a plain 404."""
-            pend_ids = {r.id for r in broker._by_id.values() if r.status == "pending"}
+            pend_ids = {r.id for r in broker._by_id.values() if r.status in ("pending", "running")}
             row, evs = broker.history.detail(rid, pend_ids)
             if row is None or rid in pend_ids or row["outcome"] == "pending":
                 code = 404 if row is None else 409

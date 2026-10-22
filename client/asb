@@ -20,8 +20,9 @@
   asb session open NAME --for "purpose" --host H [--host H2]... [--methods GET,HEAD,POST] [--ttl 15m] [--max-calls N]
                                               a time-boxed multi-call permission (login + cookie flows); a human approves
   asb session close ID | asb session status ID
-  asb http ... --session ID [--capture NAME=header:X|cookie:N|json:$.a.b]
-                                              http call inside a session (no new prompt, cookies kept by the broker)
+  asb http ... [--session ID] [--capture NAME=header:X|cookie:N|json:$.a.b]
+                                              http call inside a session (no new prompt, cookies kept by the broker);
+                                              prefer export ASB_SESSION=ID, which keeps the id out of `ps`
   asb guidance propose FILE|- | --from-dir DIR  propose risk guidance; the human reviews it
   asb guidance status ID                      outcome of a proposal (no approval)
   asb enroll [--name NAME] [--url URL] [--force]  get this machine its own credential; a human approves
@@ -98,10 +99,11 @@ Which command? (decision rule)
   the cookies and tokens, so the secret and the session never reach you.
 
 HTTP sessions (multi-step flows; one human approval for a bounded unit of work)
-  asb session open unifi --for "list clients and rename one" --host unifi.local --methods GET,HEAD,POST,PUT
+  asb session open unifi --for "list clients and rename one" --host unifi.local:443 --methods GET,HEAD,POST,PUT
   prints the session id; the human approves a card showing the credential, hosts, methods, time limit
   and call cap. Defaults: methods GET,HEAD; 15 minutes; 200 calls (--ttl 20m, --max-calls 50).
-  Then use it, with no further prompts:
+  Prefer `export ASB_SESSION=ID` (keeps the id out of the process list; --session ID does the same and wins).
+  Unset it when the flow is over. Then use it, with no further prompts:
     asb http unifi POST https://unifi.local/api/auth/login --session ID \
         -H 'Content-Type: application/json' \
         -d '{"username":"{{UNIFI_USERNAME}}","password":"{{UNIFI_PASSWORD}}"}' \
@@ -113,6 +115,8 @@ HTTP sessions (multi-step flows; one human approval for a bounded unit of work)
   The broker stores cookies from responses (and removes Set-Cookie from what you see) and sends them
   on later calls to the same host. --capture saves a value (header:NAME, cookie:NAME or json:$.a.b[0])
   for later use as {{session.NAME}} in the URL, headers and body; you never see it.
+  --host is HOST (ports 80 and 443 only) or HOST:PORT (exactly that port). Redirects are never followed:
+  you get the 3xx and its Location, and make a new call yourself.
   Rules you cannot change: the session ends at its deadline (it is NEVER extended or renewed, however
   much you use it), after --max-calls, on `asb session close`, or when the human revokes it; it only
   works for the client that opened it. A call outside its hosts or methods is refused, not prompted:
@@ -237,13 +241,15 @@ Exit 1 when nothing matches, 2 usage, 3 broker unreachable or refused.
 example: asb audit --request AbC123
          asb audit --event failed --since 1h""",
     "http": """usage: asb http NAME[,NAME] METHOD URL [-H 'K: V']... [-d BODY | -d @file | -d @-]
-                [--session ID [--capture NAME=header:X|cookie:N|json:$.a.b]...]
+                [--session ID | $ASB_SESSION] [--capture NAME=header:X|cookie:N|json:$.a.b]...
 
 The broker makes the HTTP call itself and replaces {{VAR}} in the URL, headers and
 body with the credential. Waits for the human's approval (up to ~5 min).
 Prints "HTTP <status>" on stderr and the response body on stdout; exit 22 if status >= 400.
 With --session ID the call runs inside an approved session (see `asb help session`): no new prompt,
 the broker keeps cookies, --capture saves a response value as {{session.NAME}}. One credential only.
+Preferred: export ASB_SESSION=ID once (it keeps the id out of the process list); the flag overrides it.
+Unset ASB_SESSION when the flow is over: while it is set every `asb http` is a session call.
 example: asb http grafana GET https://grafana.example.com/api/health \\
              -H 'Authorization: Bearer {{GRAFANA_TOKEN}}'""",
     "session": """usage: asb session open NAME --for "purpose" --host H [--host H2]... [--methods GET,HEAD,POST]
@@ -254,8 +260,9 @@ example: asb http grafana GET https://grafana.example.com/api/health \\
 Ask the human for a time-boxed permission to make several related calls with credential NAME (an
 http credential; env and ssh credentials are refused). Use it for multi-step flows (log in, reuse a
 cookie, carry a CSRF token); use plain `asb http` for single calls and env mode only when a program
-needs the secret itself. --host (required, repeatable or comma separated) must be inside the
-credential's allowed hosts: a session only narrows. --methods defaults to GET,HEAD; declare POST, PUT,
+needs the secret itself. --host (required, repeatable or comma separated) is HOST (only ports 80 and 443,
+by scheme) or HOST:PORT (exactly that port); the host must be inside the credential's allowed hosts: a
+session only narrows. Redirects are never followed: you get the 3xx and make a new call. --methods defaults to GET,HEAD; declare POST, PUT,
 PATCH, DELETE or OPTIONS if you need them (the human sees them). --ttl is s, m or h (default 15m, the
 broker has a maximum). --max-calls defaults to 200. --for is one line, up to 300 characters; the human
 sees it as your unverified claim.
@@ -2570,8 +2577,12 @@ def main(argv):
                 body, rest = read_body(rest[1]), rest[2:]
             else:
                 die(f"unexpected argument {rest[0]!r}")
+        if not session and os.environ.get("ASB_SESSION"):
+            session = os.environ["ASB_SESSION"].strip()      # keeps the id out of the process list
+            if not SESSION_ID_RE.match(session):
+                die("ASB_SESSION is not a session id (the one `asb session open` printed)")
         if caps and not session:
-            die("--capture needs --session")
+            die("--capture needs --session (or ASB_SESSION)")
         payload = {"mode": "http", "names": names, "method": method, "url": url, "headers": headers, **body}
         if session:
             if len(names) != 1:

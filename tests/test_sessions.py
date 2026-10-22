@@ -81,6 +81,8 @@ class Unifi(BaseHTTPRequestHandler):
                               [("X-Echo", self.headers.get("Cookie") or "")])
         if path == "/redir-in":
             return self._send(302, {}, [("Location", "/proxy/network/api/s/default/stat/sta")])
+        if path == "/redir-cookie":
+            return self._send(302, {}, [("Location", "/"), ("Set-Cookie", "RC=COOKIE-CANARY-redir; Path=/")])
         if path == "/redir-out":
             return self._send(302, {}, [("Location", f"http://localhost:{self.server.server_address[1]}/echo")])
         if path == "/setcookie":
@@ -89,12 +91,16 @@ class Unifi(BaseHTTPRequestHandler):
                                         ("Set-Cookie", "S=" + st["tokens_prefix"] + "SSSS; Path=/; Secure")])
         if path in ("/", "/sub/x", "/other"):
             return self._send(200, {"cookie": self.headers.get("Cookie")})
+        if path == "/hold":
+            st["holding"].append(1)                 # in flight: the test releases it when it is ready
+            st["release"].wait(20)
+            return self._send(200, {"hold": "HELDBODY"}, [("Set-Cookie", "H=COOKIE-CANARY-held; Path=/")])
         if path == "/boom":
             self.connection.close()
             return None
         if path == "/json":
             return self._send(200, {"a": {"b": [{"c": "deep-value-1234"}], "n": 7, "t": True, "o": {"x": 1},
-                                          "crlf": "x\r\ny"}})
+                                          "crlf": "x\r\ny", "uni": "caf\u00e9", "s3": "abc", "s4": "wxyz"}})
         return self._send(404, {"error": "no"})
 
     do_HEAD = do_GET
@@ -141,6 +147,7 @@ class Unifi(BaseHTTPRequestHandler):
 class SBase(CBase):
     """CBase plus the stub upstream and a `unifi` login credential allowed for 127.0.0.1 and localhost."""
     sessions_cfg = None
+    inject_clock = True
     unifi_hosts = ("127.0.0.1", "localhost")
 
     def tweak(self, cfg):
@@ -160,27 +167,34 @@ class SBase(CBase):
         super().setUp()
         self.ux = ThreadingHTTPServer(("127.0.0.1", 0), Unifi)
         self.ux.daemon_threads = True
-        self.ux.st = {"tokens": set(), "csrf": None, "seen": [], "rotate": False,
+        self.ux.st = {"holding": [], "release": threading.Event(), "tokens": set(), "csrf": None, "seen": [], "rotate": False,
                       "tokens_prefix": "COOKIE-CANARY-"}
         threading.Thread(target=self.ux.serve_forever, daemon=True).start()
         self.port = self.ux.server_address[1]
         self.st = self.ux.st
         self.model = ModelStub()
         self.broker.summarizer = self.model
+        if self.inject_clock:       # the production clock is time.monotonic; tests move this one with `advance`
+            self.broker.sessions_clock = lambda: time.monotonic() + self.offset
         self.out = []                       # CLI output seen
         self.dir = os.path.dirname(self.audit)
 
     def tearDown(self):
+        self.st["release"].set()
         self.ux.shutdown()
         self.ux.server_close()
         super().tearDown()
 
     # -- helpers ---------------------------------------------------------
+    def hp(self, host="127.0.0.1"):
+        """A manifest host entry for the stub: host:port."""
+        return f"{host}:{self.port}"
+
     def url(self, path, host="127.0.0.1"):
         return f"http://{host}:{self.port}{path}"
 
     def ask(self, key=KEY, expect=202, cred="unifi", **kw):
-        body = {"mode": "session", "names": [cred], "purpose": PURPOSE, "hosts": ["127.0.0.1"],
+        body = {"mode": "session", "names": [cred], "purpose": PURPOSE, "hosts": [self.hp()],
                 "methods": ["GET", "HEAD", "POST", "PUT"], "source": "t@box"}
         body.update(kw)
         code, text = self.as_client(key, "POST", "/v1/requests", body)
@@ -296,12 +310,12 @@ class Helpers(unittest.TestCase):
 
     def test_storable_refuses_control_characters_and_big_values(self):
         self.assertTrue(S.storable("abc"))
-        for bad in ("", "a\r\nb", "a\x00b", "x" * 4097, None, 5):
+        for bad in ("", "a\r\nb", "a\x00b", "x" * 4097, None, 5, "caf\u00e9", "a\x7fb", "tab\there"):
             self.assertFalse(S.storable(bad))
 
     def test_jar_scoping_path_secure_expiry_and_caps(self):
         now = [1000.0]
-        j = S.Jar(lambda: now[0])
+        j = S.Jar(lambda: now[0], wall=lambda: now[0])
         j.store("a.example", "/", True, ["k=1; Path=/", "p=2; Path=/sub", "s=3; Secure", "d=4; Domain=example",
                                              "e=5; Max-Age=10", "bad", "=x", "n a=1"])
         self.assertEqual(j.header("a.example", "/", True), "k=1; s=3; d=4; e=5")      
@@ -318,7 +332,7 @@ class Helpers(unittest.TestCase):
         self.assertNotIn("k=1", j.header("a.example", "/", True) or "")               # deleted
         j.store("a.example", "/", True, ["x=1; Expires=Thu, 01 Jan 1970 00:00:01 GMT"])
         self.assertNotIn("x=1", j.header("a.example", "/", True) or "")               # past Expires
-        j2 = S.Jar(lambda: 0)
+        j2 = S.Jar(lambda: 0, wall=lambda: 0)
         j2.store("h", "/", True, [f"c{i}=v" for i in range(S.MAX_COOKIES + 10)])
         self.assertEqual(len(j2), S.MAX_COOKIES)
         j2.store("h", "/", True, ["big=" + "x" * S.MAX_COOKIE_BYTES])
@@ -429,7 +443,7 @@ class Flow(SBase):
             self.assertEqual(e["max_calls"], 200)
         ev = self.events("session_opened")[0]
         self.assertEqual((ev["hosts"], ev["methods"], ev["ttl_s"], ev["max_calls"]),
-                         (["127.0.0.1"], ["GET", "HEAD", "POST", "PUT"], 900, 200))
+                         ([self.hp()], ["GET", "HEAD", "POST", "PUT"], 900, 200))
         self.assertEqual(ev["session"], sid[:8])
         self.assertEqual(self.events("session_requested")[0]["ttl_s"], 900)
         # every call is a normal audited request too: approved via the session, executed, delivered
@@ -453,7 +467,7 @@ class Flow(SBase):
         self.assertTrue(r["http"]["headers"]["X-Echo"].startswith("TOKEN=***"))
 
     def test_cookie_is_host_scoped(self):
-        sid = self.open(hosts=["127.0.0.1", "localhost"])
+        sid = self.open(hosts=[self.hp(), self.hp("localhost")])
         self.login(sid)
         code, r = self.call(sid, "GET", "/proxy/network/api/s/default/stat/sta", host="localhost")
         self.assertEqual(r["http"]["status"], 401)          # the cookie belongs to 127.0.0.1 only
@@ -529,22 +543,24 @@ class Flow(SBase):
         self.assertEqual(self.st["seen"][-1]["body"], "{{UNIFI_PASSWORD}} " + USER)
         self.assertNotIn(PASSWORD, json.dumps(r))
 
-    def test_redirects_inside_the_hosts_are_followed_and_outside_are_not(self):
-        sid = self.open()
+    def test_redirects_are_never_followed(self):
+        sid = self.open(hosts=[self.hp(), self.hp("localhost")])
         self.login(sid)
-        code, r = self.call(sid, "GET", "/redir-in")
-        self.assertEqual((r["http"]["status"], "laptop" in r["http"]["body"]), (200, True))
-        n = len(self.st["seen"])
-        code, r = self.call(sid, "GET", "/redir-out")        # localhost is not one of the session's hosts
-        self.assertEqual(r["http"]["status"], 302)
-        self.assertEqual(len(self.st["seen"]), n + 1)        # the redirect target was never contacted
+        for path in ("/redir-in", "/redir-out"):          # one inside the hosts, one to another session host
+            n = len(self.st["seen"])
+            code, r = self.call(sid, "GET", path)
+            self.assertEqual(r["http"]["status"], 302, path)
+            self.assertEqual(len(self.st["seen"]), n + 1)  # the target was never contacted
+        self.assertIn("Location", r["http"]["headers"])    # the agent gets the Location and makes its own call
+        self.assertEqual(self.sess(sid).calls, 3)          # login and the two 302s: each hop is a counted call
 
-    def test_redirect_to_another_session_host_does_not_carry_the_first_hosts_cookie(self):
-        sid = self.open(hosts=["127.0.0.1", "localhost"])
-        self.login(sid)
-        code, r = self.call(sid, "GET", "/redir-out")
-        self.assertEqual(r["http"]["status"], 200)           # followed to localhost
-        self.assertIsNone(json.loads(r["http"]["body"])["cookie"])
+    def test_a_redirect_response_still_updates_the_jar_and_never_shows_set_cookie(self):
+        sid = self.open()
+        code, r = self.call(sid, "GET", "/redir-cookie")
+        self.assertEqual(r["http"]["status"], 302)
+        self.assertNotIn("set-cookie", {k.lower() for k in r["http"]["headers"]})
+        self.call(sid, "GET", "/")
+        self.assertIn("RC=COOKIE-CANARY-redir", self.st["seen"][-1]["cookie"])
 
     def test_set_cookie_attributes_over_http_flow(self):
         sid = self.open(methods=["GET"])
@@ -869,7 +885,7 @@ class Scope(SBase):
         sid = self.open()                                   # hosts: 127.0.0.1 only; the credential also allows localhost
         code, r = self.call(sid, "GET", "/", host="localhost")
         self.assertEqual((code, r["code"]), (403, "session_refused"))
-        self.assertIn("outside this session's hosts", r["error"])
+        self.assertIn("outside this session's scope", r["error"])
         self.assertEqual(len(self.broker.pending()), 0)
         self.assertEqual(self.events("session_refused")[-1]["host"], "localhost")
         self.assertEqual(self.st["seen"], [])
@@ -885,7 +901,7 @@ class Scope(SBase):
 
     def test_methods_default_to_get_and_head(self):
         code, text = self.as_client(KEY, "POST", "/v1/requests", {"mode": "session", "names": ["unifi"],
-                                                                  "purpose": PURPOSE, "hosts": ["127.0.0.1"]})
+                                                                  "purpose": PURPOSE, "hosts": [self.hp()]})
         rid = json.loads(text)["id"]
         self.approve(rid)
         sid = self.result(rid)["session"]["id"]
@@ -915,8 +931,8 @@ class Scope(SBase):
 
     def test_a_session_never_widens_allowed_hosts(self):
         self.ask(hosts=["example.org"], expect=403)
-        self.ask(hosts=["127.0.0.1", "example.org"], expect=403)
-        self.ask(hosts=["LOCALHOST"], expect=202)           # inside allowed_hosts, case folded
+        self.ask(hosts=[self.hp(), "example.org"], expect=403)
+        self.ask(hosts=["LOCALHOST:" + str(self.port)], expect=202)           # inside allowed_hosts, case folded
         self.assertEqual(len(self.events("rejected")), 2)
 
     def test_narrowing_the_credential_after_opening_refuses_calls(self):
@@ -988,20 +1004,28 @@ class Scope(SBase):
         self.assertEqual(code, 403)
 
     def test_upstream_errors_are_class_only_and_still_count(self):
-        sid = self.open()
+        sid = self.open(hosts=[self.hp(), "127.0.0.1:1"])
         code, r = self.call(sid, "GET", "/", url="http://127.0.0.1:1/x")      # nothing listens there
         self.assertEqual(r["status"], "failed")
         self.assertEqual(r["error"], "upstream call failed (connection)")
         self.assertEqual(self.events("http_failed")[-1]["error"], "connection")
-        code, r = self.call(sid, "GET", "/", headers={"X-A": "a\r\nInjected: 1"})
-        self.assertEqual(r["error"], "upstream call failed (invalid_request)")
         code, r = self.call(sid, "GET", "/boom")
         self.assertTrue(r["error"].startswith("upstream call failed ("))
         for text in (json.dumps(self.records()),):
             self.assertNotIn("Errno", text)
             self.assertNotIn("Traceback", text)
-            self.assertNotIn("Injected", text)
-        self.assertEqual(self.sess(sid).calls, 3)
+        self.assertEqual(self.sess(sid).calls, 2)                           # both left the broker
+
+    def test_a_call_that_never_left_the_broker_is_not_charged(self):
+        sid = self.open()
+        for headers in ({"X-A": "a\r\nInjected: 1"}, {"X-A": "caf\u00e9"}, {"bad name": "v"}, {"X-A": "a\x00b"}):
+            code, r = self.call(sid, "GET", "/", headers=headers)
+            self.assertEqual(r["error"], "upstream call failed (invalid_request)", headers)
+        self.assertEqual(self.sess(sid).calls, 0)
+        self.assertEqual(self.st["seen"], [])
+        self.assertNotIn("Injected", json.dumps(self.records()))
+        code, r = self.call(sid, "GET", "/")
+        self.assertEqual((r["http"]["status"], self.sess(sid).calls), (200, 1))
 
 
 # ------------------------------------------------------------------------- approval rules
@@ -1249,7 +1273,7 @@ class Leaks(SBase):
 
 
 # ------------------------------------------------------------------------- the real CLI
-class CliFlow(SBase):
+class CliBase(SBase):
     def run_cli(self, *args, human=None, key=KEY, timeout=60, stdin=None):
         env = {"PATH": os.environ["PATH"], "HOME": self.dir, "SECRET_BROKER_URL": self.base, "SECRET_BROKER_KEY": key}
         p = subprocess.Popen([CLI, *args], env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -1273,13 +1297,18 @@ class CliFlow(SBase):
         return lambda rid: self.post("/decide", {"id": rid, "decision": "approve", **limits})
 
     def cli_open(self, *extra, key=KEY, human=None):
-        rc, out, err = self.run_cli("session", "open", "unifi", "--for", PURPOSE, "--host", "127.0.0.1",
+        rc, out, err = self.run_cli("session", "open", "unifi", "--for", PURPOSE, "--host", self.hp(),
                                     "--methods", "GET,POST,PUT", *extra, human=human or self.human_approves(), key=key)
         self.assertEqual(rc, 0, err)
         sid = out.strip()
         self.assertRegex(sid, r"^[A-Za-z0-9_-]{32}$")
         return sid
 
+    def records_count_requests(self):
+        return len(self.events("requested"))
+
+
+class CliFlow(CliBase):
     def test_unifi_flow_with_the_real_asb(self):
         sid = self.cli_open("--ttl", "10m", "--max-calls", "20")
         rc, out, err = self.run_cli("http", "unifi", "POST", self.url("/api/auth/login"), "--session", sid,
@@ -1329,7 +1358,7 @@ class CliFlow(SBase):
         rc, out, err = self.run_cli("http", "unifi", "GET", self.url("/"), "--session", sid, key=other["secret"])
         self.assertEqual(rc, 7, err)
         self.assertIn("unknown session", err)
-        rc, out, err = self.run_cli("session", "open", "unifi", "--for", PURPOSE, "--host", "127.0.0.1",
+        rc, out, err = self.run_cli("session", "open", "unifi", "--for", PURPOSE, "--host", self.hp(),
                                     human=lambda rid: self.post("/decide", {"id": rid, "decision": "deny"}))
         self.assertEqual(rc, 4, err)
         rc, out, err = self.run_cli("session", "open", "deploy", "--for", PURPOSE, "--host", "127.0.0.1")
@@ -1353,9 +1382,6 @@ class CliFlow(SBase):
             self.assertEqual(rc, 2, (args, err))
         self.assertEqual(self.records_count_requests(), 0)
 
-    def records_count_requests(self):
-        return len(self.events("requested"))
-
     def test_help_and_guide_cover_sessions(self):
         rc, out, _ = self.run_cli("help", "session")
         self.assertEqual(rc, 0)
@@ -1367,6 +1393,415 @@ class CliFlow(SBase):
             self.assertIn(frag, out)
         rc, out, _ = self.run_cli("help", "http")
         self.assertIn("--session ID", out)
+
+
+# ------------------------------------------------------------------------- review hardening
+def bg(fn, *a, **kw):
+    out = []
+    t = threading.Thread(target=lambda: out.append(fn(*a, **kw)), daemon=True)
+    t.start()
+    return t, out
+
+
+class Hardening(SBase):
+    def hold(self, sid, key=KEY):
+        """Start a call the upstream holds open; returns (thread, result list) once it is in flight."""
+        n = len(self.st["holding"])
+        t, out = bg(self.call, sid, "GET", "/hold", key)
+        end = time.time() + 10
+        while len(self.st["holding"]) <= n and time.time() < end:
+            time.sleep(0.02)
+        self.assertGreater(len(self.st["holding"]), n, "the call never reached the upstream")
+        return t, out
+
+    def finish(self, t, out):
+        self.st["release"].set()
+        t.join(20)
+        return out[0]
+
+    def running(self):
+        return [r for r in self.broker._by_id.values() if r.session is not None and r.status == "running"]
+
+    # -- (1) regex DoS and the global lock ------------------------------------------
+    def test_placeholder_scans_are_linear(self):
+        nasty = ["{{" + " " * 4000, "{{" * 5000, "{{ " * 3000 + "}}", "{{" + "a" * 200000, "}}" * 50000,
+                 "{{" + " " * 4000 + "x" * 10, "{{a" * 3000]
+        t0 = time.time()
+        for text in nasty:
+            try:
+                S.placeholders(text)
+            except ValueError:
+                pass
+            try:
+                S.fill(text, {})
+            except KeyError:
+                pass
+        self.assertLess(time.time() - t0, 1.0)
+
+    def test_adversarial_calls_are_refused_fast_and_do_not_freeze_the_store(self):
+        sid = self.open()
+        other = self.open()
+        for where in ("url", "header", "body"):
+            for nasty in ("{{" + " " * 4000, "{{" + "a" * 3000 + "}}"):
+                t0 = time.time()
+                if where == "url":
+                    code, r = self.call(sid, "GET", "/?q=" + nasty)
+                elif where == "header":
+                    code, r = self.call(sid, "GET", "/", headers={"X-A": nasty})
+                else:
+                    code, r = self.call(sid, "POST", "/echo", body=nasty)
+                self.assertLess(time.time() - t0, 3.0, (where, nasty[:8]))
+                self.assertIn(code, (200, 400, 403))
+                if code == 403:
+                    self.assertEqual(r["code"], "session_refused")
+        t0 = time.time()
+        self.assertEqual(self.broker.session_status(other, {"id": "legacy", "name": "x"})[0], "ok")
+        self.assertLess(time.time() - t0, 1.0)
+
+    def test_the_scope_check_does_not_hold_the_store_lock(self):
+        sid = self.open()
+        held = []
+
+        def slow_scope(*a, **k):
+            held.append(self.broker._sess_lock.locked())
+            return None
+        with mock.patch.object(S, "scope_problem", slow_scope):
+            self.call(sid, "GET", "/")
+        self.assertEqual(held, [False])
+
+    def test_call_size_caps(self):
+        sid = self.open()
+        self.assertEqual(self.call(sid, "GET", "/", url=self.url("/") + "x" * 9000)[0], 400)
+        self.assertEqual(self.call(sid, "GET", "/", headers={f"H{i}": "v" for i in range(S.MAX_HEADERS + 1)})[0], 400)
+        self.assertEqual(self.call(sid, "GET", "/", headers={"X": "v" * 9000})[0], 400)
+        self.assertEqual(self.call(sid, "GET", "/", headers={"X" * 300: "v"})[0], 400)
+        code, r = self.call(sid, "POST", "/echo", body="{{" + "p" * 100 + "}}")        # a long placeholder name
+        self.assertEqual((code, r["code"]), (403, "session_refused"))
+        code, r = self.call(sid, "POST", "/echo", body="{{A}}" * (S.MAX_PLACEHOLDERS + 1))
+        self.assertEqual(code, 400)
+        self.assertEqual(self.sess(sid).calls, 0)
+
+    def test_a_slow_call_never_blocks_revoke_status_close_or_sweep_of_other_sessions(self):
+        a, b = self.open(), self.open()
+        t, out = self.hold(a)
+        t0 = time.time()
+        self.assertEqual(self.call(b, "GET", "/")[1]["http"]["status"], 200)
+        self.assertEqual(self.broker.session_status(b, {"id": "legacy", "name": "x"})[0], "ok")
+        self.broker.sweep_sessions()
+        self.assertEqual(self.broker.active_sessions()[0]["calls"] in (0, 1), True)
+        status, _, hdr = self.post("/sessions/revoke", {"pid": b[:8]})
+        self.assertIn("note=sesrevoked", hdr["Location"])
+        c = self.open()
+        code, text = self.as_client(KEY, "POST", "/v1/requests", {"mode": "session_close", "session": c})
+        self.assertEqual(code, 200)
+        self.assertLess(time.time() - t0, 5.0)
+        self.assertTrue(t.is_alive())                         # the slow call is still in flight the whole time
+        self.finish(t, out)
+
+    # -- (2) in-flight calls do not survive revoke, expiry or close --------------------
+    def test_revoke_mid_flight_discards_the_response(self):
+        sid = self.open()
+        t, out = self.hold(sid)
+        s = self.sess(sid)
+        self.post("/sessions/revoke", {"pid": sid[:8]})
+        code, r = self.finish(t, out)
+        self.assertEqual((code, r["code"]), (410, "session_expired"))
+        self.assertIn("revoked", r["error"])
+        self.assertNotIn("HELDBODY", json.dumps(r))
+        self.assertEqual((len(s.jar), s.captures), (0, {}))      # the cookie it set was not kept
+        self.assertEqual([x.status for x in self.broker._by_id.values() if x.session is not None], ["failed"])
+        self.assertNotIn("COOKIE-CANARY-held", self.audit_text() + "\n".join(self.seen))
+
+    def test_expiry_mid_flight_discards_the_response(self):
+        sid = self.open(ttl_s=60)
+        t, out = self.hold(sid)
+        self.advance(61)
+        code, r = self.finish(t, out)
+        self.assertEqual((code, r["code"]), (410, "session_expired"))
+        self.assertNotIn("HELDBODY", json.dumps(r))
+        self.assertIn("cannot be extended", r["error"])
+
+    def test_close_mid_flight_discards_the_response(self):
+        sid = self.open()
+        t, out = self.hold(sid)
+        self.as_client(KEY, "POST", "/v1/requests", {"mode": "session_close", "session": sid})
+        code, r = self.finish(t, out)
+        self.assertEqual((code, r["code"]), (410, "session_expired"))
+        self.assertNotIn("HELDBODY", json.dumps(r))
+
+    def test_client_revoke_mid_flight_discards_the_response(self):
+        a = self.new_client("alice-box")
+        sid = self.open(key=a["secret"])
+        t, out = self.hold(sid, a["secret"])
+        self.post("/clients/revoke", {"id": a["id"]})
+        code, r = self.finish(t, out)
+        self.assertEqual(code, 410)
+        self.assertNotIn("HELDBODY", json.dumps(r))
+
+    def test_the_call_is_bounded_by_the_time_left(self):
+        from secret_broker import broker as bm
+        sid = self.open(ttl_s=60)
+        self.advance(50)
+        seen = []
+
+        class Boom:
+            def open(self, req, timeout=None):
+                seen.append(timeout)
+                raise OSError("x")
+        with mock.patch.object(bm, "_opener_for", lambda tls: Boom()):
+            self.call(sid, "GET", "/")
+        self.assertEqual(len(seen), 1)
+        self.assertLessEqual(seen[0], 10.5)
+        self.assertGreater(seen[0], 0)
+        sid2 = self.open(ttl_s=3600)
+        seen.clear()
+        with mock.patch.object(bm, "_opener_for", lambda tls: Boom()):
+            self.call(sid2, "GET", "/")
+        self.assertEqual(seen, [S.CALL_TIMEOUT_S])
+
+    # -- (3) session calls are not approvable requests -------------------------------
+    def test_an_in_flight_session_call_is_not_a_pending_approvable_request(self):
+        sid = self.open()
+        t, out = self.hold(sid)
+        (req,) = self.running()
+        self.assertEqual(req.status, "running")
+        self.assertEqual(self.broker.pending(), [])
+        self.assertEqual(self.broker.attention(), 0)
+        page = self.get("/")[1]
+        self.assertNotIn(req.id, page.split("id=cards", 1)[1].split("</div>", 1)[0])
+        self.assertNotIn("name=decision value=approve", page)
+        hits = len(self.st["holding"])
+        for decision in ("approve", "approve_always", "approve_grant_15", "deny"):
+            status, loc, _ = self.decide(req.id, decision)
+            self.assertEqual(status, 303)
+            self.assertIn("note=stale", loc, decision)
+        self.assertEqual(self.broker.decide_via("dashboard", req.id, "approve", "alice"), (410, None))
+        self.assertEqual(self.broker.decide_via("link", None, "approve", "alice", nonce=req.nonce), (404, None))
+        self.assertEqual(self.broker.active_grants(), [])
+        self.assertEqual(req.status, "running")
+        self.finish(t, out)
+        self.assertEqual(len(self.st["holding"]), hits)           # never executed twice
+        self.assertIn(req.status, ("approved", "released"))
+
+    def test_slow_session_calls_do_not_block_other_clients_or_session_opens(self):
+        a, b = self.new_client("alice-box"), self.new_client("bob-box")
+        sa = self.open(key=a["secret"])
+        n0 = len(self.st["holding"])
+        ths = [bg(self.call, sa, "GET", "/hold", a["secret"]) for _ in range(3)]
+        end = time.time() + 10
+        while len(self.st["holding"]) < n0 + 3 and time.time() < end:
+            time.sleep(0.02)
+        self.assertEqual(len(self.running()), 3)
+        t0 = time.time()
+        # the cap on pending requests (3) is not eaten by the running calls
+        ids = []
+        for i in range(3):
+            code, text = self.as_client(b["secret"], "POST", "/v1/requests", {
+                "mode": "http", "names": ["svc"], "method": "GET", "url": f"http://127.0.0.1:{self.up.server_address[1]}/x{i}",
+                "headers": {"Authorization": "Bearer {{SVC_TOKEN}}"}})
+            self.assertEqual(code, 202, text)
+            ids.append(json.loads(text)["id"])
+        self.assertEqual(len(self.broker.pending()), 3)
+        for rid in ids:
+            self.post("/decide", {"id": rid, "decision": "deny"})
+        self.broker._denied_at.clear()
+        sb = self.open(key=b["secret"])                              # the human can still open sessions
+        self.assertEqual(self.call(sb, "GET", "/", key=b["secret"])[1]["http"]["status"], 200)
+        self.assertLess(time.time() - t0, 8.0)
+        self.st["release"].set()
+        for t, _ in ths:
+            t.join(20)
+
+    # -- (4) method override ---------------------------------------------------------
+    def test_method_override_headers_and_fields_are_refused(self):
+        sid = self.open(methods=["GET", "POST"])
+        cases = [("POST", "/echo", {"X-HTTP-Method-Override": "DELETE"}, "x"),
+                 ("POST", "/echo", {"x-http-method": "PUT"}, "x"),
+                 ("POST", "/echo", {"X-Method-Override": "DELETE"}, "x"),
+                 ("POST", "/echo", {"X-Method-Override": "{{session.NOPE}}"}, "x"),
+                 ("POST", "/echo?_method=DELETE", {}, "x"),
+                 ("POST", "/echo?a=1&%5Fmethod=DELETE", {}, "x"),
+                 ("POST", "/echo", {}, "a=1&_method=DELETE"),
+                 ("POST", "/echo", {}, '{"_method": "PATCH"}'),
+                 ("POST", "/echo", {}, "{'_METHOD':'delete'}"),
+                 ("POST", "/echo", {}, "a=1&%5Fmethod=DELETE"),
+                 ("POST", "/echo", {}, "_method="),
+                 ("POST", "/echo", {}, "_method={{UNIFI_USERNAME}}")]
+        for m, path, hdr, body in cases:
+            code, r = self.call(sid, m, path, headers=hdr, body=body)
+            self.assertEqual((code, r.get("code")), (403, "session_refused"), (path, hdr, body))
+        self.assertEqual(self.st["seen"], [])
+        self.assertEqual(self.sess(sid).calls, 0)
+        # a body_b64 field too
+        import base64
+        code, r = self.as_client(KEY, "POST", "/v1/requests", {
+            "mode": "http", "names": ["unifi"], "method": "POST", "url": self.url("/echo"), "headers": {},
+            "session": sid, "body_b64": base64.b64encode(b"_method=DELETE").decode()})
+        self.assertEqual(code, 403)
+
+    def test_the_override_is_allowed_when_that_verb_is_declared(self):
+        sid = self.open(methods=["GET", "POST", "DELETE"])
+        code, r = self.call(sid, "POST", "/echo", headers={"X-HTTP-Method-Override": "DELETE"}, body="x")
+        self.assertEqual(r["http"]["status"], 200)
+        code, r = self.call(sid, "POST", "/echo?_method=delete", body="x")
+        self.assertEqual(r["http"]["status"], 200)
+
+    def test_a_captured_value_cannot_smuggle_an_override_after_substitution(self):
+        sid = self.open(methods=["GET", "POST"])
+        self.call(sid, "GET", "/json", capture=["A=json:$.a.n"])
+        self.sess(sid).captures["Q"] = "a=1&_method=DELETE"
+        code, r = self.call(sid, "POST", "/echo?{{session.Q}}", body="x")
+        self.assertEqual((code, r["code"]), (403, "session_refused"))
+        self.assertEqual(len(self.st["seen"]), 1)                 # only the /json call reached the upstream
+        code, r = self.call(sid, "POST", "/echo", body="{{session.Q}}")
+        self.assertEqual(len(self.st["seen"]), 1)
+        self.assertEqual(self.sess(sid).calls, 1)                 # both refused before sending: not charged
+
+    def test_get_and_head_cannot_carry_a_body(self):
+        sid = self.open()
+        for m in ("GET", "HEAD"):
+            code, r = self.call(sid, m, "/", body="x")
+            self.assertEqual((code, r["code"]), (403, "session_refused"), m)
+        self.assertEqual(self.events("session_refused")[-1]["reason_class"], "body")
+        self.assertEqual(self.sess(sid).calls, 0)
+
+    # -- (6) ports -------------------------------------------------------------------
+    def test_the_scope_includes_the_port(self):
+        sid = self.open()                                          # 127.0.0.1:<port>
+        self.assertEqual(self.call(sid, "GET", "/")[1]["http"]["status"], 200)
+        for url in ("http://127.0.0.1:1/x", "http://127.0.0.1/x", "https://127.0.0.1:%d/x" % (self.port + 1),
+                    "http://127.0.0.1:99999/x"):
+            code, r = self.call(sid, "GET", "/", url=url)
+            self.assertEqual((code, r["code"]), (403, "session_refused"), url)
+        code, r = self.call(sid, "GET", "/", url="http://127.0.0.1:1/x")
+        self.assertIn("scope", r["error"])
+        self.assertEqual(len(self.st["seen"]), 1)
+        self.assertEqual(self.sess(sid).calls, 1)
+
+    def test_a_bare_host_means_the_default_ports_only(self):
+        r = self.ask(hosts=["127.0.0.1"])
+        card = self.get("/")[1]
+        self.assertIn("127.0.0.1 (ports 80 and 443)", card)
+        self.approve(r["id"])
+        sid = self.result(r["id"])["session"]["id"]
+        code, r = self.call(sid, "GET", "/")                      # the stub is on another port
+        self.assertEqual((code, r["code"]), (403, "session_refused"))
+        s = self.sess(sid)
+        self.assertTrue(s.in_scope("http", "127.0.0.1", 80))
+        self.assertTrue(s.in_scope("https", "127.0.0.1", 443))
+        self.assertFalse(s.in_scope("http", "127.0.0.1", 443))
+        self.assertFalse(s.in_scope("https", "127.0.0.1", 80))
+        self.assertFalse(s.in_scope("http", "other", 80))
+
+    def test_the_card_and_the_list_show_host_and_port(self):
+        self.ask()
+        self.assertIn(f"127.0.0.1:{self.port}", self.get("/")[1])
+        sid = self.open()
+        self.assertIn(f"127.0.0.1:{self.port}", self.get("/clients")[1])
+        self.assertEqual(self.events("session_opened")[-1]["hosts"], [self.hp()])
+
+    def test_bad_host_entries_are_refused(self):
+        for bad in ("127.0.0.1:0", "127.0.0.1:99999", "127.0.0.1:x", "127.0.0.1:", ":80", "a b", "127.0.0.1:80:80",
+                    "http://127.0.0.1", "127.0.0.1/x", 5, None):
+            self.ask(hosts=[bad], expect=400)
+
+    # -- (7) the clock ----------------------------------------------------------------
+    def test_a_session_does_not_use_wall_time(self):
+        calls = []
+        sid = self.open(ttl_s=60)
+        s = self.sess(sid)
+        with mock.patch.object(time, "time", side_effect=lambda: calls.append(1) or 0.0):
+            with self.broker._sess_lock:
+                self.broker._sess_lookup(sid, "legacy", self.broker.sessions_clock())
+            self.broker.sweep_sessions()
+        self.assertEqual(calls, [])
+        self.assertGreater(s.expires, 0)
+
+
+class WallClock(SBase):
+    inject_clock = False        # the production clock, untouched
+
+    def test_production_uses_the_monotonic_clock(self):
+        self.assertIs(self.broker.sessions_clock, time.monotonic)
+
+    def test_a_wall_clock_step_neither_extends_nor_shortens_a_session(self):
+        sid = self.open(ttl_s=600)
+        before = self.sess(sid).expires
+        self.offset = -7200                                        # wall time jumps back two hours
+        code, r = self.call(sid, "GET", "/")
+        self.assertEqual(r["http"]["status"], 200)
+        self.assertLessEqual(r["session"]["expires_in"], 600)
+        self.assertEqual(self.sess(sid).expires, before)
+        self.offset = 10 * 86400                                   # and forward ten days: still not expired
+        self.assertEqual(self.call(sid, "GET", "/")[1]["http"]["status"], 200)
+        code, text = self.as_client(KEY, "GET", f"/v1/sessions/{sid}")
+        self.assertLessEqual(json.loads(text)["expires_in"], 600)
+        self.broker.sweep_sessions()
+        self.assertEqual(len(self.broker._sess), 1)
+        self.assertLessEqual(self.broker.active_sessions()[0]["left_s"], 600)
+
+    def test_the_real_deadline_is_enforced_with_the_real_clock(self):
+        sid = self.open(ttl_s=S.TTL_FLOOR)
+        self.sess(sid).expires = time.monotonic() - 1
+        self.assertEqual(self.call(sid, "GET", "/")[1]["code"], "session_expired")
+
+
+# ------------------------------------------------------------------------- captures and masking
+class Masking(SBase):
+    def test_captured_values_must_be_printable_ascii(self):
+        sid = self.open()
+        code, r = self.call(sid, "GET", "/json", capture=["U=json:$.a.uni", "A=json:$.a.n"])
+        self.assertEqual((r["session"]["captured"], r["session"]["missing"]), (["A"], ["U"]))
+        self.assertNotIn("U", self.sess(sid).captures)
+
+    def test_masking_threshold_is_four_characters(self):
+        sid = self.open()
+        self.call(sid, "GET", "/json", capture=["S3=json:$.a.s3", "S4=json:$.a.s4"])
+        code, r = self.call(sid, "POST", "/echo", body="{{session.S3}} {{session.S4}}")
+        echoed = json.loads(r["http"]["body"])["body"]
+        self.assertEqual(echoed, "abc ***")                         # 3 characters: left alone; 4: masked
+        self.assertEqual(S.mask_values("a wxyz abc", ["wxyz", "abc", ""]), "a *** abc")
+        self.assertIn("4 or more characters", self.get("/")[1] if self.ask() else "")
+
+    def test_session_refused_logs_a_capped_host(self):
+        sid = self.open()
+        code, r = self.call(sid, "GET", "/", url="http://" + "a" * 400 + ".example/x")
+        self.assertEqual(code, 403)
+        for ev in self.events("session_refused"):
+            self.assertLessEqual(len(ev.get("host") or ""), 255)
+        self.assertEqual(self.events("session_refused")[-1]["host"], ("a" * 400 + ".example")[:255])
+
+
+# ------------------------------------------------------------------------- ASB_SESSION
+class EnvSession(CliBase):
+    def test_asb_session_env_var_is_the_preferred_way_and_the_flag_overrides_it(self):
+        sid = self.cli_open()
+        rc, out, err = self.run_cli_env({"ASB_SESSION": sid}, "http", "unifi", "GET", self.url("/"))
+        self.assertEqual(rc, 0, err)
+        self.assertIn("calls left", err)
+        self.assertEqual(self.sess(sid).calls, 1)
+        rc, out, err = self.run_cli_env({"ASB_SESSION": "a" * 32}, "http", "unifi", "GET", self.url("/"), "--session", sid)
+        self.assertEqual(rc, 0, err)                                # the flag wins over a bad or other value
+        self.assertEqual(self.sess(sid).calls, 2)
+        rc, out, err = self.run_cli_env({"ASB_SESSION": "nonsense"}, "http", "unifi", "GET", self.url("/"))
+        self.assertEqual(rc, 2, err)
+        rc, out, err = self.run_cli_env({"ASB_SESSION": sid}, "http", "unifi", "GET", self.url("/"),
+                                        "--capture", "A=header:X-Nope")
+        self.assertEqual(rc, 0, err)
+        rc, out, err = self.run_cli_env({}, "http", "unifi", "GET", self.url("/"), "--capture", "A=header:X")
+        self.assertEqual(rc, 2, err)                                # no session anywhere
+
+    def run_cli_env(self, extra, *args):
+        env = {"PATH": os.environ["PATH"], "HOME": self.dir, "SECRET_BROKER_URL": self.base,
+               "SECRET_BROKER_KEY": KEY, **extra}
+        p = subprocess.run([CLI, *args], env=env, capture_output=True, text=True, timeout=60)
+        self.out.extend([p.stdout, p.stderr])
+        return p.returncode, p.stdout, p.stderr
+
+    def test_help_and_guide_recommend_asb_session(self):
+        for args in (("help", "http"), ("guide",)):
+            rc, out, err = self.run_cli_env({}, *args)
+            self.assertIn("ASB_SESSION", out)
 
 
 if __name__ == "__main__":

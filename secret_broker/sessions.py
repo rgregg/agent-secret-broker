@@ -65,7 +65,12 @@ MAX_COOKIE_BYTES = 4096         # name + value
 MAX_CAPTURES = 16               # captured values per session
 MAX_CAPTURE_BYTES = 4096        # per captured value
 MAX_CAPTURE_EXPRS = 8           # capture expressions per call
-MAX_REDIRECTS = 5
+MAX_URL = 8192                  # per call: url, header values, header count, placeholders
+MAX_HEADER_NAME, MAX_HEADERS, MAX_PLACEHOLDERS, MAX_PLACEHOLDER_NAME = 256, 50, 100, 64
+MAX_CALL_BODY = 5_000_000
+CALL_TIMEOUT_S = 30
+MASK_MIN = 4                    # captured, cookie and credential values shorter than this are not masked
+MAX_HOST_LOG = 255
 MAX_TOMBSTONES = 500            # ended sessions remembered (id hash -> client, reason) so the owner is told why
 TOMBSTONE_S = 86400
 SWEEP_S = 5
@@ -76,7 +81,11 @@ _HEADER_RE = re.compile(r"^[A-Za-z0-9-]{1,64}$")
 _COOKIE_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 _KEY_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _TOKEN_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
-_PH_RE = re.compile(r"\{\{\s*([^{}]*?)\s*\}\}")
+OVERRIDE_HEADERS = ("x-http-method", "x-http-method-override", "x-method-override")
+_OVR_RE = re.compile(rb"_method[\"']?\s*[:=]\s*[\"']?([A-Za-z]*)", re.I)
+_HOSTPORT_RE = re.compile(r"^([A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?)(?::([0-9]{1,5}))?$")
+_ILLEGAL_HEADER_VALUE = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")
+_HEADER_TOKEN = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
 _CTRL = re.compile(r"[\x00-\x1f\x7f]")
 REASON = "an HTTP session always needs a human to approve it; always high"
 WARNING = ("The requesting agent asked for this session. Its purpose text is the agent's own claim and "
@@ -197,10 +206,10 @@ def json_value(obj, segs):
 
 
 def storable(value):
-    """A captured value is stored only if it is short text with no control characters: it will be
-    placed into URLs, headers and bodies later, so a line break would be a header injection."""
-    return (isinstance(value, str) and 0 < len(value.encode("utf-8", "replace")) <= MAX_CAPTURE_BYTES
-            and not _CTRL.search(value))
+    """A captured value is stored only if it is short printable ASCII text: it will be placed into URLs,
+    headers and bodies later, so a control character or a non-ASCII one is refused at capture time."""
+    return (isinstance(value, str) and 0 < len(value) <= MAX_CAPTURE_BYTES
+            and all(" " <= ch <= "~" for ch in value))
 
 
 # ---------------------------------------------------------------- cookie jar
@@ -209,8 +218,9 @@ class Jar:
     Domain attribute widens nothing), is sent only to that host, honours Path, Secure, Max-Age and
     Expires, and is bounded in number and size. Memory only."""
 
-    def __init__(self, clock):
-        self._clock = clock
+    def __init__(self, clock, wall=time.time):
+        self._clock = clock             # monotonic seconds: every expiry here is relative to it
+        self._wall = wall               # only to turn an absolute Expires date into "seconds from now"
         self._c = OrderedDict()         # (host, path, name) -> {"value", "secure", "exp"}
 
     def store(self, host, req_path, https, set_cookies):
@@ -238,14 +248,14 @@ class Jar:
                     exp = now + age
             elif "expires" in attrs:
                 try:
-                    when = parsedate_to_datetime(attrs["expires"]).timestamp()
+                    when = parsedate_to_datetime(attrs["expires"]).timestamp() - self._wall()
                 except (TypeError, ValueError, IndexError, OverflowError):
                     when = None
                 if when is not None:
-                    if when <= now:
+                    if when <= 0:
                         self._c.pop((host, path, name), None)
                         continue
-                    exp = when
+                    exp = now + when
             key = (host, path, name)
             if key not in self._c and len(self._c) >= MAX_COOKIES:
                 continue
@@ -305,14 +315,40 @@ class Jar:
         self._c.clear()
 
 
+ENDED = {"unknown": ("unknown session", "session_unknown", 404),
+         "expired": ("session expired: it reached its time limit and cannot be extended; open a new "
+                     "one with `asb session open`", "session_expired", 410),
+         "closed": ("session closed; open a new one with `asb session open`", "session_expired", 410),
+         "revoked": ("session revoked by the human; do not reopen it without asking",
+                     "session_expired", 410)}
+
+
+def parse_host_entry(text):
+    """`host` or `host:port` -> (host, port or None). A bare host means the default port of whichever
+    scheme a call uses (80 for http, 443 for https); `host:port` means exactly that port. ValueError
+    (fixed text) on anything else."""
+    m = _HOSTPORT_RE.match(text) if isinstance(text, str) else None
+    if not m or (m.group(2) is not None and not 1 <= int(m.group(2)) <= 65535):
+        raise ValueError(f"hosts must be 1 to {MAX_HOSTS} plain host names, each optionally with :port (--host)")
+    return m.group(1).lower(), (int(m.group(2)) if m.group(2) else None)
+
+
+def host_label(entry):
+    """How a manifest host is shown to the human: a bare host says which ports it means."""
+    return entry if ":" in entry else f"{entry} (ports 80 and 443)"
+
+
 class Session:
-    """One approved session. Everything secret about it (jar, captures) stays in this object."""
+    """One approved session. Everything secret about it (jar, captures) stays in this object. Time is
+    monotonic: `opened` and `expires` are readings of the session clock, never wall time (wall time is
+    kept only for display and the audit log)."""
 
     def __init__(self, sid, pid, client, cred, hosts, methods, ttl_s, max_calls, opened, purpose, approver,
                  clock):
         self.id, self.pid = sid, pid
         self.cid, self.cname = client["id"], client["name"]
         self.cred, self.hosts, self.methods = cred, tuple(hosts), tuple(methods)
+        self.scopes = tuple(parse_host_entry(h) for h in hosts)
         self.ttl_s, self.max_calls = ttl_s, max_calls
         self.opened, self.expires = opened, opened + ttl_s       # absolute: never moved
         self.calls = 0
@@ -321,11 +357,18 @@ class Session:
         self.captures = {}
         self.lock = threading.Lock()
         self.dead = False
+        self.end_reason = None
 
-    def drop(self):
+    def in_scope(self, scheme, host, port):
+        """Host and port allowed by the manifest. `port` is the effective port of the call."""
+        default = 443 if scheme == "https" else 80
+        return any(h == host and (p == port if p is not None else port == default) for h, p in self.scopes)
+
+    def drop(self, reason="expired"):
         """Abandon: forget every secret this session holds."""
         with self.lock:
             self.dead = True
+            self.end_reason = reason
             self.jar.clear()
             self.captures.clear()
 
@@ -350,141 +393,223 @@ def coarse_class(exc):
     return "other"
 
 
+def placeholders(text):
+    """The {{NAME}} names in `text`, by a linear scan (no regex: a hostile string must not cost more
+    than its length). A name longer than MAX_PLACEHOLDER_NAME is returned as a marker that no
+    credential or capture can match. ValueError when there are more than MAX_PLACEHOLDERS."""
+    out, i, text = [], 0, text or ""
+    while True:
+        a = text.find("{{", i)
+        if a < 0:
+            return out
+        b = text.find("}}", a + 2)
+        if b < 0:
+            return out
+        name = text[a + 2:b].strip()
+        out.append(name if len(name) <= MAX_PLACEHOLDER_NAME else "\0toolong")
+        if len(out) > MAX_PLACEHOLDERS:
+            raise ValueError("too many placeholders")
+        i = b + 2
+
+
 def fill(text, values):
     """Substitute {{NAME}} in one pass (a substituted value is never scanned again, so an
-    upstream-supplied value cannot smuggle in another placeholder). KeyError for an unknown name."""
-    return _PH_RE.sub(lambda m: values[m.group(1)], text)
+    upstream-supplied value cannot smuggle in another placeholder). Linear. KeyError for an unknown name."""
+    out, i = [], 0
+    while True:
+        a = text.find("{{", i)
+        b = text.find("}}", a + 2) if a >= 0 else -1
+        if a < 0 or b < 0:
+            out.append(text[i:])
+            return "".join(out)
+        out.append(text[i:a])
+        out.append(values[text[a + 2:b].strip()])
+        i = b + 2
 
 
-def placeholders(text):
-    return [m.group(1) for m in _PH_RE.finditer(text or "")]
+def mask_values(text, values):
+    """Replace every value of MASK_MIN or more characters (longest first) with ***. Shorter values are
+    not masked: that would corrupt ordinary words and numbers in a response."""
+    for v in sorted({v for v in values if isinstance(v, str) and len(v) >= MASK_MIN}, key=len, reverse=True):
+        text = text.replace(v, "***")
+    return text
 
 
-def _host_of(url):
+def _origin(url):
+    """(scheme, host, effective port, path) of a url, or ("", "", 0, "") when it cannot be read."""
     try:
         u = urllib.parse.urlsplit(url)
-        return u.scheme, (u.hostname or "").lower(), (u.path or "/") + (("?" + u.query) if u.query else "")
+        port = u.port or (443 if u.scheme == "https" else 80)
+        return u.scheme, (u.hostname or "").lower(), port, (u.path or "/") + (("?" + u.query) if u.query else "")
     except ValueError:
-        return "", "", ""
+        return "", "", 0, ""
 
 
-def run_http(sess, spec, env, tls, allowed_now, opener_for, mask, expr):
-    """Perform one session call. `env` holds the credential values, `expr` the parsed capture
-    expressions. Returns (out, info): out is {"status", "headers", "body"} with Set-Cookie removed
-    and every credential, cookie and captured value masked; info is {"captured": [names],
-    "missing": [names]} (names only). Raises only ValueError/OSError/SSLError and friends for the
-    caller to reduce to a coarse class."""
+def override_problem(methods, url, headers, body):
+    """A reason when the call tries to smuggle in another HTTP verb: an X-HTTP-Method style header, or a
+    `_method` query or body field, naming a verb the session did not declare. `body` is bytes or None.
+    Applies to the template and again to what is actually sent."""
+    for k, v in headers.items():
+        if k.lower() in OVERRIDE_HEADERS and v.strip().upper() not in methods:
+            return "a method override header names a verb this session did not declare"
+    try:
+        query = urllib.parse.urlsplit(url).query
+    except ValueError:
+        query = ""
+    blobs = [query.encode("utf-8", "replace"), urllib.parse.unquote_to_bytes(query)]
+    if body:
+        blobs += [body, urllib.parse.unquote_to_bytes(body)]
+    for blob in blobs:
+        for m in _OVR_RE.finditer(blob):
+            if m.group(1).decode("ascii", "replace").upper() not in methods:
+                return "a _method override names a verb this session did not declare"
+    return None
+
+
+class NotSent(SessionError):
+    """Refused before anything left the broker: the call is not charged."""
+
+    def __init__(self, message, code="session_refused", http=403):
+        super().__init__(message, code, http)
+
+
+def _alive(sess, clock):
+    """Raise the fixed ended/expired error unless the session is alive now. Call with sess.lock held."""
+    if sess.dead:
+        raise SessionError(*ENDED[sess.end_reason if sess.end_reason in ENDED else "unknown"])
+    if clock() >= sess.expires:
+        raise SessionError(*ENDED["expired"])
+
+
+def run_http(sess, spec, env, tls, allowed_now, opener_for, clock, state):
+    """Perform one session call. `env` holds the credential values, spec["capture_expr"] the parsed
+    capture expressions, `clock` the session clock. Returns (out, info): out is {"status", "headers",
+    "body"} with Set-Cookie removed and every credential, cookie and captured value masked; info is
+    {"captured": [names], "missing": [names]}. Redirects are never followed: a 3xx is returned as it is
+    (Location masked) and the agent makes a new in-scope call. `state["sent"]` becomes True just before
+    the request leaves the broker (so the caller knows whether to charge the call). The session is
+    re-checked after the upstream answers: a response that arrives after a revoke, close or the deadline
+    is discarded and the fixed error raised."""
     with sess.lock:
-        if sess.dead:
-            raise SessionError("session ended", "session_unknown", 404)
+        _alive(sess, clock)
         values = {**env, **{"session." + k: v for k, v in sess.captures.items()}}
     method = spec["method"]
-    if spec.get("body_b64") is not None:
-        import base64
-        data = base64.b64decode(spec["body_b64"])
-    elif spec.get("body"):
-        data = fill(spec["body"], values).encode()
-    else:
-        data = None
-    url = fill(spec["url"], values)
-    headers = {k: fill(v, values) for k, v in spec["headers"].items()}
-    opener = opener_for(tls)
-    for hop in range(MAX_REDIRECTS + 1):
-        scheme, host, path = _host_of(url)
-        if scheme not in ("http", "https") or host not in sess.hosts or host not in allowed_now:
-            raise ValueError("host outside the session")
-        https = scheme == "https"
-        hdr = dict(headers)
-        with sess.lock:
-            cookie = sess.jar.header(host, path.split("?")[0], https)
-        if cookie:
-            have = next((k for k in hdr if k.lower() == "cookie"), None)
-            hdr[have or "Cookie"] = (hdr[have] + "; " + cookie) if have else cookie
-        r = urllib.request.Request(url, data=data, method=method, headers=hdr)
+    try:
+        if spec.get("body_b64") is not None:
+            import base64
+            data = base64.b64decode(spec["body_b64"])
+        elif spec.get("body"):
+            data = fill(spec["body"], values).encode("utf-8")
+        else:
+            data = None
+        url = fill(spec["url"], values)
+        headers = {k: fill(v, values) for k, v in spec["headers"].items()}
+    except (KeyError, ValueError, UnicodeError):
+        raise NotSent("a placeholder or value in this call cannot be used", "session_refused") from None
+    problem = override_problem(sess.methods, url, headers, data)
+    if problem:
+        raise NotSent(problem)
+    scheme, host, port, path = _origin(url)
+    if scheme not in ("http", "https") or not sess.in_scope(scheme, host, port) or host not in allowed_now:
+        raise NotSent("that host or port is outside this session's scope")
+    if len(url) > MAX_URL or _ILLEGAL_HEADER_VALUE.search(url) or " " in url:
+        raise ValueError("bad url")
+    for k, v in headers.items():
+        if not _HEADER_TOKEN.match(k) or _ILLEGAL_HEADER_VALUE.search(v) or not v.isascii():
+            raise ValueError("bad header")
+    https = scheme == "https"
+    with sess.lock:
+        cookie = sess.jar.header(host, path.split("?")[0], https)
+    if cookie:
+        have = next((k for k in headers if k.lower() == "cookie"), None)
+        headers[have or "Cookie"] = (headers[have] + "; " + cookie) if have else cookie
+    with sess.lock:
+        _alive(sess, clock)
+        timeout = min(CALL_TIMEOUT_S, max(0.1, sess.expires - clock()))
+    r = urllib.request.Request(url, data=data, method=method, headers=headers)
+    state["sent"] = True
+    try:
+        with opener_for(tls).open(r, timeout=timeout) as resp:
+            status, msg, body = resp.status, resp.headers, resp.read(READ_LIMIT)
+    except urllib.error.HTTPError as e:
         try:
-            with opener.open(r, timeout=30) as resp:
-                status, msg, body = resp.status, resp.headers, resp.read(READ_LIMIT)
-        except urllib.error.HTTPError as e:
-            try:
-                status, msg, body = e.code, e.headers, e.read(READ_LIMIT)
-            finally:
-                e.close()
-        with sess.lock:
-            if not sess.dead:
-                sess.jar.store(host, path.split("?")[0], https, msg.get_all("Set-Cookie") or [])
-        loc = msg.get("Location")
-        if status in (301, 302, 303, 307, 308) and loc and hop < MAX_REDIRECTS:
-            nxt = urllib.parse.urljoin(url, loc)
-            ns, nh, _ = _host_of(nxt)
-            if ns in ("http", "https") and nh in sess.hosts and nh in allowed_now and not (https and ns == "http"):
-                if status in (301, 302, 303) and method not in ("GET", "HEAD"):
-                    method, data = "GET", None
-                    headers = {k: v for k, v in headers.items() if k.lower() not in ("content-type", "content-length")}
-                url = nxt
-                continue
-        break
+            status, msg, body = e.code, e.headers, e.read(READ_LIMIT)
+        finally:
+            e.close()
     caps, missing = {}, []
-    if expr:
-        parsed = None
-        for name, kind, arg in expr:
-            val = None
-            if kind == "header":
-                val = msg.get(arg)
-            elif kind == "cookie":
-                with sess.lock:
-                    val = sess.jar.get(host, arg)
-            else:
-                if parsed is None:
-                    try:
-                        parsed = [json.loads(body.decode("utf-8"))]
-                    except (ValueError, UnicodeDecodeError, RecursionError):
-                        parsed = [None]
-                val = json_value(parsed[0], arg)
+    parsed = None
+    exprs = spec.get("capture_expr") or []
+    found = {}
+    for name, kind, arg in exprs:          # read what the response offers before touching the session
+        if kind == "header":
+            found[name] = msg.get(arg)
+        elif kind == "json":
+            if parsed is None:
+                try:
+                    parsed = [json.loads(body.decode("utf-8"))]
+                except (ValueError, UnicodeDecodeError, RecursionError):
+                    parsed = [None]
+            found[name] = json_value(parsed[0], arg)
+    with sess.lock:
+        _alive(sess, clock)                 # revoked, closed or past the deadline meanwhile: discard it all
+        sess.jar.store(host, path.split("?")[0], https, msg.get_all("Set-Cookie") or [])
+        for name, kind, arg in exprs:
+            val = sess.jar.get(host, arg) if kind == "cookie" else found.get(name)
             if storable(val):
                 caps[name] = val
             else:
                 missing.append(name)
-    with sess.lock:
-        if not sess.dead:
-            for name, val in list(caps.items()):
-                if name in sess.captures or len(sess.captures) < MAX_CAPTURES:
-                    sess.captures[name] = val
-                else:
-                    del caps[name]
-                    missing.append(name)
+        for name, val in list(caps.items()):
+            if name in sess.captures or len(sess.captures) < MAX_CAPTURES:
+                sess.captures[name] = val
+            else:
+                del caps[name]
+                missing.append(name)
         secret_values = list(env.values()) + sess.jar.values() + list(sess.captures.values())
     out_headers = {}
     for k, v in msg.items():
         if k.lower() in ("set-cookie", "set-cookie2"):
             continue
-        out_headers[k] = mask(v, secret_values)
-    out = {"status": status, "headers": out_headers, "body": mask(body.decode("utf-8", "replace"), secret_values)}
+        out_headers[k] = mask_values(v, secret_values)
+    out = {"status": status, "headers": out_headers,
+           "body": mask_values(body.decode("utf-8", "replace"), secret_values)}
     return out, {"captured": sorted(caps), "missing": sorted(set(missing))}
 
 
-def scope_problem(s, sc, names, method, spec):
+def scope_problem(s, sc, names, method, spec, capture_names=()):
     """None when a call is inside the session's scope, else (reason_class, fixed message). `sc` is the
-    credential's current catalog entry (None if it vanished). Pure: no state is changed. Call it under
-    the store lock so the check and the call-count increment are atomic. (Extension point: a manifest
-    rule check belongs here.)"""
-    scheme, host, _ = _host_of(spec["url"])
+    credential's current catalog entry (None if it vanished), `capture_names` the names captured so far.
+    Pure and linear in the size of the call: it reads only fields that never change after the session
+    opens, and the caller runs it WITHOUT holding the store lock. The call cap is checked where the call
+    is charged. (Extension point: a manifest rule check belongs here.)"""
+    scheme, host, port, _ = _origin(spec["url"])
     if list(names) != [s.cred]:
         return "credential", "the call names a different credential than the session's"
     if sc is None or sc.get("ssh") or host not in (sc.get("allowed_hosts") or []):
         return "host", "that host is not allowed for this session's credential"
-    if scheme not in ("http", "https") or host not in s.hosts:
-        return "host", "that host is outside this session's hosts; open a new session for it"
+    if scheme not in ("http", "https") or not s.in_scope(scheme, host, port):
+        return "host", "that host or port is outside this session's scope; open a new session for it"
     if method not in s.methods:
         return "method", (f"{method} is not one of this session's methods ({', '.join(s.methods)}); "
                           "open a new session that declares it")
+    if method in ("GET", "HEAD") and (spec.get("body") or spec.get("body_b64")):
+        return "body", f"a {method} call cannot carry a body"
     if any(k.lower() == "host" for k in spec["headers"]):
         return "header", "a session call cannot set the Host header"
-    if s.calls >= s.max_calls:
-        return "max_calls", f"this session used all {s.max_calls} of its calls; open a new one"
+    body = spec.get("body")
+    if spec.get("body_b64") is not None:
+        import base64
+        body = base64.b64decode(spec["body_b64"])
+    elif isinstance(body, str):
+        body = body.encode("utf-8", "replace")
+    why = override_problem(s.methods, spec["url"], spec["headers"], body)
+    if why:
+        return "method", why
+    names_in = set(capture_names)
     for text in [spec["url"], spec.get("body") or ""] + list(spec["headers"].values()):
         for ph in placeholders(text):
             if ph.startswith("session."):
-                if ph[8:] not in s.captures:
+                if ph[8:] not in names_in:
                     return "missing_value", "a {{session.NAME}} value used here has not been captured in this session"
             elif ph not in sc["vars"]:
                 return "placeholder", "a placeholder is not provided by the session's credential"
@@ -497,12 +622,11 @@ def validate_open(cfg, spec, allowed_hosts):
     text. `allowed_hosts` is the credential's list. Never repeats the agent's input."""
     purpose = credreq_mod.validate_purpose(spec.get("purpose"))
     hosts = spec.get("hosts")
-    if (not isinstance(hosts, list) or not 1 <= len(hosts) <= MAX_HOSTS
-            or not all(isinstance(h, str) and re.fullmatch(r"[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?", h)
-                       for h in hosts)):
-        raise ValueError(f"hosts must be 1 to {MAX_HOSTS} plain host names (--host)")
-    hosts = sorted({h.lower() for h in hosts})
-    if any(h not in allowed_hosts for h in hosts):
+    if not isinstance(hosts, list) or not 1 <= len(hosts) <= MAX_HOSTS:
+        raise ValueError(f"hosts must be 1 to {MAX_HOSTS} plain host names, each optionally with :port (--host)")
+    parsed = [parse_host_entry(h) for h in hosts]
+    hosts = sorted({h if p is None else f"{h}:{p}" for h, p in parsed})
+    if any(h not in allowed_hosts for h, _ in parsed):
         raise PermissionError("a session host is outside this credential's allowed hosts: a session can "
                               "only narrow what the credential allows (see `asb list`)")
     methods = spec.get("methods")
@@ -596,9 +720,11 @@ def describe_html(req):
         meth += (f" <span class='pill warn'>changes things: {e(', '.join(extra))}</span>")
     what = (f"<b>HTTP session</b> with credential <b>{e(req.names[0])}</b><br>"
             f"Purpose, as the agent put it (unverified):<div class=crpurpose>{credreq_mod._esc(sp['purpose'])}</div>{flag}"
-            f"Hosts: {e(', '.join(sp['hosts']))}<br>Methods: {meth}<br>"
+            f"Hosts and ports: {e('; '.join(host_label(h) for h in sp['hosts']))}<br>Methods: {meth}<br>"
             f"Time limit: {e(_fmt_ttl(sp['ttl_s']))} from the moment you approve (fixed, never extended)<br>"
-            f"Call cap: {sp['max_calls']} calls")
+            f"Call cap: {sp['max_calls']} calls<br>"
+            "Redirects are never followed. Credential, cookie and captured values of 4 or more characters are "
+            "masked if the upstream echoes them; shorter ones are not.")
     return what, WARNING
 
 
@@ -637,7 +763,7 @@ def sessions_section(broker, csrf, now=None):
             f"<tr><td data-label=Credential><b>{e(r['cred'])}</b>"
             f"<br><span class=idn>session {e(r['pid'])}</span></td>"
             f"<td data-label=Client>{e(r['client_name'])}<br><span class=idn>id {e(r['client_id'])}</span></td>"
-            f"<td data-label=Hosts>{e(', '.join(r['hosts']))}</td>"
+            f"<td data-label=Hosts>{e('; '.join(host_label(h) for h in r['hosts']))}</td>"
             f"<td data-label=Methods>{e(', '.join(r['methods']))}</td>"
             f"<td data-label='Time left'>{left}</td>"
             f"<td data-label=Calls>{r['calls']} / {r['max_calls']}</td>"
@@ -656,7 +782,7 @@ class SessionsMixin:
 
     def _init_sessions(self, config):
         self.sessions_cfg = parse_config(config.get("sessions"))
-        self.sessions_clock = lambda: time.time()      # injectable (tests); the deadline is read from it
+        self.sessions_clock = time.monotonic           # deadlines are monotonic; tests may inject a clock
         self._sess = {}                                # sha256(id) -> Session
         self._sess_tomb = OrderedDict()                # sha256(id) -> {"cid", "reason", "t"}
         self._sess_lock = threading.Lock()
@@ -680,7 +806,7 @@ class SessionsMixin:
         expired | closed | revoked."""
         self._sess.pop(self._skey(s.id), None)
         used = s.calls
-        s.drop()
+        s.drop(reason)
         self._sess_tomb[self._skey(s.id)] = {"cid": s.cid, "reason": reason, "t": now}
         while len(self._sess_tomb) > MAX_TOMBSTONES:
             self._sess_tomb.popitem(last=False)
@@ -731,10 +857,11 @@ class SessionsMixin:
         now = self.sessions_clock()
         with self._sess_lock:
             rows = [{"pid": s.pid, "cred": s.cred, "client_id": s.cid, "client_name": s.cname,
-                     "hosts": list(s.hosts), "methods": list(s.methods), "expires_at": s.expires,
+                     "hosts": list(s.hosts), "methods": list(s.methods),
+                     "expires_at": time.time() + max(0, s.expires - now),      # wall time, for display only
                      "left_s": max(0, int(s.expires - now)), "calls": s.calls, "max_calls": s.max_calls}
                     for s in self._sess.values()]
-        return sorted(rows, key=lambda r: r["expires_at"])
+        return sorted(rows, key=lambda r: r["left_s"])
 
     def session_counts(self, cid):
         with self._sess_lock:
@@ -788,7 +915,7 @@ class SessionsMixin:
         sc = self.cfg["secrets"].get(req.names[0])
         if sc is None or sc.get("ssh") or not sc.get("allowed_hosts"):
             raise SessionOpenError("the credential is no longer available for http")
-        if any(h not in sc["allowed_hosts"] for h in sp["hosts"]):
+        if any(parse_host_entry(h)[0] not in sc["allowed_hosts"] for h in sp["hosts"]):
             raise SessionOpenError("a host is no longer allowed for this credential")
         with self._sess_lock:
             mine = sum(s.cid == cid for s in self._sess.values())
@@ -798,40 +925,52 @@ class SessionsMixin:
             while any(s.pid == sid[:8] for s in self._sess.values()):
                 sid = secrets.token_urlsafe(24)
             s = Session(sid, sid[:8], req.client, req.names[0], sp["hosts"], sp["methods"], ttl, calls, now,
-                        sp["purpose"], who.get("approver"), self.sessions_clock)
+                        sp["purpose"], who.get("approver"), lambda: self.sessions_clock())
             self._sess[self._skey(sid)] = s
         self.audit("session_opened", req, session=s.pid, hosts=sp["hosts"], methods=sp["methods"], ttl_s=ttl,
-                   max_calls=calls, expires_at=int(s.expires), shortened=(ttl, calls) != (sp["ttl_s"], sp["max_calls"]))
+                   max_calls=calls, expires_at=int(time.time() + ttl), shortened=(ttl, calls) != (sp["ttl_s"], sp["max_calls"]))
         return {"session": {"id": sid, "expires_in": ttl, "hosts": sp["hosts"], "methods": sp["methods"],
                             "max_calls": calls}}
 
     # -- using -----------------------------------------------------------------------
     def _refuse(self, client, sess, reason, message, code="session_refused", http=403, **fields):
         """Audit a refused call (class only) and raise the fixed error."""
+        if isinstance(fields.get("host"), str):
+            fields["host"] = fields["host"][:MAX_HOST_LOG]
         self.log("session_refused", session=sess.pid if sess else None, reason_class=reason,
                  client_id=client["id"], client_name=client["name"], **fields)
         raise SessionError(message, code, http)
 
-    _MISSING = {"unknown": ("unknown session", "session_unknown", 404),
-                "expired": ("session expired: it reached its time limit and cannot be extended; open a new "
-                            "one with `asb session open`", "session_expired", 410),
-                "closed": ("session closed; open a new one with `asb session open`", "session_expired", 410),
-                "revoked": ("session revoked by the human; do not reopen it without asking",
-                            "session_expired", 410)}
+    _MISSING = ENDED
 
     def _session_call(self, names, spec, source, peer, client):
         """A `--session` http call: released with no prompt and no model verdict when it is inside
-        the session's scope, refused (never prompted) otherwise. Returns the finished request."""
+        the session's scope, refused (never prompted) otherwise. Returns the finished request.
+
+        Locking: the store lock is held only for dictionary work (lookup, then charging the call);
+        parsing, the scope check and the upstream call all run outside it, so no call, however hostile
+        or slow, can delay another client's lookup, revoke, close or sweep."""
         client = client or dict(clients_mod.ClientStore.LEGACY_VIEW)
-        cid, now = client["id"], self.sessions_clock()
+        cid = client["id"]
         if not self.sessions_cfg["enabled"]:
             raise PermissionError("http sessions are disabled")
         for k in ("method", "url", "headers"):
             if k not in spec:
                 raise ValueError("bad request")
-        if not isinstance(spec["headers"], dict) or not all(
-                isinstance(k, str) and isinstance(v, str) for k, v in spec["headers"].items()):
-            raise ValueError("headers must be text")
+        hdrs = spec["headers"]
+        if (not isinstance(hdrs, dict) or len(hdrs) > MAX_HEADERS or not all(
+                isinstance(k, str) and isinstance(v, str) and len(k) <= MAX_HEADER_NAME and len(v) <= MAX_URL
+                for k, v in hdrs.items())):
+            raise ValueError("headers must be text, at most %d of them" % MAX_HEADERS)
+        if (not isinstance(spec["url"], str) or len(spec["url"]) > MAX_URL or not isinstance(spec["method"], str)
+                or len(spec["method"]) > 16):
+            raise ValueError("url or method too long")
+        body = spec.get("body")
+        if body is not None and (not isinstance(body, str) or len(body) > MAX_CALL_BODY):
+            raise ValueError("body too large")
+        if spec.get("body_b64") is not None and (not isinstance(spec["body_b64"], str)
+                                                 or len(spec["body_b64"]) > MAX_CALL_BODY * 4 // 3 + 8):
+            raise ValueError("body too large")
         try:
             expr = [parse_capture(x) for x in (spec.get("capture") or [])]
         except TypeError:
@@ -849,40 +988,60 @@ class SessionsMixin:
                 raise ValueError("send body or body_b64, not both")
         sid = spec.get("session")
         method = spec["method"].upper()
-        scheme, host, _ = _host_of(spec["url"])
+        _, host, _, _ = _origin(spec["url"])
+        shown = host[:MAX_HOST_LOG] or None
         active = self.clients.is_active(cid)    # a revoked client reaches nothing, even before its sessions are purged
         with self._sess_lock:
-            s, state = self._sess_lookup(sid, cid, now)
-            problem = None
-            if s is None or not active:
-                s, problem = None, ("missing", state if active else "unknown")
-            else:
-                problem = scope_problem(s, self.cfg["secrets"].get(s.cred), names, method, spec)
-                if problem is None:
+            s, state = self._sess_lookup(sid, cid, self.sessions_clock())
+        if s is None or not active:
+            state = state if active else "unknown"
+            msg, code, http = ENDED[state]
+            self.log("session_refused", session=None, reason_class=state, client_id=cid,
+                     client_name=client["name"], method=method[:16], host=shown)
+            raise SessionError(msg, code, http)
+        with s.lock:
+            have = frozenset(s.captures)
+        problem = scope_problem(s, self.cfg["secrets"].get(s.cred), names, method, spec, have)   # no lock held
+        if problem is None:
+            with self._sess_lock:                       # charge the call: re-check life and cap atomically
+                s2, state = self._sess_lookup(sid, cid, self.sessions_clock())
+                if s2 is not s:
+                    problem = ("missing", state)
+                elif s.calls >= s.max_calls:
+                    problem = ("max_calls", f"this session used all {s.max_calls} of its calls; open a new one")
+                else:
                     s.calls += 1
                     calls_now, max_calls = s.calls, s.max_calls
         if problem is not None:
             kind, text = problem
             if kind == "missing":
-                msg, code, http = self._MISSING[text]
+                msg, code, http = ENDED[text]
                 self.log("session_refused", session=None, reason_class=text, client_id=cid,
-                         client_name=client["name"], method=method, host=host or None)
+                         client_name=client["name"], method=method[:16], host=shown)
                 raise SessionError(msg, code, http)
-            self._refuse(client, s, kind, text, method=method, host=host or None)
+            self._refuse(client, s, kind, text, method=method[:16], host=shown)
         req = self._new_request("http", list(names), {
             "method": method, "url": spec["url"], "headers": dict(spec["headers"]), "body": spec.get("body"),
-            "body_b64": spec.get("body_b64"), "capture_expr": expr}, source, 30, peer, client)
+            "body_b64": spec.get("body_b64"), "capture_expr": expr}, source, CALL_TIMEOUT_S, peer, client)
         req.session = s
+        req.sess_state = {"sent": False}
+        req.status = "running"      # never "pending": a session call is not waiting for anyone and no one can decide it
         with self._lock:
-            self._by_id[req.id] = req
-            self._by_nonce[req.nonce] = req
+            self._by_id[req.id] = req       # no nonce: there is no approval link for a session call
         self.audit("requested", req)
         self._retain_details(req)
-        self.audit("session_used", req, session=s.pid, host=host, calls=calls_now, max_calls=max_calls,
-                   left_s=max(0, int(s.expires - now)))
+        self.audit("session_used", req, session=s.pid, host=shown or "", calls=calls_now, max_calls=max_calls,
+                   left_s=max(0, int(s.expires - self.sessions_clock())))
         try:
             result = self._release(req)
         except Exception as e:  # noqa: BLE001 -- the request must always settle; never repeat the text
+            if not req.sess_state["sent"]:          # it never left the broker: do not charge it
+                with self._sess_lock:
+                    if not s.dead and s.calls > 0:
+                        s.calls -= 1
+            if isinstance(e, SessionError):         # ended mid-flight, or refused before sending: the fixed text
+                self._finish(req, "failed", error=str(e), via="session")
+                raise
             if getattr(e, "public", None):
                 err = e.public
             elif isinstance(e, BackendError):
@@ -901,7 +1060,9 @@ class SessionsMixin:
         sc = self.cfg["secrets"].get(req.names[0]) or {}
         try:
             out, info = run_http(s, req.spec, env, self._tls_policy(req.names), set(sc.get("allowed_hosts") or []),
-                                 broker_mod._opener_for, broker_mod._mask, req.spec.get("capture_expr") or [])
+                                 broker_mod._opener_for, lambda: self.sessions_clock(), req.sess_state)
+            with s.lock:                            # last look: nothing survives a revoke, close or the deadline
+                _alive(s, self.sessions_clock)
         except SessionError:
             raise
         except Exception as e:  # noqa: BLE001 -- class only, never the exception's text

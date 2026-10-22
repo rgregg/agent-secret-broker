@@ -1840,7 +1840,7 @@ the broker instead. The design and its rationale are in
 [proposals/http-sessions.md](proposals/http-sessions.md).
 
     asb session open NAME --for "purpose" --host H [--host H2]... [--methods GET,HEAD,POST] [--ttl 15m] [--max-calls N]
-    asb http NAME METHOD URL ... --session ID [--capture NAME=header:X|cookie:NAME|json:$.a.b]...
+    asb http NAME METHOD URL ... [--session ID] [--capture NAME=header:X|cookie:NAME|json:$.a.b]...
     asb session status ID | asb session close ID
 
 **What the human is approving.** A session is a time-boxed standing permission for one client, one
@@ -1877,17 +1877,31 @@ ends its sessions at once.
 
 **Scope (guardrails).**
 
-- Hosts are required and must sit inside the credential's `allowed_hosts`: a session can only narrow, never widen
+- Hosts are required, each `HOST` or `HOST:PORT`, and the host must sit inside the credential's `allowed_hosts`: a session can only narrow, never widen
   (re-checked on every call, so narrowing the credential later also narrows the session). Http credentials only:
-  ssh keys and credentials without `allowed_hosts` (env-only) are refused with a clear error.
+  ssh keys and credentials without `allowed_hosts` (env-only) are refused with a clear error. The manifest records and the card shows
+  the port: a bare `HOST` means ports 80 (http) and 443 (https) only, `HOST:PORT` means exactly that port for either scheme. A call to
+  any other port of an allowed host is refused.
 - Methods default to GET and HEAD; others must be declared on open. A call outside the hosts, methods or call cap
   (`--max-calls`, default and cap `sessions.max_calls` 200) is **refused** with a specific error (exit 8), never
   prompted: the agent must open a new session, which you read in full. Refusals do not count as calls.
 - A session call names exactly the session's credential and may not set a `Host` header. It is released
   without a prompt and without a model verdict. `asb http` without `--session` behaves exactly as before.
-- Redirects are followed (at most 5) only to hosts inside the session's hosts and the credential's allowed hosts,
-  never from https to http; any other redirect is returned to the agent unfollowed. TLS verification, pinning and
-  `tls_verify` are as for plain http calls.
+- **Redirects are never followed.** A 3xx is returned to the agent with its `Location` (masked); `Set-Cookie` on it is stored in the jar
+  and stripped as usual. The agent makes a new call, which is scope-checked and counted like any other. This also means no redirect can
+  change the method, port or host, and no hop goes uncounted. TLS verification, pinning and `tls_verify` are as for plain http calls.
+- **Method override is refused.** `X-HTTP-Method`, `X-HTTP-Method-Override` and `X-Method-Override` headers, and a `_method` query
+  parameter or body field (also percent-encoded, and after `{{session.NAME}}` substitution), are refused unless the verb they name is
+  itself declared by the session. A GET or HEAD call cannot carry a body.
+- **Bounded work.** URL and header values up to 8192 characters, 50 headers, 100 placeholders of up to 64 characters, body up to 5 MB.
+  Placeholders are scanned in linear time, and the store lock is held only for dictionary work (never for a scope check or an upstream
+  call), so one hostile or slow call cannot delay another client's lookup, revoke, close or sweep.
+- **In-flight calls do not outlive the session.** A call runs with a timeout of at most 30 seconds and never past the deadline. When the
+  upstream answers, the session is checked again: a revoke, close, client revoke or the deadline in the meantime discards the response
+  (the agent gets the fixed `session_expired` error, the cookies it set are not kept). A session call has status `running`, never
+  `pending`: it is not an approvable request, no card or button exists for it, and `decide` refuses it.
+- **Clock.** Deadlines use the monotonic clock; wall time is only for display and the audit log. A wall-clock step backward neither
+  extends nor shortens a session.
 
 **State held per session (memory only).**
 
@@ -1900,9 +1914,9 @@ ends its sessions at once.
   is sent). A value must be short text without control characters. At most 16 per session and 8 expressions per call;
   repeating a name replaces it, which is how a rotating CSRF token is followed. They are used as `{{session.NAME}}` in the
   URL, headers and body (substituted in one pass), never returned. A capture that finds nothing is reported by name
-  (`NOT captured`), and a `{{session.NAME}}` that was never captured refuses the call.
+  (`NOT captured`), and a `{{session.NAME}}` that was never captured refuses the call. A value must be printable ASCII (anything else is not stored and is reported as not captured).
 - Credential, cookie and captured values are masked in the response body and headers if the upstream echoes them
-  (the same exact-match masking as http mode, values of 6 or more characters). A response header the agent did not
+  (exact-match masking like http mode, but for values of 4 or more characters; shorter values are not masked because that would corrupt ordinary words and numbers in a response, and the card says so). A response header the agent did not
   capture (for example a CSRF header) is an ordinary header and is visible.
 
 **Errors and exit codes.** Messages are fixed text; no exception text reaches an agent, a log, the audit log, history or a
@@ -1912,7 +1926,7 @@ page (only class names and coarse categories such as `timeout`, `connection`, `t
 |---|---|---|---|
 | unknown id, malformed id, another client's id | 404 | `session_unknown` | 7 |
 | expired, closed or revoked (told to the owner only) | 410 | `session_expired` | 7 |
-| out of scope (host, method, credential), call cap used, missing `{{session.NAME}}`, bad placeholder | 403 | `session_refused` | 8 |
+| out of scope (host, port, method, credential), method override, body on GET/HEAD, call cap used, missing `{{session.NAME}}`, bad placeholder | 403 | `session_refused` | 8 |
 | bad capture expression or open parameters | 400 | none | 2 (client-side) or 3 |
 
 **Config** (validated at startup, naming the field):
@@ -1922,9 +1936,9 @@ page (only class names and coarse categories such as `timeout`, `connection`, `t
 **Audit events.** `session_requested`, `session_opened` (client, hosts, methods, ttl, max calls, expiry; `shortened`
 when you lowered the limits), `session_used` (call number and cap, host; the call itself is also an ordinary request:
 `requested`, `approved` with `via: session`, `secret_read`, `http_executed`, `delivered`), `session_refused` (reason
-class: `max_calls`, `method`, `host`, `credential`, `placeholder`, `missing_value`, `header`, `unknown`, `expired`,
+class: `max_calls`, `method`, `body`, `host`, `credential`, `placeholder`, `missing_value`, `header`, `unknown`, `expired`,
 `closed`, `revoked`), `session_closed`, `session_expired`, `session_revoked` (who). Only the first 8 characters of
-the id are ever logged; no cookie, captured value or credential is in any record. The agent's own audit view
+the id are ever logged (and a host string at most 255 characters); no cookie, captured value or credential is in any record. The agent's own audit view
 ([above](#what-a-client-sees-of-the-audit-log)) shows its client's session events through a deny-by-default whitelist
 (no approver, no policy). The Clients tab has an **Active sessions** list: credential, client, hosts, methods, live
 time left, calls used and the cap, and Revoke (CSRF-protected, audited).
@@ -1932,7 +1946,7 @@ time left, calls used and the cap, and Revoke (CSRF-protected, audited).
 **Threat model.** A session is a time-boxed standing permission: size it by what the card says. A stolen id is
 useless without the owning client's key; with the key it can do only what the card allowed until the deadline. A
 prompt-injected agent can spend the session inside its scope but cannot widen it, extend it, or turn out-of-scope
-calls into prompts. A malicious upstream cannot redirect the credential or cookies off the session's hosts. What
+calls into prompts. A malicious upstream cannot redirect the credential or cookies anywhere: redirects are not followed. What
 masking cannot stop: an upstream that echoes a value in a transformed form (encoded or split), and a program on the
 agent's machine that has its own access to the broker's client key.
 
