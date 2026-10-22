@@ -722,3 +722,8 @@ Everything above holds except the following, each decided while building it.
     credential), and the sessions' override-family scan over the URL tail, header names and values and the body,
     all on the template. A rule declaring a key, query key or path prefix that contains `method` is the only
     exception. `plans.allowed_request_headers` may only name headers from that list (and Content-Length).
+16. **Review fixes (revision 6).** Liveness is checked again right before sending (refunding the use, upstream
+    timeout capped by the time left), deadline expiry noticed during a submit is audited, an exhausted plan with its
+    last call in flight can be revoked or closed, `any` bodies are scanned as bytes (every text view), non-ASCII
+    digits are refused in form fields, a revoked client leaves no denial cooldown, and `plans.max_pending` defaults to
+    4 and must be at least `2 * max_pending_per_client + 1`.

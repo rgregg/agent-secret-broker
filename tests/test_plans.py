@@ -69,7 +69,7 @@ class Config(unittest.TestCase):
                          (True, 30, 480, 900))
         self.assertEqual((c["max_rules"], c["max_uses_per_rule"], c["max_total_uses"], c["rate_per_min"],
                           c["max_inflight"], c["max_body_bytes"], c["max_pending"], c["max_active_per_client"]),
-                         (20, 500, 2000, 30, 4, 16384, 2, 2))
+                         (20, 500, 2000, 30, 4, 16384, 4, 2))
         self.assertFalse(c["allow_any_body"] or c["allow_root_prefix"] or c["allow_graphql_mutation"]
                          or c["allow_legacy"])
         self.assertEqual(c["allowed_request_headers"],
@@ -1333,6 +1333,7 @@ class Store(unittest.TestCase):
         self.assertIsNone(s.submit(CLIENT, self.manifest(task="t10"), "r", 3600)[1])
 
     def test_caps_pending_and_active(self):
+        self.cfg["max_pending"] = 2
         self.assertIsNone(self.store.submit(CLIENT, self.manifest(task="a"), "1", 3600)[1])
         self.assertIsNone(self.store.submit(CLIENT, self.manifest(task="b"), "2", 3600)[1])
         self.assertEqual(self.store.submit(CLIENT, self.manifest(task="c"), "3", 3600), (None, "too_many"))
@@ -1752,6 +1753,96 @@ class Events(unittest.TestCase):
             self.assertEqual(set(out) - {"seq", "ts", "event", "request"}, want, ev)
         out = audit_api.redact({**base, "event": "plan_internal_error", "error_class": "X"})
         self.assertIsNone(out)
+
+
+class ReviewFixes(Store):
+    def test_a_submit_after_the_deadline_still_audits_plan_closed(self):
+        pid = self.active(granted=600)
+        self.t.advance(601)                                    # past the deadline, before any sweep or use
+        p, err = self.store.submit(OTHER, self.manifest(task="x"), "r", 3600)
+        self.assertIsNone(err)
+        closed = [e for e in self.events if e[0] == "plan_closed"]
+        self.assertEqual([(e[1]["plan_id"], e[1]["cause"]) for e in closed], [(pid, "deadline")])
+        self.store.sweep()
+        self.assertEqual(len([e for e in self.events if e[0] == "plan_closed"]), 1)     # once
+
+    def test_time_left_and_refund(self):
+        pid = self.active(granted=600, rules=[rule(max_uses=3)])
+        self.assertEqual(self.store.time_left(pid), 600)
+        m = self.use(pid)
+        self.assertEqual(self.store.status_for(CLIENT["id"], pid)["uses"], 1)
+        m.refund()
+        m.release()
+        v = self.store.status_for(CLIENT["id"], pid)
+        self.assertEqual((v["uses"], v["inflight"], len(self.store._plans[pid].recent)), (0, 0, 0))
+        self.t.advance(590)
+        self.assertEqual(self.store.time_left(pid), 10)
+        self.t.m += 20                                         # the monotonic clock says it is over
+        self.assertIsNone(self.store.time_left(pid))
+        self.assertIsNone(self.store.time_left("0" * 32))
+        self.store.refund("0" * 32, 0)                         # unknown plan: nothing happens
+
+    def test_an_exhausted_plan_with_its_last_call_in_flight_can_be_revoked_or_closed(self):
+        for how in ("revoke", "close"):
+            pid = self.active(client=OTHER if how == "close" else CLIENT, rules=[rule(max_uses=1)], task="t" + how)
+            c = OTHER if how == "close" else CLIENT
+            m = self.use(pid, client=c)
+            self.assertEqual(self.store.status_for(c["id"], pid)["state"], "exhausted")
+            self.assertFalse(self.store.alive(pid) is False)
+            ok = self.store.revoke(pid, "alice") if how == "revoke" else self.store.close(c["id"], pid)
+            self.assertTrue(ok, how)
+            self.assertFalse(self.store.alive(pid))
+            self.assertIsNone(self.store.time_left(pid))
+            m.release()
+            self.assertFalse(self.store.revoke(pid, "alice") if how == "revoke" else self.store.close(c["id"], pid) is True)
+
+    def test_an_exhausted_plan_with_nothing_in_flight_stays_terminal(self):
+        pid = self.active(rules=[rule(max_uses=1)])
+        self.use(pid).release()
+        self.assertFalse(self.store.revoke(pid, "alice"))
+        self.assertIsNone(self.store.close(CLIENT["id"], pid))
+
+    def test_a_revoked_client_leaves_no_cooldown(self):
+        p, _ = self.store.submit(CLIENT, self.manifest(), "r", 3600)
+        self.store.settle(p.id, "denied", cooldown=False)
+        self.assertIsNone(self.store.submit(CLIENT, self.manifest(task="again"), "r2", 3600)[1])
+        p2, _ = self.store.submit(CLIENT, self.manifest(task="b"), "r3", 3600)
+        self.store.settle(p2.id, "denied")
+        self.assertEqual(self.store.submit(CLIENT, self.manifest(task="c"), "r4", 3600), (None, "cooldown"))
+        self.store.revoke_client(CLIENT["id"])
+        self.assertIsNone(self.store.submit(CLIENT, self.manifest(task="d"), "r5", 3600)[1])
+
+    def test_two_clients_cannot_hold_the_global_pending_cap(self):
+        cfg = P.parse_config(None)
+        self.assertGreaterEqual(cfg["max_pending"], 2 * cfg["max_pending_per_client"] + 1)
+        s = P.PlanStore(cfg, None, self.t.now, self.t.mono)
+        a = {"id": "c-aaaa0001", "name": "a", "legacy": False}
+        b = {"id": "c-aaaa0002", "name": "b", "legacy": False}
+        c = {"id": "c-aaaa0003", "name": "c", "legacy": False}
+        for cl in (a, b):
+            self.assertIsNone(s.submit(cl, self.manifest(task="t"), "r", 3600)[1])
+            self.assertEqual(s.submit(cl, self.manifest(task="u"), "r", 3600), (None, "too_many"))   # per client
+        self.assertIsNone(s.submit(c, self.manifest(task="t"), "r", 3600)[1])                       # a third gets in
+        for bad in ({"max_pending": 2}, {"max_pending": 4, "max_pending_per_client": 2}):
+            with self.assertRaises(ValueError, msg=bad):
+                P.parse_config(bad)
+        P.parse_config({"max_pending": 5, "max_pending_per_client": 2})
+
+    def test_any_bodies_get_every_text_view(self):
+        cfg = P.parse_config({"allow_any_body": True})
+        r = norm(rule(body={"any": True}), cfg)
+        def v(body, ct="text/plain"):
+            return verdict(r, P.Frozen("POST", "https://api.example.com/v1/notes",
+                                       [("Authorization", "Bearer {{LEDGER_TOKEN}}"), ("Content-Type", ct)], body), cfg)
+        self.assertIsNone(v(b"hello world"))
+        self.assertEqual(v("\uff4dethod".encode("utf-8")), "override")                  # fullwidth m
+        self.assertEqual(v("a \uff2d\uff25\uff34\uff28\uff2f\uff24".encode("utf-8")), "override")
+        self.assertEqual(v("method".encode("utf-16-le")), "override")
+        self.assertEqual(v(b"\xff\xfe" + "my method".encode("utf-16-le")), "override")
+        self.assertEqual(v("method".encode("utf-32-le")), "override")
+        self.assertEqual(v("method".encode("utf-8").decode("latin-1").encode("utf-8")), "override")   # double encoded
+        self.assertEqual(v(b"\xff\xfe\xfd"), "override")                               # not UTF-8: cannot be checked
+
 
 
 if __name__ == "__main__":

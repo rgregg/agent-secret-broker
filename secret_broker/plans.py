@@ -93,7 +93,7 @@ HEADER_NAMES = frozenset(sessions_mod.ALLOWED_HEADERS) | {"content-length"}
 DEFAULTS = {
     "enabled": True, "default_minutes": 30, "max_minutes": 480, "pending_ttl_s": 900,
     "max_rules": 20, "max_uses_per_rule": 500, "max_total_uses": 2000, "rate_per_min": 30,
-    "max_inflight": 4, "max_body_bytes": 16384, "max_pending": 2, "max_active_per_client": 2,
+    "max_inflight": 4, "max_body_bytes": 16384, "max_pending": 4, "max_active_per_client": 2,
     "max_pending_per_client": 1, "submits_per_hour": 6,
     "allow_any_body": False, "allow_root_prefix": False, "allow_graphql_mutation": False,
     "allow_legacy": False,
@@ -144,6 +144,9 @@ def parse_config(raw, field="plans"):
             raise ValueError(f"{field}.{k} must be a whole number from {lo} to {hi}")
     if out["default_minutes"] > out["max_minutes"]:
         raise ValueError(f"{field}.default_minutes must not be above {field}.max_minutes")
+    if out["max_pending"] < 2 * out["max_pending_per_client"] + 1:
+        raise ValueError(f"{field}.max_pending must be at least 2 * max_pending_per_client + 1, so that two "
+                         "clients can never hold every pending slot")
     if out["max_total_uses"] < out["max_uses_per_rule"]:
         raise ValueError(f"{field}.max_total_uses must not be below {field}.max_uses_per_rule")
     hs = out["allowed_request_headers"]
@@ -970,7 +973,7 @@ def _match_body(spec, body, hdrs):
             raise NoMatch("body")
         return ""
     if "any" in spec:
-        return body.decode("utf-8", "replace")      # text, not latin-1 bytes: NFKC must see real characters
+        return body                                 # bytes: override_problem builds every text view itself
     if not _CT_JSON.match(hdrs.get("content-type", "")):
         raise NoMatch("body")
     try:
@@ -1014,7 +1017,7 @@ def assert_sent_is_matched(frozen, req):
         raise NoMatch("url")
     sent = {k.lower(): v for k, v in req.header_items()}
     cl = sent.get("content-length")
-    if cl is not None and (not cl.isdigit() or int(cl) != len(frozen.body)):
+    if cl is not None and (not (cl.isascii() and cl.isdigit()) or int(cl) != len(frozen.body)):
         raise NoMatch("url")        # the byte length on the wire must be the matched body length
     if len(sent) != len(frozen.headers) or any(sent.get(n.lower()) != v for n, v in frozen.headers):
         raise NoMatch("url")
@@ -1086,6 +1089,10 @@ class Match:
 
     def release(self):
         self.store._release_ticket(self.plan_id, self.ticket)
+
+    def refund(self):
+        """Give the reserved use back: the call was stopped before anything was sent."""
+        self.store.refund(self.plan_id, self.rule_index)
 
 
 class Miss:
@@ -1169,10 +1176,17 @@ class PlanStore:
     # -- submit / decide ---------------------------------------------------------
     def submit(self, client, manifest, request_id, requested_s):
         """Create a pending plan -> (plan, None) or (None, error class: "too_many"|"cooldown"|"full")."""
+        ev = []
+        try:
+            return self._submit(client, manifest, request_id, requested_s, ev)
+        finally:
+            self._emit(ev)                  # deadlines noticed here are audited, after the lock is released
+
+    def _submit(self, client, manifest, request_id, requested_s, ev):
         with self._lock:
             now = self.now()
             for p in list(self._plans.values()):
-                self._tick_locked(p, [])
+                self._tick_locked(p, ev)
             self._drop_old_locked(now)
             if len(self._plans) >= MAX_PLANS:
                 return None, "full"
@@ -1214,15 +1228,16 @@ class PlanStore:
             if p is not None:
                 p.request_id = request_id
 
-    def settle(self, pid, state):
-        """The card ended without an approval: state "denied" or "expired" (or "failed" -> expired)."""
+    def settle(self, pid, state, cooldown=True):
+        """The card ended without an approval: state "denied" or "expired" (or "failed" -> expired). A denial
+        starts the client's cooldown unless `cooldown` is False (the client was revoked)."""
         with self._lock:
             p = self._plans.get(pid)
             if p is None or p.state != "pending":
                 return False
             p.state = "denied" if state == "denied" else "expired"
             p.ended_at = self.now()
-            if p.state == "denied":
+            if p.state == "denied" and cooldown:
                 d = self._denied.get(p.client_id)
                 n = (d["n"] + 1) if d is not None and self.now() - d["t"] < DENY_RESET_S else 1
                 self._denied[p.client_id] = {"t": self.now(), "n": n}
@@ -1272,6 +1287,30 @@ class PlanStore:
             ok = p.state in ("active", "exhausted") and not self._expired_locked(p)
         self._emit(ev)
         return ok
+
+    def time_left(self, pid):
+        """Seconds the plan may still send, or None when it may not (not active/exhausted, or past its deadline
+        on either clock)."""
+        ev = []
+        with self._lock:
+            p = self._plans.get(pid)
+            if p is None:
+                return None
+            self._tick_locked(p, ev)
+            left = self._left_locked(p) if p.state in ("active", "exhausted") and not self._expired_locked(p) else None
+        self._emit(ev)
+        return left if left else None
+
+    def refund(self, pid, rule_index):
+        """A reserved use that never left the broker is given back (counters and the rate window only)."""
+        with self._lock:
+            p = self._plans.get(pid)
+            if p is None or p.uses_by_rule[rule_index] <= 0:
+                return
+            p.uses_by_rule[rule_index] -= 1
+            p.uses_total = max(0, p.uses_total - 1)
+            if p.recent:
+                p.recent.pop()
 
     def needs_confirm(self, pid):
         with self._lock:
@@ -1429,7 +1468,7 @@ class PlanStore:
             if p is None or not hmac.compare_digest(p.client_id.encode(), client_id.encode()):
                 return None
             self._tick_locked(p, ev)
-            if p.state != "active":
+            if p.state != "active" and not (p.state == "exhausted" and p.inflight > 0):
                 done = None
             else:
                 p.state, p.ended_at = "closed", self.now()
@@ -1446,7 +1485,7 @@ class PlanStore:
             if p is None:
                 return False
             self._tick_locked(p, ev)
-            ok = p.state == "active"
+            ok = p.state == "active" or (p.state == "exhausted" and p.inflight > 0)
             if ok:
                 left = self._left_locked(p)
                 p.state, p.ended_at = "revoked", self.now()
@@ -1458,6 +1497,8 @@ class PlanStore:
         """A revoked client loses every plan, pending and active. Returns the ids."""
         ev, gone = [], []
         with self._lock:
+            self._denied.pop(client_id, None)
+            self._submits.pop(client_id, None)
             for p in self._plans.values():
                 if p.client_id != client_id or p.state in _TERMINAL:
                     continue

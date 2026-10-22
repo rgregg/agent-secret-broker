@@ -1970,6 +1970,13 @@ schema matching, windows, sessions, renewal.
   key cannot submit plans (`plans.allow_legacy`, default false). Revoking a client revokes its plans.
 - **Memory only.** A restart drops every plan (fail closed): calls get exit 7 `kind: unknown` and the job must
   submit again, which needs you.
+- **Before and after sending.** Immediately before the request is sent (after the vault read and header
+  substitution, which can take seconds) the plan's liveness is checked again: client active, plan active (or
+  exhausted with this call in flight) and inside its deadline on both clocks; if not, nothing is sent, the use is
+  given back and the call fails with the fixed text "release failed: plan or client ended". The upstream timeout is
+  `min(30 s, time left to the plan deadline)`. After the upstream answers the same check runs and a response for an
+  ended plan or revoked client is discarded. A plan whose last use is in flight (state `exhausted`) can still be
+  revoked or closed. A deadline noticed by any operation (even a submit) is audited as `plan_closed`.
 - **Revoke.** Clients tab, **Active plans** table (above Active sessions), Revoke (SSO, CSRF, same-origin). It takes effect before the
   next call; a call already released finishes. Terminal plans stay visible to their owner and History for an
   hour.
@@ -1991,7 +1998,9 @@ token or the link page's old form: only the SSO approval pages, with CSRF.
 Hard caps (a manifest over one is a 400 naming the field): `max_rules` 20, `max_uses_per_rule`,
 `max_total_uses`, `max_minutes`, `rate_per_min`, `max_body_bytes`, no any-body, no `/` prefix, no GraphQL
 mutation, `deny_secrets`. Approver-fatigue limits (all 429): a card waits `pending_ttl_s` (900); `max_pending`
-2 pending plans overall and `max_pending_per_client` 1 per client; `max_active_per_client` 2 active;
+4 pending plans overall (`max_pending`) and `max_pending_per_client` 1 per client, validated so that
+`max_pending` is at least `2 * max_pending_per_client + 1` (two clients can never hold every pending slot; the
+effective ceiling is the smaller of `max_pending` and clients times the per-client cap); `max_active_per_client` 2 active;
 `submits_per_hour` 6 per client; and a **denial cooldown keyed on the client id only** (never the
 agent-chosen task text, so rewording a task bypasses nothing) that escalates 60 s, 5 min, 30 min with each
 further denial and is forgotten after a quiet day. Plan cards have their own pending caps and never consume
@@ -2035,7 +2044,7 @@ channel holds a secret, header value, body, document, `task`, `description` or e
 
     "plans": {"enabled": true, "default_minutes": 30, "max_minutes": 480, "pending_ttl_s": 900,
               "max_rules": 20, "max_uses_per_rule": 500, "max_total_uses": 2000, "rate_per_min": 30,
-              "max_inflight": 4, "max_body_bytes": 16384, "max_pending": 2, "max_pending_per_client": 1, "max_active_per_client": 2,
+              "max_inflight": 4, "max_body_bytes": 16384, "max_pending": 4, "max_pending_per_client": 1, "max_active_per_client": 2,
               "submits_per_hour": 6, "allow_any_body": false, "allow_root_prefix": false, "allow_graphql_mutation": false,
               "allow_legacy": false,
               "allowed_request_headers": ["Accept", "Content-Type", "Content-Length", "If-None-Match", "User-Agent"],

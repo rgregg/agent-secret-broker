@@ -853,6 +853,111 @@ class Wire(PBase):
             P.assert_sent_is_matched(f, req2)
 
 
+class BeforeSend(PBase):
+    """A revoke, close, revoked client or deadline between reserving a use and sending it stops the call."""
+    plans_cfg = {"max_inflight": 4, "rate_per_min": 100}
+
+    def setUp(self):
+        super().setUp()
+        self.pid = self.approve(self.manifest(rules=[self.rule(max_uses=50)]))
+
+    def gated_call(self, action, pid=None):
+        """Run a call whose vault read is held on a gate; `action` runs while it waits."""
+        gate, reached = threading.Event(), threading.Event()
+        real = self.broker.backend.get
+
+        def slow(*a, **k):
+            reached.set()
+            gate.wait(10)
+            return real(*a, **k)
+        out = []
+        with mock.patch.object(self.broker.backend, "get", slow):
+            th = threading.Thread(target=lambda: out.append(self.call(pid or self.pid, body=self.ok_note())))
+            th.start()
+            self.assertTrue(reached.wait(10))
+            action()
+            gate.set()
+            th.join()
+        return out
+
+    def assert_stopped(self, out, pid=None):
+        self.assertEqual(self.upstream(), [])                                  # nothing was ever sent
+        rid = [e for e in self.events("requested") if e.get("mode") == "http"][-1]["id"]
+        req = self.broker._by_id[rid]
+        self.assertEqual((req.status, req.error), ("failed", "release failed: plan or client ended"))
+        v = self.plan_view(pid or self.pid)
+        self.assertEqual((v["uses"], v["inflight"]), (0, 0))                   # the use was given back
+
+    def test_revoked_between_reserve_and_send(self):
+        out = self.gated_call(lambda: self.broker.revoke_plan(self.pid, "alice"))
+        self.assert_stopped(out)
+
+    def test_closed_between_reserve_and_send(self):
+        out = self.gated_call(lambda: self.api("POST", f"/v1/plans/{self.pid}/close", {}))
+        self.assert_stopped(out)
+
+    def test_client_revoked_between_reserve_and_send(self):
+        out = self.gated_call(lambda: self.broker.revoke_client(self.client["id"], "alice"))
+        self.assert_stopped(out)
+
+    def test_deadline_passing_during_the_vault_read(self):
+        out = self.gated_call(lambda: self.tick(4000))
+        self.assert_stopped(out)
+
+    def test_an_undisturbed_slow_vault_read_still_sends(self):
+        out = self.gated_call(lambda: None)
+        self.assertEqual(out[0][0], 202)
+        self.assertEqual(len(self.upstream()), 1)
+
+    def test_the_upstream_timeout_is_capped_by_the_plan_deadline(self):
+        import secret_broker.broker as bmod
+        seen = []
+        real = bmod._exchange
+
+        def spy(req, values, tls, strip_cookies=False, timeout=30):
+            seen.append(timeout)
+            return real(req, values, tls, strip_cookies=strip_cookies, timeout=timeout)
+        with mock.patch.object(bmod, "_exchange", spy):
+            self.call(self.pid, body=self.ok_note())                            # an hour left: the usual 30 s
+            self.tick(3600 - 12)
+            self.call(self.pid, body=self.ok_note())                            # 12 s left
+        self.assertEqual(seen[0], 30)
+        self.assertTrue(1 <= seen[1] <= 12, seen)
+
+    def test_the_last_use_in_flight_can_be_revoked_and_its_response_is_discarded(self):
+        pid = self.approve(self.manifest(task="one", rules=[self.rule(max_uses=1)]))
+        Stub.gate = threading.Event()
+        out = []
+        th = threading.Thread(target=lambda: out.append(self.call(pid, body=self.ok_note())))
+        th.start()
+        end = time.time() + 10
+        while time.time() < end and self.plan_view(pid)["inflight"] < 1:
+            time.sleep(0.02)
+        self.assertEqual(self.plan_view(pid)["state"], "exhausted")
+        self.assertTrue(self.broker.revoke_plan(pid, "alice"))
+        Stub.gate.set()
+        th.join()
+        rid = [e for e in self.events("requested") if e.get("mode") == "http"][-1]["id"]
+        self.assertEqual(self.broker._by_id[rid].error, "release failed: plan or client ended")
+
+    def test_a_non_ascii_digit_in_a_form_field_is_not_a_server_error(self):
+        r = self.submit(self.manifest(task="digits"))
+        for bad in ("\u00b2", "\u0663", "\uff12"):
+            st, body, hdr = self.decide(r["id"], "approve", granted=bad)
+            self.assertEqual(st, 303, bad)
+            self.assertIn("note=bad", hdr["Location"], bad)
+        st, _, hdr = self.post("/decide", {"id": r["id"], "decision": "approve_grant_\u00b2"})
+        self.assertEqual(st, 303)
+        st = self.get("/?note=gapplied&n=%C2%B2")[0]
+        self.assertEqual(st, 200)
+
+    def test_a_revoked_client_leaves_no_cooldown_for_its_denied_pending_card(self):
+        r = self.submit(self.manifest(task="p"))
+        self.broker.revoke_client(self.client["id"], "alice")
+        self.assertEqual(self.card(r["id"]).status, "denied")
+        self.assertEqual(self.broker.plans._denied.get(self.client["id"]), None)
+
+
 class Submission(PBase):
     def test_bad_manifests_are_400_with_a_fixed_sentence(self):
         for m, frag in ((self.manifest(v=2), "v: must be 1"), (self.manifest(rules=[]), "rules"),
@@ -878,6 +983,7 @@ class Submission(PBase):
         self.assertEqual(code, 413)
 
     def test_caps(self):
+        self.broker.plans.cfg["max_pending"] = 2
         self.submit(self.manifest(task="a"))
         self.submit(self.manifest(task="b"))
         code, r = self.api("POST", "/v1/plans", {"manifest": self.manifest(task="c")})

@@ -336,8 +336,15 @@ class PlansMixin:
             raise BackendError("credential is gone")
         env = self._read_env(req)
         done = plans_mod.substitute(req.frozen, env, m.rule, self.plans_cfg, live["vars"])
+        # Liveness immediately before sending (the vault read above can take seconds): a revoke, close,
+        # revoked client or deadline in that window stops the call, and the use is given back.
+        left = self.plans.time_left(m.plan_id)
+        if left is None or not self.clients.is_active(req.client["id"]):
+            m.refund()
+            raise PlanEnded()
         t0 = time.time()
-        out = _exchange_frozen(done, list(env.values()), self._tls_policy(req.names))
+        out = _exchange_frozen(done, list(env.values()), self._tls_policy(req.names),
+                               timeout=max(1, min(30, int(left))))
         self.audit("http_executed", req, upstream_status=out["status"], response_bytes=len(out["body"]),
                    duration_ms=int((time.time() - t0) * 1000))
         # Re-check after the upstream answered (the sessions rule): a revoked client, or a plan that was

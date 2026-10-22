@@ -1955,7 +1955,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             if req.mode == "guidance" and req.result is None:
                 req.result = proposals_mod.outcome(req, status)
         if req.mode == "plan" and status != "approved" and req.plan_id:
-            self.plans.settle(req.plan_id, status)      # the plan record follows its card
+            self.plans.settle(req.plan_id, status, cooldown=extra.get("via") != "client_revoked")  # the plan follows its card
         if status == "denied" and req.mode not in ("guidance", "plan") and extra.get("via") != "client_revoked":
             now = time.time()
             for n in req.names:
@@ -2854,10 +2854,10 @@ def _do_http(spec, env, tls=None):
     return _exchange(req, list(env.values()), tls)
 
 
-def _exchange(req, values, tls, strip_cookies=False):
+def _exchange(req, values, tls, strip_cookies=False, timeout=30):
     """Send one urllib request (never following a redirect) and return the masked response."""
     try:
-        with _opener_for(tls).open(req, timeout=30) as r:
+        with _opener_for(tls).open(req, timeout=timeout) as r:
             status, headers, body = r.status, dict(r.headers), r.read(MAX_RESPONSE_BYTES)
     except urllib.error.HTTPError as e:
         status, headers, body = e.code, dict(e.headers), e.read(MAX_RESPONSE_BYTES)
@@ -2870,12 +2870,12 @@ def _exchange(req, values, tls, strip_cookies=False):
     }
 
 
-def _exchange_frozen(frozen, values, tls):
+def _exchange_frozen(frozen, values, tls, timeout=30):
     """Send the frozen plan request EXACTLY as matched: its url, method, headers and body bytes."""
     req = urllib.request.Request(frozen.url, data=frozen.body or None, method=frozen.method,
                                  headers=dict(frozen.headers))
     plans_mod.assert_sent_is_matched(frozen, req)
-    return _exchange(req, values, tls, strip_cookies=True)
+    return _exchange(req, values, tls, strip_cookies=True, timeout=timeout)
 
 
 # -- HTTP layer -------------------------------------------------------------
@@ -3915,7 +3915,7 @@ def _session_limits(form, req):
 
 def _apply_set(form):
     """The entry indexes ticked on a guidance proposal form (fields apply_<index>)."""
-    return {int(k[6:]) for k in form if k.startswith("apply_") and k[6:].isdigit() and len(k) <= 12}
+    return {int(k[6:]) for k in form if k.startswith("apply_") and k[6:].isascii() and k[6:].isdigit() and len(k) <= 12}
 
 
 def _fmt_minutes(m):
@@ -3928,7 +3928,7 @@ def _parse_decision(decision):
         return decision, False, None
     if decision == "approve_always":
         return "approve", True, None
-    if decision.startswith("approve_grant_") and decision[14:].isdigit() and len(decision) < 22:
+    if decision.startswith("approve_grant_") and decision[14:].isascii() and decision[14:].isdigit() and len(decision) < 22:
         return "approve", False, int(decision[14:])
     return None
 
@@ -4512,7 +4512,7 @@ def approval_handler(broker):
             recent = self._recent_history(a, pend_ids)
             msg = notes.get(note, "")
             n_ent = ((q or {}).get("n") or [""])[0]
-            if note == "gapplied" and n_ent.isdigit() and len(n_ent) < 4:
+            if note == "gapplied" and n_ent.isascii() and n_ent.isdigit() and len(n_ent) < 4:
                 msg = f"Applying {n_ent} entr{'y' if n_ent == '1' else 'ies'}... " + msg
             _page(self, 200,
                   f"<div id=flash class=flash{'' if msg else ' hidden'}>{html.escape(msg)}</div>"
@@ -4707,7 +4707,7 @@ def approval_handler(broker):
             gs = one("granted")
             nonce, rid = one("nonce")[:64] or None, one("id")[:64] or None
             code, done = broker.decide_plan(decision, user, rid=rid, nonce=nonce,
-                                            granted_s=int(gs) if gs.isdigit() and len(gs) < 9 else None,
+                                            granted_s=int(gs) if gs.isascii() and gs.isdigit() and len(gs) < 9 else None,
                                             peer=peer, client_ip=fwd)
             if done is None:
                 if code == 409:
