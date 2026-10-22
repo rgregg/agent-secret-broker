@@ -245,6 +245,17 @@ class PlansMixin:
         raise PlanRefused(res.http, res.body(), hdrs)
 
     def _plan_call(self, names, spec, source, peer, client):
+        """Guarded entry: anything unexpected becomes a fixed 500 and a class name in the log."""
+        try:
+            return self._plan_call_inner(names, spec, source, peer, client)
+        except PlanRefused:
+            raise
+        except Exception as e:  # noqa: BLE001 -- no exception text out: class name to the log only
+            self.log("plan_internal_error", error_class=type(e).__name__,
+                     **self._client_fields(client or clients_mod.ClientStore.LEGACY_VIEW))
+            raise PlanRefused(500, {"error": "plan error"}) from None
+
+    def _plan_call_inner(self, names, spec, source, peer, client):
         """An http request that names a plan: match it deterministically, release it without a
         prompt, or refuse it. Never a prompt, never a model."""
         from .broker import Request
