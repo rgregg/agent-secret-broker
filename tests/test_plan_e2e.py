@@ -595,13 +595,13 @@ class WithSessions(PBase):
 
     def test_a_plan_call_that_names_a_session_is_refused_and_nothing_is_sent(self):
         pid = self.approve()
-        code, r = self.call(pid, body=self.ok_note(), extra={"session": "S" * 22, "capture": ["A=header:X"]})
+        code, r = self.call(pid, body=self.ok_note(), extra={"session": "S" * 32, "capture": ["A=header:X"]})
         self.assertEqual((code, r["reason"], r["why"]), (403, "no_rule", "request"))
         self.assertEqual(self.upstream(), [])
 
     def test_the_cli_refuses_both_a_plan_and_a_session(self):
         rc, out, err, _ = self.cli("http", "ledger", "GET", "http://127.0.0.1:1/", "--plan", "0" * 32,
-                                   "--session", "S" * 22)
+                                   "--session", "S" * 32)
         self.assertEqual(rc, 2, err)
         self.assertIn("not both", err)
 
