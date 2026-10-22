@@ -121,9 +121,15 @@ HTTP sessions (multi-step flows; one human approval for a bounded unit of work)
   The broker stores cookies from responses (and removes Set-Cookie from what you see) and sends them
   on later calls to the same host. --capture saves a value (header:NAME, cookie:NAME or json:$.a.b[0])
   for later use as {{session.NAME}} in the URL, headers and body; you never see it.
-  Session calls take only plain headers (Accept, Content-Type, Authorization, X-CSRF-Token, other X- headers, headers
-  carrying a {{VAR}}); Content-Length, Cookie, Host, Connection etc. are refused. Any text containing "method" in the URL,
-  headers or body is refused too (use plain `asb http` for fields like payment_method).
+  Session calls accept ONLY these headers (exact names): Accept, Accept-Language, Content-Type, User-Agent,
+  If-None-Match, If-Modified-Since, Authorization, X-CSRF-Token, X-Updated-CSRF-Token, X-Requested-With,
+  X-API-Key. Content-Type must be application/json, application/x-www-form-urlencoded, text/plain,
+  application/graphql or multipart/form-data (with a boundary), plus at most charset=utf-8. A value that carries
+  a placeholder must be exactly {{NAME}}, optionally after "Bearer ", "Basic " or "Token " (so
+  `Authorization: Bearer {{TOKEN}}` and `X-API-Key: {{KEY}}` work). Every other header (X-Auth-Token,
+  Content-Length, Cookie, Host, Connection, ...) is refused, even with a placeholder: an API that needs another
+  auth header must use plain `asb http` without --session for now. Any text containing "method" in the URL,
+  headers or body is refused too (plain `asb http` for fields like payment_method), and bodies are limited to 256 KB.
   --host is HOST (ports 80 and 443 only) or HOST:PORT (exactly that port). Redirects are never followed:
   you get the 3xx and its Location, and make a new call yourself.
   Rules you cannot change: the session ends at its deadline (it is NEVER extended or renewed, however
@@ -327,7 +333,8 @@ http credential; env and ssh credentials are refused). Use it for multi-step flo
 cookie, carry a CSRF token); use plain `asb http` for single calls and env mode only when a program
 needs the secret itself. --host (required, repeatable or comma separated) is HOST (only ports 80 and 443,
 by scheme) or HOST:PORT (exactly that port); the host must be inside the credential's allowed hosts: a
-session only narrows. Redirects are never followed: you get the 3xx and make a new call. --methods defaults to GET,HEAD; declare POST, PUT,
+session only narrows. Redirects are never followed: you get the 3xx and make a new call. Calls accept only a fixed header allowlist
+(`asb guide` lists it); an API that needs another auth header uses plain `asb http`. --methods defaults to GET,HEAD; declare POST, PUT,
 PATCH, DELETE or OPTIONS if you need them (the human sees them). --ttl is s, m or h (default 15m, the
 broker has a maximum). --max-calls defaults to 200. --for is one line, up to 300 characters; the human
 sees it as your unverified claim.
@@ -807,8 +814,8 @@ def run_request_credential(argv):
     return 0
 
 
-SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{32}$")
-CAPTURE_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,31}$")
+SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{32}\Z")
+CAPTURE_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,31}\Z")
 SESSION_METHODS = ("GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE")
 
 
@@ -833,7 +840,7 @@ def check_capture(text):
 
 
 def parse_ttl(text):
-    m = re.fullmatch(r"(\d{1,6})([smh])", text or "")
+    m = re.fullmatch(r"([0-9]{1,6})([smh])", text or "")
     if not m:
         die("--ttl must be a number with a unit: 90s, 15m or 1h")
     return int(m.group(1)) * {"s": 1, "m": 60, "h": 3600}[m.group(2)]
@@ -892,7 +899,7 @@ def run_session(argv):
     if "--ttl" in opts:
         payload["ttl_s"] = parse_ttl(opts["--ttl"])
     if "--max-calls" in opts:
-        if not opts["--max-calls"].isdigit() or not 1 <= int(opts["--max-calls"]) <= 100000:
+        if not (opts["--max-calls"].isascii() and opts["--max-calls"].isdigit()) or not 1 <= int(opts["--max-calls"]) <= 100000:
             die("--max-calls must be a whole number of at least 1")
         payload["max_calls"] = int(opts["--max-calls"])
     s = obtain(payload, "waiting for the human to approve the session...")["session"]

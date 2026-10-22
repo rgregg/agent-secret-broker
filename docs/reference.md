@@ -2159,12 +2159,13 @@ ends its sessions at once.
   normalisation, and each of those with every non-letter removed. Bodies are scanned as UTF-8, latin-1, UTF-16/32 (when NUL bytes or a BOM suggest it) and double-encoded text, so fullwidth or mojibake spellings cannot hide; a body that is not valid UTF-8 is refused unless it is multipart/form-data or sent as `body_b64` (then all views are still scanned). Userinfo in the URL is refused. A multipart body that declares a
   Content-Transfer-Encoding is refused. This covers `_method` fields in a query, path, form, JSON or multipart, encoded and mixed-case
   variants and `;` separators, without any parser that could disagree with the upstream's. It deliberately also refuses legitimate fields such
-  as `payment_method`: a call that needs one must use plain `asb http` without `--session` (one approval per call). The same check runs again on what
-  is actually sent, after `{{session.NAME}}` substitution. A GET or HEAD call cannot carry a body. A captured value containing `method` (same
+  as `payment_method`: a call that needs one must use plain `asb http` without `--session` (one approval per call). The check runs once per call on the agent's text, and again on the substituted text only when the call uses `{{session.NAME}}`. A GET or HEAD call cannot carry a body. A captured value containing `method` (same
   forms) is not stored, so an upstream cannot poison a later call.
-- **Refusals that cost the caller nothing are metered.** A call refused after the credential was read but before anything was sent is not charged
-  against the call cap, but counts against a per-session budget of 10; the 11th ends the session (`session_ended`, `reason: refusal_budget`, exit 7).
-- **Bounded work.** URL and header values up to 8192 characters, 50 headers, 100 placeholders of up to 64 characters, body up to 5 MB.
+- **Refusals are metered and the audit log cannot be flooded.** A refused call is not charged against the call cap, but every refusal (scope, method,
+  header, override, missing capture, call cap used, and a refund for a call that never left the broker) counts against a per-session budget of 10;
+  the 11th ends the session (`session_ended`, `reason: refusal_budget`, exit 7). `session_refused` audit lines are coalesced: the first 5 per minute
+  per session (or per client for unknown ids), then a counter that rides on the next logged line as `suppressed`.
+- **Bounded work.** URL and header values up to 8192 characters, 50 headers, 100 placeholders of up to 64 characters, body up to 256 KB (a larger body is refused with a fixed message; use plain `asb http` for big uploads: every session body is scanned, so its size is bounded).
   Placeholders are scanned in linear time, and the store lock is held only for dictionary work (never for a scope check or an upstream
   call), so one hostile or slow call cannot delay another client's lookup, revoke, close or sweep.
 - **In-flight calls do not outlive the session.** A call runs with a timeout of at most 30 seconds and never past the deadline. When the
