@@ -38,6 +38,7 @@ from collections import deque
 
 from . import clock as clock_mod
 from . import guidance as guidance_mod
+from . import sessions as sessions_mod     # the header, Content-Type and override rules are shared, not copied
 
 # ---------------------------------------------------------------- constants
 SCHEMA_VERSION = 1
@@ -67,7 +68,6 @@ _URL_RE = re.compile(r"^[\x21-\x7e]{1,4096}\Z")
 _URL_BAD = re.compile(r"[\\\"<>^`{}|]")
 _PCT_RE = re.compile(r"%([0-9A-Fa-f]{2})")
 _NETLOC_RE = re.compile(r"^(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+)(?::([0-9]{1,5}))?\Z")
-_PLACEHOLDER_HDR = re.compile(r"^(?:([A-Za-z][A-Za-z0-9_-]{0,19}) )?\{\{ ?([A-Z][A-Z0-9_]{0,60}) ?\}\}\Z")
 _CT_JSON = re.compile(r"^application/json(?:; ?charset=utf-8)?\Z")
 _DIGITS = re.compile(r"^(0|[1-9][0-9]{0,15})\Z")
 _QKEY_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}\Z")
@@ -86,6 +86,9 @@ _FORBIDDEN_HEADERS = frozenset((
     "x-http-method-override", "x-http-method", "x-method-override", "x-real-ip", "x-original-url",
     "x-rewrite-url", "expect", "content-encoding", "content-range", "range", "x-forwarded-for"))
 _FORBIDDEN_PREFIXES = ("x-forwarded-", "x-envoy-", "x-original-")
+
+# Header names a plan may ever allow: the shared session allowlist, plus Content-Length (checked to equal the body).
+HEADER_NAMES = frozenset(sessions_mod.ALLOWED_HEADERS) | {"content-length"}
 
 DEFAULTS = {
     "enabled": True, "default_minutes": 30, "max_minutes": 480, "pending_ttl_s": 900,
@@ -147,6 +150,9 @@ def parse_config(raw, field="plans"):
     if not isinstance(hs, list) or len(hs) > 20 or not all(isinstance(h, str) and _HDR_NAME_RE.match(h) for h in hs):
         raise ValueError(f"{field}.allowed_request_headers must be a list of up to 20 header names")
     for h in hs:
+        if h.lower() not in HEADER_NAMES:
+            raise ValueError(f"{field}.allowed_request_headers may only name headers from the shared session "
+                             "allowlist (or Content-Length)")
         if _forbidden_header(h):
             raise ValueError(f"{field}.allowed_request_headers may not include a routing or framing header")
     ds = out["deny_secrets"]
@@ -183,6 +189,15 @@ def describe_config(cfg):
         return "Plans are turned off"
     return (f"Plans: on, up to {_hm(cfg['max_minutes'] * 60)} each, {cfg['max_active_per_client']} active per "
             f"client, {cfg['rate_per_min']} calls a minute at most")
+
+
+def _ph(value):
+    """(scheme prefix such as "Bearer ", variable name) when `value` is exactly the shared placeholder shape
+    (sessions._PLACEHOLDER_VALUE: `(Bearer |Basic |Token )?{{NAME}}`), else None."""
+    if "\n" in value or not sessions_mod._PLACEHOLDER_VALUE.match(value):
+        return None
+    a = value.index("{{")
+    return value[:a], value[a + 2:-2]
 
 
 def _forbidden_header(name):
@@ -856,7 +871,7 @@ def _norm_headers(frozen, cfg, own_vars, opaque, post=False):
             raise NoMatch("headers")
         out[low] = value
         if low in opaque:
-            if low in allowed or _forbidden_header(low):
+            if low in allowed or _forbidden_header(low) or low not in sessions_mod.ALLOWED_HEADERS:
                 raise NoMatch("headers")
             continue
         if "{{" in name or "}}" in name:
@@ -864,13 +879,15 @@ def _norm_headers(frozen, cfg, own_vars, opaque, post=False):
         if "{{" in value or "}}" in value:
             if post:
                 raise NoMatch("placeholder")        # nothing may survive substitution
-            m = _PLACEHOLDER_HDR.match(value)
-            if not m or m.group(2) not in own_vars:
+            m = _ph(value)
+            if not m or m[1] not in own_vars:
                 raise NoMatch("placeholder")
-            if low in allowed or _forbidden_header(low):
+            if low in allowed or _forbidden_header(low) or low not in sessions_mod.ALLOWED_HEADERS:
                 raise NoMatch("headers")
             continue
-        if low not in allowed or _forbidden_header(low):
+        if low not in allowed or _forbidden_header(low) or low not in HEADER_NAMES:
+            raise NoMatch("headers")
+        if low == "content-type" and not sessions_mod._content_type_ok(value):
             raise NoMatch("headers")
     return out
 
@@ -904,17 +921,50 @@ def match_rule(rule, frozen, cfg, own_vars, opaque=frozenset(), post=False):
         raise NoMatch("headers")
     if b"{{" in frozen.body:
         raise NoMatch("placeholder")
-    _match_body(rule["body"], frozen.body, hdrs)
+    scan_body = _match_body(rule["body"], frozen.body, hdrs)
+    # The override-family scan (shared with sessions): `method` in any decoded form anywhere in the URL tail,
+    # a header name or value, or the body is refused, except text the rule itself declares (and the approver
+    # saw): a path prefix, listed query keys, listed json keys / variable keys. Run on the TEMPLATE: the
+    # filled header values are replaced by a neutral token, so the outcome never depends on a secret.
+    templ = {n: ("P" if n.lower() in opaque else sessions_mod.neutralize(v)) for n, v in frozen.headers}
+    if sessions_mod.override_problem(None, _scan_url(rule, scheme, path, has_query, _q), templ, scan_body):
+        raise NoMatch("override")
     return None
 
 
+def _has_method(text):
+    return "method" in text.casefold()
+
+
+def _scan_url(rule, scheme, path, has_query, query):
+    """The URL tail with the parts the rule declares and that contain `method` masked."""
+    pre = rule["path_prefix"]
+    if _has_method(pre) and pre != "/":
+        path = "/P" + path[len(pre):]
+    q = query
+    if isinstance(rule["query"], list) and q:
+        parts = []
+        for i, part in enumerate(q.split("&")):
+            k, eq, v = part.partition("=")
+            parts.append((f"K{i}" if k in rule["query"] and _has_method(k) else k) + eq + v)
+        q = "&".join(parts)
+    return f"{scheme}://h" + path + ("?" + q if has_query else "")
+
+
+def _masked_json(obj, declared):
+    """Serialization for the scan with the declared top-level keys that contain `method` renamed."""
+    out = {(f"K{i}" if k in declared and _has_method(k) else k): v for i, (k, v) in enumerate(obj.items())}
+    return json.dumps(out, ensure_ascii=True)
+
+
 def _match_body(spec, body, hdrs):
+    """Match the body; returns the bytes the override scan should read."""
     if "none" in spec:
         if body:
             raise NoMatch("body")
-        return
+        return ""
     if "any" in spec:
-        return
+        return body.decode("utf-8", "replace")      # text, not latin-1 bytes: NFKC must see real characters
     if not _CT_JSON.match(hdrs.get("content-type", "")):
         raise NoMatch("body")
     try:
@@ -930,7 +980,7 @@ def _match_body(spec, body, hdrs):
         for k, v in j["pin"].items():
             if k not in doc or type(doc[k]) is not type(v) or doc[k] != v:
                 raise NoMatch("body")
-        return
+        return _masked_json(doc, set(j["keys"]))
     g = spec["graphql"]
     if not set(doc) <= {"query", "operationName", "variables"}:
         raise NoMatch("body")           # a batch is an array (refused above); extensions and extras land here
@@ -943,6 +993,14 @@ def _match_body(spec, body, hdrs):
     if vs is not None:
         if not isinstance(vs, dict) or not set(vs) <= set(g["variables_keys"]):
             raise NoMatch("body")
+    # the document and operation name are declared in full on the card; only the variables are scanned
+    masked = {"query": "Q"}
+    if "operationName" in doc and doc["operationName"] is not None:
+        masked["operationName"] = "O"
+    if vs is not None:
+        masked["variables"] = {(f"K{i}" if k in g["variables_keys"] and _has_method(k) else k): v
+                               for i, (k, v) in enumerate(vs.items())}
+    return json.dumps(masked, ensure_ascii=True)
 
 
 def assert_sent_is_matched(frozen, req):
@@ -966,9 +1024,9 @@ def own_placeholder_headers(frozen):
     """{lowercase header name: variable name} for the headers that are a placeholder."""
     out = {}
     for name, value in frozen.headers:
-        m = _PLACEHOLDER_HDR.match(value)
+        m = _ph(value)
         if m:
-            out[name.lower()] = m.group(2)
+            out[name.lower()] = m[1]
     return out
 
 
@@ -980,12 +1038,11 @@ def substitute(frozen, env, rule, cfg, own_vars):
     out = []
     for name, value in frozen.headers:
         if name.lower() in ph:
-            m = _PLACEHOLDER_HDR.match(value)
-            var = m.group(2)
-            val = env.get(var)
+            m = _ph(value)
+            val = env.get(m[1])
             if not isinstance(val, str) or re.search(r"[\x00-\x1f\x7f]", val):
                 raise NoMatch("placeholder")
-            value = (m.group(1) + " " if m.group(1) else "") + val
+            value = m[0] + val
         out.append((name, value))
     done = Frozen(frozen.method, frozen.url, out, frozen.body)
     if done.url is not frozen.url or done.body is not frozen.body or done.method is not frozen.method:
@@ -1250,7 +1307,7 @@ class PlanStore:
             if not (isinstance(names, list) and len(names) == 1 and isinstance(names[0], str)):
                 return Miss("no_rule", why="secret", plan_id=p.id)
             cands, why, rank = [], "secret", -1
-            order = ("method", "host", "path", "query", "headers", "placeholder", "size", "body")
+            order = ("method", "host", "path", "query", "headers", "placeholder", "size", "body", "override")
             for i, r in enumerate(p.rules):
                 if r["secret"] != names[0]:
                     continue

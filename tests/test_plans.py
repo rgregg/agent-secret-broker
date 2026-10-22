@@ -678,9 +678,9 @@ class MatcherHeaders(unittest.TestCase):
         self.assertEqual(self.v(hdrs(TE="trailers")), "headers")
 
     def test_a_configured_header_list_is_honoured_but_never_a_framing_header(self):
-        cfg = P.parse_config({"allowed_request_headers": ["Accept", "Content-Type", "X-Trace"]})
-        self.assertIsNone(self.v(hdrs(**{"X-Trace": "1"}), cfg=cfg) if False else
-                          verdict(self.R, frozen(headers=hdrs(**{"X-Trace": "1"}), body=NOTE), cfg))
+        cfg = P.parse_config({"allowed_request_headers": ["Accept", "Content-Type", "X-Csrf-Token"]})
+        self.assertIsNone(self.v(hdrs(**{"X-Csrf-Token": "1"}), cfg=cfg) if False else
+                          verdict(self.R, frozen(headers=hdrs(**{"X-Csrf-Token": "1"}), body=NOTE), cfg))
         self.assertEqual(verdict(self.R, frozen(headers=hdrs(**{"User-Agent": "x"}), body=NOTE), cfg), "headers")
 
     # -- placeholders -------------------------------------------------------------
@@ -699,11 +699,11 @@ class MatcherHeaders(unittest.TestCase):
         self.assertEqual(verdict(r, frozen(headers=hdrs(), body=b"x {{LEDGER_TOKEN}} y".decode())), "placeholder")
 
     def test_placeholder_headers(self):
-        ok = ("{{LEDGER_TOKEN}}", "Bearer {{LEDGER_TOKEN}}", "Token {{ LEDGER_TOKEN }}", "Basic {{LEDGER_TOKEN}}")
+        ok = ("{{LEDGER_TOKEN}}", "Bearer {{LEDGER_TOKEN}}", "Token {{LEDGER_TOKEN}}", "Basic {{LEDGER_TOKEN}}")
         for v in ok:
             self.assertIsNone(self.v({"Content-Type": "application/json", "Authorization": v}), v)
         bad = ("Bearer {{OTHER_TOKEN}}", "Bearer {{LEDGER_TOKEN}} extra", "x Bearer {{LEDGER_TOKEN}}",
-               "Bearer {{LEDGER_TOKEN}}{{LEDGER_TOKEN}}", "Bearer {{ledger_token}}", "Bearer {{LEDGER_TOKEN}",
+               "Bearer {{LEDGER_TOKEN}}{{LEDGER_TOKEN}}", "Bearer {{ledger_token}}", "Token {{ LEDGER_TOKEN }}", "Digest {{LEDGER_TOKEN}}", "bearer {{LEDGER_TOKEN}}", "Bearer {{LEDGER_TOKEN}",
                "Bearer {{LEDGER_TOKEN}}}", "{{LEDGER_TOKEN}}:{{LEDGER_TOKEN}}", "Bearer  {{LEDGER_TOKEN}}",
                "Bearer {{}}", "{{ LEDGER_TOKEN   }}", "a b {{LEDGER_TOKEN}}", "Bearer{{LEDGER_TOKEN}}",
                "}} {{")
@@ -966,6 +966,109 @@ class Tiers(unittest.TestCase):
         self.assertEqual(P.plan_tier(rules[:2]), "medium")
         self.assertEqual(P.plan_tier(rules[:1]), "low")
         self.assertTrue(P.plan_flags(rules))
+
+
+class SessionsHardeningShared(unittest.TestCase):
+    """Plan calls run the sessions header, Content-Type and override rules, imported, not copied."""
+    from secret_broker import sessions as S
+    R = norm(rule())
+
+    def test_the_helpers_are_the_sessions_ones(self):
+        src = open(os.path.join(ROOT, "secret_broker", "plans.py")).read()
+        for name in ("def _content_type_ok", "def _decoded_forms", "def override_problem", "def neutralize",
+                     "_JSON_UNESC", "_ENTITY", "DECODE_ROUNDS"):
+            self.assertNotIn(name, src, name)
+        self.assertIs(P.sessions_mod, self.S)
+        self.assertEqual(P.HEADER_NAMES, frozenset(self.S.ALLOWED_HEADERS) | {"content-length"})
+        self.assertEqual(P._ph("Bearer {{A_B}}"), ("Bearer ", "A_B"))
+        self.assertIsNone(P._ph("Bearer {{A}}\n"))
+
+    def test_header_names_are_exact_and_from_the_shared_list(self):
+        for name in ("Authorization", "X-Api-Key", "X-Csrf-Token", "X-Updated-Csrf-Token", "X-Requested-With"):
+            h = {"Content-Type": "application/json", name: "{{LEDGER_TOKEN}}"}
+            self.assertIsNone(verdict(self.R, frozen(headers=h, body=NOTE)), name)
+        for name in ("X-Custom", "Cookie", "X-Auth", "Accept-Encoding", "Authorization ", "Authorisation"):
+            h = {"Content-Type": "application/json", name: "{{LEDGER_TOKEN}}"}
+            self.assertIsNotNone(verdict(self.R, frozen(headers=h, body=NOTE)), name)
+        for name in ("X-Custom", "Cookie", "Accept-Encoding", "Connection"):
+            with self.assertRaises(ValueError, msg=name):
+                P.parse_config({"allowed_request_headers": [name]})
+
+    def test_content_types_are_the_five_with_charset_utf8_only(self):
+        r = norm(rule(body={"any": True}), P.parse_config({"allow_any_body": True}))
+        cfg = P.parse_config({"allow_any_body": True})
+        ok = ("application/x-www-form-urlencoded", "text/plain", "text/plain; charset=utf-8",
+              "application/graphql", "application/json; charset=utf-8")
+        bad = ("text/html", "application/xml", "text/plain; charset=utf-16", "text/plain; charset=latin-1",
+               "text/plain; foo=bar", "text/plain; charset=utf-8; charset=utf-8; x=1", "multipart/form-data",
+               "application/octet-stream", "")
+        for ct in ok:
+            self.assertIsNone(verdict(r, frozen(headers={"Content-Type": ct}, body="x"), cfg), ct)
+        for ct in bad:
+            self.assertEqual(verdict(r, frozen(headers={"Content-Type": ct}, body="x"), cfg), "headers", ct)
+
+    def test_the_outcome_never_depends_on_a_secret_value(self):
+        f = frozen(body=NOTE)
+        for secret in ("plain-value", "payment_method", "METHOD", "%6dethod", "{{X}}", "a" * 300):
+            done = P.substitute(f, {"LEDGER_TOKEN": secret}, self.R, CFG, OWN)
+            self.assertEqual(dict(done.headers)["Authorization"], "Bearer " + secret)
+        self.assertEqual(verdict(self.R, f), None)
+
+    def declared(self, **kw):
+        return norm(rule(**kw))
+
+    def test_method_text_is_refused_anywhere_unless_the_rule_declares_it(self):
+        any_cfg = P.parse_config({"allow_any_body": True})
+        anyr = norm(rule(body={"any": True}), any_cfg)
+        for body in ("my method", "METHOD", "pay_ment_me_thod", "%6dethod", "\\u006dethod", "&#109;ethod", "\uff4dethod",
+                     "m\u0435thod" if False else "m-e-t-h-o-d", "\\x6dethod", "=6Dethod"):
+            self.assertEqual(verdict(anyr, frozen(headers=hdrs(), body=body), any_cfg), "override", body)
+        self.assertIsNone(verdict(anyr, frozen(headers=hdrs(), body="fine"), any_cfg))
+        # json: a key containing `method` must be declared in keys; values are always scanned
+        jr = self.declared(body={"json": {"keys": ["payment_method", "text"], "pin": {}}})
+        self.assertIsNone(verdict(jr, frozen(headers=hdrs(), body={"payment_method": "card", "text": "hi"})))
+        self.assertEqual(verdict(jr, frozen(headers=hdrs(), body={"text": "my method"})), "override")
+        self.assertEqual(verdict(jr, frozen(headers=hdrs(), body={"payment_method": "a method"})), "override")
+        self.assertEqual(verdict(jr, frozen(headers=hdrs(), body={"text": "%6dethod"})), "override")
+        self.assertEqual(verdict(jr, frozen(headers=hdrs(), body='{"text": "\\u006dethod"}')), "override")
+        self.assertEqual(verdict(jr, frozen(headers=hdrs(), body={"text": "\uff4dethod"})), "override")
+        undeclared = self.declared(body={"json": {"keys": ["text", "other"], "pin": {}}})
+        self.assertEqual(verdict(undeclared, frozen(headers=hdrs(), body={"payment_method": "x"})), "body")
+        # nested keys are never declared
+        nested = self.declared(body={"json": {"keys": ["data"], "pin": {}}})
+        self.assertEqual(verdict(nested, frozen(headers=hdrs(), body={"data": {"payment_method": 1}})), "override")
+        self.assertIsNone(verdict(nested, frozen(headers=hdrs(), body={"data": {"a": 1}})))
+
+    def test_graphql_document_is_declared_variables_are_scanned(self):
+        doc = "query P { paymentMethod { id } }"
+        g = self.declared(body={"graphql": {"document": doc, "variables_keys": ["payment_method", "first"]}})
+        self.assertIsNone(verdict(g, frozen(headers=hdrs(), body={"query": doc})))
+        self.assertIsNone(verdict(g, frozen(headers=hdrs(), body={"query": doc, "variables": {"payment_method": 1}})))
+        self.assertEqual(verdict(g, frozen(headers=hdrs(), body={"query": doc, "variables": {"first": "a method"}})),
+                         "override")
+
+    def test_url_header_scan(self):
+        # path prefix and listed query keys that contain `method` are declared; nothing else is
+        pr = self.declared(path_prefix="/v1/payment_method", query=["payment_method", "page"])
+        base = "https://api.example.com/v1/payment_method"
+        self.assertIsNone(verdict(pr, frozen(base, body=NOTE)))
+        self.assertIsNone(verdict(pr, frozen(base + "/7?payment_method=1&page=2", body=NOTE)))
+        self.assertEqual(verdict(pr, frozen(base + "/method", body=NOTE)), "override")
+        self.assertEqual(verdict(pr, frozen(base + "/x?page=method", body=NOTE)), "override")
+        plain = self.declared()
+        self.assertEqual(verdict(plain, frozen("https://api.example.com/v1/notes/method", body=NOTE)), "override")
+        self.assertEqual(verdict(plain, frozen("https://api.example.com/v1/notes/payment_method", body=NOTE)), "override")
+        rd = norm(rule(method="GET", body=None))
+        hh = {"Authorization": "Bearer {{LEDGER_TOKEN}}"}
+        self.assertEqual(verdict(rd, frozen("https://api.example.com/v1/notes?payment_method=1", method="GET", headers=hh)),
+                         "override")                       # `any` query: nothing declared
+        for k, v in (("Accept", "x/method"), ("User-Agent", "my-METHOD"), ("If-None-Match", "m%65thod" if False else "method")):
+            self.assertEqual(verdict(rd, frozen("https://api.example.com/v1/notes", method="GET",
+                                                headers={**hh, k: v})), "override", k)
+
+    def test_the_host_is_not_scanned(self):
+        r = norm(rule(host="method.example.com"))
+        self.assertIsNone(verdict(r, frozen("https://method.example.com/v1/notes", body=NOTE)))
 
 
 class ParserDifferentials(unittest.TestCase):

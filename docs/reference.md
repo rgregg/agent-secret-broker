@@ -1912,11 +1912,27 @@ the filled header values treated as opaque).
   `"any"`. In every mode keys must be plain (`A-Za-z0-9_.-`, never percent-encoded, no `;`), and method or body
   override parameters (`_method`, `method`, `operationName`, `variables`, `extensions`,
   `x-http-method-override`, `body`) are always refused, so a matching body cannot be changed from the URL.
-- **Headers.** Only `plans.allowed_request_headers` (default `Accept`, `Content-Type`, `Content-Length`,
-  `If-None-Match`, `User-Agent`) plus the placeholder headers above. Anything else (`Host`,
+- **Headers.** Exact names only, from the same allowlist the sessions use (`Accept`, `Accept-Language`,
+  `Content-Type`, `User-Agent`, `If-None-Match`, `If-Modified-Since`, `Authorization`, `X-Csrf-Token`,
+  `X-Updated-Csrf-Token`, `X-Requested-With`, `X-Api-Key`; plus `Content-Length`, checked to equal the body):
+  `plans.allowed_request_headers` (default `Accept`, `Content-Type`, `Content-Length`, `If-None-Match`,
+  `User-Agent`) chooses among them, and a header carrying a placeholder must be one of the credential headers
+  of that list. A placeholder value must be exactly `(Bearer |Basic |Token )?{{NAME}}` with `NAME` a variable of
+  the rule's own credential. `Content-Type`, when present, is one of the five session types
+  (`application/json`, `application/x-www-form-urlencoded`, `text/plain`, `application/graphql`,
+  `multipart/form-data` with a boundary) with at most `charset=utf-8`; a json or GraphQL rule needs
+  `application/json`. All of this is checked on the TEMPLATE (a filled credential is a neutral token), so a refusal
+  never depends on a secret's value. Anything else (`Host`,
   `X-HTTP-Method-Override`, `X-Forwarded-*`, `Transfer-Encoding`...) is a non-match, as is any duplicate
   header (case-insensitive). `Content-Length`, when present, must equal the body's size in bytes; chunked
   bodies are refused.
+- **Override scan.** The sessions' fail-closed rule applies: the text `method` (case-insensitive) in any decoded
+  form (percent, HTML entity, `\\u`/`\\x`/quoted-printable escapes, NFKC, up to five rounds, non-letters
+  removed) anywhere in the URL after the host, in a header name or value, or in the body refuses the call
+  (`why: override`). The only exceptions are text the rule itself declares and the approver sees on the card: a
+  path prefix, listed query keys, listed top-level json keys and GraphQL variable keys that contain `method`, and the
+  exact GraphQL document. Values and nested keys are always scanned. The code is the sessions' own
+  (`sessions.override_problem`, `header_problem`'s Content-Type and placeholder rules), imported, not copied.
 - **Body.** `none` (empty), `json` (top-level keys a subset of `keys`; every `pin` present with exactly the
   pinned string, boolean, integer or null; unpinned values are free and the card says so; nested values are
   never pinned), `graphql` (see below) or `any` (opt-in with `plans.allow_any_body`; shown in red). A rule with

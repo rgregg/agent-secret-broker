@@ -562,6 +562,24 @@ class Hardening(PBase):
         self.assertEqual(len(self.upstream()), n_up)
         self.assertEqual(self.plan_view(pid)["uses"], 0)
 
+    def test_sessions_hardening_applies_to_plan_calls(self):
+        decl = self.rule(path_prefix="/v1/pay", max_uses=50,
+                         body={"json": {"keys": ["payment_method", "text"], "pin": {}}})
+        pid = self.approve(self.manifest(rules=[decl, self.rule(max_uses=50)]))
+        base = f"http://127.0.0.1:{self.port}"
+        n = len(self.upstream())
+        code, r = self.call(pid, body={"payment_method": "card", "text": "ok"}, url=base + "/v1/pay")
+        self.assertEqual(code, 202)                                       # declared in the rule: allowed
+        for body, url in (({"text": "pay by method"}, "/v1/pay"), ({"text": "%6dethod"}, "/v1/pay"),
+                          ({"text": "ok", "kind": "reconcile"}, "/v1/notes/method")):
+            code, r = self.call(pid, body=body, url=base + url)
+            self.assertEqual((code, r["why"]), (403, "override"), (body, url))
+        for h in ({"Cookie": "a=b"}, {"Authorization": "Digest {{LEDGER_TOKEN}}"}, {"X-Custom": "1"},
+                  {"Content-Type": "text/html"}):
+            code, r = self.call(pid, body=self.ok_note(), headers=h)
+            self.assertEqual(code, 403, h)
+        self.assertEqual(len(self.upstream()), n + 1)
+
     def test_a_credential_that_changed_between_submit_and_approval_kills_the_plan(self):
         r = self.submit()
         self.broker.cfg["secrets"]["ledger"]["vars"] = {"LEDGER_TOKEN": {"item": "Other", "field": "token"}}

@@ -717,3 +717,8 @@ Everything above holds except the following, each decided while building it.
     injectable `sessions_clock`, now `clock.mono`, and the monotonic deadline semantics); the Active plans
     table moved from the Policies tab to the Clients tab, above Active sessions; exit codes 7/8 are one
     contract (plans add 9); a plan call that also names a session is refused (phase 2).
+15. **Sessions hardening shared (revision 5).** Plan calls use the sessions' header allowlist (exact names, the five
+    Content-Types, charset utf-8, placeholder values only as `(Bearer |Basic |Token )?{{NAME}}` of the rule's
+    credential), and the sessions' override-family scan over the URL tail, header names and values and the body,
+    all on the template. A rule declaring a key, query key or path prefix that contains `method` is the only
+    exception. `plans.allowed_request_headers` may only name headers from that list (and Content-Length).
