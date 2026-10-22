@@ -178,7 +178,9 @@ class GrantStore:
         if not self._path:
             return
         every = sorted(self._by_set.values(), key=lambda g: g["id"])
-        data = {"version": 4, "grants": [g for g in every if g["client"] == clients_mod.ANY],
+        data = {"version": 4,
+                "grants": [{k: v for k, v in g.items() if k != "client"}
+                           for g in every if g["client"] == clients_mod.ANY],
                 "client_grants": [g for g in every if g["client"] != clients_mod.ANY]}
         tmp = f"{self._path}.tmp"
         try:
@@ -220,12 +222,13 @@ class GrantStore:
             self._save_locked()
         return dict(g)
 
-    def find(self, names, mode=None, client=None):
-        """The active grant for exactly this set of names and mode that applies to `client`,
-        or None. A grant scoped to that client wins over one for any client. A grant scoped
-        to another client never applies. With no client, only a grant for any client.
+    def find_all(self, names, mode=None, client=None):
+        """The active grants for exactly this set of names and mode that apply to `client`,
+        this client's own first, then any for every client. A grant scoped to another client
+        never applies. With no client, only grants for any client.
         With no mode, any grant for the set (a legacy grant has no mode)."""
         scopes = [client, clients_mod.ANY] if client and client != clients_mod.ANY else [clients_mod.ANY]
+        out = []
         with self._lock:
             self._expire_locked()
             for sc in scopes:
@@ -237,8 +240,13 @@ class GrantStore:
                     if g is None and mode in ("http", "ssh_sign"):
                         g = self._by_set.get((frozenset(names), LEGACY, sc))
                 if g:
-                    return dict(g)
-            return None
+                    out.append(dict(g))
+        return out
+
+    def find(self, names, mode=None, client=None):
+        """The first of find_all(), or None."""
+        found = self.find_all(names, mode, client)
+        return found[0] if found else None
 
     def active(self):
         with self._lock:

@@ -2356,8 +2356,13 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin):
         """The standing approval of `kind` for exactly this request's secrets and
         mode, preferring one that covers it by scope; None when there is none."""
         if kind == "timed":
-            return (self.grants.find(req.names, req.mode, req.client["id"])
-                    if self.grants_cfg["enabled"] else None)
+            if not self.grants_cfg["enabled"]:
+                return None
+            # this client's grant and the any-client grant may differ in method scope: prefer
+            # one that covers this request
+            found = self.grants.find_all(req.names, req.mode, req.client["id"])
+            return next((g for g in found if grants_mod.covers(g, req.mode, req.spec)),
+                        found[0] if found else None)
         if len(req.names) != 1 or req.mode not in standing_mod.ALWAYS_MODES:
             return None
         sc = self.cfg["secrets"].get(req.names[0]) or {}
