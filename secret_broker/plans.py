@@ -952,9 +952,12 @@ def assert_sent_is_matched(frozen, req):
     scheme, host, port, path, has_q, q = _parse_url(frozen.url)
     want_sel = path + ("?" + q if has_q else "")
     if (req.full_url != frozen.url or req.selector != want_sel or req.get_method() != frozen.method
-            or (req.data or b"") != frozen.body or req.fragment):
+            or (req.data or b"") != frozen.body or len(req.data or b"") != len(frozen.body) or req.fragment):
         raise NoMatch("url")
     sent = {k.lower(): v for k, v in req.header_items()}
+    cl = sent.get("content-length")
+    if cl is not None and (not cl.isdigit() or int(cl) != len(frozen.body)):
+        raise NoMatch("url")        # the byte length on the wire must be the matched body length
     if len(sent) != len(frozen.headers) or any(sent.get(n.lower()) != v for n, v in frozen.headers):
         raise NoMatch("url")
 
@@ -1198,6 +1201,20 @@ class PlanStore:
                                           **(extra or {})}))
         self._emit(ev)
         return view, None
+
+    def alive(self, pid):
+        """True while the plan may still deliver a response: active, or exhausted (its last use may
+        be in flight), and inside its deadline on both clocks. Revoked, closed, ended, denied and
+        unknown plans are not."""
+        ev = []
+        with self._lock:
+            p = self._plans.get(pid)
+            if p is None:
+                return False
+            self._tick_locked(p, ev)
+            ok = p.state in ("active", "exhausted") and not self._expired_locked(p)
+        self._emit(ev)
+        return ok
 
     def needs_confirm(self, pid):
         with self._lock:

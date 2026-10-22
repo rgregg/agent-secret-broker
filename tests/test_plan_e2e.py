@@ -631,6 +631,210 @@ class WithSessions(PBase):
         self.assertIs(self.broker.plans.mono, clock_mod.mono)
 
 
+class MidFlight(PBase):
+    """The response of a call whose client or plan ended while the upstream was answering is discarded."""
+    plans_cfg = {"max_inflight": 4, "rate_per_min": 100}
+
+    def run_one(self, pid, action):
+        Stub.gate = threading.Event()
+        out = []
+        th = threading.Thread(target=lambda: out.append(self.call(pid, body=self.ok_note())))
+        th.start()
+        end = time.time() + 10
+        while time.time() < end and self.plan_view(pid)["inflight"] < 1:
+            time.sleep(0.02)
+        self.assertEqual(self.plan_view(pid)["inflight"], 1)
+        rid = [e for e in self.events("requested") if e.get("mode") == "http"][-1]["id"]
+        action()
+        Stub.gate.set()
+        th.join()
+        return rid, out
+
+    def assert_discarded(self, rid, out):
+        req = self.broker._by_id[rid]
+        self.assertEqual((req.status, req.error), ("failed", "release failed: plan or client ended"))
+        self.assertIsNone(req.result)
+        blob = json.dumps(out) + self.audit_text()
+        self.assertNotIn('"ok": true', blob)
+        self.assertEqual(self.plan_view(self.pid)["inflight"], 0)
+
+    def setUp(self):
+        super().setUp()
+        self.pid = self.approve(self.manifest(rules=[self.rule(max_uses=50)]))
+
+    def test_client_revoked_mid_flight(self):
+        rid, out = self.run_one(self.pid, lambda: self.broker.revoke_client(self.client["id"], "alice"))
+        self.assert_discarded(rid, out)
+
+    def test_plan_revoked_mid_flight(self):
+        rid, out = self.run_one(self.pid, lambda: self.broker.revoke_plan(self.pid, "alice"))
+        self.assert_discarded(rid, out)
+
+    def test_plan_closed_mid_flight(self):
+        rid, out = self.run_one(self.pid, lambda: self.api("POST", f"/v1/plans/{self.pid}/close", {}))
+        self.assert_discarded(rid, out)
+
+    def test_plan_deadline_passes_mid_flight(self):
+        rid, out = self.run_one(self.pid, lambda: self.tick(4000))
+        self.assert_discarded(rid, out)
+
+    def test_an_undisturbed_call_still_delivers(self):
+        rid, out = self.run_one(self.pid, lambda: None)
+        self.assertIn(self.broker._by_id[rid].status, ("approved", "released"))
+        self.assertEqual(out[0][1]["http"]["status"], 200)
+
+    def test_the_last_use_in_flight_is_still_delivered(self):
+        pid = self.approve(self.manifest(task="one", rules=[self.rule(max_uses=1)]))
+        self.pid = pid
+        rid, out = self.run_one(pid, lambda: None)
+        self.assertIn(self.broker._by_id[rid].status, ("approved", "released"))      # exhausted is not ended
+
+
+class RawStub:
+    """An upstream on a raw socket: records every byte of every connection, answers once the headers and
+    the declared body are in, then keeps listening briefly for a second (pipelined) request."""
+
+    def __init__(self):
+        import socket
+        self.sock = socket.socket()
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(8)
+        self.port = self.sock.getsockname()[1]
+        self.conns = []
+        self.lock = threading.Lock()
+        threading.Thread(target=self.run, daemon=True).start()
+
+    def run(self):
+        import socket
+        while True:
+            try:
+                c, _ = self.sock.accept()
+            except OSError:
+                return
+            threading.Thread(target=self.one, args=(c,), daemon=True).start()
+
+    def one(self, c):
+        import socket
+        buf = b""
+        c.settimeout(0.5)
+        answered = False
+        try:
+            while True:
+                d = c.recv(65536)
+                if not d:
+                    break
+                buf += d
+                if not answered and b"\r\n\r\n" in buf:
+                    answered = True
+                    c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+        except (socket.timeout, OSError):
+            pass
+        with self.lock:
+            self.conns.append(buf)
+        c.close()
+
+    def settled(self):
+        time.sleep(1.2)
+        with self.lock:
+            return list(self.conns)
+
+    def close(self):
+        self.sock.close()
+
+
+class Wire(PBase):
+    """Request smuggling at the wire: exactly the matched bytes reach the upstream, once."""
+    plans_cfg = {"allow_any_body": True}
+
+    def setUp(self):
+        super().setUp()
+        self.raw_up = RawStub()
+        self.addCleanup(self.raw_up.close)
+
+    def rrule(self, **kw):
+        return self.rule(port=self.raw_up.port, max_uses=50, **kw)
+
+    def rcall(self, pid, **kw):
+        kw.setdefault("url", f"http://127.0.0.1:{self.raw_up.port}/v1/notes")
+        return self.call(pid, **kw)
+
+    def split(self, raw):
+        head, _, body = raw.partition(b"\r\n\r\n")
+        lines = head.split(b"\r\n")
+        hdrs = {l.split(b":", 1)[0].decode().lower(): l.split(b":", 1)[1].strip().decode() for l in lines[1:]}
+        return lines[0].decode(), hdrs, body
+
+    def test_a_hostile_content_length_never_reaches_the_wire(self):
+        pid = self.approve(self.manifest(rules=[self.rrule()]))
+        body = json.dumps(self.ok_note(text="x" * 40))
+        for cl in ("5", "0", str(len(body) - 1), str(len(body) + 1), "-1", "5, 5", "0x28"):
+            code, r = self.rcall(pid, raw_body=body, headers={"Content-Length": cl})
+            self.assertEqual((code, r["why"]), (403, "headers"), cl)
+        self.assertEqual(self.raw_up.settled(), [])
+
+    def test_a_matching_call_is_exactly_one_request_with_the_real_content_length(self):
+        pid = self.approve(self.manifest(rules=[self.rrule()]))
+        body = json.dumps(self.ok_note())
+        for hdr in ({}, {"Content-Length": str(len(body))}):
+            self.raw_up.conns.clear()
+            code, r = self.rcall(pid, raw_body=body, headers=hdr)
+            self.assertEqual((code, r["http"]["status"]), (202, 200))
+            conns = self.raw_up.settled()
+            self.assertEqual(len(conns), 1)
+            line, hd, got = self.split(conns[0])
+            self.assertTrue(line.startswith("POST /v1/notes HTTP/1.1"))
+            self.assertEqual(int(hd["content-length"]), len(body.encode()))
+            self.assertEqual(got, body.encode())                       # nothing after the matched body
+            self.assertEqual(conns[0].count(b"HTTP/1."), 1)
+            self.assertNotIn("transfer-encoding", hd)
+
+    def test_a_body_that_looks_like_a_second_request_stays_inside_the_declared_length(self):
+        pid = self.approve(self.manifest(rules=[self.rrule(body={"any": True})]))
+        smuggle = '{"a": 1}\r\n\r\nGET /evil HTTP/1.1\r\nHost: x\r\n\r\n'
+        code, r = self.rcall(pid, raw_body=smuggle, headers={"Content-Length": str(len(smuggle.encode()))})
+        self.assertEqual(code, 202)
+        conns = self.raw_up.settled()
+        self.assertEqual(len(conns), 1)
+        line, hd, got = self.split(conns[0])
+        self.assertEqual((int(hd["content-length"]), got), (len(smuggle.encode()), smuggle.encode()))
+        # and with a short declared length the call never leaves the broker
+        self.raw_up.conns.clear()
+        code, r = self.rcall(pid, raw_body=smuggle, headers={"Content-Length": "8"})
+        self.assertEqual((code, r["why"]), (403, "headers"))
+        self.assertEqual(self.raw_up.settled(), [])
+
+    def test_framing_and_routing_headers_are_refused(self):
+        pid = self.approve(self.manifest(rules=[self.rrule()]))
+        body = self.ok_note()
+        for name, val in (("Connection", "keep-alive"), ("Connection", "close"), ("Expect", "100-continue"),
+                          ("TE", "trailers"), ("Upgrade", "websocket"), ("Trailer", "X"),
+                          ("Transfer-Encoding", "chunked"), ("Content-Encoding", "gzip"), ("Host", "evil.example"),
+                          ("Cookie", "a=b"), ("Keep-Alive", "1"), ("Proxy-Connection", "x"),
+                          ("X-HTTP-Method-Override", "DELETE"), ("Forwarded", "for=x")):
+            for variant in (name, name.lower(), name.upper()):
+                code, r = self.rcall(self.pid_of(pid), body=body, headers={variant: val})
+                self.assertEqual((code, r.get("why")), (403, "headers"), variant)
+        self.assertEqual(self.raw_up.settled(), [])
+
+    def pid_of(self, pid):
+        return pid
+
+    def test_urllib_sets_the_length_from_the_real_body(self):
+        import urllib.request
+        from secret_broker import plans as P
+        body = b'{"a": 1}'
+        f = P.Frozen("POST", "http://127.0.0.1:9/x", [("Content-Type", "application/json")], body)
+        req = urllib.request.Request(f.url, data=f.body, method=f.method, headers=dict(f.headers))
+        P.assert_sent_is_matched(f, req)
+        req.add_header("Content-Length", "3")
+        with self.assertRaises(P.NoMatch):
+            P.assert_sent_is_matched(f, req)                           # a length that is not the body's
+        req2 = urllib.request.Request(f.url, data=f.body, method=f.method, headers=dict(f.headers))
+        req2.data = body + b"GET / HTTP/1.1\r\n\r\n"                     # surplus bytes
+        with self.assertRaises(P.NoMatch):
+            P.assert_sent_is_matched(f, req2)
+
+
 class Submission(PBase):
     def test_bad_manifests_are_400_with_a_fixed_sentence(self):
         for m, frag in ((self.manifest(v=2), "v: must be 1"), (self.manifest(rules=[]), "rules"),

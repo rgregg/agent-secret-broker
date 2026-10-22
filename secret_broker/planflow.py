@@ -44,12 +44,19 @@ def error_class(exc):
         return "connection"
     if type(exc).__name__ == "BackendError":
         return "vault"
+    if isinstance(exc, PlanEnded):
+        return "ended"
     return "other"
 
 
 _RELEASE_TEXT = {"timeout": "release failed: timeout", "tls": "release failed: tls",
                  "dns": "release failed: name resolution", "connection": "release failed: connection",
-                 "vault": "release failed: vault", "other": "release failed: other"}
+                 "vault": "release failed: vault", "other": "release failed: other",
+                 "ended": "release failed: plan or client ended"}
+
+
+class PlanEnded(Exception):
+    """The plan or its client ended while the upstream call was in flight: the response is discarded."""
 
 
 def source_sig(sc):
@@ -333,6 +340,11 @@ class PlansMixin:
         out = _exchange_frozen(done, list(env.values()), self._tls_policy(req.names))
         self.audit("http_executed", req, upstream_status=out["status"], response_bytes=len(out["body"]),
                    duration_ms=int((time.time() - t0) * 1000))
+        # Re-check after the upstream answered (the sessions rule): a revoked client, or a plan that was
+        # revoked, closed or ran out of time mid-flight, never gets the response.
+        if not self.clients.is_active(req.client["id"]) or not self.plans.alive(m.plan_id):
+            out = None
+            raise PlanEnded()
         return {"http": out}
 
     # -- the owner's own views ------------------------------------------------------------
