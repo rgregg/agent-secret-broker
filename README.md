@@ -57,7 +57,7 @@ Then:
 ## The web app
 
 `https://<your approval site>/` has three tabs: **Requests** (what is waiting, and
-recent history), **Policies** (standing approvals, with Revoke), and
+recent history), **Policies** (active plans and standing approvals, each with Revoke), and
 **Settings** (browser and push notifications). It follows your system light or
 dark setting and works on a phone.
 
@@ -70,6 +70,7 @@ dark setting and works on a phone.
 | [docs/cli.md](docs/cli.md) | Install `asb`, use it, and set up agents; exit codes; troubleshooting |
 | [docs/guidance.md](docs/guidance.md) | Per-credential risk guidance: how it works and starter texts for common services |
 | [docs/rehearsal.md](docs/rehearsal.md) | `tools/rehearse_local_backend.py`: an end-to-end rehearsal of the encrypted local backend (real broker, real CLI, Docker) before you rely on it |
+| [docs/proposals/task-plans.md](docs/proposals/task-plans.md) | Plan mode: one approval for an unattended job's exact calls, with an absolute deadline (`asb plan`) |
 | [docs/reference.md](docs/reference.md) | How it works: catalog format, policy and risk, notifications, storing credentials, audit, threat model |
 
 ## Threat model, in one paragraph

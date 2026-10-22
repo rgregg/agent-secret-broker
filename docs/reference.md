@@ -1830,6 +1830,208 @@ validated exactly as the catalog will read it back before anything is written. I
   `credential_provided` and `credential_refused` are hidden approver activity.
   History shows the request, follows a rename, and the detail view says the purpose is not retained.
 
+## Plans (task-scoped grants for unattended jobs)
+
+An unattended or long job (an overnight sync, a multi-step task while nobody is at the phone) can make
+exactly the calls it declared up front, after a human approved the whole list once. The alternative is
+one tap per call, or `approval: allow`, where the risk model is the only gate and the model reads text the
+agent controls. A plan replaces that with a **deterministic match against a manifest a human read**. No
+model is involved: not for the card, not for the match. Design and decisions:
+[proposals/task-plans.md](proposals/task-plans.md). Commands: [cli.md](cli.md#plans-for-unattended-jobs).
+
+    asb plan submit manifest.json          # waits for you; prints the plan id once approved
+    asb http NAME POST URL ... --plan ID   # released with no prompt if it matches a rule
+    asb plan status ID | list | close ID
+
+Mental model: you approve a job's shopping list, with a stopwatch, on one machine.
+
+### The manifest
+
+    {"v": 1, "task": "nightly finance sync", "description": "pull balances, post one note",
+     "ttl_seconds": 28800,
+     "rules": [
+       {"secret": "monarch", "method": "POST", "host": "api.monarchmoney.com", "path_prefix": "/graphql/read",
+        "max_uses": 50, "body": {"graphql": {"document": "query Accounts { accounts { id balance } }",
+                                              "variables_keys": []}}},
+       {"secret": "ledger", "method": "POST", "host": "ledger.example.com", "path_prefix": "/v1/notes",
+        "max_uses": 5, "body": {"json": {"keys": ["text"], "pin": {"kind": "reconcile"}}}}]}
+
+Rule keys: `secret`, `method` (uppercase), `host` (lowercase ASCII, one of the credential's
+`allowed_hosts`), `path_prefix`, `max_uses`; optional `port` (default 443, or 80 for `http`), `scheme`
+(`https`, or `http` only for a private IP address host), `query`, `body`. `sessions`, `window` and
+`rules[].session` are recognized and refused ("not supported yet"). `task` (1-80 characters) and
+`description` (0-400) are **untrusted text**: hidden and control characters are refused (the same checks as
+credential-request purposes; the 400 names the class and offset, never the character), the card shows every
+non-ASCII character as `<U+XXXX>` in a box marked "written by the agent, not verified, not used for any
+decision", they never go into a notification, and the audit log keeps only their length and a hash prefix.
+`ttl_seconds` defaults to `plans.default_minutes`; more than `plans.max_minutes` is a 400.
+
+### The matcher
+
+A call made with `--plan ID` is built once into a frozen request (placeholders substituted as in any http
+call) and matched against the rules as sent. **Every** item must hold; any doubt or parse error is a
+non-match, and that exact object is what is sent (the matcher runs again on the substituted request with
+the filled header values treated as opaque).
+
+- **Placeholders.** `{{...}}` in the URL (path, query or host) or in the body is refused. In a header it is
+  allowed only if it is one of the rule's **own** credential's variables and is the **entire** value
+  (optionally behind a scheme word such as `Bearer `). Nothing may survive substitution.
+- **Host and URL.** One parse. Refused: userinfo, a fragment, a trailing dot, uppercase or non-ASCII
+  characters in the host (checked before comparing; no silent lowercasing), characters parsers disagree on
+  (backslash, spaces, control characters), an IP literal unless it is the rule's own host. Host and explicit
+  port must equal the rule's. The rule host must be in the credential's `allowed_hosts` at submit **and at
+  every use**. Scheme must equal the rule's; plain `http` only for a private/loopback/link-local IP literal
+  (a name such as `.lan` is never "private" for plans). **Redirects are never followed**: the 3xx comes back
+  masked, without `Set-Cookie`, and a follow-up is a new call that needs its own rule.
+- **Method.** Exact and uppercase, one method per rule.
+- **Path.** `path_prefix` is absolute, segment aligned (the path equals it or continues after a `/`), as
+  sent. Refused: dot segments, an empty segment (`//`), `;`, backslash, control characters. **Percent-encoding
+  is an allowlist**: only `%20` and non-ASCII UTF-8 sequences in uppercase hex (a valid, non-overlong
+  sequence) may appear; every other encoded byte (`%25`, `%2e`, `%2f`, `%5c`, `%00`, encoded letters and
+  digits, lowercase hex) is a non-match, so nothing can double-decode into another path upstream. The broker
+  never decodes anything before comparing. A prefix of only `/` needs `plans.allow_root_prefix`.
+- **Query string.** A rule that writes (anything but GET, HEAD, OPTIONS) defaults to `"query": "none"`: any
+  query string is a non-match. It may instead list the allowed key names (`"query": ["dry_run", "page"]`,
+  values unconstrained, up to 16); the card shows them. A GraphQL rule must be `"none"`. Read rules default to
+  `"any"`. In every mode keys must be plain (`A-Za-z0-9_.-`, never percent-encoded, no `;`), and method or body
+  override parameters (`_method`, `method`, `operationName`, `variables`, `extensions`,
+  `x-http-method-override`, `body`) are always refused, so a matching body cannot be changed from the URL.
+- **Headers.** Only `plans.allowed_request_headers` (default `Accept`, `Content-Type`, `Content-Length`,
+  `If-None-Match`, `User-Agent`) plus the placeholder headers above. Anything else (`Host`,
+  `X-HTTP-Method-Override`, `X-Forwarded-*`, `Transfer-Encoding`...) is a non-match, as is any duplicate
+  header (case-insensitive). `Content-Length`, when present, must equal the body's size in bytes; chunked
+  bodies are refused.
+- **Body.** `none` (empty), `json` (top-level keys a subset of `keys`; every `pin` present with exactly the
+  pinned string, boolean, integer or null; unpinned values are free and the card says so; nested values are
+  never pinned), `graphql` (see below) or `any` (opt-in with `plans.allow_any_body`; shown in red). A rule with
+  no `body` accepts only an empty one; a write must declare a matcher. All JSON is parsed strictly:
+  duplicate keys at any depth, NaN/Infinity, integers beyond 2^53, lone surrogates, a BOM, trailing data,
+  nesting over 8 and more than 64 members per object are non-matches. `Content-Type` must be exactly
+  `application/json` (optionally `; charset=utf-8`). Strings compare byte-exact after decoding. A body over
+  `plans.max_body_bytes` never matches.
+- **GraphQL.** `query` must be **byte-equal** to the declared `document` (at most 4096 characters), with
+  only `query`, `operationName` and `variables` in the object: a batch (an array), `extensions` (including
+  persisted-query hashes) or any other key is a non-match. `variables` keys must be a subset of
+  `variables_keys`; values are free. `operation_name` is required when the document has more than one
+  operation. A document containing `mutation` or `subscription` anywhere (strings and comments too, on
+  purpose) or that cannot be parsed is a **write**; it is accepted only with
+  `plans.allow_graphql_mutation` (default false) and is then high.
+- **Uses, rate, in-flight.** Every rule needs `max_uses`. A use is **reserved under the plan lock when the
+  match succeeds, before the upstream call**; a failed or timed-out call still counts (no refunds). At most
+  `plans.rate_per_min` released calls per plan in a sliding 60 s (`rate_limited`, with `retry_after_s`; it
+  does not consume a use) and at most `plans.max_inflight` calls executing per plan (`inflight_limit`; the
+  slot is released in a `finally`, and the 15 s sweep reconciles it against live threads). Check order: plan
+  state and client, rule match, rate, in-flight, uses.
+
+Nothing user-supplied is ever compiled as a regular expression. Not in v1: regex, JSON-pointer pins, wildcards,
+schema matching, windows, sessions, renewal.
+
+### Time, binding and revocation
+
+- **Absolute deadline.** `expires_at = approved_at + granted_s`, fixed at approval, never moved by use, no
+  renewal and no extend button. On the card you may pick a **shorter** duration than requested, never longer.
+  A plan is dead if **either** the wall clock or the monotonic clock says so (a clock set back cannot revive
+  it; suspend is covered by the wall check); expiry is enforced on every use and by the 15 s sweeper.
+- **Per client.** A plan belongs to the authenticated client id; every operation re-checks it under the plan
+  lock. The plan id (128 random bits, hex) is an identifier, never a bearer: it authorizes nothing without the
+  client credential. Unknown, expired, foreign and malformed ids all get the **same 404**. The shared legacy
+  key cannot submit plans (`plans.allow_legacy`, default false). Revoking a client revokes its plans.
+- **Memory only.** A restart drops every plan (fail closed): calls get exit 7 `kind: unknown` and the job must
+  submit again, which needs you.
+- **Revoke.** Policies tab, **Active plans** table, Revoke (SSO, CSRF, same-origin). It takes effect before the
+  next call; a call already released finishes. Terminal plans stay visible to their owner and History for an
+  hour.
+- **Per credential.** `"plans": false` in the credential's broker metadata refuses it in plans, checked at
+  submit and at use. Per client: `clients.<id>.plans` with `enabled` and `max_minutes`.
+
+### The card
+
+Requests tab and the link page, behind SSO, CSRF and same-origin. It shows, generated by code from the
+validated structure: each rule (method, URL, uses, body fixed / partly pinned / "not constrained", that a path
+prefix covers a **subtree**), the worst case (calls, credentials, sites, per minute, whether anything changes
+data, deletes or accepts any content), each credential's `allowed_hosts` surface, and the deterministic tier:
+read-only rules low; rules that write medium; **high** for DELETE, an any-content body, a GraphQL mutation or
+a **shallow prefix** (one path segment or fewer). A high plan needs a **second confirmation** (Approve, then
+"This plan can ... Approve anyway?"); the server enforces it, so a forged plain approve is refused. A long
+duration is not a reason. The card cannot be approved from a notification, a push or Home Assistant button, a
+token or the link page's old form: only the SSO approval pages, with CSRF.
+
+Hard caps (a manifest over one is a 400 naming the field): `max_rules` 20, `max_uses_per_rule`,
+`max_total_uses`, `max_minutes`, `rate_per_min`, `max_body_bytes`, no any-body, no `/` prefix, no GraphQL
+mutation, `deny_secrets`. Fatigue limits: a card waits `pending_ttl_s` (900), `max_pending` 2 pending plans,
+`max_active_per_client` 2 active (excess: 429), 60 s cooldown after denying the same client's same task name.
+
+**A plan makes a client effectively exempt from its own `auto_approve_max` for exactly the approved calls; that
+is the point**, and it is why you approve each plan. A plan never widens a credential's `allowed_hosts`,
+`deny_secrets`, `plans: false`, a client's `auto_approve_max: "none"` or a client-level `plans.enabled: false`:
+each is checked at submit and again at every use (a per-client deny wins over a plan). A catalog change in the
+vault is seen within `CATALOG_TTL` (60 s); changes made through the broker apply at once.
+
+### Notifications
+
+Push, Home Assistant, Telegram and ticker carry **no Approve or Deny**: the text is
+`Plan requested: <client name>, <n> rule(s): <secret names>` plus a link to the card. Every token channel
+refuses mode `plan`.
+
+### Audit and History
+
+| Event | Fields |
+|---|---|
+| `plan_issued` | `id` (the card), `plan_id`, rule count, `names`, `granted_s`, `expires_at`, approver, channel, peer, `manifest_hash`, `rules_hash`, task and description length and hash prefix |
+| `plan_closed` | `plan_id`, `cause` (`agent`, `deadline`, `exhausted`), `uses` |
+| `plan_revoked` | `plan_id`, `by`, `left_s`, `cause` (`human`, `client_revoked`), peer, client IP |
+| `plan_used` | `id` (the call), `plan_id`, `rule` (index), `uses_left_rule`, `uses_left_plan`, `left_s` |
+| `plan_miss` | `plan_id` (only the owner's), `reason`, `why` (the item that failed), `suppressed`; **coalesced** to 5 a minute per plan |
+
+`plan_internal_error` (class name only) is hidden from agents. A plan-released call also writes the normal
+`requested`, `approved` (`via: policy`, `decision_source: plan`, `plan_id`), `http_executed`, `delivered`, so
+History shows "Decided by: plan abcd1234 (auto-approved), 3 h 12 min left". The agent audit view is a
+deny-by-default whitelist: it sees `plan_id`, the rule index, uses left and a coarse reason, never the
+approver, channel, cause, hashes or any text, and a plan-released call is a plain `approved`. Nothing in any
+channel holds a secret, header value, body, document, `task`, `description` or exception text.
+
+### Config
+
+    "plans": {"enabled": true, "default_minutes": 30, "max_minutes": 480, "pending_ttl_s": 900,
+              "max_rules": 20, "max_uses_per_rule": 500, "max_total_uses": 2000, "rate_per_min": 30,
+              "max_inflight": 4, "max_body_bytes": 16384, "max_pending": 2, "max_active_per_client": 2,
+              "allow_any_body": false, "allow_root_prefix": false, "allow_graphql_mutation": false,
+              "allow_legacy": false,
+              "allowed_request_headers": ["Accept", "Content-Type", "Content-Length", "If-None-Match", "User-Agent"],
+              "deny_secrets": []}
+
+Validated at startup naming the field (unknown keys refused; `max_minutes` 1-720, the ceiling; routing and
+framing headers cannot be allowed). `enabled: false` makes `POST /v1/plans` a 403 and every plan call a 404
+`kind: unknown` (it is never turned into a prompt). `GET /v1/status` reports `features.plans`.
+Per client: `"clients": {"c-1a2b3c4d": {"plans": {"enabled": true, "max_minutes": 60}}}`.
+
+### Errors and exit codes
+
+Unknown, expired, closed and wrong-client plans are always `404 {"error": "plan not usable", "kind": ...}`;
+only the owner's retained record gets a specific `kind` (`ended`, `exhausted`, `closed`, `revoked`), else
+`unknown`.
+
+| Situation | HTTP | `asb` exit |
+|---|---|---|
+| Manifest invalid or over a cap | 400 | 3 |
+| Disabled, legacy client, never-auto client, `plans: false` or `deny_secrets` | 403 | 3 |
+| Too many pending or active plans, or the same task denied recently | 429 | 3 |
+| Call outside the plan (`no_rule` with `why`, `uses_exhausted`, `wrong_policy`) | 403 `{"error": "outside plan", "reason": ...}` | 3 |
+| `rate_limited`, `inflight_limit` | 429 with `retry_after_s` | 8 |
+| Plan not usable | 404 | 7 |
+| Denied / expired while pending | | 4 / 5 |
+| Upstream status 400 or more | | 22 |
+
+### Threat model for plans
+
+An injected agent can submit a broad manifest: the caps refuse the widest shapes, every plan needs you to read
+a code-rendered worst case, a high plan needs a second confirmation, and it can never reach beyond
+`allowed_hosts`. The residual is approving without reading: treat an unexpected plan card as a possible
+injection and deny it. A stolen plan id is useless without the client credential. A compromised client holds
+the credential and can use its own live plans within their rules, caps, rate and deadline, nothing more; revoke
+the client and its plans die at once. Not protected: what a matched call does at the target (the match
+constrains the request, not the API's behavior), which is why every write is labelled "can change data".
+
 ## Vault session lifetime
 
 The vault is not kept open (the local backend drops its decrypted contents after
@@ -2138,7 +2340,7 @@ values, header values or bodies (those live in the separate, short-lived
 Events: `startup` (policies in force), `requested`, `assessed`, `notified`,
 `secret_read`, `approved`/`denied`/`expired`/`failed` (with `via` user or
 policy, approver, reported client IP, latency), `http_executed`, `delivered`,
-`escalated`, `stored`, `request_detail_viewed`, `grant_created`/`grant_used`/`grant_revoked`/`grant_expired` (see Standing approvals), `standing_change_failed`, `config_warning`, `policy_changed`, `policy_change_refused`, `policy_change_failed`, `guidance_changed`
+`escalated`, `stored`, `request_detail_viewed`, `plan_issued`/`plan_used`/`plan_miss`/`plan_closed`/`plan_revoked` (see Plans), `grant_created`/`grant_used`/`grant_revoked`/`grant_expired` (see Standing approvals), `standing_change_failed`, `config_warning`, `policy_changed`, `policy_change_refused`, `policy_change_failed`, `guidance_changed`
 (secret, user, peer, length, sha256 prefixes of the old and new text, never the
 text), `guidance_change_refused`, `guidance_change_failed`, and
 security events `auth_failed` (Home Assistant hook), `client_auth_failed`, `rejected`, `approval_viewed`,
@@ -2287,6 +2489,8 @@ or `expired` mean a human was asked (the agent also learns that from its own req
   needs you to match the code. An attacker who can race a pending enrollment gains nothing unless
   you approve a card you did not start. Rate limits are per socket address, so behind a proxy they
   are global. Until `legacy_client_key` is `deny`, anyone with the old shared key still works.
+- **Plans** are one human approval for a deterministic list of calls with an absolute deadline; they do not
+  stop what an approved call does at the target. See [Plans](#plans-task-scoped-grants-for-unattended-jobs).
 - Output masking is exact-match; a program that transforms a secret before
   printing it (base64, splitting) defeats it.
 

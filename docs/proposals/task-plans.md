@@ -1,9 +1,9 @@
 # Proposal: plan mode (task-scoped grants for unattended jobs)
 
-Status: **proposed** (revision 2, after review). Closes issue #5 ("task-scoped grants") and is
+Status: **v1 implemented** (revision 3; see "Deviations in the v1 implementation" at the end). Closes issue #5 ("task-scoped grants") and is
 designed together with issue #18 (http sessions), as #5's follow-up comment asks. It builds on
 per-client credentials (merged, see "Clients" in reference.md) and on the http sessions design
-decisions below. This document is a design only; no code is part of it.
+decisions below. The v1 code is secret_broker/plans.py, secret_broker/planflow.py and small hooks in broker.py and client/asb.
 
 ## Goal
 
@@ -270,8 +270,16 @@ the 3xx comes back masked and a follow-up is a new call that needs its own rule.
 **D. Path.** `path_prefix` is absolute, 1-200 ASCII characters, segment aligned: the request path
 equals the prefix, or begins with the prefix plus `/`. Matched as sent. Non-match for: dot segments
 (`.`, `..`, percent-encoded forms), `%2f`, `%5c`, `%00`, other percent-encoded unreserved
-characters, backslash, `;`, control characters, a `//` run. A prefix of only `/` needs
-`plans.allow_root_prefix` (default false). `query`: `"any"` (default) or `"none"`.
+characters, backslash, `;`, control characters, a `//` run. **Percent-encoding is an allowlist**: only
+`%20` and non-ASCII UTF-8 sequences in uppercase hex (strictly valid, so no overlong forms) may appear; every
+other encoded byte, including `%25` (which can double-decode upstream), `%2e`, `%2f`, `%5c`, `%00`, encoded
+unreserved characters and lowercase hex, is a non-match. A prefix of only `/` needs `plans.allow_root_prefix`
+(default false). **`query`**: a rule that writes defaults to `"none"` (any URL query string is a non-match)
+and may instead list the allowed query key names (`["dry_run"]`, up to 16, values unconstrained; shown on the
+card); a GraphQL rule must be `"none"`; read rules default to `"any"`. Keys must be plain (never
+percent-encoded, no `;`) and method or body override parameters (`_method`, `method`, `operationName`,
+`variables`, `extensions`, `x-http-method-override`, `body`) are always a non-match, so the URL cannot change
+what a matching body means upstream.
 
 **E. Headers.** The request may carry only `plans.allowed_request_headers` (default `Accept`,
 `Content-Type`, `Content-Length`, `If-None-Match`, `User-Agent`) plus the placeholder headers of
@@ -650,3 +658,36 @@ All earlier open questions were decided (see "Decisions"). One remains:
 1. **Sessions code coordination.** The session record and in-scope check did not exist when this
    was written; the integration names in section 2 (`open_for_plan`, `close_for_plan`,
    `session.run`) and the redirect override must be reconciled with that code before phase 2.
+
+## Deviations in the v1 implementation
+
+Everything above holds except the following, each decided while building it.
+
+1. **Query string and percent-encoding** are stricter than first written (item D above): writes and GraphQL
+   default to no query string; only `%20` and uppercase-hex UTF-8 may be percent-encoded.
+2. **Rule keys `port` and `scheme`** were added (defaults 443 / `https`; `http` only for a private IP literal
+   host), so a rule states exactly what it matches and a loopback stub can be used in tests. The credential
+   metadata pin for plain http to a named host is **not** implemented: plain http is private IP literals only.
+3. **`asb plan submit` waits for the human by default** and prints the plan id once approved; `--no-wait`
+   prints the pending id; `--wait` is accepted as a no-op. `POST /v1/plans` takes `{"manifest": {...},
+   "source": "user@host"}` and answers `{"id": <card request id>, "plan": <plan id>, "status", "expires_in"}`;
+   the card is polled with `GET /v1/requests/<id>` whose approved result carries the plan id and is repeatable.
+4. **`plans.enabled: false`** refuses plan calls (404 `kind: unknown`) instead of ignoring `plan` on a request,
+   because ignoring it would turn the call into a prompt.
+5. **`GET /v1/plans/<id>` and `asb plan status`** return rule summaries (URL, method, body kind, uses), never
+   the task, description, GraphQL document, pins or keys, so those texts have no agent-readable channel.
+6. **Item-id re-read** is implemented as a comparison of the credential's vault source (item, field, key of
+   every variable) recorded at approval. The catalog is re-read within `CATALOG_TTL` (60 s); changes made
+   through the broker's own policy pages apply immediately.
+7. **`plan_miss`** carries `why` (the failed matcher item: `method`, `host`, `path`, `query`, `headers`,
+   `placeholder`, `size`, `body`, `secret`, `request`) besides `reason`; a use of a plan that is not usable is
+   audited as `unusable_<kind>`. The agent audit view shows only `plan_id` and `reason`.
+8. **A shallow prefix is high for every rule**, read-only ones too (literal reading), so the example manifest
+   in section 1 (`/graphql`) would show the second confirmation; use a deeper prefix to avoid it.
+9. **Set-Cookie** is stripped from 3xx responses of plan calls (the doc's session rule, applied to plan calls
+   in general).
+10. **Per-client `plans.max_minutes`** replaces the global ceiling for that client (1-720); it can be higher
+    than the global value.
+11. `asb http --plan` sends the method uppercased (ASCII); a plan call's method is matched exactly as sent.
+12. Plan cards expire through the same request expiry; the plan record follows its card (denied, expired,
+    failed all end it).
