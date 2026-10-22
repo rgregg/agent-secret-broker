@@ -689,7 +689,7 @@ class SessionsMixin:
                   "names": [s.cred]}
         if actor is not None:
             fields["revoked_by"] = actor
-        self.log("session_" + reason, **fields, **extra)
+        self.log(f"session_{reason}", **fields, **extra)
 
     def _sess_lookup(self, sid, cid, now):
         """(Session or None, state) for `sid` as seen by client `cid`: ok | unknown | expired | closed |

@@ -1,6 +1,6 @@
 # Proposal: http sessions (cookie jar and captured values for multi-step API flows)
 
-Status: **in progress** (issue #18). See "Implementation notes and deviations" at the end.
+Status: **implemented** (issue #18; validated against a stub upstream only, see "Not covered"). See "Implementation notes and deviations" at the end.
 Relates to issue #5 (task-scoped grants), #15 (per-client credentials) and #14 (agent setup).
 
 ## Problem
@@ -111,8 +111,8 @@ A plan-mode feature builds on sessions rather than beside them:
 - **The session record.** `secret_broker/sessions.py: Session` (id, public prefix, client, credential,
   hosts, methods, ttl, expiry, calls, jar, captures). Expiry is read only from `Session.expires`.
 - **The in-scope check function.** `SessionsMixin._session_call` calls one pure function,
-  `scope_problem(session, secret_cfg, names, method, url, headers, captures)`, returning None or a
-  (reason_class, message) pair. A manifest rule check is added there. It runs under the store lock
+  `scope_problem(session, secret_cfg, names, method, spec)` (spec holds url, headers, body), returning None or
+  a (reason_class, message) pair. A manifest rule check is added there. It runs under the store lock
   so the counter increment and the check are atomic.
 - **Audit events.** `session_requested`, `session_opened`, `session_used`, `session_refused`
   (reason class), `session_closed`, `session_expired`, `session_revoked`. A plan feature can add
@@ -251,4 +251,19 @@ against a throwaway broker for the end-to-end flow. Rehearsal scenario in
 
 ## Implementation notes and deviations
 
-(Filled in as the implementation lands.)
+- Code: `secret_broker/sessions.py` (config, capture parser, jar, `Session`, `scope_problem`, the http executor,
+  card and active-list HTML, `SessionsMixin`); hooks in `broker.py` (`create`, `decide_via`, `_release`, handlers),
+  `clients.py` (revoke ends sessions), `audit_api.py`, `history.py`, `risk.py`; the CLI in `client/asb`.
+- A session call is an ordinary `Request` that is finished inline (`via: session`), so history, request details and the
+  `delivered` flow work unchanged. The result carries `session: {captured, missing, calls_left, expires_in}`.
+- Ended sessions leave a tombstone (id hash, client, reason; 500 max, 24 h) so the owner is told "expired/closed/revoked"
+  while everyone else gets "unknown". Tombstones hold no jar or values.
+- The agent's audit view whitelists the session events but deliberately omits `hosts` and `methods` (the agent chose them,
+  and the redaction test treats `hosts` as policy context). The human's history shows everything.
+- `asb session close` and `status` use `POST /v1/requests` mode `session_close` and `GET /v1/sessions/<id>`, so the client
+  API still has exactly one POST endpoint and none takes a secret.
+- `features.http_sessions` in `/v1/status` is an object (the config values), not a bool.
+- Not done: the `asb agent-setup` instruction block (#14) is unchanged; the decision rule is in `asb guide` and
+  `asb help session`. Per-credential `modes`, batch requests and automatic CSRF rotation are out of scope.
+- The cookie jar is deliberately simpler than a browser's: every cookie is host-only, `Domain` and `SameSite` are
+  ignored, `__Host-` and `__Secure-` prefixes get no special handling.

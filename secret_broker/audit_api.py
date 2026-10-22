@@ -84,10 +84,8 @@ WHITELIST = {
     "catalog_loaded": {"count": ("count", _I), "invalid_count": ("invalid", "count")},
     "catalog_error": {}, "backend_error": {},
     # http sessions (the agent's own: client-scoped like every event). No approver, no policy.
-    "session_requested": {"names": ("names", _L), "hosts": ("hosts", _L), "methods": ("methods", _L),
-                          "ttl_s": ("ttl_s", _I), "max_calls": ("max_calls", _I)},
-    "session_opened": {"session": ("session", _S), "hosts": ("hosts", _L), "methods": ("methods", _L),
-                       "ttl_s": ("ttl_s", _I), "max_calls": ("max_calls", _I)},
+    "session_requested": {"names": ("names", _L), "ttl_s": ("ttl_s", _I), "max_calls": ("max_calls", _I)},
+    "session_opened": {"session": ("session", _S), "ttl_s": ("ttl_s", _I), "max_calls": ("max_calls", _I)},
     "session_used": {"session": ("session", _S), "host": ("host", _S), "calls": ("calls", _I),
                      "max_calls": ("max_calls", _I)},
     "session_refused": {"session": ("session", _S), "reason": ("reason_class", _S), "method": ("method", _S),
