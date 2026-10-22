@@ -218,6 +218,17 @@ shows them. Active sessions appear on the Clients tab with a live countdown and 
 default and cap (configurable, ceiling 10000); 3 sessions per client (configurable), 20 total; 2
 pending open requests per client plus the general pending cap and deny cooldown; 5 hosts; no redirects; 8192-character urls and header values, 50 headers, 100 placeholders of up to 64 characters; 50 cookies; 16 captures; 1 MB response read.
 
+## Method override (fail closed)
+
+A session's methods are the verbs the human approved, and many servers let a request change its verb with a header or a
+`_method` field. A regex over the raw request cannot be trusted for this (JSON unicode escapes, double percent-encoding, multipart
+field names, content encodings all evade it), so the broker parses instead and refuses what it cannot parse: request
+`Content-Encoding`/`Transfer-Encoding` are refused; X-HTTP-Method style headers are refused unless the verb is declared; query,
+form and JSON keys are decoded (at every JSON depth) and refused if they name an override; any other or unparseable body, and a
+query with `;` separators, must contain no case-insensitive `method` in raw, percent-decoded or JSON-unescaped form. The checks
+run on the template and again on the substituted request. Nothing is allowed that merely "looks harmless": the rule is
+refuse-by-default, with the cost that a non-JSON, non-form body containing the word `method` is refused.
+
 ## Failure modes
 
 - Broker restart: all sessions gone; the next call is `session_unknown` (exit 7).
@@ -267,7 +278,7 @@ against a throwaway broker for the end-to-end flow. Rehearsal scenario in
   linear placeholder scan with size caps and no scope check under the store lock (a cubic regex under the global lock froze
   every session for seconds); in-flight calls are re-checked after the upstream answers (revoke, close, client revoke, deadline
   discard the response and the jar changes); session calls have status `running`, not `pending`, so they cannot be decided or
-  counted as pending; method-override headers, `_method` fields and bodies on GET/HEAD are refused; redirects are never
+  counted as pending; method override is refused by parsing, not by a pattern (see below) and bodies on GET/HEAD are refused; redirects are never
   followed (replacing the earlier follow-inside-hosts design: simpler, and no hop can change method, port or count);
   the manifest and card carry the port and calls are scope-checked on it; deadlines use `time.monotonic()` (an injectable
   clock for tests, wall time for display only); captured values must be printable ASCII and a call that never left the

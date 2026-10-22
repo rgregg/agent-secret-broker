@@ -82,7 +82,10 @@ _COOKIE_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 _KEY_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _TOKEN_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
 OVERRIDE_HEADERS = ("x-http-method", "x-http-method-override", "x-method-override")
-_OVR_RE = re.compile(rb"_method[\"']?\s*[:=]\s*[\"']?([A-Za-z]*)", re.I)
+_OVERRIDE_KEYS = ("_method", "method", "_http_method", "http_method", "x-http-method", "x-http-method-override",
+                  "x-method-override")
+MAX_JSON_DEPTH = 64
+_JSON_UNESC = re.compile(r"\\u([0-9a-fA-F]{4})")
 _HOSTPORT_RE = re.compile(r"^([A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?)(?::([0-9]{1,5}))?$")
 _ILLEGAL_HEADER_VALUE = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")
 _HEADER_TOKEN = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
@@ -445,24 +448,109 @@ def _origin(url):
         return "", "", 0, ""
 
 
+OVERRIDE_REFUSED = "a method override is not allowed in a session call"
+ENCODING_REFUSED = "a session call cannot use Content-Encoding or Transfer-Encoding"
+
+
+def _decoded_forms(data):
+    """The raw text and its percent-decoded (up to 3 rounds) and JSON-unescaped forms, lowercased, plus a
+    variant with every non-letter removed. Used only for the fail-closed substring test."""
+    text = data.decode("latin-1") if isinstance(data, bytes) else data
+    forms = {text}
+    cur = text
+    for _ in range(3):
+        cur = urllib.parse.unquote_to_bytes(cur).decode("latin-1")
+        forms.add(cur)
+    for f in list(forms):
+        forms.add(_JSON_UNESC.sub(lambda m: chr(int(m.group(1), 16)), f))
+    forms |= {f.replace("\\", "") for f in forms}
+    out = set()
+    for f in forms:
+        f = f.lower()
+        out.add(f)
+        out.add(re.sub(r"[^a-z]", "", f))
+    return out
+
+
+def _has_method_text(data):
+    return any("method" in f for f in _decoded_forms(data))
+
+
+def _key_is_override(key):
+    """A form or JSON key that names a method override, after repeated percent-decoding."""
+    k = key
+    for _ in range(4):
+        if k.strip().lower() in _OVERRIDE_KEYS:
+            return True
+        nk = urllib.parse.unquote(k)
+        if nk == k:
+            break
+        k = nk
+    return False
+
+
+def _json_keys_override(doc):
+    """True when any object key at any depth is an override name. Iterative, depth-bounded."""
+    stack = [(doc, 0)]
+    while stack:
+        node, depth = stack.pop()
+        if depth > MAX_JSON_DEPTH:
+            return True                      # too deep to inspect: fail closed
+        if isinstance(node, dict):
+            for k, v in node.items():
+                if _key_is_override(k):
+                    return True
+                stack.append((v, depth + 1))
+        elif isinstance(node, list):
+            stack.extend((v, depth + 1) for v in node)
+    return False
+
+
 def override_problem(methods, url, headers, body):
-    """A reason when the call tries to smuggle in another HTTP verb: an X-HTTP-Method style header, or a
-    `_method` query or body field, naming a verb the session did not declare. `body` is bytes or None.
-    Applies to the template and again to what is actually sent."""
-    for k, v in headers.items():
-        if k.lower() in OVERRIDE_HEADERS and v.strip().upper() not in methods:
-            return "a method override header names a verb this session did not declare"
+    """A fixed reason when the call could smuggle in another HTTP verb, else None. Fail closed, with real
+    parsers rather than patterns: request Content-Encoding and Transfer-Encoding are refused (a body the
+    broker cannot read is a body it cannot check); X-HTTP-Method style headers are refused unless the verb
+    they name is declared; query keys and form or JSON body keys (decoded, at every depth) must not be a
+    method-override name; any body in another or unparseable type (multipart, text, unknown) and any query
+    that cannot be parsed must contain no case-insensitive `method` in raw, percent-decoded or
+    JSON-unescaped form. `body` is bytes or None. Applies to the template and again to what is sent."""
+    lower = {k.lower(): v for k, v in headers.items()}
+    if "content-encoding" in lower or "transfer-encoding" in lower:
+        return ENCODING_REFUSED
+    for k in OVERRIDE_HEADERS:
+        if k in lower and lower[k].strip().upper() not in methods:
+            return OVERRIDE_REFUSED
     try:
         query = urllib.parse.urlsplit(url).query
+        qkeys = [k for k, _ in urllib.parse.parse_qsl(query, keep_blank_values=True, max_num_fields=1000)]
     except ValueError:
-        query = ""
-    blobs = [query.encode("utf-8", "replace"), urllib.parse.unquote_to_bytes(query)]
+        return OVERRIDE_REFUSED
+    if any(_key_is_override(k) for k in qkeys) or (";" in query and _has_method_text(query)):
+        return OVERRIDE_REFUSED         # ";" is a parameter separator for some servers: do not trust our parse
     if body:
-        blobs += [body, urllib.parse.unquote_to_bytes(body)]
-    for blob in blobs:
-        for m in _OVR_RE.finditer(blob):
-            if m.group(1).decode("ascii", "replace").upper() not in methods:
-                return "a _method override names a verb this session did not declare"
+        ctype = lower.get("content-type", "").split(";", 1)[0].strip().lower()
+        checked = False
+        if ctype == "application/x-www-form-urlencoded":
+            try:
+                keys = [k for k, _ in urllib.parse.parse_qsl(body.decode("latin-1"), keep_blank_values=True,
+                                                             max_num_fields=1000)]
+                checked = True
+            except ValueError:
+                keys = []
+            if checked and any(_key_is_override(k) for k in keys):
+                return OVERRIDE_REFUSED
+        elif ctype == "application/json" or ctype.endswith("+json"):
+            def refuse(_):
+                raise ValueError("constant")
+            try:
+                doc = json.loads(body, parse_constant=refuse)
+                checked = True
+            except (ValueError, UnicodeDecodeError, RecursionError):
+                doc = None
+            if checked and _json_keys_override(doc):
+                return OVERRIDE_REFUSED
+        if not checked and _has_method_text(body):
+            return OVERRIDE_REFUSED
     return None
 
 

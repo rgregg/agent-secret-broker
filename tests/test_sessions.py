@@ -1615,36 +1615,80 @@ class Hardening(SBase):
     # -- (4) method override ---------------------------------------------------------
     def test_method_override_headers_and_fields_are_refused(self):
         sid = self.open(methods=["GET", "POST"])
-        cases = [("POST", "/echo", {"X-HTTP-Method-Override": "DELETE"}, "x"),
-                 ("POST", "/echo", {"x-http-method": "PUT"}, "x"),
-                 ("POST", "/echo", {"X-Method-Override": "DELETE"}, "x"),
-                 ("POST", "/echo", {"X-Method-Override": "{{session.NOPE}}"}, "x"),
-                 ("POST", "/echo?_method=DELETE", {}, "x"),
-                 ("POST", "/echo?a=1&%5Fmethod=DELETE", {}, "x"),
-                 ("POST", "/echo", {}, "a=1&_method=DELETE"),
-                 ("POST", "/echo", {}, '{"_method": "PATCH"}'),
-                 ("POST", "/echo", {}, "{'_METHOD':'delete'}"),
-                 ("POST", "/echo", {}, "a=1&%5Fmethod=DELETE"),
-                 ("POST", "/echo", {}, "_method="),
-                 ("POST", "/echo", {}, "_method={{UNIFI_USERNAME}}")]
-        for m, path, hdr, body in cases:
-            code, r = self.call(sid, m, path, headers=hdr, body=body)
+        form = {"Content-Type": "application/x-www-form-urlencoded"}
+        js = {"Content-Type": "application/json"}
+        cases = [("/echo", {"X-HTTP-Method-Override": "DELETE"}, "x"),
+                 ("/echo", {"x-http-method": "PUT"}, "x"),
+                 ("/echo", {"X-Method-Override": "DELETE"}, "x"),
+                 ("/echo", {"X-Method-Override": "{{session.NOPE}}"}, "x"),
+                 ("/echo?_method=DELETE", {}, "x"),
+                 ("/echo?_MeThOd=DELETE", {}, "x"),
+                 ("/echo?a=1&%5Fmethod=DELETE", {}, "x"),
+                 ("/echo?%255Fmethod=DELETE", {}, "x"),                       # double percent-encoding
+                 ("/echo?a=1;_method=DELETE", {}, "x"),                       # odd separator
+                 ("/echo?a+b=1&%5f%4dethod=x", {}, "x"),
+                 # form bodies: plus, %5F, mixed case, double encoding, hex-encoded letters
+                 ("/echo", form, "a=1&_method=DELETE"),
+                 ("/echo", form, "a+b=1&%5Fmethod=DELETE"),
+                 ("/echo", form, "a=1&_MeThOd=DELETE"),
+                 ("/echo", form, "%255Fmethod=DELETE"),
+                 ("/echo", form, "_meth%6Fd=DELETE"),
+                 ("/echo", form, "_method+=x"),
+                 ("/echo", {"Content-Type": "application/x-www-form-urlencoded; charset=utf-8"}, "_method=PUT"),
+                 # JSON bodies: plain, unicode escape, nested, mixed case, in an array
+                 ("/echo", js, '{"_method": "PATCH"}'),
+                 ("/echo", js, '{"_\\u006dethod": "DELETE"}'),
+                 ("/echo", js, '{"a": {"b": [{"_Method": "x"}]}}'),
+                 ("/echo", js, '[{"method": "DELETE"}]'),
+                 ("/echo", {"Content-Type": "application/vnd.api+json"}, '{"_method":"x"}'),
+                 # unparseable or unknown types: any `method` substring in any decoded form is refused
+                 ("/echo", {}, "{'_METHOD':'delete'}"),
+                 ("/echo", {}, '{"_\\u006dethod": "DELETE"}'),
+                 ("/echo", {}, "a=1&%5Fmethod=DELETE"),
+                 ("/echo", {}, "a=1&%255Fmethod=DELETE"),
+                 ("/echo", {"Content-Type": "text/plain"}, "_method="),
+                 ("/echo", js, '{"a": 1, "_method": '),                       # broken JSON falls back to the substring test
+                 ("/echo", js, '{"_\\u006dethod": '),
+                 ("/echo", {"Content-Type": "multipart/form-data; boundary=b"},
+                  '--b\r\nContent-Disposition: form-data; name="_method"\r\n\r\nDELETE\r\n--b--\r\n'),
+                 ("/echo", {"Content-Type": "multipart/form-data; boundary=b"},
+                  '--b\r\nContent-Disposition: form-data; name="_%6Dethod"\r\n\r\nDELETE\r\n--b--\r\n'),
+                 ("/echo", {"Content-Type": "multipart/form-data; boundary=b"},
+                  '--b\r\nContent-Disposition: form-data; name="m\\u0065thod"\r\n\r\nx\r\n--b--\r\n'),
+                 ("/echo", {}, "_method={{UNIFI_USERNAME}}"),
+                 # request encodings are refused outright: the broker cannot read what it cannot decode
+                 ("/echo", {"Content-Encoding": "gzip"}, "x"),
+                 ("/echo", {"content-encoding": "identity"}, "x"),
+                 ("/echo", {"Transfer-Encoding": "chunked"}, "x")]
+        for path, hdr, body in cases:
+            code, r = self.call(sid, "POST", path, headers=hdr, body=body)
             self.assertEqual((code, r.get("code")), (403, "session_refused"), (path, hdr, body))
+            self.assertNotIn("Traceback", json.dumps(r))
         self.assertEqual(self.st["seen"], [])
         self.assertEqual(self.sess(sid).calls, 0)
-        # a body_b64 field too
         import base64
-        code, r = self.as_client(KEY, "POST", "/v1/requests", {
-            "mode": "http", "names": ["unifi"], "method": "POST", "url": self.url("/echo"), "headers": {},
-            "session": sid, "body_b64": base64.b64encode(b"_method=DELETE").decode()})
-        self.assertEqual(code, 403)
+        for raw in (b"_method=DELETE", b'{"_\\u006dethod":1}', b"m\x00e\x00t\x00h\x00o\x00d\x00"):   # b64, incl. UTF-16
+            code, r = self.as_client(KEY, "POST", "/v1/requests", {
+                "mode": "http", "names": ["unifi"], "method": "POST", "url": self.url("/echo"), "headers": {},
+                "session": sid, "body_b64": base64.b64encode(raw).decode()})
+            self.assertEqual(code, 403, raw)
 
-    def test_the_override_is_allowed_when_that_verb_is_declared(self):
+    def test_ordinary_bodies_and_queries_are_still_allowed(self):
+        sid = self.open(methods=["GET", "POST"])
+        ok = [("/echo?a=1&b=2", {"Content-Type": "application/x-www-form-urlencoded"}, "a=1&b=2"),
+              ("/echo", {"Content-Type": "application/json"}, '{"name": "x", "tags": [{"k": "v"}], "note": "a method"}'),
+              ("/echo", {"Content-Type": "text/plain"}, "hello world"),
+              ("/echo", {}, "plain body without the word")]
+        for path, hdr, body in ok:
+            code, r = self.call(sid, "POST", path, headers=hdr, body=body)
+            self.assertEqual(r["http"]["status"], 200, (path, hdr, body))
+
+    def test_the_override_header_is_allowed_only_when_that_verb_is_declared(self):
         sid = self.open(methods=["GET", "POST", "DELETE"])
         code, r = self.call(sid, "POST", "/echo", headers={"X-HTTP-Method-Override": "DELETE"}, body="x")
         self.assertEqual(r["http"]["status"], 200)
-        code, r = self.call(sid, "POST", "/echo?_method=delete", body="x")
-        self.assertEqual(r["http"]["status"], 200)
+        code, r = self.call(sid, "POST", "/echo?_method=delete", body="x")        # fields are refused regardless
+        self.assertEqual((code, r["code"]), (403, "session_refused"))
 
     def test_a_captured_value_cannot_smuggle_an_override_after_substitution(self):
         sid = self.open(methods=["GET", "POST"])

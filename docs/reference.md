@@ -1890,9 +1890,15 @@ ends its sessions at once.
 - **Redirects are never followed.** A 3xx is returned to the agent with its `Location` (masked); `Set-Cookie` on it is stored in the jar
   and stripped as usual. The agent makes a new call, which is scope-checked and counted like any other. This also means no redirect can
   change the method, port or host, and no hop goes uncounted. TLS verification, pinning and `tls_verify` are as for plain http calls.
-- **Method override is refused.** `X-HTTP-Method`, `X-HTTP-Method-Override` and `X-Method-Override` headers, and a `_method` query
-  parameter or body field (also percent-encoded, and after `{{session.NAME}}` substitution), are refused unless the verb they name is
-  itself declared by the session. A GET or HEAD call cannot carry a body.
+- **Method override is refused, by parsing rather than pattern.** Request `Content-Encoding` and `Transfer-Encoding` headers are refused
+  (a body the broker cannot decode is a body it cannot check). `X-HTTP-Method`, `X-HTTP-Method-Override` and `X-Method-Override` headers
+  are refused unless the verb they name is declared by the session. Query keys, `application/x-www-form-urlencoded` body keys and
+  `application/json` (or `+json`) body keys at every depth are decoded (repeated percent-decoding, `+`, JSON escapes) and refused if any is
+  `_method`, `method` or a similar override name. Any other body type (multipart, text, unknown), an unparseable JSON or form body, a body
+  sent as base64, and a query using `;` separators must contain no case-insensitive `method` in raw, percent-decoded (up to 3 rounds) or
+  JSON-unescaped form (or with non-letters removed), or the call is refused with a fixed message. The same checks run again on what is
+  actually sent, after `{{session.NAME}}` substitution. A GET or HEAD call cannot carry a body. The cost: a body that mentions the word
+  `method` in a non-JSON, non-form type is refused; send it as JSON or form data, or open a session for that.
 - **Bounded work.** URL and header values up to 8192 characters, 50 headers, 100 placeholders of up to 64 characters, body up to 5 MB.
   Placeholders are scanned in linear time, and the store lock is held only for dictionary work (never for a scope check or an upstream
   call), so one hostile or slow call cannot delay another client's lookup, revoke, close or sweep.
