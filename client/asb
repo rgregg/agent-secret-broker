@@ -15,8 +15,10 @@
   asb audit verify                            is the broker's audit log intact?
   asb ssh-agent [--socket PATH] [-- command args...]  local ssh-agent; keys stay in the broker
   asb fingerprint HOST[:PORT]                 print a server certificate's sha256 (for tls_fingerprint)
-  asb http NAME METHOD URL [-H 'K: V']... [-d BODY | -d @file | -d @-]
-                                              broker makes the call itself
+  asb http NAME METHOD URL [-H 'K: V']... [-d BODY | -d @file | -d @-] [--plan ID]
+                                              broker makes the call itself (--plan: under an approved plan)
+  asb plan submit FILE|- [--no-wait] | status ID | list | close ID
+                                              plan mode: one human approval for an unattended job's calls
   asb guidance propose FILE|- | --from-dir DIR  propose risk guidance; the human reviews it
   asb guidance status ID                      outcome of a proposal (no approval)
   asb enroll [--name NAME] [--url URL] [--force]  get this machine its own credential; a human approves
@@ -51,6 +53,7 @@ import urllib.request
 # Exit codes (also in `asb guide`).
 EXIT_NOT_FOUND, EXIT_USAGE, EXIT_BROKER, EXIT_DENIED, EXIT_EXPIRED = 1, 2, 3, 4, 5
 EXIT_SCRIPT_CHANGED = 6
+EXIT_PLAN_GONE, EXIT_SLOW_DOWN = 7, 8       # plan not usable (stop, submit a new plan); rate or in-flight limit
 EXIT_HTTP_ERROR = 22
 
 GUIDE = """asb guide (for agents)
@@ -120,6 +123,18 @@ Asking the human for a credential you do not have (you never see the value)
   `asb update`; invalid name; too many pending; disabled); 2 usage. Never put a secret in --for or
   any argument, and do not retry a denial. A request is always high risk and always needs the human.
 
+Plans: an unattended or long job (use one for MANY calls; do not submit a plan for one call)
+  A plan is a manifest of the exact calls the job will make, approved by the human ONCE, for a limited
+  time, on this machine only. Write the manifest (asb help plan has the format), then:
+    asb plan submit manifest.json          waits for the human; prints the plan id when approved
+    asb http NAME GET URL ... --plan ID    (or set ASB_PLAN=ID) released with no prompt if it matches a rule
+    asb plan status ID | asb plan list | asb plan close ID
+  A call that does not match a rule is REFUSED (exit 3, with a reason), never turned into a prompt;
+  make that call without --plan if you need the normal approval. Exit 7: the plan is not usable
+  (kind: ended, exhausted, closed, revoked or unknown, e.g. the broker restarted): stop and submit a
+  new plan, which needs the human again. Exit 8: slow down (rate or in-flight limit), retry after the
+  printed seconds. There is no renewal. Do not submit a broader plan to get around a refusal.
+
 Giving this machine its own credential
   asb enroll --name NAME [--url URL]   prints a confirmation code and waits for the human to approve
   the card showing the same code; then ~/.config/secret-broker/client.json holds this machine's own
@@ -160,11 +175,47 @@ Exit codes
   3 broker unreachable or refused the request
   4 denied by the human (or the policy)            5 expired or timed out waiting
   6 env: a script changed between the request and the run (nothing was executed)
+  7 plan not usable (ended, exhausted, closed, revoked, unknown): stop, submit a new plan
+  8 plan call refused for now (rate or in-flight limit): wait the printed seconds and retry
   22 http: the upstream answered with status >= 400 (body is still printed)
   other: env mode returns the wrapped command's own exit code
 """
 
 HELP = {
+    "plan": """usage: asb plan submit FILE|- [--no-wait]
+       asb plan status ID [--json]
+       asb plan list [--json]
+       asb plan close ID
+       asb http NAME METHOD URL [-H ...] [-d ...] --plan ID      (or ASB_PLAN=ID)
+
+Plan mode for an unattended job: you declare the calls in a manifest, the human approves the whole
+list once (they read a rendering of every rule), and matching calls then run with no prompt until the
+deadline. Anything not in the manifest is refused, never prompted. `submit` waits for the human (about
+15 minutes) and prints the plan id; --no-wait prints the pending id and returns at once.
+Manifest (JSON):
+  {"v": 1, "task": "nightly sync", "description": "what and why", "ttl_seconds": 28800,
+   "rules": [{"secret": "ledger", "method": "POST", "host": "ledger.example.com",
+              "path_prefix": "/v1/notes", "max_uses": 5,
+              "body": {"json": {"keys": ["text", "kind"], "pin": {"kind": "reconcile"}}}},
+             {"secret": "monarch", "method": "GET", "host": "api.example.com",
+              "path_prefix": "/v1/accounts", "max_uses": 50}]}
+  rule keys: secret, method (uppercase), host (lowercase, one of the credential's hosts), path_prefix
+  (absolute, covers the path and everything under it), max_uses, optional port, scheme (https; http only
+  for a private IP address), query ("any" or "none"), body. body is one of {"none": true},
+  {"json": {"keys": [...], "pin": {...}}}, {"graphql": {"document": "...", "operation_name": "...",
+  "variables_keys": [...]}}; a rule that writes (POST, PUT, PATCH, DELETE) must declare a body.
+  A GraphQL call must send exactly the declared document. Send the same Content-Type
+  application/json and use only these headers: Accept, Content-Type, Content-Length, If-None-Match,
+  User-Agent, plus Authorization-style headers whose whole value is the credential's own {{VAR}}.
+  No {{VAR}} in the URL or body. Redirects are never followed.
+Exit codes: 0 ok; 3 broker refused (manifest invalid, outside the plan, too many plans); 4 denied by
+the human; 5 expired; 7 plan not usable (kind: ended|exhausted|closed|revoked|unknown): submit a new
+plan; 8 slow down (rate_limited or inflight_limit; prints retry_after_s); 2 usage.
+A plan is bound to this machine's own credential (run `asb enroll` first; the shared key cannot
+submit plans), has an absolute deadline, and ends when the broker restarts.
+example: asb plan submit manifest.json && asb http ledger POST https://ledger.example.com/v1/notes \\
+             -H 'Authorization: Bearer {{LEDGER_TOKEN}}' -H 'Content-Type: application/json' \\
+             -d '{"text": "ok", "kind": "reconcile"}' --plan $PLAN_ID""",
     "list": """usage: asb list [--json]
 
 List every credential the broker knows: NAME, the VAR placeholders it provides,
@@ -198,11 +249,13 @@ broker's response. `verify` checks the log's hash chain (exit 1 if it is broken)
 Exit 1 when nothing matches, 2 usage, 3 broker unreachable or refused.
 example: asb audit --request AbC123
          asb audit --event failed --since 1h""",
-    "http": """usage: asb http NAME[,NAME] METHOD URL [-H 'K: V']... [-d BODY | -d @file | -d @-]
+    "http": """usage: asb http NAME[,NAME] METHOD URL [-H 'K: V']... [-d BODY | -d @file | -d @-] [--plan ID]
 
 The broker makes the HTTP call itself and replaces {{VAR}} in the URL, headers and
 body with the credential. Waits for the human's approval (up to ~5 min).
 Prints "HTTP <status>" on stderr and the response body on stdout; exit 22 if status >= 400.
+--plan ID (or ASB_PLAN=ID) makes the call under an approved plan: no prompt if it matches a rule,
+refused (exit 3) if not, exit 7 if the plan is not usable, exit 8 to slow down. See `asb help plan`.
 example: asb http grafana GET https://grafana.example.com/api/health \\
              -H 'Authorization: Bearer {{GRAFANA_TOKEN}}'""",
     "run": """usage: asb NAME[,NAME] -- command [args...]
@@ -2227,6 +2280,165 @@ def run_agent_setup(args):
     return 0
 
 
+# ---- plan mode: task-scoped grants (BEGIN) ----------------------------------------------------
+PLAN_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+PLAN_BODY_LIMIT = 64 * 1024
+PLAN_KINDS = ("ended", "exhausted", "closed", "revoked", "unknown")
+
+
+def _plan_id(v):
+    """A plan id from an argument or ASB_PLAN: 32 hex digits, else a usage error."""
+    if not isinstance(v, str) or not PLAN_ID_RE.match(v):
+        die("a plan id is 32 lowercase hex digits (printed by `asb plan submit`)")
+    return v
+
+
+def _plan_refusal(code, r):
+    """Exit for a broker answer that is not success, in the plan vocabulary. Nothing but fixed
+    words from the broker is printed, and only as printable ASCII."""
+    if not isinstance(r, dict):
+        r = {}
+    err = _safe_text(r.get("error", f"broker returned {code}"))
+    if code == 404 and r.get("error") == "plan not usable":
+        kind = r.get("kind") if r.get("kind") in PLAN_KINDS else "unknown"
+        hint = {"unknown": "it is unknown here, was never approved, or the broker restarted",
+                "ended": "its deadline passed", "exhausted": "every use was spent",
+                "closed": "it was closed", "revoked": "a human revoked it"}[kind]
+        die(f"plan not usable (kind: {kind}): {hint}. Stop; submit a new plan, which needs the human again.",
+            EXIT_PLAN_GONE)
+    if code == 429 and r.get("error") == "outside plan":
+        die(f"slow down: {_safe_text(r.get('reason', 'limit'))}; retry after "
+            f"{int(r['retry_after_s']) if isinstance(r.get('retry_after_s'), int) else 1} s", EXIT_SLOW_DOWN)
+    if code == 403 and r.get("error") == "outside plan":
+        why = f", why: {_safe_text(r['why'])}" if r.get("why") else ""
+        die(f"refused: this call is outside the plan (reason: {_safe_text(r.get('reason', 'no_rule'))}{why}). "
+            "No prompt was sent. Make the call without --plan to ask the human.", EXIT_BROKER)
+    die(err, EXIT_BROKER)
+
+
+def run_plan_http(payload, plan_id):
+    """POST an http request that names a plan and print the response like `asb http`."""
+    base, key = config()
+    payload["plan"] = _plan_id(plan_id)
+    payload["source"] = f"{os.environ.get('USER', '?')}@{socket.gethostname()}"
+    code, r = call(base, key, "/v1/requests", payload, timeout=60)
+    if code != 202:
+        _plan_refusal(code, r)
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        code, r2 = call(base, key, f"/v1/requests/{r['id']}?wait=25")
+        if r2.get("status") == "approved":
+            return r2["http"]
+        if r2.get("status") in ("denied", "expired", "failed", "released"):
+            die(f"request {r2['status']}" + (f": {_safe_text(r2['error'])}" if r2.get("error") else ""),
+                status_exit(r2["status"]))
+    die("timed out waiting for the call", EXIT_EXPIRED)
+
+
+def _plan_when(s):
+    s = int(s or 0)
+    if s >= 3600:
+        return f"{s // 3600}h {(s % 3600) // 60}m"
+    return f"{s // 60}m" if s >= 60 else f"{s}s"
+
+
+def _plan_print(v):
+    print(f"plan:    {v['id']}")
+    print(f"state:   {v['status']}")
+    if v.get("left_s") or v["status"] == "active":
+        print(f"left:    {_plan_when(v.get('left_s'))}")
+    print(f"uses:    {v['uses']['used']} / {v['uses']['max']}")
+    print(f"secrets: {', '.join(v['secrets'])}")
+    for i, r in enumerate(v.get("rules") or [], 1):
+        print(f"  {i}. {r['secret']} {r['method']} {r['url']} body={r['body']} used {r['uses']}/{r['max_uses']}")
+
+
+def run_plan(argv):
+    """asb plan submit|status|list|close. The manifest is read locally and sent as given."""
+    if not argv or argv[0] not in ("submit", "status", "list", "close"):
+        die(HELP["plan"])
+    sub, rest = argv[0], argv[1:]
+    as_json = "--json" in rest
+    rest = [a for a in rest if a != "--json"]
+    base, key = config()
+    if sub == "submit":
+        wait = True
+        if "--no-wait" in rest:
+            wait, rest = False, [a for a in rest if a != "--no-wait"]
+        rest = [a for a in rest if a != "--wait"]
+        if len(rest) != 1:
+            die(HELP["plan"])
+        try:
+            raw = sys.stdin.buffer.read(PLAN_BODY_LIMIT + 1) if rest[0] == "-" else open(rest[0], "rb").read(PLAN_BODY_LIMIT + 1)
+        except OSError:
+            die("cannot read the manifest file")
+        if len(raw) > PLAN_BODY_LIMIT:
+            die(f"the manifest is larger than {PLAN_BODY_LIMIT} bytes")
+        try:
+            manifest = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            die("the manifest is not valid JSON")
+        code, r = call(base, key, "/v1/plans",
+                       {"manifest": manifest, "source": f"{os.environ.get('USER', '?')}@{socket.gethostname()}"})
+        if code != 202:
+            _plan_refusal(code, r)
+        if not wait:
+            print(r["plan"])
+            print("asb: pending; the human must approve it on the approval page", file=sys.stderr)
+            return 0
+        print("asb: waiting for the human to read and approve the plan...", file=sys.stderr)
+        end = time.time() + r["expires_in"] + 15
+        while time.time() < end:
+            code, r2 = call(base, key, f"/v1/requests/{r['id']}?wait=25")
+            st = r2.get("status")
+            if st == "approved" and isinstance(r2.get("plan"), dict):
+                pl = r2["plan"]
+                print(pl["plan"])
+                print(f"asb: approved for {_plan_when(pl['granted_s'])}, until {_safe_text(pl['expires_at'])}; "
+                      "after that, submit a new plan", file=sys.stderr)
+                return 0
+            if st in ("denied", "expired", "failed", "released"):
+                die(f"plan {st}" + (f": {_safe_text(r2['error'])}" if r2.get("error") else ""), status_exit(st))
+        die("timed out waiting for approval", EXIT_EXPIRED)
+    if sub == "list":
+        if rest:
+            die(HELP["plan"])
+        code, r = call(base, key, "/v1/plans")
+        if code != 200:
+            _plan_refusal(code, r)
+        if as_json:
+            print(json.dumps(r["plans"], indent=2))
+            return 0
+        if not r["plans"]:
+            print("asb: no plans", file=sys.stderr)
+            return EXIT_NOT_FOUND
+        print("ID\tSTATE\tLEFT\tUSES\tSECRETS", file=sys.stderr)
+        for v in r["plans"]:
+            print(f"{v['id']}\t{v['status']}\t{_plan_when(v['left_s'])}\t{v['uses']['used']}/{v['uses']['max']}\t"
+                  f"{','.join(v['secrets'])}")
+        return 0
+    if len(rest) != 1:
+        die(HELP["plan"])
+    pid = _plan_id(rest[0])
+    if sub == "status":
+        code, r = call(base, key, f"/v1/plans/{pid}")
+        if code != 200:
+            _plan_refusal(code, r)
+        if as_json:
+            print(json.dumps(r, indent=2))
+        else:
+            _plan_print(r)
+        return 0
+    code, r = call(base, key, f"/v1/plans/{pid}/close", {})
+    if code != 200:
+        _plan_refusal(code, r)
+    print(f"closed: {pid}")
+    return 0
+
+
+# ---- plan mode (END) --------------------------------------------------------------------------
+
+
 def main(argv):
     if not argv or argv[0] in ("-h", "--help"):
         print(__doc__)
@@ -2236,6 +2448,8 @@ def main(argv):
         return 0
     if argv[0] == "agent-setup":
         return run_agent_setup(argv[1:])
+    if argv[0] == "plan" and not any(a in ("-h", "--help") for a in argv[1:3]):
+        return run_plan(argv[1:])
     if argv[0] == "help":
         topic = argv[1] if len(argv) > 1 else None
         if topic is None:
@@ -2384,7 +2598,7 @@ def main(argv):
             die(HELP["http"])
         check_name(argv[1])
         names, method, url, rest = argv[1].split(","), argv[2], argv[3], argv[4:]
-        headers, body = {}, {}
+        headers, body, plan = {}, {}, os.environ.get("ASB_PLAN") or None
         while rest:
             if rest[0] == "-H" and len(rest) > 1:
                 k, _, v = rest[1].partition(":")
@@ -2392,17 +2606,24 @@ def main(argv):
                 rest = rest[2:]
             elif rest[0] == "-d" and len(rest) > 1:
                 body, rest = read_body(rest[1]), rest[2:]
+            elif rest[0] == "--plan" and len(rest) > 1:
+                plan, rest = rest[1], rest[2:]
             else:
                 die(f"unexpected argument {rest[0]!r}")
-        r = obtain({"mode": "http", "names": names, "method": method, "url": url,
-                    "headers": headers, **body})["http"]
+        if plan:
+            # a plan call: the method goes as typed in ASCII uppercase (the broker matches it exactly)
+            r = run_plan_http({"mode": "http", "names": names, "method": method.upper() if method.isascii() else method,
+                               "url": url, "headers": headers, **body}, plan)
+        else:
+            r = obtain({"mode": "http", "names": names, "method": method, "url": url,
+                        "headers": headers, **body})["http"]
         print(f"HTTP {r['status']}", file=sys.stderr)
         sys.stdout.write(r["body"])
         return 0 if r["status"] < 400 else EXIT_HTTP_ERROR
 
     if "--" not in argv:
         die(f"unknown command {argv[0]!r}.\ncommands: list, which, status, audit, http, store, update, "
-            "request-credential, guidance, enroll, ssh-agent, fingerprint, help, guide; or: asb NAME -- command\n"
+            "request-credential, guidance, plan, enroll, ssh-agent, fingerprint, help, guide; or: asb NAME -- command\n"
             "start with `asb guide`")
     i = argv.index("--")
     names, cmd = argv[0].split(",") if i == 1 else None, argv[i + 1:]

@@ -84,6 +84,14 @@ WHITELIST = {
     "catalog_loaded": {"count": ("count", _I), "invalid_count": ("invalid", "count")},
     "catalog_error": {}, "backend_error": {},
     "backend_ready": {"duration_ms": ("duration_ms", _I)},
+    # plans (the agent's own, scoped by client id like every event). The agent sees that its plan
+    # was issued, ended, revoked, used or missed: the plan id, the rule index, the uses left and a
+    # coarse reason. Never the approver, channel, cause, time left, hashes or any text.
+    "plan_issued": {"plan_id": ("plan_id", _S)},
+    "plan_closed": {"plan_id": ("plan_id", _S)},
+    "plan_revoked": {"plan_id": ("plan_id", _S)},
+    "plan_used": {"plan_id": ("plan_id", _S), "rule": ("rule", _I), "uses_left": ("uses_left_rule", _I)},
+    "plan_miss": {"plan_id": ("plan_id", _S), "reason": ("reason", _S)},
 }
 
 # Not returned at all. Several of these carry policy or risk outright; `notified`
@@ -129,6 +137,8 @@ HIDDEN = frozenset({
     "enroll_requested", "enroll_decided", "enroll_refused", "enroll_notify_failed",
     "client_revoked", "client_renamed", "client_rename_refused", "client_removed",
     "client_auth_failed", "clients_file_corrupt", "clients_file_write_failed", "clients_file_recovered",
+    # an internal plan error is an operator matter (a class name only)
+    "plan_internal_error",
 })
 
 def error_class(text):
