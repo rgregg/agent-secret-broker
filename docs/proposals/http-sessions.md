@@ -218,17 +218,34 @@ shows them. Active sessions appear on the Clients tab with a live countdown and 
 default and cap (configurable, ceiling 10000); 3 sessions per client (configurable), 20 total; 2
 pending open requests per client plus the general pending cap and deny cooldown; 5 hosts; no redirects; 8192-character urls and header values, 50 headers, 100 placeholders of up to 64 characters; 50 cookies; 16 captures; 1 MB response read.
 
-## Method override (fail closed)
+## Headers and method override (fail closed)
 
-A session's methods are the verbs the human approved, and many servers let a request change its verb with a header or a
-`_method` field. Any filter that parses the request (regex, key sets, per-content-type parsers) is a differential against the
-upstream's parser: JSON unicode escapes, double percent-encoding, multipart names, `;` separators and key variants all evaded
-earlier versions. The broker therefore applies ONE rule with no parsing: a session call is refused, with a fixed message and without
-charging the call, if its query string, its body or any header name contains `method` case-insensitively in the raw, percent-decoded
-(3 rounds), JSON-unescaped or letters-only form. Request `Content-Encoding` and `Transfer-Encoding` are refused so the body is always
-readable. The check runs on the template and again on the substituted request. The cost, stated plainly: legitimate fields such as
-`payment_method` are refused in session calls; such a call uses plain `asb http` (one approval per call), and the later manifest
-(task-grant) approach is the place to allow specific ones.
+**Header allowlist.** A denylist is not enough: a caller-supplied `Content-Length` shorter than the body puts the surplus on the wire as a
+second pipelined request, with the credential already substituted. Session calls therefore accept only an exact-name allowlist (Accept,
+Accept-Language, Content-Type, User-Agent, If-None-Match, If-Modified-Since, Authorization, X-CSRF-Token, X-Updated-CSRF-Token,
+X-Requested-With, X-API-Key) and refuse every other name and any duplicate. Content-Type is one of application/json,
+application/x-www-form-urlencoded, text/plain, application/graphql or multipart/form-data with a boundary, with no parameter except
+charset=utf-8 (so the decode forms below match what the upstream reads). A value containing a placeholder must be exactly one placeholder,
+optionally after Bearer/Basic/Token. urllib sets Content-Length from the bytes it sends, which are the substituted body; a raw-socket
+test asserts the upstream receives exactly one request with that length.
+
+**No secret-dependent outcome.** All of these checks run on the agent's own text with credential placeholders neutralised to a fixed token, so a
+refusal can never reveal whether a credential contains some text. Captured values are checked when captured and again where they are substituted.
+Credential values are only checked for characters illegal in a header, with one generic error.
+
+**Method override.** A session's methods are the verbs the human approved, and many servers let a request change its verb with a header,
+a `_method` field or a path suffix. Any filter that parses the request (regex, key sets, per-content-type parsers) is a differential against
+the upstream's parser, and earlier versions were evaded by JSON unicode escapes, double percent-encoding, multipart names, `;` separators
+and key variants. The broker therefore applies ONE rule with no parsing: a session call is refused, with a fixed message and without
+charging the call, if its URL (path, parameters, query, fragment), any header name or value, or its body contains `method`
+case-insensitively in any decoded form (raw; up to 5 rounds of percent, HTML numeric entity, `\u`, `\x` and quoted-printable decoding with
+NFKC; letters-only). Userinfo in the URL and multipart bodies declaring a Content-Transfer-Encoding are refused. The check runs on the template
+and again on the substituted request. The cost, stated plainly: legitimate fields such as `payment_method` are refused in session calls;
+such a call uses plain `asb http` (one approval per call), and the later manifest (task-grant) approach is the place to allow specific ones.
+
+**Free refusals.** Captured values containing `method` are not stored (a hostile upstream could otherwise poison `{{session.X}}` so later calls
+fail for free while still costing vault reads and audit lines). Calls refused after the vault read but before sending are not charged but
+are metered: more than 10 per session ends it (`session_ended`, `reason: refusal_budget`).
 
 ## Failure modes
 

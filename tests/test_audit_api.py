@@ -47,7 +47,7 @@ def event_names_in_broker():
               for c in ("dashboard", "push", "ha", "link")}
     names |= set(re.findall(r'self\._finish\(\s*req,\s*"([a-z]+)"', src))
     names |= {"approved", "denied", "expired", "failed"}      # via _finish(status)
-    names |= {"session_expired", "session_closed", "session_revoked"}   # sessions.py: "session_" + reason
+    names |= {"session_expired", "session_closed", "session_revoked", "session_ended"}   # sessions.py: "session_" + reason
     return names
 
 

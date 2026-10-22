@@ -2115,14 +2115,30 @@ ends its sessions at once.
 - **Redirects are never followed.** A 3xx is returned to the agent with its `Location` (masked); `Set-Cookie` on it is stored in the jar
   and stripped as usual. The agent makes a new call, which is scope-checked and counted like any other. This also means no redirect can
   change the method, port or host, and no hop goes uncounted. TLS verification, pinning and `tls_verify` are as for plain http calls.
-- **Method override is refused by one fail-closed rule.** A session call is refused (fixed message, not charged) if its query string, its
-  body or any request header name contains the text `method`, case-insensitively, in any of these forms: raw, percent-decoded (up to 3 rounds),
-  JSON-unescaped, or with every non-letter removed. That covers `X-HTTP-Method-Override`, `_method` fields in query, form, JSON or
-  multipart, encoded and mixed-case variants, `;` separators and similar, without any parser that could disagree with the upstream's. It
-  deliberately also refuses legitimate fields such as `payment_method`: a call that needs one must use plain `asb http` without
-  `--session` (one approval per call). `Content-Encoding` and `Transfer-Encoding` request headers are refused (a body the broker cannot read
-  is a body it cannot check). The same check runs again on what is actually sent, after `{{session.NAME}}` substitution. A GET or HEAD call
-  cannot carry a body.
+- **Headers are allowlisted by exact name** (case-insensitive): `Accept`, `Accept-Language`, `Content-Type`, `User-Agent`, `If-None-Match`,
+  `If-Modified-Since`, `Authorization`, `X-CSRF-Token`, `X-Updated-CSRF-Token`, `X-Requested-With`, `X-API-Key`. (The catalog has no
+  "declared auth header" metadata, so no credential adds names.) Everything else is refused with one fixed message: `Content-Length` (urllib
+  sets it from the bytes it sends, so the body on the wire is exactly the substituted body and never a second pipelined request),
+  `Accept-Encoding`, `Connection`, `Expect`, `TE`, `Upgrade`, `Trailer`, `Transfer-Encoding`, `Content-Encoding`, `Host`, `Cookie` (the jar's), `Proxy-*`,
+  `Forwarded`, `X-Forwarded-*`, `X-Original-*`, `X-Rewrite-*`, other `X-` names, duplicates, and so on. `Content-Type` must be one of
+  `application/json`, `application/x-www-form-urlencoded`, `text/plain`, `application/graphql` or `multipart/form-data` with a `boundary`,
+  with no parameter except `charset=utf-8`. A header value that contains a placeholder is allowed only if the whole value is
+  `{{NAME}}`, optionally preceded by `Bearer `, `Basic ` or `Token `.
+- **The checks never depend on a secret.** The header and method-override checks run on what the agent wrote, with credential placeholders replaced
+  by a neutral token; captured values (chosen by the upstream, scanned when captured and again after substitution) are substituted. A credential
+  whose value contains `method` neither changes the outcome nor produces a different error; a credential value with a line break or other illegal
+  header character gets the same generic `invalid_request` error as any other bad header.
+- **Method override is refused by one fail-closed rule.** A session call is refused (fixed message, not charged) if the agent's URL path, parameters,
+  query or fragment, any header name or value, or its body contains the text `method` (case-insensitive) in any decoded form: raw, up to 5
+  rounds of percent-, HTML numeric entity (`&#109;`, `&#x6d;`), `\uXXXX`, `\xNN` and quoted-printable (`=6D`) decoding with NFKC
+  normalisation, and each of those with every non-letter removed. Userinfo in the URL is refused. A multipart body that declares a
+  Content-Transfer-Encoding is refused. This covers `_method` fields in a query, path, form, JSON or multipart, encoded and mixed-case
+  variants and `;` separators, without any parser that could disagree with the upstream's. It deliberately also refuses legitimate fields such
+  as `payment_method`: a call that needs one must use plain `asb http` without `--session` (one approval per call). The same check runs again on what
+  is actually sent, after `{{session.NAME}}` substitution. A GET or HEAD call cannot carry a body. A captured value containing `method` (same
+  forms) is not stored, so an upstream cannot poison a later call.
+- **Refusals that cost the caller nothing are metered.** A call refused after the credential was read but before anything was sent is not charged
+  against the call cap, but counts against a per-session budget of 10; the 11th ends the session (`session_ended`, `reason: refusal_budget`, exit 7).
 - **Bounded work.** URL and header values up to 8192 characters, 50 headers, 100 placeholders of up to 64 characters, body up to 5 MB.
   Placeholders are scanned in linear time, and the store lock is held only for dictionary work (never for a scope check or an upstream
   call), so one hostile or slow call cannot delay another client's lookup, revoke, close or sweep.

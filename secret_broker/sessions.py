@@ -39,6 +39,7 @@ import socket
 import ssl
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -83,6 +84,19 @@ _COOKIE_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 _KEY_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _TOKEN_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
 _JSON_UNESC = re.compile(r"\\u([0-9a-fA-F]{4})")
+_HEX_ESC = re.compile(r"\\x([0-9a-fA-F]{2})")
+_QP_ESC = re.compile(r"=([0-9A-Fa-f]{2})")
+_ENTITY = re.compile(r"&#([xX][0-9a-fA-F]{1,6}|[0-9]{1,7});?")
+DECODE_ROUNDS = 5
+MAX_FREE_REFUSALS = 10          # refusals that cost the caller nothing (it never left the broker), per session
+ALLOWED_HEADERS = ("accept", "accept-language", "content-type", "user-agent", "if-none-match", "if-modified-since",
+                   "authorization", "x-csrf-token", "x-updated-csrf-token", "x-requested-with", "x-api-key")
+# (the catalog has no "declared auth header" metadata, so no credential adds names to this list)
+CONTENT_TYPES = ("application/json", "application/x-www-form-urlencoded", "text/plain", "application/graphql",
+                 "multipart/form-data")
+_BOUNDARY_RE = re.compile(r"^boundary=\"?[A-Za-z0-9'()+_,./:=?-]{1,70}\"?$", re.I)
+_CHARSET_RE = re.compile(r"^charset=\"?utf-8\"?$", re.I)
+_PLACEHOLDER_VALUE = re.compile(r"^(Bearer |Basic |Token )?\{\{[A-Za-z0-9_.]{1,64}\}\}$")
 _HOSTPORT_RE = re.compile(r"^([A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?)(?::([0-9]{1,5}))?$")
 _ILLEGAL_HEADER_VALUE = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")
 _HEADER_TOKEN = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
@@ -318,6 +332,8 @@ class Jar:
 ENDED = {"unknown": ("unknown session", "session_unknown", 404),
          "expired": ("session expired: it reached its time limit and cannot be extended; open a new "
                      "one with `asb session open`", "session_expired", 410),
+         "ended": ("session ended: too many refused calls; open a new one if the human agrees",
+                   "session_expired", 410),
          "closed": ("session closed; open a new one with `asb session open`", "session_expired", 410),
          "revoked": ("session revoked by the human; do not reopen it without asking",
                      "session_expired", 410)}
@@ -358,6 +374,7 @@ class Session:
         self.lock = threading.Lock()
         self.dead = False
         self.end_reason = None
+        self.free_refusals = 0          # refusals after the vault read that cost the caller nothing
 
     def in_scope(self, scheme, host, port):
         """Host and port allowed by the manifest. `port` is the effective port of the call."""
@@ -446,22 +463,31 @@ def _origin(url):
 
 
 OVERRIDE_REFUSED = "a session call cannot use a method override (the text `method` is not allowed in it)"
-ENCODING_REFUSED = "a session call cannot use Content-Encoding or Transfer-Encoding"
+
+
+def _decode_step(t):
+    """One round of every decoding an upstream might apply: percent, HTML numeric entities, \\uXXXX and \\xNN
+    escapes, quoted-printable =XX, then NFKC normalisation."""
+    t = urllib.parse.unquote_to_bytes(t.encode("utf-8", "replace")).decode("utf-8", "replace")
+    t = _ENTITY.sub(lambda m: chr(min(int(m.group(1)[1:], 16) if m.group(1)[0] in "xX" else int(m.group(1)), 0x10FFFF)), t)
+    t = _JSON_UNESC.sub(lambda m: chr(int(m.group(1), 16)), t)
+    t = _HEX_ESC.sub(lambda m: chr(int(m.group(1), 16)), t)
+    t = _QP_ESC.sub(lambda m: chr(int(m.group(1), 16)), t)
+    return unicodedata.normalize("NFKC", t)
 
 
 def _decoded_forms(data):
-    """Lowercased forms of `data` for the substring test: raw, percent-decoded (3 rounds), JSON-unescaped,
-    and each of those with every non-letter removed."""
+    """Lowercased forms of `data` for the substring test: raw, then up to DECODE_ROUNDS rounds of every
+    decoding, each also with backslashes removed, and each with every non-letter removed."""
     text = data.decode("latin-1") if isinstance(data, bytes) else data
     forms, cur = {text}, text
-    for _ in range(3):
-        cur = urllib.parse.unquote_to_bytes(cur).decode("latin-1")
+    for _ in range(DECODE_ROUNDS):
+        cur = _decode_step(cur)
         forms.add(cur)
-    forms |= {_JSON_UNESC.sub(lambda m: chr(int(m.group(1), 16)), f) for f in forms}
     forms |= {f.replace("\\", "") for f in forms}
     out = set()
     for f in forms:
-        f = f.lower()
+        f = f.casefold()
         out.add(f)
         out.add(re.sub(r"[^a-z]", "", f))
     return out
@@ -471,26 +497,89 @@ def _has_method_text(data):
     return any("method" in f for f in _decoded_forms(data))
 
 
+HEADER_REFUSED = "a session call may use only a fixed set of plain headers (see `asb help session`)"
+
+
+def _content_type_ok(value):
+    parts = [p.strip() for p in value.split(";")]
+    media, params = parts[0].lower(), parts[1:]
+    if media not in CONTENT_TYPES or len(params) > 2 or len(value) > 200:
+        return False
+    boundary = charset = 0
+    for prm in params:
+        if _CHARSET_RE.match(prm):
+            charset += 1
+        elif media == "multipart/form-data" and _BOUNDARY_RE.match(prm):
+            boundary += 1
+        else:
+            return False
+    return charset <= 1 and boundary == (1 if media == "multipart/form-data" else 0)
+
+
+def header_problem(headers):
+    """A fixed reason unless every header is on the exact-name allowlist, else None. Fail closed: Content-Length,
+    Connection, Expect, TE, Upgrade, Trailer, Transfer-Encoding, Content-Encoding, Host, Cookie, Proxy-*,
+    Forwarded, X-Forwarded-*, X-Original-*, X-Rewrite-*, Accept-Encoding, duplicates and every other name are
+    refused (urllib sets Content-Length itself, from the bytes it sends). Content-Type is one of CONTENT_TYPES
+    with at most `charset=utf-8` (and, for multipart, a boundary). A value containing a placeholder must BE a
+    placeholder, optionally after Bearer/Basic/Token. Checked on the template: it never depends on a secret."""
+    seen = set()
+    for k, v in headers.items():
+        low = k.lower()
+        if low in seen or low not in ALLOWED_HEADERS:
+            return HEADER_REFUSED
+        seen.add(low)
+        if low == "content-type":
+            if not _content_type_ok(v):
+                return HEADER_REFUSED
+        elif "{{" in v and not _PLACEHOLDER_VALUE.match(v):
+            return HEADER_REFUSED
+    return None
+
+
+def neutralize(text, values=None):
+    """`text` with every {{NAME}} replaced by `values[NAME]` when given, else by the neutral token P. Linear.
+    Used so that scans of the agent's own text never depend on a credential's secret content."""
+    out, i = [], 0
+    while True:
+        a = text.find("{{", i)
+        b = text.find("}}", a + 2) if a >= 0 else -1
+        if a < 0 or b < 0:
+            out.append(text[i:])
+            return "".join(out)
+        out.append(text[i:a])
+        name = text[a + 2:b].strip()
+        out.append((values or {}).get(name, "P"))
+        i = b + 2
+
+
 def override_problem(methods, url, headers, body):
     """A fixed reason when the call could smuggle in another HTTP verb, else None. ONE fail-closed rule, no
-    parsers (every parser is a differential against the upstream's): the call is refused when its query
-    string, its body, or any header NAME contains the text `method` (case-insensitive) in any of these forms:
-    raw, percent-decoded (up to 3 rounds), JSON-unescaped, or with every non-letter removed. This also
-    refuses legitimate fields such as `payment_method`: such calls must use plain `asb http` without
-    --session. Request Content-Encoding and Transfer-Encoding are refused too (a body that cannot be read
-    cannot be checked). `methods` is unused and kept for the extension point. `body` is bytes or None.
-    Applies to the template and again to what is sent."""
-    lower = {k.lower() for k in headers}
-    if "content-encoding" in lower or "transfer-encoding" in lower:
-        return ENCODING_REFUSED
-    if any(_has_method_text(k) for k in headers):
-        return OVERRIDE_REFUSED
+    parsers (every parser is a differential against the upstream's): the call is refused when its URL
+    (path, parameters, query and fragment; userinfo is refused outright), any header NAME or VALUE, or its
+    body contains the text `method` (case-insensitive) in any decoded form (see _decoded_forms). It also
+    refuses legitimate fields such as `payment_method`: such calls use plain `asb http` without --session.
+    A multipart body that declares a Content-Transfer-Encoding is refused. `methods` is unused (kept for the
+    extension point). `body` is bytes or None. Applies to the template and again to what is sent."""
     try:
-        query = urllib.parse.urlsplit(url).query
+        parts = urllib.parse.urlsplit(url)
     except ValueError:
         return OVERRIDE_REFUSED
-    if _has_method_text(query) or (body and _has_method_text(body)):
+    if "@" in parts.netloc:
         return OVERRIDE_REFUSED
+    tail = url.split(parts.netloc, 1)[1] if parts.netloc and parts.netloc in url else url
+    if _has_method_text(tail):
+        return OVERRIDE_REFUSED
+    for k, v in headers.items():
+        if _has_method_text(k) or _has_method_text(v):
+            return OVERRIDE_REFUSED
+    if body:
+        if _has_method_text(body):
+            return OVERRIDE_REFUSED
+        ctype = next((v for k, v in headers.items() if k.lower() == "content-type"), "").lower()
+        if ctype.startswith("multipart/") and any("content-transfer-encoding" in f or "contenttransferencoding" in f
+                                                  for f in _decoded_forms(body)):
+            return OVERRIDE_REFUSED
     return None
 
 
@@ -534,7 +623,14 @@ def run_http(sess, spec, env, tls, allowed_now, opener_for, clock, state):
         headers = {k: fill(v, values) for k, v in spec["headers"].items()}
     except (KeyError, ValueError, UnicodeError):
         raise NotSent("a placeholder or value in this call cannot be used", "session_refused") from None
-    problem = override_problem(sess.methods, url, headers, data)
+    # The header and method checks run on what the AGENT wrote: credential placeholders become a neutral token, so
+    # the outcome never depends on a secret's content; captured values are substituted because an upstream chose them.
+    cap_values = {k: v for k, v in values.items() if k.startswith("session.")}
+    scan_data = data if spec.get("body_b64") is not None else (
+        neutralize(spec["body"], cap_values).encode("utf-8") if spec.get("body") else None)
+    problem = header_problem(spec["headers"]) or override_problem(
+        sess.methods, neutralize(spec["url"], cap_values), {k: neutralize(v, cap_values) for k, v in spec["headers"].items()},
+        scan_data)
     if problem:
         raise NotSent(problem)
     scheme, host, port, path = _origin(url)
@@ -583,7 +679,7 @@ def run_http(sess, spec, env, tls, allowed_now, opener_for, clock, state):
         sess.jar.store(host, path.split("?")[0], https, msg.get_all("Set-Cookie") or [])
         for name, kind, arg in exprs:
             val = sess.jar.get(host, arg) if kind == "cookie" else found.get(name)
-            if storable(val):
+            if storable(val) and not _has_method_text(val):     # a value that would later trip the override rule is not kept
                 caps[name] = val
             else:
                 missing.append(name)
@@ -622,15 +718,17 @@ def scope_problem(s, sc, names, method, spec, capture_names=()):
                           "open a new session that declares it")
     if method in ("GET", "HEAD") and (spec.get("body") or spec.get("body_b64")):
         return "body", f"a {method} call cannot carry a body"
-    if any(k.lower() == "host" for k in spec["headers"]):
-        return "header", "a session call cannot set the Host header"
+    why = header_problem(spec["headers"])
+    if why:
+        return "header", why
     body = spec.get("body")
     if spec.get("body_b64") is not None:
         import base64
         body = base64.b64decode(spec["body_b64"])
     elif isinstance(body, str):
-        body = body.encode("utf-8", "replace")
-    why = override_problem(s.methods, spec["url"], spec["headers"], body)
+        body = neutralize(body).encode("utf-8", "replace")
+    why = override_problem(s.methods, neutralize(spec["url"]), {k: neutralize(v) for k, v in spec["headers"].items()},
+                           body)
     if why:
         return "method", why
     names_in = set(capture_names)
@@ -843,7 +941,10 @@ class SessionsMixin:
                   "names": [s.cred]}
         if actor is not None:
             fields["revoked_by"] = actor
-        self.log(f"session_{reason}", **fields, **extra)
+        if reason == "ended":
+            self.log("session_ended", reason="refusal_budget", **fields, **extra)
+        else:
+            self.log(f"session_{reason}", **fields, **extra)
 
     def _sess_lookup(self, sid, cid, now):
         """(Session or None, state) for `sid` as seen by client `cid`: ok | unknown | expired | closed |
@@ -1063,10 +1164,13 @@ class SessionsMixin:
         try:
             result = self._release(req)
         except Exception as e:  # noqa: BLE001 -- the request must always settle; never repeat the text
-            if not req.sess_state["sent"]:          # it never left the broker: do not charge it
+            if not req.sess_state["sent"]:          # it never left the broker: do not charge it, but meter it
                 with self._sess_lock:
-                    if not s.dead and s.calls > 0:
-                        s.calls -= 1
+                    if not s.dead:
+                        s.calls = max(0, s.calls - 1)
+                        s.free_refusals += 1
+                        if s.free_refusals > MAX_FREE_REFUSALS:
+                            self._sess_end_locked(s, "ended", self.sessions_clock())
             if isinstance(e, SessionError):         # ended mid-flight, or refused before sending: the fixed text
                 self._finish(req, "failed", error=str(e), via="session")
                 raise
