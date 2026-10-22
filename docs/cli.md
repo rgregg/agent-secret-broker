@@ -184,7 +184,8 @@ prompt-injection stance are in
 
 ## Teaching an agent to use it
 
-The CLI documents itself (`asb guide`), so an agent needs only a pointer. Add
+The quickest way is `asb agent-setup` (next section). To do it by hand instead:
+the CLI documents itself (`asb guide`), so an agent needs only a pointer. Add
 this to the agent's instructions: `~/.claude/CLAUDE.md` for Claude Code,
 `AGENTS.md` in a repository for agents that read it, or the equivalent for other
 tools. Do not put your broker's URL or key in a public repository.
@@ -199,6 +200,58 @@ tools. Do not put your broker's URL or key in a public repository.
     - Every use asks the user to approve. A denial or timeout is final: stop and
       tell them what you needed.
     - Run `asb guide` for the full manual (store/update, exit codes).
+
+### `asb agent-setup`
+
+    asb agent-setup [--agent claude|codex|copilot|all] [--scope user|project] [--dry-run] [--remove]
+
+Installs a short block (about 12 lines, no names or hosts, pointing at `asb guide`) into the
+instruction files of the coding agents on this machine. It is local only: it makes no broker
+call, never reads `client.json` and never prints the client key.
+
+| Agent | `--scope user` (default) | `--scope project` (current directory) |
+|---|---|---|
+| `claude` | `~/.claude/CLAUDE.md` | `./CLAUDE.md` (or `./.claude/CLAUDE.md` when only that exists) |
+| `codex` | `$CODEX_HOME/AGENTS.md`, default `~/.codex/AGENTS.md` | `./AGENTS.md` |
+| `copilot` | `$COPILOT_HOME/copilot-instructions.md`, default `~/.copilot/copilot-instructions.md` | `./.github/copilot-instructions.md` |
+
+- Without `--agent` it auto-detects agents (config directory, program on PATH, or for project scope
+  an existing file), prints what it found, and only creates files in directories that already
+  exist. With `--agent NAME` or `all` it also creates missing files and directories. Exit 1 when it
+  finds no agent.
+- The block sits between `<!-- asb:agent-setup begin vN -->` and `<!-- asb:agent-setup end -->`. A
+  re-run replaces just that span in place (so a newer `asb` upgrades an older block); text outside
+  the markers is never touched. Line endings (LF or CRLF) follow the file, and a symlinked file is
+  written through the link.
+- `--dry-run` prints a unified diff and writes nothing. A file that changes is first copied to
+  `FILE.asb-bak-YYYYMMDDHHMMSS`; unchanged files are not rewritten or backed up.
+- `--remove` deletes only the block (and the blank line the install added before it).
+- It refuses, exit 2 and writing nothing for any target, when a marker is damaged (begin without
+  end, end without begin, duplicates, wrong order), the file is read-only, not UTF-8, a directory or
+  a dangling symlink. Fix the file by hand and re-run.
+- Open: `asb status` does not yet warn about an outdated block; compare the `vN` in the marker.
+
+Verified instruction-file locations (checked 2026-10-21 against the vendors' docs):
+
+- Claude Code (<https://code.claude.com/docs/en/memory>): user `~/.claude/CLAUDE.md`; project
+  `./CLAUDE.md` or `./.claude/CLAUDE.md`; also `./CLAUDE.local.md`. All files found from the working
+  directory up are concatenated (nearer ones last), not overridden. An `AGENTS.md` is read only when
+  there is no `CLAUDE.md` above the working directory.
+- Codex CLI (<https://developers.openai.com/codex/guides/agents-md>, now served from
+  learn.chatgpt.com): global `$CODEX_HOME/AGENTS.md` (default `~/.codex`), but a non-empty
+  `AGENTS.override.md` in that directory replaces it (agent-setup prints a note if one exists);
+  project `AGENTS.md` from the repository root down to the working directory, concatenated with the
+  nearest last, capped at 32 KiB in total. Restart Codex after changes.
+- GitHub Copilot CLI (<https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/add-custom-instructions>):
+  repo `.github/copilot-instructions.md`; user `$HOME/.copilot/copilot-instructions.md`
+  (`COPILOT_HOME` replaces `~/.copilot`). User and repo files are merged with no defined precedence.
+  Takes effect in a new session.
+
+Not verified: a user-level file for Copilot in VS Code or other IDEs (GitHub documents only
+personal instructions set on github.com for Copilot Chat there, which a local file cannot set;
+the SSMS docs name `%USERPROFILE%/copilot-instructions.md`, not checked here). The Copilot target
+is therefore the CLI's file. Behaviour was not tested against the real agents, only the documented
+paths.
 
 Two further steps make it stick:
 
