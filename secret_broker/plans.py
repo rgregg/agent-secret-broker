@@ -68,6 +68,12 @@ _NETLOC_RE = re.compile(r"^(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+)(?::([0-9]{1,5}))?
 _PLACEHOLDER_HDR = re.compile(r"^(?:([A-Za-z][A-Za-z0-9_-]{0,19}) )?\{\{ ?([A-Z][A-Z0-9_]{0,60}) ?\}\}$")
 _CT_JSON = re.compile(r"^application/json(?:; ?charset=utf-8)?$")
 _DIGITS = re.compile(r"^(0|[1-9][0-9]{0,15})$")
+_QKEY_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+# URL query parameters that can override the method or replace parts of a body upstream. Refused in
+# every plan call, whatever the rule says.
+_QUERY_OVERRIDES = frozenset((
+    "_method", "method", "_http_method", "http_method", "x-http-method-override", "x_http_method_override",
+    "_httpmethod", "operationname", "variables", "extensions", "_body", "body", "_json"))
 _UNRESERVED = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
 
 # Headers a plan call may never carry, whatever the configuration says: they change how the
@@ -247,7 +253,7 @@ def strict_loads(raw, max_depth=8, max_members=64):
             text = raw.decode("utf-8")
         else:
             text = raw
-        if text.startswith("﻿"):
+        if text.startswith("\ufeff"):
             raise StrictError("byte order mark")
         v = json.loads(text, object_pairs_hook=_pairs, parse_constant=_no_const,
                        parse_int=_int_hook, parse_float=_float_hook)
@@ -448,6 +454,14 @@ def is_private_ip(host):
     return ip.is_private or ip.is_loopback or ip.is_link_local
 
 
+def _utf8_ok(raw):
+    try:
+        bytes(raw).decode("utf-8")      # strict: overlong forms, surrogates and truncation fail
+        return True
+    except UnicodeDecodeError:
+        return False
+
+
 def path_problem(path, prefix=False):
     """None when `path` is acceptable for matching, else a short class. Checked as sent: no
     normalisation, so nothing is ever decoded before it is compared."""
@@ -460,18 +474,32 @@ def path_problem(path, prefix=False):
     for seg in path.split("/"):
         if seg in (".", ".."):
             return "dot segment"
-    i = 0
-    while True:
-        i = path.find("%", i)
-        if i < 0:
-            break
+    # Percent-encoding is allowed only for a space (%20) and for non-ASCII UTF-8 sequences, with
+    # UPPERCASE hex. Everything else encoded (%25, %2e, %2f, %5c, %00, unreserved, reserved...) is
+    # refused, so nothing can double-decode or change meaning at the upstream.
+    i, run = 0, bytearray()
+    while i < len(path):
+        if path[i] != "%":
+            if run and not _utf8_ok(run):
+                return "bad percent-encoding"
+            run = bytearray()
+            i += 1
+            continue
         m = _PCT_RE.match(path, i)
-        if not m:
+        if not m or m.group(1) != m.group(1).upper():
             return "bad percent-encoding"
-        ch = chr(int(m.group(1), 16))
-        if ch in "/\\" or ch == "\x00" or ch in _UNRESERVED or ch == ";" or ord(ch) < 32 or ord(ch) == 127:
+        b = int(m.group(1), 16)
+        if b == 0x20:
+            if run and not _utf8_ok(run):
+                return "bad percent-encoding"
+            run = bytearray()
+        elif b >= 0x80:
+            run.append(b)
+        else:
             return "encoded special character"
         i += 3
+    if run and not _utf8_ok(run):
+        return "bad percent-encoding"
     return None
 
 
@@ -512,15 +540,51 @@ def _norm_rule(raw, i, cfg, graphql_write_ok):
         _bad(f"{f}.path_prefix", "must not end with /")
     if prefix == "/" and not cfg["allow_root_prefix"]:
         _bad(f"{f}.path_prefix", "a prefix of only / is not allowed")
-    query = raw.get("query", "any")
-    if query not in ("any", "none"):
-        _bad(f"{f}.query", 'must be "any" or "none"')
+    query = _norm_query(raw.get("query"), method, raw.get("body"), f"{f}.query")
     mu = raw.get("max_uses")
     if not _int(mu) or not 1 <= mu <= cfg["max_uses_per_rule"]:
         _bad(f"{f}.max_uses", f"must be a whole number from 1 to {cfg['max_uses_per_rule']}")
     body = _norm_body(raw.get("body"), method, f"{f}.body", cfg, graphql_write_ok)
     return {"secret": secret, "method": method, "scheme": scheme, "host": host, "port": port,
             "path_prefix": prefix, "query": query, "max_uses": mu, "body": body}
+
+
+def _norm_query(v, method, body, f):
+    """"none" (no query string), "any" (read methods only) or a sorted list of allowed key names.
+    The default is "none" for a method that writes. A GraphQL rule never allows a query string."""
+    gql = isinstance(body, dict) and "graphql" in body
+    if v is None:
+        v = "any" if method in READ_METHODS and not gql else "none"
+    if v == "none":
+        return "none"
+    if gql:
+        _bad(f, 'a GraphQL rule must use "none" (a query string could override the document)')
+    if v == "any":
+        if method not in READ_METHODS:
+            _bad(f, 'a rule that writes must use "none" or list the allowed query keys')
+        return "any"
+    if (isinstance(v, list) and 1 <= len(v) <= 16 and all(isinstance(k, str) and _QKEY_RE.match(k) for k in v)):
+        if any(k.lower() in _QUERY_OVERRIDES for k in v):
+            _bad(f, "a method or body override parameter is never allowed")
+        return sorted(set(v))
+    _bad(f, 'must be "none", "any" (read methods only) or a list of up to 16 query key names')
+
+
+def query_problem(q, rule_query):
+    """None when the raw query string `q` (without the ?) is acceptable for the rule."""
+    if q == "":
+        return None
+    if ";" in q:
+        return "query"
+    for part in q.split("&"):
+        key = part.split("=", 1)[0]
+        if not _QKEY_RE.match(key):
+            return "query"              # empty, encoded or odd keys
+        if key.lower() in _QUERY_OVERRIDES:
+            return "query"
+        if isinstance(rule_query, list) and key not in rule_query:
+            return "query"
+    return None
 
 
 def _norm_body(raw, method, f, cfg, graphql_write_ok):
@@ -748,10 +812,10 @@ def freeze(spec):
 def _parse_url(url):
     """(scheme, host, port, path, has_query) from the URL text with ONE parse, or NoMatch. The URL
     must be plain printable ASCII with none of the characters that different parsers disagree on."""
+    if "{{" in url or "}}" in url:
+        raise NoMatch("placeholder")
     if not _URL_RE.match(url) or _URL_BAD.search(url):
         raise NoMatch("url")
-    if "{{" in url:
-        raise NoMatch("placeholder")
     if "#" in url:
         raise NoMatch("url")        # a fragment
     for scheme in ("https", "http"):
@@ -843,6 +907,8 @@ def match_rule(rule, frozen, cfg, own_vars, opaque=frozenset(), post=False):
     if not (path == pre or (pre != "/" and path.startswith(pre + "/")) or (pre == "/" and path.startswith("/"))):
         raise NoMatch("path")
     if rule["query"] == "none" and has_query:
+        raise NoMatch("query")
+    if query_problem(_q, rule["query"]):
         raise NoMatch("query")
     hdrs = _norm_headers(frozen, cfg, own_vars, opaque, post)
     if len(frozen.body) > cfg["max_body_bytes"]:
@@ -1157,6 +1223,8 @@ class PlanStore:
                 if r["secret"] != names[0]:
                     continue
                 cur = live(r["secret"])
+                if cur is None:
+                    return Miss("wrong_policy", plan_id=p.id)      # the credential is gone
                 if cur is None or cur["plans"] is False or r["secret"] in cfg["deny_secrets"] \
                         or r["host"] not in cur["hosts"] or p.item_sigs.get(r["secret"]) != cur["sig"]:
                     why_policy = True
@@ -1416,7 +1484,9 @@ def rule_lines(rule):
     lines = [f"<b>{e(rule['secret'])}</b> <span class='pill {'bad' if tier == 'high' else 'warn' if tier == 'medium' else 'ok'}'>"
              f"{e(label)}</span>",
              f"{e(rule['method'])} {e(where)}, up to {n} time{'' if n == 1 else 's'}."
-             + (" No query string." if rule["query"] == "none" else "")]
+             + (" No query string." if rule["query"] == "none" else
+                " Any query string (no method or body override parameters)." if rule["query"] == "any" else
+                " Query keys allowed: " + e(", ".join(rule["query"])) + " (values not constrained).")]
     b = rule["body"]
     if "none" in b:
         lines.append("Body: none (an empty body only).")
