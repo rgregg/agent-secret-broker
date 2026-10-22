@@ -1621,19 +1621,25 @@ class Hardening(SBase):
                  ("/echo", {"x-http-method": "PUT"}, "x"),
                  ("/echo", {"X-Method-Override": "DELETE"}, "x"),
                  ("/echo", {"X-Method-Override": "{{session.NOPE}}"}, "x"),
+                 ("/echo", {"X-HTTP-Method-Override": "GET"}, "x"), ("/echo", {"X_Method": "1"}, "x"),
+                 ("/echo", {"X-Http-Meth%6fd": "1"}, "x"),
                  ("/echo?_method=DELETE", {}, "x"),
                  ("/echo?_MeThOd=DELETE", {}, "x"),
                  ("/echo?a=1&%5Fmethod=DELETE", {}, "x"),
                  ("/echo?%255Fmethod=DELETE", {}, "x"),                       # double percent-encoding
                  ("/echo?a=1;_method=DELETE", {}, "x"),                       # odd separator
                  ("/echo?a+b=1&%5f%4dethod=x", {}, "x"),
+                 ("/echo?x_method=1", {}, "x"), ("/echo?x_Method=1", {}, "x"), ("/echo?meth%6fd=1", {}, "x"),
+                 ("/echo?payment_method=card", {}, "x"), ("/echo?a=1%3b_method=DELETE", {}, "x"),
                  # form bodies: plus, %5F, mixed case, double encoding, hex-encoded letters
                  ("/echo", form, "a=1&_method=DELETE"),
                  ("/echo", form, "a+b=1&%5Fmethod=DELETE"),
                  ("/echo", form, "a=1&_MeThOd=DELETE"),
                  ("/echo", form, "%255Fmethod=DELETE"),
                  ("/echo", form, "_meth%6Fd=DELETE"),
-                 ("/echo", form, "_method+=x"),
+                 ("/echo", form, "_method+=x"), ("/echo", form, "a=1;_method=x"), ("/echo", form, "x_method=1"),
+                 ("/echo", form, "meth%6fd=1"), ("/echo", form, "payment_method=card"),
+                 ("/echo", {"Content-Type": "application/json; charset=utf-16"}, "{\"m e t h o d\": 1}"),
                  ("/echo", {"Content-Type": "application/x-www-form-urlencoded; charset=utf-8"}, "_method=PUT"),
                  # JSON bodies: plain, unicode escape, nested, mixed case, in an array
                  ("/echo", js, '{"_method": "PATCH"}'),
@@ -1676,19 +1682,23 @@ class Hardening(SBase):
     def test_ordinary_bodies_and_queries_are_still_allowed(self):
         sid = self.open(methods=["GET", "POST"])
         ok = [("/echo?a=1&b=2", {"Content-Type": "application/x-www-form-urlencoded"}, "a=1&b=2"),
-              ("/echo", {"Content-Type": "application/json"}, '{"name": "x", "tags": [{"k": "v"}], "note": "a method"}'),
+              ("/echo", {"Content-Type": "application/json"}, '{"name": "x", "tags": [{"k": "v"}], "note": "a note"}'),
               ("/echo", {"Content-Type": "text/plain"}, "hello world"),
               ("/echo", {}, "plain body without the word")]
         for path, hdr, body in ok:
             code, r = self.call(sid, "POST", path, headers=hdr, body=body)
             self.assertEqual(r["http"]["status"], 200, (path, hdr, body))
 
-    def test_the_override_header_is_allowed_only_when_that_verb_is_declared(self):
+    def test_the_method_rule_has_no_exception_even_for_a_declared_verb(self):
         sid = self.open(methods=["GET", "POST", "DELETE"])
-        code, r = self.call(sid, "POST", "/echo", headers={"X-HTTP-Method-Override": "DELETE"}, body="x")
-        self.assertEqual(r["http"]["status"], 200)
-        code, r = self.call(sid, "POST", "/echo?_method=delete", body="x")        # fields are refused regardless
+        for hdr, path in (({"X-HTTP-Method-Override": "DELETE"}, "/echo"), ({}, "/echo?_method=delete")):
+            code, r = self.call(sid, "POST", path, headers=hdr, body="x")
+            self.assertEqual((code, r["code"]), (403, "session_refused"), (hdr, path))
+        code, r = self.call(sid, "POST", "/echo", body="payment_method=card")        # a legitimate field: use plain asb http
         self.assertEqual((code, r["code"]), (403, "session_refused"))
+        self.assertEqual(self.sess(sid).calls, 0)                                   # refused calls are not charged
+        self.assertIn("method", r["error"])
+        self.assertNotIn("payment_method", r["error"])                              # the text is fixed
 
     def test_a_captured_value_cannot_smuggle_an_override_after_substitution(self):
         sid = self.open(methods=["GET", "POST"])

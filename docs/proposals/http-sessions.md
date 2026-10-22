@@ -221,13 +221,14 @@ pending open requests per client plus the general pending cap and deny cooldown;
 ## Method override (fail closed)
 
 A session's methods are the verbs the human approved, and many servers let a request change its verb with a header or a
-`_method` field. A regex over the raw request cannot be trusted for this (JSON unicode escapes, double percent-encoding, multipart
-field names, content encodings all evade it), so the broker parses instead and refuses what it cannot parse: request
-`Content-Encoding`/`Transfer-Encoding` are refused; X-HTTP-Method style headers are refused unless the verb is declared; query,
-form and JSON keys are decoded (at every JSON depth) and refused if they name an override; any other or unparseable body, and a
-query with `;` separators, must contain no case-insensitive `method` in raw, percent-decoded or JSON-unescaped form. The checks
-run on the template and again on the substituted request. Nothing is allowed that merely "looks harmless": the rule is
-refuse-by-default, with the cost that a non-JSON, non-form body containing the word `method` is refused.
+`_method` field. Any filter that parses the request (regex, key sets, per-content-type parsers) is a differential against the
+upstream's parser: JSON unicode escapes, double percent-encoding, multipart names, `;` separators and key variants all evaded
+earlier versions. The broker therefore applies ONE rule with no parsing: a session call is refused, with a fixed message and without
+charging the call, if its query string, its body or any header name contains `method` case-insensitively in the raw, percent-decoded
+(3 rounds), JSON-unescaped or letters-only form. Request `Content-Encoding` and `Transfer-Encoding` are refused so the body is always
+readable. The check runs on the template and again on the substituted request. The cost, stated plainly: legitimate fields such as
+`payment_method` are refused in session calls; such a call uses plain `asb http` (one approval per call), and the later manifest
+(task-grant) approach is the place to allow specific ones.
 
 ## Failure modes
 
@@ -278,7 +279,7 @@ against a throwaway broker for the end-to-end flow. Rehearsal scenario in
   linear placeholder scan with size caps and no scope check under the store lock (a cubic regex under the global lock froze
   every session for seconds); in-flight calls are re-checked after the upstream answers (revoke, close, client revoke, deadline
   discard the response and the jar changes); session calls have status `running`, not `pending`, so they cannot be decided or
-  counted as pending; method override is refused by parsing, not by a pattern (see below) and bodies on GET/HEAD are refused; redirects are never
+  counted as pending; method override is refused by a single parser-free substring rule (see below) and bodies on GET/HEAD are refused; redirects are never
   followed (replacing the earlier follow-inside-hosts design: simpler, and no hop can change method, port or count);
   the manifest and card carry the port and calls are scope-checked on it; deadlines use `time.monotonic()` (an injectable
   clock for tests, wall time for display only); captured values must be printable ASCII and a call that never left the
