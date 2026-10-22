@@ -1906,7 +1906,7 @@ ends its sessions at once.
 - **Method override is refused by one fail-closed rule.** A session call is refused (fixed message, not charged) if the agent's URL path, parameters,
   query or fragment, any header name or value, or its body contains the text `method` (case-insensitive) in any decoded form: raw, up to 5
   rounds of percent-, HTML numeric entity (`&#109;`, `&#x6d;`), `\uXXXX`, `\xNN` and quoted-printable (`=6D`) decoding with NFKC
-  normalisation, and each of those with every non-letter removed. Userinfo in the URL is refused. A multipart body that declares a
+  normalisation, and each of those with every non-letter removed. Bodies are scanned as UTF-8, latin-1, UTF-16/32 (when NUL bytes or a BOM suggest it) and double-encoded text, so fullwidth or mojibake spellings cannot hide; a body that is not valid UTF-8 is refused unless it is multipart/form-data or sent as `body_b64` (then all views are still scanned). Userinfo in the URL is refused. A multipart body that declares a
   Content-Transfer-Encoding is refused. This covers `_method` fields in a query, path, form, JSON or multipart, encoded and mixed-case
   variants and `;` separators, without any parser that could disagree with the upstream's. It deliberately also refuses legitimate fields such
   as `payment_method`: a call that needs one must use plain `asb http` without `--session` (one approval per call). The same check runs again on what

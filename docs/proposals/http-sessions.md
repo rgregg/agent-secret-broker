@@ -239,7 +239,7 @@ the upstream's parser, and earlier versions were evaded by JSON unicode escapes,
 and key variants. The broker therefore applies ONE rule with no parsing: a session call is refused, with a fixed message and without
 charging the call, if its URL (path, parameters, query, fragment), any header name or value, or its body contains `method`
 case-insensitively in any decoded form (raw; up to 5 rounds of percent, HTML numeric entity, `\u`, `\x` and quoted-printable decoding with
-NFKC; letters-only). Userinfo in the URL and multipart bodies declaring a Content-Transfer-Encoding are refused. The check runs on the template
+NFKC; letters-only). Bodies are scanned as UTF-8, latin-1, UTF-16/32 and double-encoded text (and refused when not valid UTF-8, except multipart or base64 bodies, which are scanned in every view). Userinfo in the URL and multipart bodies declaring a Content-Transfer-Encoding are refused. The check runs on the template
 and again on the substituted request. The cost, stated plainly: legitimate fields such as `payment_method` are refused in session calls;
 such a call uses plain `asb http` (one approval per call), and the later manifest (task-grant) approach is the place to allow specific ones.
 
