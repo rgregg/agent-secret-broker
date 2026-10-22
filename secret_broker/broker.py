@@ -4174,6 +4174,8 @@ def client_handler(broker, client_key):
                     if n > proposals_mod.BODY_CAP:
                         return _json(self, 413, {"error": "guidance proposal too large"})
                     names = proposals_mod.names_of(body.get("entries"))
+                elif mode == "session_close":
+                    names = []
                 else:
                     names = list(body["names"])
                 if mode == "guidance":
@@ -4192,7 +4194,7 @@ def client_handler(broker, client_key):
                     spec.setdefault("purpose", None)
                 elif mode == "session_close":
                     state = broker.session_close(body.get("session"), self.client)
-                    if state == "closed":
+                    if state == "done":
                         return _json(self, 200, {"status": "closed"})
                     msg, code, http = broker._MISSING[state]
                     return _json(self, http, {"error": msg, "code": code})

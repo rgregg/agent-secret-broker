@@ -916,15 +916,15 @@ class SessionsMixin:
 
     # -- ending ----------------------------------------------------------------------
     def session_close(self, sid, client):
-        """The agent closes its own session. True when it was open; otherwise the same answer for
-        unknown, other-client and already-ended ids is raised as a SessionError by the caller."""
+        """The agent closes its own session. Returns "done" when it was open; otherwise the lookup
+        state (unknown for another client's or a made-up id, expired/closed/revoked for the owner's)."""
         cid, now = client["id"], self.sessions_clock()
         with self._sess_lock:
             s, state = self._sess_lookup(sid, cid, now)
             if s is None:
                 return state
             self._sess_end_locked(s, "closed", now)
-        return "closed"
+        return "done"
 
     def session_status(self, sid, client):
         cid, now = client["id"], self.sessions_clock()
