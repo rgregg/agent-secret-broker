@@ -58,6 +58,8 @@ SECRETS = {
     "credtoken": "FAKE-credreq-token-4d9a17c3",
     "creduser": "FAKE-credreq-user-a07e52b9",
     "credpw": "FAKE-credreq-pw-6e2c80d1",
+    "sesscookie": "FAKE-session-cookie-3e7b19d4",
+    "sesscsrf": "FAKE-session-csrf-a52c8f70",
 }
 
 
@@ -96,6 +98,9 @@ class Upstream(BaseHTTPRequestHandler):
         raw = json.dumps({"echo": rec}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
+        if self.path.startswith("/sess/login"):         # a login that sets a cookie and returns a CSRF header
+            self.send_header("Set-Cookie", "SESS=" + SECRETS["sesscookie"] + "; HttpOnly; Path=/")
+            self.send_header("X-CSRF-Token", SECRETS["sesscsrf"])
         self.send_header("Content-Length", str(len(raw)))
         self.end_headers()
         self.wfile.write(raw)
@@ -756,6 +761,84 @@ def scenario_C(rh):
              len(Aux.telegram) > 3 and not any(v in t for t in Aux.telegram for v in S.values()), f"{len(Aux.telegram)} messages")
     credreq_scenario(rh, g)
     clients_scenario(rh, g)
+    sessions_scenario(rh, g)
+
+
+def sessions_scenario(rh, g):
+    """HTTP sessions on the main throwaway broker with the real asb: open (the card shows credential,
+    hosts, methods, time and cap; the human shortens the cap), log in with a captured CSRF value, calls
+    that need the cookie and the CSRF value, refusals (host, method, cap), close, revoke, and no cookie or
+    CSRF value anywhere the agent or the logs can see."""
+    b = rh.main
+    S = SECRETS
+    seen = set(b.ap.cards())
+    p = rh.asb_popen(b, "session", "open", "stub", "--for", "rehearse a login flow", "--host", "127.0.0.1",
+                     "--methods", "GET,POST", "--ttl", "10m", "--max-calls", "6")
+    p.stdin.close()
+    p.stdin = None
+    rid = b.ap.wait_card(seen, timeout=25, proc=p)
+    page = b.ap.get("/")[2] if rid else ""
+    rh.check(g, "sessions: the card shows credential, hosts, methods, time limit and call cap, with no Always chips",
+             rid and all(x in page for x in ("HTTP session", "stub", "127.0.0.1", "GET, POST", "10 min", "6 calls",
+                                             "name=session_ttl_min", "HIGH RISK"))
+             and "approve_always" not in page and "approve_grant_" not in page, "")
+    if rid:
+        b.ap.decide(rid, "approve", {"session_max_calls": "5"})
+    out, err = p.communicate(timeout=60)
+    rh.outputs.append(("asb session open", out + err))
+    sid = out.strip()
+    rh.check(g, "sessions: open exits 0 and prints only the session id; the approver shortened the cap to 5",
+             p.returncode == 0 and re.fullmatch(r"[A-Za-z0-9_-]{32}", sid) and "up to 5 calls" in err, f"rc={p.returncode}")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{32}", sid or ""):
+        return
+    n0 = len(b.records())
+    rc, o, e = rh.asb(b, "http", "stub", "POST", up_url(rh, "/sess/login"), "--session", sid, "-H",
+                      "Authorization: Bearer {{STUB_TOKEN}}", "--capture", "CSRF=header:X-CSRF-Token")
+    rh.check(g, "sessions: login runs with no prompt, captures the CSRF header, and the agent sees no cookie, CSRF or token",
+             rc == 0 and "captured CSRF" in e and not b.ap.cards() and S["sesscookie"] not in o + e
+             and S["sesscsrf"] not in o + e and S["http"] not in o + e, f"rc={rc} {e.strip()[:80]}")
+    rc, o, e = rh.asb(b, "http", "stub", "POST", up_url(rh, "/sess/write"), "--session", sid, "-H",
+                      "X-CSRF-Token: {{session.CSRF}}", "-d", "{}")
+    h = last_hit(rh)
+    hl = {k.lower(): v for k, v in (h or {}).get("headers", {}).items()}
+    rh.check(g, "sessions: the next call carries the jar's cookie and the captured CSRF value upstream, masked in the reply",
+             rc == 0 and h and hl.get("cookie") == "SESS=" + S["sesscookie"]
+             and hl.get("x-csrf-token") == S["sesscsrf"] and S["sesscookie"] not in o + e
+             and S["sesscsrf"] not in o + e, f"rc={rc}")
+    rc, o, e = rh.asb(b, "http", "stub", "DELETE", up_url(rh, "/sess/x"), "--session", sid)
+    rh.check(g, "sessions: a method outside the session is refused (exit 8), not prompted", rc == 8 and not b.ap.cards(), f"rc={rc}")
+    rc, o, e = rh.asb(b, "http", "stub", "GET", "http://localhost:%d/sess/x" % rh.up_port, "--session", sid)
+    rh.check(g, "sessions: a host outside the session is refused (exit 8)", rc == 8, f"rc={rc} {e.strip()[:80]}")
+    rc, o, e = rh.asb(b, "session", "status", sid)
+    rh.check(g, "sessions: status shows the calls left", rc == 0 and "calls left: 3 of 5" in o, o.strip()[:80])
+    for _ in range(3):
+        rh.asb(b, "http", "stub", "GET", up_url(rh, "/sess/more"), "--session", sid)
+    rc, o, e = rh.asb(b, "http", "stub", "GET", up_url(rh, "/sess/more"), "--session", sid)
+    rh.check(g, "sessions: the call cap is enforced (exit 8)", rc == 8, f"rc={rc}")
+    ev = {r["event"] for r in b.records()[n0:]}
+    rh.check(g, "sessions: audit has session_used and session_refused, and no cookie or CSRF value",
+             {"session_used", "session_refused"} <= ev and S["sesscookie"] not in open(b.audit).read()
+             and S["sesscsrf"] not in open(b.audit).read(), "")
+    # a second session: closed by the agent, then another revoked by the human on the Clients tab
+    def open_one():
+        return rh.asb_decided(b, ["session", "open", "stub", "--for", "second", "--host", "127.0.0.1", "--ttl", "5m"])
+    rc, o, e, rid2 = open_one()
+    sid2 = o.strip()
+    rc2, o2, e2 = rh.asb(b, "session", "close", sid2)
+    rc3, o3, e3 = rh.asb(b, "http", "stub", "GET", up_url(rh, "/sess/x"), "--session", sid2)
+    rh.check(g, "sessions: the agent closes its session (exit 0) and later calls exit 7", rc == 0 and rc2 == 0 and rc3 == 7, f"{rc},{rc2},{rc3}")
+    rc, o, e, rid3 = open_one()
+    sid3 = o.strip()
+    page = b.ap.get("/clients")[2]
+    rh.check(g, "sessions: the Clients tab lists the active session with its time left and a Revoke button",
+             "Active sessions" in page and "data-gexp=" in page and "/sessions/revoke" in page and sid3 not in page, "")
+    m = re.search(r"name=pid value='([^']+)'", page)
+    if m:
+        b.ap.post("/sessions/revoke", {"pid": m.group(1)})
+    rc, o, e = rh.asb(b, "http", "stub", "GET", up_url(rh, "/sess/x"), "--session", sid3)
+    rh.check(g, "sessions: a revoked session stops at once (exit 7)", rc == 7 and "revoked" in e, f"rc={rc}")
+    rc, o, e = rh.asb(b, "http", "stub", "GET", up_url(rh, "/sess/x"), "--session", sid, extra_env={"SECRET_BROKER_KEY": "wrong-key"})
+    rh.check(g, "sessions: a call with another key never reaches the session (auth fails)", rc == 3, f"rc={rc}")
 
 
 def clients_scenario(rh, g):

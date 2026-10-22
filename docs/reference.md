@@ -9,6 +9,7 @@ How the broker works, in detail. For installing and configuring it see
     asb list [--json]             what credentials exist? name, vars, hosts
     asb which HOST|URL            is a credential available? (no approval, no push)
     asb http NAME METHOD URL [-H 'K: V']... [-d BODY | -d @file | -d @-]
+    asb http NAME METHOD URL ... --session ID     inside an approved http session (see "HTTP sessions")
     asb NAME[,NAME] -- command args...
     asb guidance propose FILE|- | --from-dir DIR   propose risk guidance for a human to review
     asb help COMMAND              usage + example for one command
@@ -1830,6 +1831,111 @@ validated exactly as the catalog will read it back before anything is written. I
   `credential_provided` and `credential_refused` are hidden approver activity.
   History shows the request, follows a rename, and the detail view says the purpose is not retained.
 
+## HTTP sessions (multi-step flows with one approval)
+
+`asb http` is one call per approval. A flow that needs several related calls (log in and reuse a
+session cookie, carry a CSRF token from one response into the next call) used to push agents into env
+mode, where a program holds the raw secret. An **HTTP session** keeps the secret and the session state in
+the broker instead. The design and its rationale are in
+[proposals/http-sessions.md](proposals/http-sessions.md).
+
+    asb session open NAME --for "purpose" --host H [--host H2]... [--methods GET,HEAD,POST] [--ttl 15m] [--max-calls N]
+    asb http NAME METHOD URL ... --session ID [--capture NAME=header:X|cookie:NAME|json:$.a.b]...
+    asb session status ID | asb session close ID
+
+**What the human is approving.** A session is a time-boxed standing permission for one client, one
+http credential, specific hosts and specific methods. The card says it plainly: this client may make
+these calls with this credential to these hosts, without asking again, until the time runs out or the
+call cap is used; each call is logged but is not shown to you as it happens. It lists the credential, hosts,
+methods (anything beyond GET and HEAD is called out), the time limit (counted from the moment you
+approve), the call cap and the client's name; the agent's purpose text is shown as its unverified claim
+with every non-ASCII character escaped. You may shorten the time and the cap on the card; you cannot
+lengthen them.
+
+**Opening always needs a human.** The open request is high by code (no model sees it), never
+auto-approved (`approval: allow`, Always, timed grants and SSH rules do not apply), has no Always or timed
+chips, and no notification button, token or Home Assistant hook can decide it: only the authenticated approval
+site can. It follows the other approval requests' rules for pending caps (3 requests, 2 session requests per
+client), the deny cooldown per credential and the request TTL (`ttl_seconds`).
+
+**Time-bound, abandoned at the deadline.** The deadline is `approval time + ttl` and is never moved:
+no sliding extension, no renewal, no idle refresh. Default 15 minutes, hard maximum `sessions.max_ttl_s`
+(default 60 minutes, ceiling 24 hours), minimum 30 seconds. At the deadline the cookie jar and captured values
+are dropped, the session is marked expired, every further call with its id fails (HTTP 410, `session_expired`,
+`asb` exit 7) and `session_expired` is audited. A sweeper does this every few seconds even when nobody
+calls, and a lookup ends an overdue session itself. A session nobody uses still expires. A broker restart drops
+all sessions (they are memory only). You can revoke one at any time on the Clients tab (immediate, audited) and
+the agent can `asb session close ID`.
+
+**Client-bound.** A session is bound to the authenticated client that opened it (see
+[Clients](#clients-per-client-credentials-and-enrollment)). A call from any other client, including the legacy
+shared key when the session belongs to an enrolled client, gets exactly the answer an unknown id gets (404,
+`session_unknown`): no oracle on whether an id exists. Ids are 192 random bits, looked up by their SHA-256 and
+compared in constant time. The legacy shared key counts as one client, `legacy`: it cannot tell machines apart, so
+machines that share it share each other's sessions; enroll each machine to separate them. Revoking a client
+ends its sessions at once.
+
+**Scope (guardrails).**
+
+- Hosts are required and must sit inside the credential's `allowed_hosts`: a session can only narrow, never widen
+  (re-checked on every call, so narrowing the credential later also narrows the session). Http credentials only:
+  ssh keys and credentials without `allowed_hosts` (env-only) are refused with a clear error.
+- Methods default to GET and HEAD; others must be declared on open. A call outside the hosts, methods or call cap
+  (`--max-calls`, default and cap `sessions.max_calls` 200) is **refused** with a specific error (exit 8), never
+  prompted: the agent must open a new session, which you read in full. Refusals do not count as calls.
+- A session call names exactly the session's credential and may not set a `Host` header. It is released
+  without a prompt and without a model verdict. `asb http` without `--session` behaves exactly as before.
+- Redirects are followed (at most 5) only to hosts inside the session's hosts and the credential's allowed hosts,
+  never from https to http; any other redirect is returned to the agent unfollowed. TLS verification, pinning and
+  `tls_verify` are as for plain http calls.
+
+**State held per session (memory only).**
+
+- A **cookie jar**: cookies from upstream responses are stored per exact host and sent only to that host. `Domain` is
+  ignored (it never widens), `Path` is honoured, `Secure` cookies are neither accepted from nor sent over plain http,
+  `Max-Age` and `Expires` are honoured. At most 50 cookies of 4096 bytes. `Set-Cookie` headers are removed from every
+  response the agent sees.
+- **Captured values**: `--capture NAME=header:X-CSRF-Token | cookie:NAME | json:$.a.b[0]` stores a value from the final
+  response (the minimal JSONPath allows dotted keys and array indexes only; anything else is a usage error and nothing
+  is sent). A value must be short text without control characters. At most 16 per session and 8 expressions per call;
+  repeating a name replaces it, which is how a rotating CSRF token is followed. They are used as `{{session.NAME}}` in the
+  URL, headers and body (substituted in one pass), never returned. A capture that finds nothing is reported by name
+  (`NOT captured`), and a `{{session.NAME}}` that was never captured refuses the call.
+- Credential, cookie and captured values are masked in the response body and headers if the upstream echoes them
+  (the same exact-match masking as http mode, values of 6 or more characters). A response header the agent did not
+  capture (for example a CSRF header) is an ordinary header and is visible.
+
+**Errors and exit codes.** Messages are fixed text; no exception text reaches an agent, a log, the audit log, history or a
+page (only class names and coarse categories such as `timeout`, `connection`, `tls`, `dns`, `invalid_request`).
+
+| Situation | HTTP | `code` | `asb` exit |
+|---|---|---|---|
+| unknown id, malformed id, another client's id | 404 | `session_unknown` | 7 |
+| expired, closed or revoked (told to the owner only) | 410 | `session_expired` | 7 |
+| out of scope (host, method, credential), call cap used, missing `{{session.NAME}}`, bad placeholder | 403 | `session_refused` | 8 |
+| bad capture expression or open parameters | 400 | none | 2 (client-side) or 3 |
+
+**Config** (validated at startup, naming the field):
+`"sessions": {"enabled": true, "default_ttl_s": 900, "max_ttl_s": 3600, "max_calls": 200, "max_per_client": 3}`.
+`GET /v1/status` shows `features.http_sessions` with these values. There is also a fixed cap of 20 open sessions in total.
+
+**Audit events.** `session_requested`, `session_opened` (client, hosts, methods, ttl, max calls, expiry; `shortened`
+when you lowered the limits), `session_used` (call number and cap, host; the call itself is also an ordinary request:
+`requested`, `approved` with `via: session`, `secret_read`, `http_executed`, `delivered`), `session_refused` (reason
+class: `max_calls`, `method`, `host`, `credential`, `placeholder`, `missing_value`, `header`, `unknown`, `expired`,
+`closed`, `revoked`), `session_closed`, `session_expired`, `session_revoked` (who). Only the first 8 characters of
+the id are ever logged; no cookie, captured value or credential is in any record. The agent's own audit view
+([above](#what-a-client-sees-of-the-audit-log)) shows its client's session events through a deny-by-default whitelist
+(no approver, no policy). The Clients tab has an **Active sessions** list: credential, client, hosts, methods, live
+time left, calls used and the cap, and Revoke (CSRF-protected, audited).
+
+**Threat model.** A session is a time-boxed standing permission: size it by what the card says. A stolen id is
+useless without the owning client's key; with the key it can do only what the card allowed until the deadline. A
+prompt-injected agent can spend the session inside its scope but cannot widen it, extend it, or turn out-of-scope
+calls into prompts. A malicious upstream cannot redirect the credential or cookies off the session's hosts. What
+masking cannot stop: an upstream that echoes a value in a transformed form (encoded or split), and a program on the
+agent's machine that has its own access to the broker's client key.
+
 ## Vault session lifetime
 
 The vault is not kept open (the local backend drops its decrypted contents after
@@ -2287,6 +2393,10 @@ or `expired` mean a human was asked (the agent also learns that from its own req
   needs you to match the code. An attacker who can race a pending enrollment gains nothing unless
   you approve a card you did not start. Rate limits are per socket address, so behind a proxy they
   are global. Until `legacy_client_key` is `deny`, anyone with the old shared key still works.
+- **HTTP sessions are standing permissions.** Approving a session lets that client make any call inside its hosts,
+  methods and call cap, without asking, until a deadline that nothing can move. Read the card's methods
+  (POST, PUT, PATCH and DELETE change things) and hosts as the worst case, keep the time short, and revoke on the
+  Clients tab if in doubt. See [HTTP sessions](#http-sessions-multi-step-flows-with-one-approval).
 - Output masking is exact-match; a program that transforms a secret before
   printing it (base64, splitting) defeats it.
 

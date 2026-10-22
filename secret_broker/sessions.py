@@ -850,11 +850,12 @@ class SessionsMixin:
         sid = spec.get("session")
         method = spec["method"].upper()
         scheme, host, _ = _host_of(spec["url"])
+        active = self.clients.is_active(cid)    # a revoked client reaches nothing, even before its sessions are purged
         with self._sess_lock:
             s, state = self._sess_lookup(sid, cid, now)
             problem = None
-            if s is None:
-                problem = ("missing", state)
+            if s is None or not active:
+                s, problem = None, ("missing", state if active else "unknown")
             else:
                 problem = scope_problem(s, self.cfg["secrets"].get(s.cred), names, method, spec)
                 if problem is None:

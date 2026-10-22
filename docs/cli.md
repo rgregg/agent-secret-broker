@@ -168,6 +168,38 @@ credential through the normal flow, which still asks you on every use. Details, 
 prompt-injection stance are in
 [reference.md](reference.md#credential-requests-the-agent-asks-the-human-supplies-the-value).
 
+### HTTP sessions: login and cookie flows without a script
+
+    asb session open NAME --for "purpose" --host H [--host H2]... [--methods GET,HEAD,POST] [--ttl 15m] [--max-calls N]
+    asb http NAME METHOD URL ... --session ID [--capture NAME=header:X|cookie:NAME|json:$.a.b]...
+    asb session status ID
+    asb session close ID
+
+Use plain `asb http` for one call or a few independent ones, **`--session` for a multi-step HTTP flow** (log in, reuse the
+cookie, carry a CSRF token, log out), and env mode only when a program needs the secret itself (an official CLI, a
+library). Do not write a script around `curl` or `requests` to do an HTTP flow.
+
+`open` shows you a card (credential, hosts, methods, time limit, call cap, client) and prints a session id when you
+approve. Hosts are required and must be inside the credential's `allowed_hosts`; methods default to GET and HEAD
+(declare POST, PUT, PATCH, DELETE or OPTIONS); the default is 15 minutes and 200 calls, and the broker has a
+maximum. The deadline is absolute: it is never extended or renewed, however much the session is used. Then every call
+is made with `--session ID` and needs no further approval: the broker keeps the cookies (and removes `Set-Cookie` from what
+the agent sees) and `--capture` stores a response value for later `{{session.NAME}}` use in the URL, headers and body. A
+UniFi-style flow:
+
+    SID=$(asb session open unifi --for "list clients and rename one" --host unifi.local --methods GET,HEAD,POST,PUT)
+    asb http unifi POST https://unifi.local/api/auth/login --session $SID -H 'Content-Type: application/json' \
+        -d '{"username":"{{UNIFI_USERNAME}}","password":"{{UNIFI_PASSWORD}}"}' --capture CSRF=header:X-CSRF-Token
+    asb http unifi GET  https://unifi.local/proxy/network/api/s/default/stat/sta --session $SID
+    asb http unifi PUT  https://unifi.local/proxy/network/api/s/default/rest/user/ID --session $SID \
+        -H 'X-CSRF-Token: {{session.CSRF}}' -d '{"name":"x"}'
+    asb session close $SID
+
+A call outside the session's hosts or methods, or past its cap, is refused (exit 8), not prompted: open a new session. When the
+session has expired, been closed or revoked, or was never yours, the call exits 7. Only the client that opened a session can use
+it. Details, limits, the threat model and the audit events are in
+[reference.md](reference.md#http-sessions-multi-step-flows-with-one-approval).
+
 ### Exit codes
 
 | Code | Meaning |
@@ -179,6 +211,8 @@ prompt-injection stance are in
 | 4 | Denied by you or by policy |
 | 5 | Expired or timed out waiting for approval |
 | 6 | Env mode: a script changed between the request and the run (`asb: script PATH changed after it was reviewed`); nothing was executed |
+| 7 | A session call: the session expired, was closed or revoked, or is unknown (open a new one, if the human agrees) |
+| 8 | A session call was refused: host or method outside the session, call cap used, or a `{{session.NAME}}` not captured |
 | 22 | `http`: the upstream answered with status 400 or more (body still printed) |
 | other | Env mode returns the wrapped command's own exit code |
 

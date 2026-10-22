@@ -776,11 +776,12 @@ class ClientBound(SBase):
         a, _ = self.two()
         sid = self.open(key=a["secret"])
         self.broker.clients.revoke(a["id"], "alice")                # revoked in memory, sessions not yet purged
-        with self.assertRaises(S.SessionError):
+        with self.assertRaises(S.SessionError) as cm:
             self.broker._session_call(["unifi"], {"method": "GET", "url": self.url("/"), "headers": {},
                                                   "session": sid}, "x", "127.0.0.1",
-                                      {"id": a["id"], "name": "alice-box", "legacy": False}) \
-                if False else (_ for _ in ()).throw(S.SessionError("x", "x"))
+                                      {"id": a["id"], "name": "alice-box", "legacy": False})
+        self.assertEqual(cm.exception.code, "session_unknown")
+        self.assertEqual(self.st["seen"], [])
 
     def test_the_agents_audit_view_is_scoped_to_its_own_sessions(self):
         a, b = self.two()
