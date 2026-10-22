@@ -115,6 +115,13 @@ Asking the human for a credential you do not have (you never see the value)
   `asb update`; invalid name; too many pending; disabled); 2 usage. Never put a secret in --for or
   any argument, and do not retry a denial. A request is always high risk and always needs the human.
 
+Giving this machine its own credential
+  asb enroll --name NAME [--url URL]   prints a confirmation code and waits for the human to approve
+  the card showing the same code; then ~/.config/secret-broker/client.json holds this machine's own
+  key. Do this only when the human asked you to; never approve or script around it. Exit 0 enrolled,
+  4 denied, 5 expired, 3 refused, 2 usage (an existing key needs --force and is backed up).
+  If a command says "this client has been revoked", stop and tell the human.
+
 Storing and rotating (value ONLY on stdin, never as an argument)
   printf '%s' "$VALUE" | asb store NAME --hosts a.example.com[,b] [--field F] [--item I] [--var V]
   printf '%s' "$VALUE" | asb update NAME [--var V]

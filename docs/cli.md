@@ -175,7 +175,7 @@ prompt-injection stance are in
 | 0 | OK |
 | 1 | Nothing found (`which`, `list`, `audit`); `audit verify`: the chain is broken |
 | 2 | Usage or configuration error |
-| 3 | Broker unreachable, or it refused the request (`status` too) |
+| 3 | Broker unreachable, or it refused the request (`status` too; `enroll`: refused) |
 | 4 | Denied by you or by policy |
 | 5 | Expired or timed out waiting for approval |
 | 6 | Env mode: a script changed between the request and the run (`asb: script PATH changed after it was reviewed`); nothing was executed |
@@ -214,11 +214,36 @@ value; it goes through stdin and the audit log records the operation, never the 
 
 ## Several machines and several users
 
-Each machine needs the `asb` file and a `client.json`; they share the broker's
-one client key (the broker has a single key today, so rotating it means updating
-every machine). Approvals always come from the one `allowed_user` signed in through your SSO,
-whichever machine asked; the request shows where it came from
-(`user@hostname`).
+Give every machine its own credential instead of copying one shared key around:
+
+    asb enroll --name build-box --url https://asb-api.example.com
+
+`asb enroll` makes a random 256-bit secret on this machine, sends the broker only a hash of it,
+prints a confirmation code such as `K4QZ-7MWD`, and waits. On the approval page a card appears
+(name, the `user@host` the machine claims, the address it came from, the same code). **Compare the
+code with your terminal and press Approve only if they match and you started it; Deny anything you
+did not start.** On approval `asb` writes `~/.config/secret-broker/client.json` (`url` and the new
+secret as `key`, mode 0600) and checks that it works. The secret is never printed, never sent
+while enrolling and never an argument. No key is copied by hand.
+
+- `--name` is the client's name (lowercase letters, digits, `- _ .`, up to 32; default: this
+  host's name). You may change it on the card. `--url` defaults to `SECRET_BROKER_URL` or the
+  `url` already in `client.json`.
+- An existing `client.json` that holds a key is replaced only with `--force`, and is first copied
+  to `client.json.bak-<time>`. If the broker rejects the new key the old file is put back.
+  `SECRET_BROKER_KEY` in the environment overrides the file: unset it.
+- Exit codes: 0 enrolled, 4 denied, 5 expired (the card lives 10 minutes by default), 3 refused
+  or unreachable (a name already waiting, too many pending, enrollment off), 2 usage.
+- The **Clients** tab lists every client (name, claimed host, enrolled, last seen, request count,
+  state, effective auto-approval ceiling, its own rules) and can rename, revoke and remove them.
+  Revoking takes effect on the next request (`asb` then says `this client has been revoked; run
+  asb enroll`), denies the client's waiting requests and deletes its own rules.
+- Every request now shows the **authenticated client** (verified) next to the `user@host` text
+  the client typed (unverified), in cards, history, request details and the audit log.
+- The old shared key keeps working as the single client "shared key (legacy)" until the broker
+  config sets `legacy_client_key` to `deny`; then it is refused with a message pointing at
+  `asb enroll`. Approvals always come from the one `allowed_user` signed in through your SSO,
+  whichever machine asked. Details: [reference.md](reference.md#clients-per-client-credentials-and-enrollment).
 
 ## Troubleshooting
 

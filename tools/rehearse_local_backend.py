@@ -755,6 +755,74 @@ def scenario_C(rh):
     rh.check(g, "notifications went to the stub transport and carry no secret value",
              len(Aux.telegram) > 3 and not any(v in t for t in Aux.telegram for v in S.values()), f"{len(Aux.telegram)} messages")
     credreq_scenario(rh, g)
+    clients_scenario(rh, g)
+
+
+def clients_scenario(rh, g):
+    """Per-client credentials on the main throwaway broker: `asb enroll` end to end (the human matches the
+    code and approves the card), the new credential working, a client-scoped Always that never applies to
+    the shared key, then revoke."""
+    b = rh.main
+    home = rh.home / "enrollhome"       # outside the scanned data and log directories
+    home.mkdir(exist_ok=True)
+    quiet = {"HOME": str(home), "SECRET_BROKER_KEY": ""}
+    seen = set()
+
+    def enroll_card():
+        _, _, page = b.ap.get("/")
+        m = re.search(r"Client enrollment: ([a-z0-9._-]+)</h2>.*?class=code>([A-Z2-7]{4}-[A-Z2-7]{4})<.*?"
+                      r"action='/enroll/decide' class=decide><input type=hidden name=id value='([^']+)'", page, re.S)
+        return m.groups() if m else None
+
+    p = rh.asb_popen(b, "enroll", "--name", "rehearsal-box", "--url", b.url, extra_env=quiet)
+    p.stdin.close()
+    p.stdin = None
+    card, end = None, time.time() + 25
+    while time.time() < end and card is None and p.poll() is None:
+        card = enroll_card()
+        time.sleep(0.2)
+    resp = b.ap.post("/enroll/decide", {"id": card[2], "decision": "approve", "name": card[0]}) if card else None
+    out, err = p.communicate(timeout=60)
+    rh.outputs.append(("asb enroll", out + err))
+    cfgf = home / ".config" / "secret-broker" / "client.json"
+    cj = json.loads(cfgf.read_text()) if cfgf.exists() else {}
+    key = cj.get("key", "")
+    rh.check(g, "enroll: the card shows the name and a confirmation code, and the terminal prints the same code",
+             bool(card) and card[0] == "rehearsal-box" and f"confirmation code: {card[1]}" in err, (card or ("?",))[0])
+    rh.check(g, "enroll: approval exits 0, writes client.json (0600) with a per-client key, prints no secret",
+             p.returncode == 0 and resp and resp[0] == 303 and key.startswith("asbc1_") and mode_of(cfgf) == 0o600
+             and key not in out + err and out.startswith("enrolled: rehearsal-box"), f"rc={p.returncode}")
+    SECRETS["clientkey"] = key or "unset-client-key-placeholder"
+    env2 = {"HOME": str(home), "SECRET_BROKER_KEY": key}
+    rc, o, e = rh.asb(b, "status", extra_env=env2)
+    rh.check(g, "enroll: the new credential authenticates (asb status)", rc == 0, f"rc={rc}")
+    args = ["http", "stub", "GET", up_url(rh, "/client-rule"), "-H", "Authorization: Bearer {{STUB_TOKEN}}"]
+    rc, o, e, rid = rh.asb_decided(b, args, decision="approve_always", extra_env=env2)
+    req = [r for r in b.records() if r.get("event") == "requested" and r.get("client_name") == "rehearsal-box"]
+    rh.check(g, "client rules: the request is attributed to the client, and Always is made for this client only",
+             rc == 0 and rid and bool(req) and any(r.get("rule_client") == req[-1]["client_id"]
+                                                   for r in b.records() if r.get("event") == "grant_created"), f"rc={rc}")
+    base = max([r["seq"] for r in b.records()] or [0])
+    rc, o, e = rh.asb(b, *args, extra_env=env2, timeout=30)
+    via = [r.get("via") for r in b.records() if r["seq"] > base and r.get("event") == "approved"]
+    rh.check(g, "client rules: the same client is then approved without a prompt", rc == 0 and via[-1:] == ["policy"], f"rc={rc} via={via}")
+    # left undecided on purpose: a denial would start the per-name cooldown that later groups trip over
+    rc, o, e, rid = rh.asb_decided(b, args, decision=None)
+    rh.check(g, "client rules: the shared key is still asked (a client's Always never applies to another)",
+             rid is not None and rc == 5, f"rc={rc} card={bool(rid)}")
+    _, _, page = b.ap.get("/clients")
+    m = re.search(r"id (c-[0-9a-f]{8})", page)
+    rh.check(g, "Clients tab lists the client and the legacy shared key",
+             bool(m) and "rehearsal-box" in page and "shared key (legacy)" in page, "")
+    if m:
+        b.ap.post("/clients/revoke", {"id": m.group(1)})
+    rc, o, e = rh.asb(b, "status", extra_env=env2)
+    rh.check(g, "revoke: the client's next request fails (exit 3, says revoked); the shared key still works",
+             rc == 3 and "revoked" in e and rh.asb(b, "status")[0] == 0, f"rc={rc}")
+    rh.check(g, "revoke: its own rules are removed and the audit has no key or hash",
+             any(r.get("event") == "client_revoked" and r.get("rules_removed", {}).get("always") == 1 for r in b.records())
+             and key not in open(b.audit).read() and __import__("hashlib").sha256(
+                 b"asb-client-secret-v1\0" + key.encode()).hexdigest() not in open(b.audit).read(), "")
 
 
 def credreq_scenario(rh, g):

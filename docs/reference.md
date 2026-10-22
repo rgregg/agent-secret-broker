@@ -2007,6 +2007,128 @@ A backend is conformant when its subclass passes. `tests/test_backends.py` runs
 it for `MemoryBackend`, `FileBackend`, `LocalBackend` (file and env key sources),
 and `BwBackend` / `BwServeBackend` against the fake `bw` of `tests/test_e2e.py`.
 
+## Clients: per-client credentials and enrollment
+
+Every machine or user is a **client** with its own credential. This replaces copying the broker's one
+`client_key` everywhere: a leaked key can be revoked for one machine, requests are attributed to a
+verified client, and rules can be scoped to one.
+
+### The credential
+
+The client generates 32 random bytes (`asbc1_` + base64url) locally and keeps them in `client.json`
+(0600). The broker stores only `sha256("asb-client-secret-v1\0" + secret)` and compares in constant
+time (`hmac.compare_digest` against every stored hash and the legacy key, no early exit). A request
+presents the secret in `X-Client-Key`, exactly as the shared key was. Python's standard library has no
+Ed25519 signing and `asb` must stay stdlib-only, so this is a bearer secret, not a keypair.
+
+**Deviation from the issue (written reason):** the enrollment request carries the *hash*, not the
+secret. The broker never sees the secret until the client uses it, so there is nothing secret in the
+enrollment body for a proxy to log. The hash cannot be used as a credential.
+
+### Enrollment endpoint
+
+`POST /v1/enroll` and `GET /v1/enroll/<id>` on the client API are the only unauthenticated paths.
+Body `{"name", "hash", "claim"}`: exactly those keys, at most 1024 bytes. It creates one thing: a
+pending enrollment (never a request: no notification button, link, token or Home Assistant hook can
+decide it). The reply is `{id, code, expires_in, interval}`; `id` is a 128-bit random token only the
+enroller holds, and the poll returns nothing but that enrollment's status (and, once approved, its
+client id and name).
+
+- Limits (fixed-window, per source address and global): 3/10 submissions per minute, 6/20 per hour;
+  polls 90/600 per minute; at most `enrollment.max_pending` (3) pending, 2 per source; a source whose
+  enrollment was denied or expired waits 5 minutes; the client list holds at most 100 rows. All
+  limiter maps are bounded. The listener sees the socket peer, so behind a reverse proxy every
+  client looks like one source and the limits act as global ones (`X-Forwarded-For` is never trusted
+  on this path).
+- No oracle: a name that belongs to an enrolled client is accepted like any other (the human sees
+  the clash on the card and must rename). Only duplicate *pending* names, the same hash, a code
+  clash and caps are answered specifically. Error strings are fixed; no exception text.
+- Notification: one per accepted enrollment, naming the proposed name only, with no buttons and no
+  token. Expiry: `enrollment.ttl_s` (600, 30-3600).
+- The card (Requests tab) shows the name (editable), the claim marked unverified, the source address
+  and the confirmation code `XXXX-XXXX` = base32 of `sha256("asb-enroll-code-v1\0" + hash)`, the
+  same code `asb enroll` prints. Approve and Deny exist only on the SSO-authenticated listener behind
+  the CSRF token and same-origin checks. A human must refuse any enrollment they did not start. A
+  newly enrolled client has no client-scoped rules.
+
+### The client store
+
+`clients.json` next to the audit log (0600, atomic write with fsync of the file and its directory):
+id (`c-` + 8 hex, random, never reused), name, hash, created, approved_by, last_seen, last_source,
+request count, state (`active`/`revoked`), the unverified claim, the enrolling address. Hashes only;
+nothing secret. Statistics are buffered and written at most every 30 s. The legacy key is one
+pseudo-client `legacy` / "shared key (legacy)" whose counters are kept in the same file.
+
+- **Revoke** takes effect on the next request and sets state in memory under the lock before
+  anything else; `Broker.create` re-checks the client under the request lock, so no request of a
+  revoked client can be created or stay pending, and approving one that was pending is refused. The
+  client's waiting requests are denied (without a name cooldown), its timed grants, Always
+  approvals and SSH rules are removed, and `client_revoked` records the counts. A revoked row stays
+  (so the error says "revoked") until removed on the Clients tab.
+- **Durable or fail closed:** if the write fails, the revocation stays in effect in memory (it wins
+  over loaded state), the Clients tab shows a warning, `asb status` reports `client_list: unsaved`,
+  one `clients_file_write_failed` (error class only) is audited, and the save is retried on the next
+  request, every 10 s and at SIGTERM. A restart before it succeeds would lose it: fix the disk. If
+  the file exists but cannot be read or parsed at startup, **no per-client credential is accepted**
+  (`clients_unavailable`, `client_list: unreadable`), enrollment is off and the file is never
+  overwritten; the legacy key follows `legacy_client_key`. A missing file is a fresh install.
+- Rename keeps the id; audit records carry both.
+
+### Config
+
+    "legacy_client_key": "allow",                       // allow (default) | deny
+    "enrollment": {"enabled": true, "ttl_s": 600, "max_pending": 3},
+    "clients": {"c-1a2b3c4d": {"risk": {"auto_approve_max": "none", "auto_modes": ["http"]}}}
+
+The override block is keyed by client id (shown on the Clients tab; ids are random, so set it after
+enrolling and restart) or `legacy`. Validated at startup, naming the field.
+
+### Per-client rules
+
+Every Always approval, timed grant and SSH host rule has a **client scope**: `*` (any client) or one
+client id.
+
+- A rule made from a card defaults to the requesting client; the card has an explicit "any client"
+  choice (`rule_scope`; any unrecognised value means the requesting client). The Policies SSH rule
+  form has a client select (default: any client, as such rules always were). The legacy shared key is
+  one client (`legacy`), so its card rules are legacy-scoped.
+- Resolution: a request is covered by a rule scoped to its client or a rule for any client (its own is
+  tried first, then the global one; a read-only rule that does not cover a POST falls through to a
+  global any-method rule). A rule for client A never applies to client B. Creating a client rule that a
+  global rule already covers is a no-op.
+- Ceilings: `risk.auto_approve_max` and `risk.auto_modes` are the defaults; a client's override wins.
+  A credential's own `auto_modes` still beats both. A client with `auto_approve_max: "none"` **always
+  prompts**: unlike the global `none` (which still honours timed grants and SSH rules) it blocks
+  `approval: allow`, store-create, Always, timed grants and SSH rules for that client.
+  `approval: allow` itself is a property of the credential and stays global. Presence suppression
+  concerns the approver, not the client, and is unchanged.
+- Storage and migration: a global rule is written exactly as before (no `client` field), so existing
+  vault metadata, `ssh_rules` and `grants.json` load as global and nothing changes on upgrade. Only a
+  client-scoped Always/SSH rule carries `client` (an older broker rejects that credential's metadata
+  until the rule is removed: **remove client-scoped rules before downgrading**). Client-scoped timed
+  grants are stored under `client_grants` so an older broker drops them instead of widening them.
+- The Policies tables show who each rule applies to; the Clients tab lists each client's own rules.
+  Revoking a client removes them.
+
+### Audit events
+
+`enroll_requested` (name, claim, peer, code), `enroll_decided` (approved/denied/expired, approver),
+`enroll_refused`, `enroll_notify_failed`, `client_revoked` (counts of denied requests and removed
+rules), `client_renamed`, `client_rename_refused`, `client_removed`, `client_auth_failed` (reason
+`bad_key`/`revoked`/`legacy_denied`/`clients_unavailable`; one record per source per 30 s with a
+`suppressed` count; never key material), `clients_file_corrupt`, `clients_file_write_failed`,
+`clients_file_recovered`. Request events gain `client_id` and `client_name`; `grant_created` and
+`ssh_rule_created` gain `rule_client`. None of the new events reaches the agent API. Neither the
+secret nor its hash is ever logged (the code is the only derived value), and no exception text.
+
+### What a client sees of the audit log
+
+`GET /v1/audit` is scoped: a client authenticated with its own credential receives only events
+stamped with its own `client_id` (so other clients' requests, names and ids, and system events,
+are not returned, whatever the filters, `--request`, `--after` or `--tail`), plus its own name on
+`requested`. The legacy shared key keeps the previous, unscoped view (it is many machines) but is
+told no client names at all.
+
 ## Audit
 
 JSONL, hash-chained, mode 0600, on the broker host. Never contains secret
@@ -2019,7 +2141,7 @@ policy, approver, reported client IP, latency), `http_executed`, `delivered`,
 `escalated`, `stored`, `request_detail_viewed`, `grant_created`/`grant_used`/`grant_revoked`/`grant_expired` (see Standing approvals), `standing_change_failed`, `config_warning`, `policy_changed`, `policy_change_refused`, `policy_change_failed`, `guidance_changed`
 (secret, user, peer, length, sha256 prefixes of the old and new text, never the
 text), `guidance_change_refused`, `guidance_change_failed`, and
-security events `auth_failed`, `rejected`, `approval_viewed`,
+security events `auth_failed` (Home Assistant hook), `client_auth_failed`, `rejected`, `approval_viewed`,
 `approval_forbidden`, `approval_stale`, `bad_request`, `discovery`,
 `ha_decide_refused`, `ha_decide_dropped`, `ha_hook_any_device`.
 
@@ -2158,6 +2280,13 @@ or `expired` mean a human was asked (the agent also learns that from its own req
   start the paste; hosts are required so a pasted token cannot be sent anywhere; the stored item still asks
   on every use; nothing is stored without your submit. It cannot stop you typing a secret you should not.
   Treat an unexpected card as a possible injection and deny it.
+- **Client credentials.** A per-client secret is a bearer token: whoever holds `client.json` is that
+  client, until you revoke it. It protects against a leaked shared key (revoke one machine, not all),
+  not against malware on the enrolled machine. The enrollment endpoint is the only unauthenticated
+  path; its worst case is a few pending cards and notifications within the caps, and an approval
+  needs you to match the code. An attacker who can race a pending enrollment gains nothing unless
+  you approve a card you did not start. Rate limits are per socket address, so behind a proxy they
+  are global. Until `legacy_client_key` is `deny`, anyone with the old shared key still works.
 - Output masking is exact-match; a program that transforms a secret before
   printing it (base64, splitting) defeats it.
 

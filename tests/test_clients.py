@@ -1012,6 +1012,40 @@ class CliEnroll(CBase):
         self.assertIn("rejected the new key", err)
         self.assertEqual(json.load(open(self.cfgfile)), old)
 
+    def test_leak_check_after_a_full_lifecycle(self):
+        """Secret, its hash and exception text appear in no log, audit record, history row, request
+        detail, notification, page, CLI output or process list."""
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            rc, out, err, ps = self.run_cli("enroll", "--name", "leaky", "--url", self.base,
+                                            human=self.approve, snapshot_ps=True)
+            self.assertEqual(rc, 0, err)
+            secret = json.load(open(self.cfgfile))["key"]
+            cid = self.broker.clients.rows()[0]["id"]
+            h = clients_mod.hash_secret(secret)
+            rc, o2, e2, ps2 = self.run_cli("http", "svc", "GET", f"http://127.0.0.1:{self.up.server_address[1]}/x",
+                                           "-H", "Authorization: Bearer {{SVC_TOKEN}}",
+                                           human=None, timeout=3)
+            self.post("/clients/rename", {"id": cid, "name": "leaky2"})
+            self.as_client("asbc1_wrongwrong", "GET", "/v1/status")
+            self.post("/clients/revoke", {"id": cid})
+            self.as_client(secret, "GET", "/v1/status")
+        self.broker.flush_notifications(5)
+        pages = [self.get(p)[1] for p in ("/", "/clients", "/policies", "/settings")]
+        details = ""
+        det = os.path.join(os.path.dirname(self.audit), "request_details.db")
+        if os.path.exists(det):
+            details = open(det, "rb").read().decode("latin-1")
+        notes = json.dumps([(n.title, n.text, n.names, n.url) for n in self.notifier.notifications])
+        hist = json.dumps(self.broker.history.rows())
+        blob = "\n".join([out, err, o2, e2, ps, ps2, buf.getvalue(), self.audit_text(), notes, hist, details,
+                          *pages, *self.seen])
+        for canary in (secret, h):
+            self.assertNotIn(canary, blob)
+        self.assertNotIn(h[:12], blob)
+        self.assertIn(h, open(os.path.join(os.path.dirname(self.audit), "clients.json")).read())
+        self.assertNotIn("Traceback", "\n".join([out, err, o2, e2, self.audit_text(), *pages]))
+
     def test_server_text_cannot_inject_terminal_control_characters(self):
         asb = load_asb()
         self.assertEqual(asb._safe_text("ok\x1b[31mred\x07\n"), "ok?[31mred??")
