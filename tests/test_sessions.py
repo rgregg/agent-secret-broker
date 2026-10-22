@@ -2136,5 +2136,66 @@ class Review3(SBase):
         self.assertEqual(set(out) - {"seq", "ts", "event", "request"}, {"session", "calls", "reason"})
 
 
+class Unicode(Review3):
+    FULL = "\uff4d" + "ethod"                       # fullwidth m
+    MIXED = "\uff4d\uff45t" + "h" + "\uff4f" + "d"
+
+    def test_unit_fullwidth_and_encodings(self):
+        for text in (self.FULL, self.MIXED, "x_" + self.FULL, "M\uff25THOD"):
+            self.assertTrue(S._has_method_text(text), text)
+            self.assertTrue(S._has_method_text(text.encode("utf-8")), text)
+            for enc in ("utf-16", "utf-16-le", "utf-16-be", "utf-32", "utf-32-le", "utf-32-be"):
+                self.assertTrue(S._has_method_text(text.encode(enc)), (text, enc))
+            self.assertTrue(S._has_method_text(text.encode("utf-8").decode("latin-1").encode("utf-8")), text)
+        self.assertTrue(S._has_method_text("method".encode("utf-16")))
+        self.assertTrue(S._has_method_text("%EF%BD%8Dethod"))        # percent-encoded fullwidth m
+        self.assertFalse(S._has_method_text("caf\u00e9 \u00fcber".encode("utf-8")))
+        self.assertFalse(S._has_method_text("hello".encode("utf-16")))
+
+    def test_invalid_utf8_bodies(self):
+        bad = b"\xff\xfe ok \xc3("
+        self.assertIsNotNone(S.override_problem((), "http://h/", {}, bad))                       # not UTF-8: refused
+        self.assertIsNotNone(S.override_problem((), "http://h/", {"Content-Type": "text/plain"}, bad))
+        self.assertIsNone(S.override_problem((), "http://h/", {}, bad, binary=True))             # declared binary: scanned
+        self.assertIsNone(S.override_problem((), "http://h/", {"Content-Type": "multipart/form-data; boundary=b"}, bad))
+        self.assertIsNotNone(S.override_problem((), "http://h/", {}, b"\xff" + b"method", binary=True))
+        self.assertIsNotNone(S.override_problem((), "http://h/", {"Content-Type": "multipart/form-data; boundary=b"},
+                                                b"\xff" + self.FULL.encode()))
+        self.assertIsNotNone(S.override_problem((), "http://h/", {}, self.FULL.encode("utf-16"), binary=True))
+
+    def test_fullwidth_in_every_place_is_refused(self):
+        sid = self.rsid()
+        form = {"Content-Type": "application/x-www-form-urlencoded"}
+        js = {"Content-Type": "application/json"}
+        for val in (self.FULL, self.MIXED):
+            cases = [("/echo?q=" + val, {}, None), ("/echo?" + val + "=1", {}, None),
+                     ("/echo", form, val + "=DELETE"), ("/echo", form, "a=1&x_" + val + "=2"),
+                     ("/echo", js, json.dumps({val: "DELETE"})), ("/echo", js, json.dumps({val: 1}, ensure_ascii=False)),
+                     ("/echo", {}, val), ("/echo", {"X-API-Key": val}, "x"), ("/echo", {"Accept": val}, "x"),
+                     ("/echo", {"Accept-Language": "en;q=" + val}, "x")]
+            for path, hdr, body in cases:
+                code, r = self.call(sid, "POST", path, headers=hdr, body=body)
+                self.assertEqual((code, r.get("code")), (403, "session_refused"), (path, hdr, body))
+        time.sleep(0.2)
+        self.assertEqual(self.st["seen"], [])
+        self.assertEqual(self.sess(sid).calls, 0)
+
+    def test_utf16_and_binary_bodies_over_the_wire(self):
+        import base64
+        sid = self.rsid()
+        def post(raw):
+            return self.as_client(KEY, "POST", "/v1/requests", {
+                "mode": "http", "names": ["unifi"], "method": "POST", "url": f"http://127.0.0.1:{self.raw_up.port}/u",
+                "headers": {}, "session": sid, "body_b64": base64.b64encode(raw).decode()})
+        for raw in (self.FULL.encode("utf-16"), self.FULL.encode("utf-16-le"), self.MIXED.encode("utf-32"),
+                    b"\xff" + self.FULL.encode()):
+            code, text = post(raw)
+            self.assertEqual(code, 403, raw)
+        code, text = post(b"\xff\xfe harmless binary \x00\x01")
+        self.assertEqual(code, 202, text)                       # binary without the word is allowed
+        time.sleep(0.3)
+        self.assertEqual(len(self.raw_up.conns), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

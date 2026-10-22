@@ -476,14 +476,33 @@ def _decode_step(t):
     return unicodedata.normalize("NFKC", t)
 
 
+def _text_views(data):
+    """Text views of `data` to scan: a str is itself; bytes are decoded as UTF-8 (errors replaced) AND as latin-1
+    (so mojibake cannot hide text), and, when NUL bytes show it may be UTF-16 or UTF-32, as those too."""
+    if not isinstance(data, bytes):
+        return [data]
+    views = [data.decode("utf-8", "replace"), data.decode("latin-1")]
+    try:                                    # text that was UTF-8 encoded twice
+        views.append(data.decode("utf-8").encode("latin-1").decode("utf-8"))
+    except (UnicodeError, ValueError):
+        pass
+    if b"\x00" in data or data[:4] in (b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff") or data[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        for enc in ("utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be"):
+            views.append(data.decode(enc, "replace"))
+    return views
+
+
 def _decoded_forms(data):
-    """Lowercased forms of `data` for the substring test: raw, then up to DECODE_ROUNDS rounds of every
-    decoding, each also with backslashes removed, and each with every non-letter removed."""
-    text = data.decode("latin-1") if isinstance(data, bytes) else data
-    forms, cur = {text}, text
-    for _ in range(DECODE_ROUNDS):
-        cur = _decode_step(cur)
+    """Lowercased forms of `data` for the substring test: every text view, raw, then up to DECODE_ROUNDS rounds of
+    every decoding (NFKC included), each also with backslashes removed, and each with every non-letter removed."""
+    forms = set()
+    for text in _text_views(data):
+        cur = unicodedata.normalize("NFKC", text)
+        forms.add(text)
         forms.add(cur)
+        for _ in range(DECODE_ROUNDS):
+            cur = _decode_step(cur)
+            forms.add(cur)
     forms |= {f.replace("\\", "") for f in forms}
     out = set()
     for f in forms:
@@ -553,7 +572,7 @@ def neutralize(text, values=None):
         i = b + 2
 
 
-def override_problem(methods, url, headers, body):
+def override_problem(methods, url, headers, body, binary=False):
     """A fixed reason when the call could smuggle in another HTTP verb, else None. ONE fail-closed rule, no
     parsers (every parser is a differential against the upstream's): the call is refused when its URL
     (path, parameters, query and fragment; userinfo is refused outright), any header NAME or VALUE, or its
@@ -574,9 +593,14 @@ def override_problem(methods, url, headers, body):
         if _has_method_text(k) or _has_method_text(v):
             return OVERRIDE_REFUSED
     if body:
+        ctype = next((v for k, v in headers.items() if k.lower() == "content-type"), "").lower()
+        if isinstance(body, bytes) and not binary and not ctype.startswith("multipart/form-data"):
+            try:
+                body.decode("utf-8")
+            except UnicodeDecodeError:
+                return OVERRIDE_REFUSED         # text we cannot read as UTF-8 is text we cannot check
         if _has_method_text(body):
             return OVERRIDE_REFUSED
-        ctype = next((v for k, v in headers.items() if k.lower() == "content-type"), "").lower()
         if ctype.startswith("multipart/") and any("content-transfer-encoding" in f or "contenttransferencoding" in f
                                                   for f in _decoded_forms(body)):
             return OVERRIDE_REFUSED
@@ -630,7 +654,7 @@ def run_http(sess, spec, env, tls, allowed_now, opener_for, clock, state):
         neutralize(spec["body"], cap_values).encode("utf-8") if spec.get("body") else None)
     problem = header_problem(spec["headers"]) or override_problem(
         sess.methods, neutralize(spec["url"], cap_values), {k: neutralize(v, cap_values) for k, v in spec["headers"].items()},
-        scan_data)
+        scan_data, binary=spec.get("body_b64") is not None)
     if problem:
         raise NotSent(problem)
     scheme, host, port, path = _origin(url)
@@ -728,7 +752,7 @@ def scope_problem(s, sc, names, method, spec, capture_names=()):
     elif isinstance(body, str):
         body = neutralize(body).encode("utf-8", "replace")
     why = override_problem(s.methods, neutralize(spec["url"]), {k: neutralize(v) for k, v in spec["headers"].items()},
-                           body)
+                           body, binary=spec.get("body_b64") is not None)
     if why:
         return "method", why
     names_in = set(capture_names)
