@@ -1890,14 +1890,25 @@ ends its sessions at once.
 - **Redirects are never followed.** A 3xx is returned to the agent with its `Location` (masked); `Set-Cookie` on it is stored in the jar
   and stripped as usual. The agent makes a new call, which is scope-checked and counted like any other. This also means no redirect can
   change the method, port or host, and no hop goes uncounted. TLS verification, pinning and `tls_verify` are as for plain http calls.
-- **Method override is refused by one fail-closed rule.** A session call is refused (fixed message, not charged) if its query string, its
-  body or any request header name contains the text `method`, case-insensitively, in any of these forms: raw, percent-decoded (up to 3 rounds),
-  JSON-unescaped, or with every non-letter removed. That covers `X-HTTP-Method-Override`, `_method` fields in query, form, JSON or
-  multipart, encoded and mixed-case variants, `;` separators and similar, without any parser that could disagree with the upstream's. It
-  deliberately also refuses legitimate fields such as `payment_method`: a call that needs one must use plain `asb http` without
-  `--session` (one approval per call). `Content-Encoding` and `Transfer-Encoding` request headers are refused (a body the broker cannot read
-  is a body it cannot check). The same check runs again on what is actually sent, after `{{session.NAME}}` substitution. A GET or HEAD call
-  cannot carry a body.
+- **Headers are allowlisted.** A session call may use only `Accept`, `Accept-Language`, `Content-Type` (one, a plain media type),
+  `User-Agent`, `Authorization`, `If-None-Match`, `If-Modified-Since`, `X-CSRF-Token`, `X-Updated-CSRF-Token`, other `X-Name` headers that are
+  not routing or override headers (no name containing forward, original, rewrite, override, method, proxy, host, url, uri, path, route, ip,
+  verb, http, real, scheme, port, length, encoding or transfer), and any other header that carries a `{{VAR}}` credential placeholder
+  (for example `Api-Key`). Everything else is refused: `Content-Length` (urllib sets it from the bytes it sends, so the body on the wire is
+  exactly the substituted body, never a second pipelined request), `Connection`, `Expect`, `TE`, `Upgrade`, `Trailer`,
+  `Transfer-Encoding`, `Content-Encoding`, `Host`, `Cookie`, `Proxy-*`, `Forwarded`, `X-Forwarded-*`, `X-Original-*`, `X-Rewrite-*`, duplicates,
+  and so on. `Cookie` is the jar's.
+- **Method override is refused by one fail-closed rule.** A session call is refused (fixed message, not charged) if its URL path, parameters,
+  query or fragment, any header name or value, or its body contains the text `method` (case-insensitive) in any decoded form: raw, up to 5
+  rounds of percent-, HTML numeric entity (`&#109;`, `&#x6d;`), `\uXXXX`, `\xNN` and quoted-printable (`=6D`) decoding with NFKC
+  normalisation, and each of those with every non-letter removed. Userinfo in the URL is refused. A multipart body that declares a
+  Content-Transfer-Encoding is refused. This covers `_method` fields in a query, path, form, JSON or multipart, encoded and mixed-case
+  variants and `;` separators, without any parser that could disagree with the upstream's. It deliberately also refuses legitimate fields such
+  as `payment_method`: a call that needs one must use plain `asb http` without `--session` (one approval per call). The same check runs again on what
+  is actually sent, after `{{session.NAME}}` substitution. A GET or HEAD call cannot carry a body. A captured value containing `method` (same
+  forms) is not stored, so an upstream cannot poison a later call.
+- **Refusals that cost the caller nothing are metered.** A call refused after the credential was read but before anything was sent is not charged
+  against the call cap, but counts against a per-session budget of 10; the 11th ends the session (`session_ended`, `reason: refusal_budget`, exit 7).
 - **Bounded work.** URL and header values up to 8192 characters, 50 headers, 100 placeholders of up to 64 characters, body up to 5 MB.
   Placeholders are scanned in linear time, and the store lock is held only for dictionary work (never for a scope check or an upstream
   call), so one hostile or slow call cannot delay another client's lookup, revoke, close or sweep.

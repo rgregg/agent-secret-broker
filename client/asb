@@ -115,6 +115,9 @@ HTTP sessions (multi-step flows; one human approval for a bounded unit of work)
   The broker stores cookies from responses (and removes Set-Cookie from what you see) and sends them
   on later calls to the same host. --capture saves a value (header:NAME, cookie:NAME or json:$.a.b[0])
   for later use as {{session.NAME}} in the URL, headers and body; you never see it.
+  Session calls take only plain headers (Accept, Content-Type, Authorization, X-CSRF-Token, other X- headers, headers
+  carrying a {{VAR}}); Content-Length, Cookie, Host, Connection etc. are refused. Any text containing "method" in the URL,
+  headers or body is refused too (use plain `asb http` for fields like payment_method).
   --host is HOST (ports 80 and 443 only) or HOST:PORT (exactly that port). Redirects are never followed:
   you get the 3xx and its Location, and make a new call yourself.
   Rules you cannot change: the session ends at its deadline (it is NEVER extended or renewed, however
