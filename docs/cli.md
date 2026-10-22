@@ -221,8 +221,13 @@ call, never reads `client.json` and never prints the client key.
   finds no agent.
 - The block sits between `<!-- asb:agent-setup begin vN -->` and `<!-- asb:agent-setup end -->`. A
   re-run replaces just that span in place (so a newer `asb` upgrades an older block); text outside
-  the markers is never touched. Line endings (LF or CRLF) follow the file, and a symlinked file is
-  written through the link.
+  the markers is never touched. Line endings (LF or CRLF) follow the file.
+- Symlinks fail closed. With `--scope project` a target whose resolved path is outside the current
+  directory is refused (a cloned repository cannot redirect the write). With `--scope user` a
+  symlinked file (dotfile setups) is written through, the resolved path is always shown
+  (`PATH -> RESOLVED`, also in `--dry-run`), and a resolved target that is not a regular file or
+  whose directory is not owned by you is refused. Temp and backup files are created exclusively
+  next to the resolved target and never follow a symlink.
 - `--dry-run` prints a unified diff and writes nothing. A file that changes is first copied to
   `FILE.asb-bak-YYYYMMDDHHMMSS`; unchanged files are not rewritten or backed up.
 - `--remove` deletes only the block (and the blank line the install added before it).

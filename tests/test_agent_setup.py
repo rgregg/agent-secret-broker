@@ -332,6 +332,89 @@ class Refusals(Base):
         self.assertEqual(os.listdir(self.home), [])
 
 
+class SymlinkSafety(Base):
+    def test_project_symlink_escaping_is_refused(self):
+        victim = os.path.join(self.tmp.name, "elsewhere", "victim.md")
+        self.write(victim, "victim\n")
+        os.symlink(victim, os.path.join(self.proj, "CLAUDE.md"))
+        r = self.asb("--agent", "claude", "--scope", "project")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("outside the project directory", r.stderr)
+        self.assertEqual(self.read(victim), b"victim\n")
+        self.assertEqual(self.backups(os.path.dirname(victim)), [])
+
+    def test_project_dir_symlink_escaping_is_refused(self):
+        outside = os.path.join(self.tmp.name, "outside")
+        os.makedirs(outside)
+        os.symlink(outside, os.path.join(self.proj, ".github"))
+        r = self.asb("--agent", "copilot", "--scope", "project")
+        self.assertEqual(r.returncode, 2)
+        self.assertEqual(os.listdir(outside), [])
+
+    def test_project_symlink_escaping_refused_for_remove_and_dry_run(self):
+        victim = os.path.join(self.tmp.name, "elsewhere", "victim.md")
+        self.write(victim, "victim\n")
+        os.symlink(victim, os.path.join(self.proj, "AGENTS.md"))
+        for extra in (["--remove"], ["--dry-run"]):
+            self.assertEqual(self.asb("--agent", "codex", "--scope", "project", *extra).returncode, 2)
+
+    def test_project_symlink_inside_project_allowed(self):
+        real = os.path.join(self.proj, "docs", "agents.md")
+        self.write(real, "inside\n")
+        os.symlink(real, os.path.join(self.proj, "AGENTS.md"))
+        r = self.asb("--agent", "codex", "--scope", "project")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn(real, r.stdout)
+        self.assertRegex(self.read(real, "r"), BEGIN)
+        self.assertTrue(os.path.islink(os.path.join(self.proj, "AGENTS.md")))
+
+    def test_user_symlink_writes_resolved_target_and_reports_it(self):
+        target = os.path.join(self.tmp.name, "dotfiles", "claude.md")
+        self.write(target, "linked\n")
+        os.makedirs(self.p(".claude"))
+        os.symlink(target, self.p(".claude", "CLAUDE.md"))
+        for extra in (["--dry-run"], []):
+            r = self.asb("--agent", "claude", *extra)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("-> " + target, r.stdout)
+            if extra:
+                self.assertEqual(self.read(target), b"linked\n")
+        self.assertRegex(self.read(target, "r"), BEGIN)
+
+    def test_user_symlink_to_non_regular_file_refused(self):
+        os.makedirs(self.p(".claude"))
+        os.symlink("/dev/null", self.p(".claude", "CLAUDE.md"))
+        r = self.asb("--agent", "claude")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("not a regular file", r.stderr)
+
+    def test_planted_symlinks_at_backup_and_temp_names_not_followed(self):
+        import time
+        f = self.p(".claude", "CLAUDE.md")
+        self.write(f, "orig\n")
+        victim = os.path.join(self.tmp.name, "victim.txt")
+        self.write(victim, "victim\n")
+        now = int(time.time())
+        for t in range(now - 2, now + 8):
+            stamp = time.strftime("%Y%m%d%H%M%S", time.localtime(t))
+            os.symlink(victim, f"{f}.asb-bak-{stamp}")
+        for pid in range(1, 50):
+            os.symlink(victim, f"{f}.asb-tmp-{pid}")
+        r = self.asb("--agent", "claude")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.read(victim), b"victim\n")
+        real_baks = [n for n in os.listdir(self.p(".claude"))
+                     if ".asb-bak-" in n and not os.path.islink(self.p(".claude", n))]
+        self.assertEqual(len(real_baks), 1)
+        self.assertEqual(self.read(self.p(".claude", real_baks[0])), b"orig\n")
+        self.assertRegex(self.read(f, "r"), BEGIN)
+
+    def test_no_temp_files_left(self):
+        self.write(self.p(".claude", "CLAUDE.md"), "x\n")
+        self.asb("--agent", "claude")
+        self.assertEqual([n for n in os.listdir(self.p(".claude")) if ".asb-tmp-" in n], [])
+
+
 class DryRunAndRemove(Base):
     def setUp(self):
         super().setUp()

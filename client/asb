@@ -37,8 +37,10 @@ import json
 import os
 import re
 import socket
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -1873,15 +1875,23 @@ def detect_agents(scope, home, cwd, env):
     return found
 
 
-def plan_target(agent, path, remove, create_ok):
+def plan_target(agent, path, remove, create_ok, scope="user", cwd=None):
     """Read-only planning. Returns dict(path, real, old, new, status, error, exists)."""
     r = {"agent": agent, "path": path, "real": os.path.realpath(path), "old": "", "new": "",
          "status": "", "error": None, "exists": False}
     real = r["real"]
     try:
+        if scope == "project":
+            root = os.path.realpath(cwd or os.getcwd())
+            if os.path.commonpath([root, real]) != root:
+                raise SetupError(f"resolves to {real}, outside the project directory {root}; "
+                                 "refusing to follow it")
         if os.path.exists(real):
-            if os.path.isdir(real):
-                raise SetupError("is a directory")
+            st = os.stat(real)
+            if not stat.S_ISREG(st.st_mode):
+                raise SetupError(f"{real} is not a regular file")
+            if scope == "user" and os.stat(os.path.dirname(real)).st_uid != os.geteuid():
+                raise SetupError(f"directory of {real} is not owned by you; refusing")
             r["exists"] = True
             try:
                 with open(real, "rb") as f:
@@ -1914,6 +1924,8 @@ def plan_target(agent, path, remove, create_ok):
                 d = os.path.dirname(real)
                 while d and not os.path.isdir(d):
                     d = os.path.dirname(d)
+                if scope == "user" and os.stat(d or ".").st_uid != os.geteuid():
+                    raise SetupError(f"{d} is not owned by you; refusing")
                 if not os.access(d or ".", os.W_OK):
                     raise SetupError(f"cannot create file: {d} is not writable")
     except SetupError as e:
@@ -1922,27 +1934,38 @@ def plan_target(agent, path, remove, create_ok):
 
 
 def write_target(r):
-    """Backup (if the file exists) and write atomically through any symlink."""
+    """Backup (if the file exists) and replace atomically. The resolved target is written;
+    temp and backup files are created exclusively and never follow a symlink."""
     real = r["real"]
     os.makedirs(os.path.dirname(real), exist_ok=True)
     mode = 0o644
     if r["exists"]:
         mode = os.stat(real).st_mode & 0o7777
-        stamp = time.strftime("%Y%m%d%H%M%S")
-        bak, n = f"{real}.asb-bak-{stamp}", 1
-        while os.path.exists(bak):
-            n += 1
-            bak = f"{real}.asb-bak-{stamp}-{n}"
-        shutil.copy2(real, bak)
+        stamp, n = time.strftime("%Y%m%d%H%M%S"), 1
+        while True:
+            bak = f"{real}.asb-bak-{stamp}" + (f"-{n}" if n > 1 else "")
+            try:
+                fd = os.open(bak, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                break
+            except FileExistsError:   # includes a planted symlink: O_EXCL never follows it
+                n += 1
+        with os.fdopen(fd, "wb") as out:
+            with open(real, "rb") as src:
+                out.write(src.read())
+            out.flush()
+            os.fchmod(out.fileno(), mode)
+            os.fsync(out.fileno())
         r["backup"] = bak
-    tmp = f"{real}.asb-tmp-{os.getpid()}"
+    fd, tmp = tempfile.mkstemp(prefix=os.path.basename(real) + ".asb-tmp-", dir=os.path.dirname(real))
     try:
-        with open(tmp, "wb") as f:
+        with os.fdopen(fd, "wb") as f:
             f.write(r["new"].encode("utf-8"))
-        os.chmod(tmp, mode)
+            f.flush()
+            os.fchmod(f.fileno(), mode)
+            os.fsync(f.fileno())
         os.replace(tmp, real)
     finally:
-        if os.path.exists(tmp):
+        if os.path.lexists(tmp):
             os.unlink(tmp)
 
 
@@ -1983,7 +2006,7 @@ def run_agent_setup(args):
         names, explicit = [a for a, _ in det], False
     else:
         names, explicit = (list(AGENT_NAMES) if agent == "all" else [agent]), True
-    plans = [plan_target(a, agent_targets(a, scope, home, cwd, env)[1], remove, explicit) for a in names]
+    plans = [plan_target(a, agent_targets(a, scope, home, cwd, env)[1], remove, explicit, scope, cwd) for a in names]
     for a, p in zip(names, plans):
         if a == "codex" and scope == "user":
             ov = os.path.join(os.path.dirname(p["path"]), "AGENTS.override.md")
@@ -1993,6 +2016,8 @@ def run_agent_setup(args):
     bad = False
     for p in plans:
         label = f"{p['agent']} ({scope}): {p['path']}"
+        if os.path.realpath(p["path"]) != os.path.abspath(p["path"]):
+            label += f" -> {p['real']}"
         if p["error"]:
             bad = True
             print(f"{label}: REFUSED: {p['error']}", file=sys.stderr)
