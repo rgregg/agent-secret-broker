@@ -2713,7 +2713,7 @@ class StatusEndpoint(Harness):
         self.assertEqual(st["features"], {"ha_hook": True, "ssh": False, "webpush_actions": False,
                                          "auto_approve_max": "low", "timed_grants": True,
                                          "guidance_proposals": True, "credential_requests": True,
-                                         "client_enrollment": True, "legacy_client_key": "allow",
+                                         "plans": True, "client_enrollment": True, "legacy_client_key": "allow",
                                          "client_list": "ok"})
 
     def test_leaks_no_names_hosts_or_config(self):
