@@ -216,7 +216,7 @@ shows them. Active sessions appear on the Clients tab with a live countdown and 
 
 15 min default, 60 min configurable maximum (absolute ceiling 24 h), 30 s minimum; 200 calls
 default and cap (configurable, ceiling 10000); 3 sessions per client (configurable), 20 total; 2
-pending open requests per client plus the general pending cap and deny cooldown; 5 hosts; no redirects; 8192-character urls and header values, 50 headers, 100 placeholders of up to 64 characters; 50 cookies; 16 captures; 1 MB response read.
+pending open requests per client plus the general pending cap and deny cooldown; 5 hosts; no redirects; 256 KB bodies; 8192-character urls and header values, 50 headers, 100 placeholders of up to 64 characters; 50 cookies; 16 captures; 1 MB response read.
 
 ## Headers and method override (fail closed)
 
@@ -244,8 +244,8 @@ and again on the substituted request. The cost, stated plainly: legitimate field
 such a call uses plain `asb http` (one approval per call), and the later manifest (task-grant) approach is the place to allow specific ones.
 
 **Free refusals.** Captured values containing `method` are not stored (a hostile upstream could otherwise poison `{{session.X}}` so later calls
-fail for free while still costing vault reads and audit lines). Calls refused after the vault read but before sending are not charged but
-are metered: more than 10 per session ends it (`session_ended`, `reason: refusal_budget`).
+fail for free while still costing vault reads and audit lines). Every refusal (scope or pre-send) is not charged but is metered: more than 10 per session ends it (`session_ended`, `reason: refusal_budget`), and
+`session_refused` audit lines are coalesced (5 per minute per session, then a `suppressed` counter).
 
 ## Failure modes
 

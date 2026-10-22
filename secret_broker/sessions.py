@@ -68,7 +68,9 @@ MAX_CAPTURE_BYTES = 4096        # per captured value
 MAX_CAPTURE_EXPRS = 8           # capture expressions per call
 MAX_URL = 8192                  # per call: url, header values, header count, placeholders
 MAX_HEADER_NAME, MAX_HEADERS, MAX_PLACEHOLDERS, MAX_PLACEHOLDER_NAME = 256, 50, 100, 64
-MAX_CALL_BODY = 5_000_000
+MAX_CALL_BODY = 262_144          # 256 KB: bigger bodies use plain `asb http` (every body is scanned, so the size is bounded)
+REFUSAL_LOG_PER_MIN = 5
+REFUSAL_LOG_KEYS = 1000
 CALL_TIMEOUT_S = 30
 MASK_MIN = 4                    # captured, cookie and credential values shorter than this are not masked
 MAX_HOST_LOG = 255
@@ -76,12 +78,12 @@ MAX_TOMBSTONES = 500            # ended sessions remembered (id hash -> client, 
 TOMBSTONE_S = 86400
 SWEEP_S = 5
 READ_LIMIT = 1_000_000          # response bytes read (same ceiling as plain http)
-SID_RE = re.compile(r"^[A-Za-z0-9_-]{32}$")
-NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,31}$")
-_HEADER_RE = re.compile(r"^[A-Za-z0-9-]{1,64}$")
-_COOKIE_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
-_KEY_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
-_TOKEN_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+SID_RE = re.compile(r"^[A-Za-z0-9_-]{32}\Z")
+NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,31}\Z")
+_HEADER_RE = re.compile(r"^[A-Za-z0-9-]{1,64}\Z")
+_COOKIE_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}\Z")
+_KEY_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}\Z")
+_TOKEN_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+\Z")
 _JSON_UNESC = re.compile(r"\\u([0-9a-fA-F]{4})")
 _HEX_ESC = re.compile(r"\\x([0-9a-fA-F]{2})")
 _QP_ESC = re.compile(r"=([0-9A-Fa-f]{2})")
@@ -93,12 +95,12 @@ ALLOWED_HEADERS = ("accept", "accept-language", "content-type", "user-agent", "i
 # (the catalog has no "declared auth header" metadata, so no credential adds names to this list)
 CONTENT_TYPES = ("application/json", "application/x-www-form-urlencoded", "text/plain", "application/graphql",
                  "multipart/form-data")
-_BOUNDARY_RE = re.compile(r"^boundary=\"?[A-Za-z0-9'()+_,./:=?-]{1,70}\"?$", re.I)
-_CHARSET_RE = re.compile(r"^charset=\"?utf-8\"?$", re.I)
-_PLACEHOLDER_VALUE = re.compile(r"^(Bearer |Basic |Token )?\{\{[A-Za-z0-9_.]{1,64}\}\}$")
-_HOSTPORT_RE = re.compile(r"^([A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?)(?::([0-9]{1,5}))?$")
+_BOUNDARY_RE = re.compile(r"^boundary=\"?[A-Za-z0-9'()+_,./:=?-]{1,70}\"?\Z", re.I)
+_CHARSET_RE = re.compile(r"^charset=\"?utf-8\"?\Z", re.I)
+_PLACEHOLDER_VALUE = re.compile(r"^(Bearer |Basic |Token )?\{\{[A-Za-z0-9_.]{1,64}\}\}\Z")
+_HOSTPORT_RE = re.compile(r"^([A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?)(?::([0-9]{1,5}))?\Z")
 _ILLEGAL_HEADER_VALUE = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")
-_HEADER_TOKEN = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+_HEADER_TOKEN = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+\Z")
 _CTRL = re.compile(r"[\x00-\x1f\x7f]")
 REASON = "an HTTP session always needs a human to approve it; always high"
 WARNING = ("The requesting agent asked for this session. Its purpose text is the agent's own claim and "
@@ -500,7 +502,10 @@ def _decoded_forms(data):
         forms.add(text)
         forms.add(cur)
         for _ in range(DECODE_ROUNDS):
-            cur = _decode_step(cur)
+            nxt = _decode_step(cur)
+            if nxt == cur:                  # a fixed point: nothing more to decode
+                break
+            cur = nxt
             forms.add(cur)
     forms |= {f.replace("\\", "") for f in forms}
     out = set()
@@ -646,16 +651,20 @@ def run_http(sess, spec, env, tls, allowed_now, opener_for, clock, state):
         headers = {k: fill(v, values) for k, v in spec["headers"].items()}
     except (KeyError, ValueError, UnicodeError):
         raise NotSent("a placeholder or value in this call cannot be used", "session_refused") from None
-    # The header and method checks run on what the AGENT wrote: credential placeholders become a neutral token, so
-    # the outcome never depends on a secret's content; captured values are substituted because an upstream chose them.
-    cap_values = {k: v for k, v in values.items() if k.startswith("session.")}
-    scan_data = data if spec.get("body_b64") is not None else (
-        neutralize(spec["body"], cap_values).encode("utf-8") if spec.get("body") else None)
-    problem = header_problem(spec["headers"]) or override_problem(
-        sess.methods, neutralize(spec["url"], cap_values), {k: neutralize(v, cap_values) for k, v in spec["headers"].items()},
-        scan_data, binary=spec.get("body_b64") is not None)
-    if problem:
-        raise NotSent(problem)
+    # The header and method checks ran on what the AGENT wrote (scope_problem, placeholders neutral), once per call. Only
+    # when the call substitutes captured values (which an upstream chose, so `me`+`thod` could join into a verb) is the
+    # substituted text scanned again, with credential placeholders still neutral so no outcome depends on a secret.
+    texts = [spec["url"], spec.get("body") or ""] + list(spec["headers"].values())
+    if any(ph.startswith("session.") for t in texts for ph in placeholders(t)):
+        cap_values = {k: v for k, v in values.items() if k.startswith("session.")}
+        scan_data = data if spec.get("body_b64") is not None else (
+            neutralize(spec["body"], cap_values).encode("utf-8") if spec.get("body") else None)
+        problem = override_problem(
+            sess.methods, neutralize(spec["url"], cap_values),
+            {k: neutralize(v, cap_values) for k, v in spec["headers"].items()}, scan_data,
+            binary=spec.get("body_b64") is not None)
+        if problem:
+            raise NotSent(problem)
     scheme, host, port, path = _origin(url)
     if scheme not in ("http", "https") or not sess.in_scope(scheme, host, port) or host not in allowed_now:
         raise NotSent("that host or port is outside this session's scope")
@@ -935,15 +944,28 @@ class SessionsMixin:
         self._sess = {}                                # sha256(id) -> Session
         self._sess_tomb = OrderedDict()                # sha256(id) -> {"cid", "reason", "t"}
         self._sess_lock = threading.Lock()
+        self._refusal_log = OrderedDict()              # session pid (or "c:<client>") -> {"t", "n", "suppressed"}
+        self._refusal_lock = threading.Lock()
+        self._sweep_err_at = None
         threading.Thread(target=self._sessions_sweeper, daemon=True).start()
 
     def _sessions_sweeper(self):
         while True:
             time.sleep(SWEEP_S)
-            try:
-                self.sweep_sessions()
-            except Exception:  # noqa: BLE001 -- never let the sweeper die
-                pass
+            self._sweeper_tick()
+
+    def _sweeper_tick(self):
+        """One sweep. A failure is logged by class name only (at most once a minute) and sweeping carries on."""
+        try:
+            self.sweep_sessions()
+        except Exception as e:  # noqa: BLE001 -- never let the sweeper die; never log the text
+            now = time.monotonic()
+            if self._sweep_err_at is None or now - self._sweep_err_at >= 60:
+                self._sweep_err_at = now
+                try:
+                    self.log("session_sweep_error", error_class=type(e).__name__)
+                except Exception:  # noqa: BLE001
+                    pass
 
     @staticmethod
     def _skey(sid):
@@ -1085,12 +1107,45 @@ class SessionsMixin:
                             "max_calls": calls}}
 
     # -- using -----------------------------------------------------------------------
+    def _log_refusal(self, key, **fields):
+        """Audit a refusal, coalesced: the first REFUSAL_LOG_PER_MIN per minute per session (or per client for an
+        unknown id), then only a counter that rides on the next logged line (`suppressed`). The log cannot be flooded."""
+        now = self.sessions_clock()
+        with self._refusal_lock:
+            st = self._refusal_log.get(key)
+            carry = 0
+            if st is None or now - st["t"] >= 60:
+                carry = st["suppressed"] if st else 0
+                while len(self._refusal_log) >= REFUSAL_LOG_KEYS:
+                    self._refusal_log.popitem(last=False)
+                st = self._refusal_log[key] = {"t": now, "n": 0, "suppressed": 0}
+            st["n"] += 1
+            if st["n"] > REFUSAL_LOG_PER_MIN:
+                st["suppressed"] += 1
+                return
+        if carry:
+            fields["suppressed"] = carry
+        self.log("session_refused", **fields)
+
+    def _meter_refusal(self, s):
+        """A refusal that costs the caller nothing counts against the session's refusal budget; one more than
+        MAX_FREE_REFUSALS ends the session."""
+        if s is None:
+            return
+        with self._sess_lock:
+            if s.dead:
+                return
+            s.free_refusals += 1
+            if s.free_refusals > MAX_FREE_REFUSALS:
+                self._sess_end_locked(s, "ended", self.sessions_clock())
+
     def _refuse(self, client, sess, reason, message, code="session_refused", http=403, **fields):
-        """Audit a refused call (class only) and raise the fixed error."""
+        """Audit (coalesced) and meter a refused call, then raise the fixed error."""
         if isinstance(fields.get("host"), str):
             fields["host"] = fields["host"][:MAX_HOST_LOG]
-        self.log("session_refused", session=sess.pid if sess else None, reason_class=reason,
-                 client_id=client["id"], client_name=client["name"], **fields)
+        self._log_refusal(sess.pid if sess else "c:" + client["id"], session=sess.pid if sess else None,
+                          reason_class=reason, client_id=client["id"], client_name=client["name"], **fields)
+        self._meter_refusal(sess)
         raise SessionError(message, code, http)
 
     _MISSING = ENDED
@@ -1118,11 +1173,12 @@ class SessionsMixin:
                 or len(spec["method"]) > 16):
             raise ValueError("url or method too long")
         body = spec.get("body")
-        if body is not None and (not isinstance(body, str) or len(body) > MAX_CALL_BODY):
-            raise ValueError("body too large")
+        if body is not None and (not isinstance(body, str) or len(body) > MAX_CALL_BODY
+                                  or len(body.encode("utf-8", "replace")) > MAX_CALL_BODY):
+            raise ValueError("a session call body is limited to 256 KB; send larger bodies with plain asb http")
         if spec.get("body_b64") is not None and (not isinstance(spec["body_b64"], str)
                                                  or len(spec["body_b64"]) > MAX_CALL_BODY * 4 // 3 + 8):
-            raise ValueError("body too large")
+            raise ValueError("a session call body is limited to 256 KB; send larger bodies with plain asb http")
         try:
             expr = [parse_capture(x) for x in (spec.get("capture") or [])]
         except TypeError:
@@ -1133,9 +1189,11 @@ class SessionsMixin:
             import base64
             import binascii
             try:
-                base64.b64decode(spec["body_b64"], validate=True)
+                raw_b64 = base64.b64decode(spec["body_b64"], validate=True)
             except (binascii.Error, ValueError):
                 raise ValueError("body_b64 is not valid base64") from None
+            if len(raw_b64) > MAX_CALL_BODY:
+                raise ValueError("a session call body is limited to 256 KB; send larger bodies with plain asb http")
             if spec.get("body") is not None:
                 raise ValueError("send body or body_b64, not both")
         sid = spec.get("session")
@@ -1148,8 +1206,8 @@ class SessionsMixin:
         if s is None or not active:
             state = state if active else "unknown"
             msg, code, http = ENDED[state]
-            self.log("session_refused", session=None, reason_class=state, client_id=cid,
-                     client_name=client["name"], method=method[:16], host=shown)
+            self._log_refusal("c:" + cid, session=None, reason_class=state, client_id=cid,
+                              client_name=client["name"], method=method[:16], host=shown)
             raise SessionError(msg, code, http)
         with s.lock:
             have = frozenset(s.captures)
@@ -1168,8 +1226,8 @@ class SessionsMixin:
             kind, text = problem
             if kind == "missing":
                 msg, code, http = ENDED[text]
-                self.log("session_refused", session=None, reason_class=text, client_id=cid,
-                         client_name=client["name"], method=method[:16], host=shown)
+                self._log_refusal("c:" + cid, session=None, reason_class=text, client_id=cid,
+                                  client_name=client["name"], method=method[:16], host=shown)
                 raise SessionError(msg, code, http)
             self._refuse(client, s, kind, text, method=method[:16], host=shown)
         req = self._new_request("http", list(names), {
@@ -1191,9 +1249,7 @@ class SessionsMixin:
                 with self._sess_lock:
                     if not s.dead:
                         s.calls = max(0, s.calls - 1)
-                        s.free_refusals += 1
-                        if s.free_refusals > MAX_FREE_REFUSALS:
-                            self._sess_end_locked(s, "ended", self.sessions_clock())
+                self._meter_refusal(s)
             if isinstance(e, SessionError):         # ended mid-flight, or refused before sending: the fixed text
                 self._finish(req, "failed", error=str(e), via="session")
                 raise

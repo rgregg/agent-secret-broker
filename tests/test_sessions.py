@@ -180,6 +180,10 @@ class SBase(CBase):
         self.st = self.ux.st
         self.model = ModelStub()
         self.broker.summarizer = self.model
+        for name, val in (("REFUSAL_LOG_PER_MIN", 10 ** 6), ("MAX_FREE_REFUSALS", 10 ** 6)):   # tests that meter patch back
+            p = mock.patch.object(S, name, val)
+            p.start()
+            self.addCleanup(p.stop)
         if self.inject_clock:       # the production clock is time.monotonic; tests move this one with `advance`
             self.broker.sessions_clock = lambda: time.monotonic() + self.offset
         self.out = []                       # CLI output seen
@@ -1388,6 +1392,16 @@ class CliFlow(CliBase):
             self.assertEqual(rc, 2, (args, err))
         self.assertEqual(self.records_count_requests(), 0)
 
+    def test_non_ascii_digits_and_newline_ids_are_usage_errors(self):
+        for args in (("session", "open", "unifi", "--for", "x", "--host", "h", "--max-calls", "\u0661\u0662\u0663"),
+                     ("session", "open", "unifi", "--for", "x", "--host", "h", "--ttl", "\u0661\u0665m"),
+                     ("session", "close", "a" * 32 + "\n"), ("session", "status", "a" * 32 + "\n"),
+                     ("http", "unifi", "GET", "http://127.0.0.1/", "--session", "a" * 32 + "\n"),
+                     ("http", "unifi", "GET", "http://127.0.0.1/", "--session", "a" * 32, "--capture", "A\n=header:X")):
+            rc, out, err = self.run_cli(*args)
+            self.assertEqual(rc, 2, (args, err))
+        self.assertEqual(self.records_count_requests(), 0)
+
     def test_help_and_guide_cover_sessions(self):
         rc, out, _ = self.run_cli("help", "session")
         self.assertEqual(rc, 0)
@@ -1399,6 +1413,12 @@ class CliFlow(CliBase):
             self.assertIn(frag, out)
         rc, out, _ = self.run_cli("help", "http")
         self.assertIn("--session ID", out)
+        rc, g, _ = self.run_cli("guide")
+        for frag in ("ONLY these headers", "X-API-Key", "X-Requested-With", "exactly {{NAME}}", "X-Auth-Token",
+                     "plain `asb http` without --session", "256 KB"):
+            self.assertIn(frag, g)
+        self.assertNotIn("other X- headers", g)
+        self.assertNotIn("headers\n  carrying a {{VAR}}", g)
 
 
 # ------------------------------------------------------------------------- review hardening
@@ -2104,6 +2124,10 @@ class Review3(SBase):
         self.assertNotIn("P", self.sess(sid).captures)
 
     def test_the_free_refusal_budget_ends_the_session(self):
+        with mock.patch.object(S, "MAX_FREE_REFUSALS", 10):
+            self._budget()
+
+    def _budget(self):
         sid = self.open()
         s = self.sess(sid)
         s.captures["Q"] = "a method"                                   # as if poisoned some other way
@@ -2123,11 +2147,105 @@ class Review3(SBase):
         self.assertEqual((len(s.jar), s.captures), (0, {}))
         self.assertEqual(self.st["seen"], [])
 
-    def test_scope_refusals_before_the_vault_read_are_not_metered(self):
+    def test_scope_refusals_are_metered_too(self):
+        with mock.patch.object(S, "MAX_FREE_REFUSALS", 10):
+            sid = self.open()
+            s = self.sess(sid)
+            for i in range(S.MAX_FREE_REFUSALS):
+                self.assertEqual(self.call(sid, "DELETE", "/")[1]["code"], "session_refused", i)
+            self.assertFalse(s.dead)
+            code, r = self.call(sid, "DELETE", "/")                   # the 11th refusal ends it
+            self.assertEqual(code, 403)
+            self.assertTrue(s.dead)
+            ev = self.events("session_ended")
+            self.assertEqual((len(ev), ev[0]["reason"]), (1, "refusal_budget"))
+            self.assertEqual(self.call(sid, "GET", "/")[1]["code"], "session_expired")
+            self.assertEqual(self.sess_count(), 0)
+
+    def sess_count(self):
+        return len(self.broker._sess)
+
+    def test_the_call_cap_refusals_are_metered_too(self):
+        with mock.patch.object(S, "MAX_FREE_REFUSALS", 10):
+            sid = self.open(max_calls=1)
+            self.call(sid, "GET", "/")
+            for _ in range(11):
+                self.call(sid, "GET", "/")
+            self.assertEqual(len(self.events("session_ended")), 1)
+
+    def test_refusal_audit_lines_are_coalesced(self):
+        with mock.patch.object(S, "REFUSAL_LOG_PER_MIN", 5):
+            sid = self.open()
+            for _ in range(12):
+                self.call(sid, "DELETE", "/")
+            self.assertEqual(len(self.events("session_refused")), 5)
+            self.advance(61)
+            self.call(sid, "DELETE", "/")
+            ev = self.events("session_refused")
+            self.assertEqual(len(ev), 6)
+            self.assertEqual(ev[-1]["suppressed"], 7)
+            self.assertNotIn("suppressed", ev[0])
+            # unknown ids are coalesced per client, and never end anything
+            for _ in range(50):
+                self.call("z" * 32, "GET", "/")
+            self.assertEqual(len([e for e in self.events("session_refused") if e["reason_class"] == "unknown"]), 5)
+            self.assertEqual(self.sess_count(), 1)
+
+    def test_the_sweeper_survives_errors_and_logs_only_the_class(self):
+        self.open(ttl_s=60)
+        with mock.patch.object(self.broker, "sweep_sessions", side_effect=RuntimeError("SECRET-TEXT-9")):
+            self.broker._sweeper_tick()
+            self.broker._sweeper_tick()
+        ev = self.events("session_sweep_error")
+        self.assertEqual(len(ev), 1)                                   # rate limited to one a minute
+        self.assertEqual(ev[0]["error_class"], "RuntimeError")
+        self.assertNotIn("SECRET-TEXT-9", self.audit_text())
+        self.advance(61)
+        self.broker._sweeper_tick()                                    # still sweeping afterwards
+        self.assertEqual(self.sess_count(), 0)
+        self.assertIn("session_sweep_error", audit_api.HIDDEN)
+
+    def test_body_cap_and_adversarial_body_timing(self):
         sid = self.open()
-        for _ in range(S.MAX_FREE_REFUSALS + 3):
-            self.call(sid, "DELETE", "/")                              # refused up front: cheap, no vault read
-        self.assertFalse(self.sess(sid).dead)
+        big = "a" * S.MAX_CALL_BODY
+        self.assertEqual(self.call(sid, "POST", "/echo", body=big)[1]["http"]["status"], 200)
+        for body in ("a" * (S.MAX_CALL_BODY + 1), "\u00e9" * (S.MAX_CALL_BODY // 2 + 1)):
+            code, r = self.call(sid, "POST", "/echo", body=body)
+            self.assertEqual(code, 400)
+            self.assertIn("256 KB", r["error"])
+        import base64
+        code, text = self.as_client(KEY, "POST", "/v1/requests", {
+            "mode": "http", "names": ["unifi"], "method": "POST", "url": self.url("/echo"), "headers": {},
+            "session": sid, "body_b64": base64.b64encode(b"x" * (S.MAX_CALL_BODY + 1)).decode()})
+        self.assertEqual(code, 400)
+        for nasty in ("%25" * (S.MAX_CALL_BODY // 3), "&#109;" * (S.MAX_CALL_BODY // 6), "\\u0061" * (S.MAX_CALL_BODY // 6),
+                      "=6E" * (S.MAX_CALL_BODY // 3), "%2526" * (S.MAX_CALL_BODY // 5)):
+            t0 = time.time()
+            code, r = self.call(sid, "POST", "/echo", body=nasty[:S.MAX_CALL_BODY])
+            self.assertLess(time.time() - t0, 10.0)
+            self.assertIn(code, (200, 403))
+
+    def test_the_override_scan_runs_once_unless_captures_are_substituted(self):
+        sid = self.open()
+        self.sess(sid).captures["T"] = "x"
+        real = S.override_problem
+        calls = []
+        with mock.patch.object(S, "override_problem", lambda *a, **k: calls.append(1) or real(*a, **k)):
+            self.call(sid, "POST", "/echo", body="plain")
+            n_plain = len(calls)
+            self.call(sid, "POST", "/echo", body="a {{session.T}}")
+        self.assertEqual(n_plain, 1)
+        self.assertEqual(len(calls), 3)                                # 1 (plain) + 2 (template, then substituted)
+
+    def test_ids_and_names_are_matched_in_full_not_up_to_a_newline(self):
+        self.assertIsNone(S.SID_RE.match("a" * 32 + "\n"))
+        self.assertIsNotNone(S.SID_RE.match("a" * 32))
+        self.assertEqual(self.call("a" * 32 + "\n", "GET", "/")[1]["code"], "session_unknown")
+        for bad in ("A\n=header:X", "A=header:X\n", "A=cookie:T\n", "A=json:$.a\n"):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                S.parse_capture(bad)
+        self.assertRaises(ValueError, S.parse_host_entry, "a.example\n")
+
 
     def test_session_ended_is_in_the_agents_audit_view_without_policy_fields(self):
         out = audit_api.redact({"seq": 1, "ts": 1.0, "event": "session_ended", "session": "abcd1234", "calls": 0,
