@@ -1039,6 +1039,31 @@ class SessionsHardeningShared(unittest.TestCase):
         self.assertEqual(verdict(nested, frozen(headers=hdrs(), body={"data": {"payment_method": 1}})), "override")
         self.assertIsNone(verdict(nested, frozen(headers=hdrs(), body={"data": {"a": 1}})))
 
+    def test_declared_keys_are_skipped_by_position_never_renamed(self):
+        jr = self.declared(body={"json": {"keys": ["K0", "K1", "payment_method", "text"], "pin": {}}})
+        ok = lambda b: verdict(jr, frozen(headers=hdrs(), body=b))     # noqa: E731
+        # a real key named like the old placeholder names cannot hide a value
+        self.assertIsNone(ok({"K0": "fine", "payment_method": "card"}))
+        self.assertEqual(ok({"K0": "a method", "payment_method": "card"}), "override")
+        self.assertEqual(ok({"payment_method": "card", "K0": "a method"}), "override")
+        self.assertEqual(ok({"K1": "x", "payment_method": "card", "K0": "%6dethod"}), "override")
+        self.assertEqual(ok({"K0": "x", "K1": "y", "payment_method": "the method"}), "override")
+        # a declared key's own value is always scanned
+        self.assertEqual(ok({"payment_method": "method"}), "override")
+        self.assertEqual(ok({"payment_method": {"a": ["x", "METHOD"]}}), "override")
+        # nested keys are never declared, even with the same name
+        self.assertEqual(ok({"text": {"payment_method": 1}}), "override")
+        self.assertEqual(ok({"payment_method": {"payment_method": 1}}), "override")
+        self.assertIsNone(ok({"payment_method": {"a": [1, 2]}, "text": "x"}))
+        # graphql variables the same way
+        doc = "query P($payment_method: Int, $K0: Int) { a }"
+        g = self.declared(body={"graphql": {"document": doc, "variables_keys": ["K0", "payment_method"]}})
+        gq = lambda v: verdict(g, frozen(headers=hdrs(), body={"query": doc, "variables": v}))   # noqa: E731
+        self.assertIsNone(gq({"K0": 1, "payment_method": 2}))
+        self.assertEqual(gq({"K0": "method", "payment_method": 2}), "override")
+        self.assertEqual(gq({"payment_method": 2, "K0": "method"}), "override")
+        self.assertEqual(gq({"payment_method": {"x": "method"}}), "override")
+
     def test_graphql_document_is_declared_variables_are_scanned(self):
         doc = "query P { paymentMethod { id } }"
         g = self.declared(body={"graphql": {"document": doc, "variables_keys": ["payment_method", "first"]}})

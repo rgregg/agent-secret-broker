@@ -951,10 +951,16 @@ def _scan_url(rule, scheme, path, has_query, query):
     return f"{scheme}://h" + path + ("?" + q if has_query else "")
 
 
-def _masked_json(obj, declared):
-    """Serialization for the scan with the declared top-level keys that contain `method` renamed."""
-    out = {(f"K{i}" if k in declared and _has_method(k) else k): v for i, (k, v) in enumerate(obj.items())}
-    return json.dumps(out, ensure_ascii=True)
+def _scan_pairs(obj, declared):
+    """Text for the override scan of a json object: every VALUE in full (nested keys included), and every
+    top-level key except the declared ones that contain `method`, which are skipped by position. Nothing is
+    renamed or rebuilt, so no key can collide with another and drop a value from the scan."""
+    pieces = []
+    for k, v in obj.items():
+        if not (k in declared and _has_method(k)):
+            pieces.append(json.dumps(k, ensure_ascii=True))
+        pieces.append(json.dumps(v, ensure_ascii=True))
+    return "\n".join(pieces)
 
 
 def _match_body(spec, body, hdrs):
@@ -980,7 +986,7 @@ def _match_body(spec, body, hdrs):
         for k, v in j["pin"].items():
             if k not in doc or type(doc[k]) is not type(v) or doc[k] != v:
                 raise NoMatch("body")
-        return _masked_json(doc, set(j["keys"]))
+        return _scan_pairs(doc, set(j["keys"]))
     g = spec["graphql"]
     if not set(doc) <= {"query", "operationName", "variables"}:
         raise NoMatch("body")           # a batch is an array (refused above); extensions and extras land here
@@ -994,13 +1000,7 @@ def _match_body(spec, body, hdrs):
         if not isinstance(vs, dict) or not set(vs) <= set(g["variables_keys"]):
             raise NoMatch("body")
     # the document and operation name are declared in full on the card; only the variables are scanned
-    masked = {"query": "Q"}
-    if "operationName" in doc and doc["operationName"] is not None:
-        masked["operationName"] = "O"
-    if vs is not None:
-        masked["variables"] = {(f"K{i}" if k in g["variables_keys"] and _has_method(k) else k): v
-                               for i, (k, v) in enumerate(vs.items())}
-    return json.dumps(masked, ensure_ascii=True)
+    return _scan_pairs(vs, set(g["variables_keys"])) if isinstance(vs, dict) else ""
 
 
 def assert_sent_is_matched(frozen, req):
