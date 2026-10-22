@@ -458,8 +458,10 @@ class Persistence(Base):
         b = self.reload()
         g = b.active_grants()[0]
         self.assertEqual((g["secrets"], g["scope"]), (["other", "svc"], "read"))
-        self.assertIsNotNone(b.grants.find(["svc", "other"]))
-        self.assertIsNone(b.grants.find(["svc"]))
+        # made from a shared-key request's card: scoped to the legacy client, which is who asked
+        self.assertIsNotNone(b.grants.find(["svc", "other"], client="legacy"))
+        self.assertIsNone(b.grants.find(["svc", "other"]))
+        self.assertIsNone(b.grants.find(["svc"], client="legacy"))
 
     def test_expired_dropped_on_load_and_audited(self):
         self.grant_it(minutes=5)

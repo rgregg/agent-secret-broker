@@ -724,7 +724,7 @@ class AuditTrail(Harness):
             urllib.request.urlopen(r, timeout=5)
         except urllib.error.HTTPError:
             pass
-        self.assertEqual(self.events("auth_failed")[0]["peer"], "127.0.0.1")
+        self.assertEqual(self.events("client_auth_failed")[0]["peer"], "127.0.0.1")
         reasons = " ".join(r["reason"] for r in self.events("rejected"))
         self.assertIn("evil.example", reasons)
         self.assertIn("unknown secret", reasons)
@@ -2712,7 +2712,8 @@ class StatusEndpoint(Harness):
         self.assertEqual(st["notifiers"], ["ticker"])
         self.assertEqual(st["features"], {"ha_hook": True, "ssh": False, "webpush_actions": False,
                                          "auto_approve_max": "low", "timed_grants": True,
-                                         "guidance_proposals": True, "credential_requests": True})
+                                         "guidance_proposals": True, "credential_requests": True,
+                                         "client_enrollment": True, "legacy_client_key": "allow"})
 
     def test_leaks_no_names_hosts_or_config(self):
         _, body = self.status()

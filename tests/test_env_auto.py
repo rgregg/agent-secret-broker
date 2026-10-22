@@ -398,8 +398,8 @@ class EnvGrants(tg.Base):
         self.assertNotIn(SECRET, raw)
         store = grants_mod.GrantStore(path, lambda *a, **k: None)
         store.load()
-        self.assertIsNotNone(store.find(["svc"], "env"))
-        self.assertIsNone(store.find(["svc"], "http"))
+        self.assertIsNotNone(store.find(["svc"], "env", "legacy"))     # scoped to the requesting (legacy) client
+        self.assertIsNone(store.find(["svc"], "http", "legacy"))
 
     def test_legacy_grant_without_mode_never_covers_env(self):
         self.broker.grants.add(["svc"], 5, "any", "alice", "dashboard", "r")     # no mode recorded
