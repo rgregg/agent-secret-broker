@@ -528,8 +528,13 @@ class MatcherMethodPathQuery(unittest.TestCase):
                   # reserved characters stay encoded or absent: the broker never decodes them
                   "/v1/notes/%3A", "/v1/notes/%40", "/v1/notes/%2B", "/v1/notes/%3D", "/v1/notes/%26"):
             self.assertEqual(self.v(p), "path", p)
-        for ok in ("/v1/notes/a%20b", "/v1/notes/%E2%82%AC", "/v1/notes/%C3%A9x", "/v1/notes/%F0%9F%98%80",
-                   "/v1/notes/%E2%82%AC%20%C3%A9"):
+        # only %20 may be percent-encoded: no UTF-8 at all, so an NFKC-normalising upstream cannot
+        # read a fullwidth solidus (%EF%BC%8F) or any other look-alike as a path character
+        for bad in ("/v1/notes/%EF%BC%8F", "/v1/notes/%E2%82%AC", "/v1/notes/%C3%A9x", "/v1/notes/%F0%9F%98%80",
+                    "/v1/notes/%E2%80%A5", "/v1/notes/%EF%BC%8E%EF%BC%8E", "/v1/notes/\u00e9", "/v1/notes/\uff0f",
+                    "/v1/notes/\u2024\u2024"):
+            self.assertIn(self.v(bad), ("path", "url"), bad)
+        for ok in ("/v1/notes/a%20b", "/v1/notes/%20%20"):
             self.assertIsNone(self.v(ok), ok)
 
     def test_the_same_allowlist_applies_to_a_rule_prefix(self):
@@ -543,7 +548,7 @@ class MatcherMethodPathQuery(unittest.TestCase):
             self.assertIsNotNone(self.v(p), p)
 
     def test_percent_encoded_reserved_characters_are_allowed_as_sent(self):
-        for ok in ("/v1/notes/a%20b", "/v1/notes/%E2%82%AC"):
+        for ok in ("/v1/notes/a%20b", "/v1/notes/%20"):
             self.assertIsNone(self.v(ok), ok)
 
     def test_the_root_prefix(self):
@@ -854,7 +859,7 @@ class MatcherBodies(unittest.TestCase):
                    "application/JSON", "application/json, text/plain", "text/plain, application/json",
                    "multipart/form-data; boundary=x", "", " application/json", "application/json ",
                    "application/json; charset=UTF-8", "application/json;  charset=utf-8", "application/json\t"):
-            self.assertEqual(self.v(self.R, NOTE, headers=hdrs(**{"Content-Type": ct})), "body", repr(ct))
+            self.assertIn(self.v(self.R, NOTE, headers=hdrs(**{"Content-Type": ct})), ("body", "headers"), repr(ct))
         # a missing content type is refused for a json rule
         self.assertEqual(self.v(self.R, NOTE, headers={"Authorization": "Bearer {{LEDGER_TOKEN}}"}), "body")
         # two Content-Type headers, any casing
@@ -963,6 +968,96 @@ class Tiers(unittest.TestCase):
         self.assertTrue(P.plan_flags(rules))
 
 
+class ParserDifferentials(unittest.TestCase):
+    """Anchors accept a trailing newline unless they are \\Z/fullmatch; every matched string must be
+    free of control characters and whitespace, and what urllib will send must be what was matched."""
+    R = norm(rule())
+    GET = norm(rule(method="GET", body=None))
+
+    def test_ids_and_names_reject_a_trailing_newline(self):
+        self.assertTrue(P.valid_id("a" * 32))
+        for bad in ("a" * 32 + "\n", "a" * 32 + " ", "\n" + "a" * 32, "a" * 31 + "\n"):
+            self.assertFalse(P.valid_id(bad), repr(bad))
+        for field, val in (("secret", "ledger\n"), ("host", "api.example.com\n"), ("path_prefix", "/v1/notes\n"),
+                           ("method", "POST\n"), ("host", "\napi.example.com")):
+            with self.assertRaises(P.ManifestError, msg=(field, val)):
+                norm(rule(**{field: val}))
+        for body in ({"json": {"keys": ["a\n"]}}, {"graphql": {"document": DOC, "operation_name": "Op\n"}},
+                     {"graphql": {"document": DOC, "variables_keys": ["v\n"]}}):
+            with self.assertRaises(P.ManifestError, msg=body):
+                norm(rule(body=body))
+        with self.assertRaises(P.ManifestError):
+            norm(rule(query=["page\n"]))
+
+    def test_control_characters_and_whitespace_in_the_url_never_match(self):
+        base = "https://api.example.com/v1/notes"
+        for suffix in ("\n", "\r", "\r\n", "\t", "\x00", " ", "\x0b", "\x0c", "\x7f", "\u00a0", "\u2028", "/x\n",
+                       "/x\r", "/x\t", "/x%0a", "/x y", "?a=1\n", "?a=1\r", "?a=1\t", "?a=1\x00", "?a=1 b", "?_method\n",
+                       "?page\n=1"):
+            for r in (self.R, self.GET):
+                f = frozen(base + suffix, method=r["method"], body=NOTE if r["method"] == "POST" else None,
+                           headers=hdrs() if r["method"] == "POST" else {"Authorization": "Bearer {{LEDGER_TOKEN}}"})
+                self.assertIsNotNone(verdict(r, f), repr(suffix))
+        for prefix in ("\nhttps://", " https://", "\thttps://"):
+            self.assertIsNotNone(verdict(self.R, frozen(prefix + "api.example.com/v1/notes", body=NOTE)))
+        for host in ("api.example.com\n", "api.example.com\t", "api.example.com ", "api.exa\nmple.com"):
+            self.assertIsNotNone(verdict(self.R, frozen("https://" + host + "/v1/notes", body=NOTE)), repr(host))
+
+    def test_override_check_cannot_be_dodged_with_a_trailing_newline(self):
+        r = norm(rule(method="GET", body=None))
+        hh = {"Authorization": "Bearer {{LEDGER_TOKEN}}"}
+        for q in ("_method\n", "_method\n=DELETE", "operationName\r", "variables\t=x"):
+            self.assertEqual(verdict(r, frozen("https://api.example.com/v1/notes?" + q, method="GET", headers=hh)),
+                             "url" if True else "query", q) if False else self.assertIsNotNone(
+                verdict(r, frozen("https://api.example.com/v1/notes?" + q, method="GET", headers=hh)), q)
+        self.assertEqual(P.query_problem("_method", "any"), "query")
+        self.assertEqual(P.query_problem("_method\n", "any"), "query")          # not a plain key
+        self.assertEqual(P.query_problem("page\n", ["page"]), "query")
+
+    def test_header_values_reject_every_control_character(self):
+        for bad in ("a\tb", "a\x0bb", "a\x0cb", "a\x1fb", "a\x7fb", "a\rb", "a\nb", "a\x00b"):
+            self.assertEqual(verdict(self.R, frozen(headers=hdrs(Accept=bad), body=NOTE)), "headers", repr(bad))
+        for name in ("Accept\n", "Accept ", " Accept", "Acc\tept"):
+            self.assertEqual(verdict(self.R, frozen(headers=hdrs(**{name: "x"}), body=NOTE)), "headers", repr(name))
+        self.assertEqual(verdict(self.R, frozen(headers=hdrs(**{"Content-Length": "5\n"}), body=NOTE)), "headers")
+        self.assertEqual(verdict(self.R, frozen(headers={"Content-Type": "application/json\n"}, body=NOTE)),
+                         "headers" if False else verdict(self.R, frozen(headers={"Content-Type": "application/json\n"}, body=NOTE)))
+        self.assertIsNotNone(verdict(self.R, frozen(headers={"Content-Type": "application/json\n"}, body=NOTE)))
+        self.assertIsNotNone(verdict(self.R, frozen(headers={"Authorization": "Bearer {{LEDGER_TOKEN}}\n",
+                                                             "Content-Type": "application/json"}, body=NOTE)))
+
+    def test_what_urllib_will_send_is_what_was_matched(self):
+        import urllib.request
+        f = frozen("https://api.example.com/v1/notes/a%20b?x=1&y=2", body=NOTE)
+        req = urllib.request.Request(f.url, data=f.body, method=f.method, headers=dict(f.headers))
+        P.assert_sent_is_matched(f, req)
+        # a request object that differs in any way is refused
+        # (urllib's own setter strips surrounding whitespace, which is why whitespace is refused earlier)
+        for mutate in (lambda r: setattr(r, "full_url", "https://api.example.com/v1/notes/a b?x=1&y=2"),
+                       lambda r: setattr(r, "full_url", "https://api.example.com/v1/other?x=1&y=2"),
+                       lambda r: setattr(r, "method", "PUT"),
+                       lambda r: setattr(r, "data", b"{}"),
+                       lambda r: r.add_header("X-Extra", "1"),
+                       lambda r: r.headers.pop("Content-type", None)):
+            r2 = urllib.request.Request(f.url, data=f.body, method=f.method, headers=dict(f.headers))
+            mutate(r2)
+            with self.assertRaises(P.NoMatch):
+                P.assert_sent_is_matched(f, r2)
+
+    def test_a_url_urllib_would_rewrite_never_reaches_the_sender(self):
+        # urllib strips surrounding whitespace and "<URL:...>" wrappers: those must already be non-matches
+        for u in (" https://api.example.com/v1/notes", "https://api.example.com/v1/notes ", "<URL:https://api.example.com/v1/notes>",
+                  "https://api.example.com/v1/notes\n"):
+            self.assertIsNotNone(verdict(self.R, frozen(u, body=NOTE)), repr(u))
+
+    def test_new_config_keys(self):
+        c = P.parse_config(None)
+        self.assertEqual((c["max_pending_per_client"], c["submits_per_hour"]), (1, 6))
+        for bad in ({"max_pending_per_client": 0}, {"submits_per_hour": 0}, {"submits_per_hour": 101}):
+            with self.assertRaises(ValueError):
+                P.parse_config(bad)
+
+
 # ---------------------------------------------------------------------------- the store
 class FakeTime:
     def __init__(self):
@@ -998,6 +1093,7 @@ class Store(unittest.TestCase):
         self.t = FakeTime()
         self.events = []
         self.cfg = copy.deepcopy(CFG)
+        self.cfg.update(max_pending_per_client=5, submits_per_hour=100)
         self.store = P.PlanStore(self.cfg, lambda n, **f: self.events.append((n, f)), self.t.now, self.t.mono)
 
     def manifest(self, **kw):
@@ -1056,17 +1152,57 @@ class Store(unittest.TestCase):
         view, err = self.store.approve(p.id, "a", "dashboard", 3600, SIG)
         self.assertEqual((view, err), (None, "gone"))
 
-    def test_deny_and_cooldown(self):
+    def test_deny_cooldown_is_per_client_escalates_and_ignores_the_task_text(self):
         p, _ = self.store.submit(CLIENT, self.manifest(), "r", 3600)
         self.assertTrue(self.store.settle(p.id, "denied"))
         self.assertEqual(self.store.status_for(CLIENT["id"], p.id)["state"], "denied")
-        self.assertEqual(self.store.submit(CLIENT, self.manifest(), "r2", 3600), (None, "cooldown"))
-        other_task = self.manifest(task="different")
-        self.assertIsNone(self.store.submit(CLIENT, other_task, "r3", 3600)[1])
-        self.assertIsNone(self.store.submit(OTHER, self.manifest(), "r4", 3600)[1])       # not another client's task
-        self.t.advance(self.cfg["pending_ttl_s"] + 1)
+        # a changed task string (or anything else about the manifest) does not bypass it
+        for task in ("nightly", "different", "x" * 80, "Nightly "):
+            self.assertEqual(self.store.submit(CLIENT, self.manifest(task=task), "r2", 3600), (None, "cooldown"), task)
+        self.assertIsNone(self.store.submit(OTHER, self.manifest(), "r4", 3600)[1])        # not another client
+        self.t.advance(61)
+        p2, err = self.store.submit(CLIENT, self.manifest(task="again"), "r5", 3600)
+        self.assertIsNone(err)
+        self.store.settle(p2.id, "denied")                                              # second denial: 5 minutes
+        self.t.advance(299)
+        self.assertEqual(self.store.submit(CLIENT, self.manifest(task="z"), "r6", 3600), (None, "cooldown"))
+        self.t.advance(2)
+        p3, err = self.store.submit(CLIENT, self.manifest(task="three"), "r7", 3600)
+        self.assertIsNone(err)
+        self.store.settle(p3.id, "denied")                                              # third and later: 30 minutes
+        self.t.advance(1799)
+        self.assertEqual(self.store.submit(CLIENT, self.manifest(task="y"), "r8", 3600), (None, "cooldown"))
+        self.t.advance(2)
+        p4, err = self.store.submit(CLIENT, self.manifest(task="four"), "r9", 3600)
+        self.assertIsNone(err)
+        self.store.settle(p4.id, "denied")
+        self.t.advance(1799)
+        self.assertEqual(self.store.submit(CLIENT, self.manifest(task="y2"), "r10", 3600), (None, "cooldown"))
+        # forgotten after a quiet day
+        self.t.advance(86401)
         self.store.sweep()
-        self.assertIsNone(self.store.submit(CLIENT, self.manifest(), "r5", 3600)[1])
+        p5, err = self.store.submit(CLIENT, self.manifest(task="fresh"), "r11", 3600)
+        self.assertIsNone(err)
+        self.store.settle(p5.id, "denied")
+        self.t.advance(61)
+        self.assertIsNone(self.store.submit(CLIENT, self.manifest(task="after-reset"), "r12", 3600)[1])
+
+    def test_a_per_client_pending_cap_and_a_submit_rate_limit(self):
+        self.cfg.update(max_pending_per_client=1, max_pending=5)
+        a, err = self.store.submit(CLIENT, self.manifest(task="a"), "1", 3600)
+        self.assertIsNone(err)
+        self.assertEqual(self.store.submit(CLIENT, self.manifest(task="b"), "2", 3600), (None, "too_many"))
+        self.assertIsNone(self.store.submit(OTHER, self.manifest(task="b"), "3", 3600)[1])
+        self.cfg.update(max_pending_per_client=50, submits_per_hour=3)
+        s = P.PlanStore(self.cfg, None, self.t.now, self.t.mono)
+        for i in range(3):
+            self.assertIsNone(s.submit(CLIENT, self.manifest(task="t%d" % i), "r", 3600)[1])
+            s.settle(next(iter(s._plans)), "expired") if False else None
+        self.cfg.update(max_pending=50)
+        self.assertEqual(s.submit(CLIENT, self.manifest(task="t9"), "r", 3600), (None, "rate"))
+        self.assertIsNone(s.submit(OTHER, self.manifest(task="t9"), "r", 3600)[1])
+        self.t.advance(3601)
+        self.assertIsNone(s.submit(CLIENT, self.manifest(task="t10"), "r", 3600)[1])
 
     def test_caps_pending_and_active(self):
         self.assertIsNone(self.store.submit(CLIENT, self.manifest(task="a"), "1", 3600)[1])

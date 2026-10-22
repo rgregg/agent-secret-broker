@@ -53,7 +53,7 @@ import urllib.request
 # Exit codes (also in `asb guide`).
 EXIT_NOT_FOUND, EXIT_USAGE, EXIT_BROKER, EXIT_DENIED, EXIT_EXPIRED = 1, 2, 3, 4, 5
 EXIT_SCRIPT_CHANGED = 6
-EXIT_PLAN_GONE, EXIT_SLOW_DOWN = 7, 8       # plan not usable (stop, submit a new plan); rate or in-flight limit
+EXIT_PLAN_GONE, EXIT_OUTSIDE, EXIT_SLOW_DOWN = 7, 8, 9   # plan ended; call outside the approved plan; rate or in-flight limit
 EXIT_HTTP_ERROR = 22
 
 GUIDE = """asb guide (for agents)
@@ -129,10 +129,10 @@ Plans: an unattended or long job (use one for MANY calls; do not submit a plan f
     asb plan submit manifest.json          waits for the human; prints the plan id when approved
     asb http NAME GET URL ... --plan ID    (or set ASB_PLAN=ID) released with no prompt if it matches a rule
     asb plan status ID | asb plan list | asb plan close ID
-  A call that does not match a rule is REFUSED (exit 3, with a reason), never turned into a prompt;
+  A call that does not match a rule is REFUSED (exit 8, with a reason), never turned into a prompt;
   make that call without --plan if you need the normal approval. Exit 7: the plan is not usable
   (kind: ended, exhausted, closed, revoked or unknown, e.g. the broker restarted): stop and submit a
-  new plan, which needs the human again. Exit 8: slow down (rate or in-flight limit), retry after the
+  new plan, which needs the human again. Exit 9: slow down (rate or in-flight limit), retry after the
   printed seconds. There is no renewal. Do not submit a broader plan to get around a refusal.
 
 Giving this machine its own credential
@@ -176,7 +176,8 @@ Exit codes
   4 denied by the human (or the policy)            5 expired or timed out waiting
   6 env: a script changed between the request and the run (nothing was executed)
   7 plan not usable (ended, exhausted, closed, revoked, unknown): stop, submit a new plan
-  8 plan call refused for now (rate or in-flight limit): wait the printed seconds and retry
+  8 plan call refused: outside the approved plan (reason printed); do not retry, ask the human or stop
+  9 plan call refused for now (rate or in-flight limit): wait the printed seconds and retry
   22 http: the upstream answered with status >= 400 (body is still printed)
   other: env mode returns the wrapped command's own exit code
 """
@@ -208,11 +209,12 @@ Manifest (JSON):
   application/json and use only these headers: Accept, Content-Type, Content-Length, If-None-Match,
   User-Agent, plus Authorization-style headers whose whole value is the credential's own {{VAR}}.
   No {{VAR}} in the URL or body. A rule that writes allows no URL query string unless it lists
-  "query": ["key", ...]; a GraphQL rule never does. Only %20 and UTF-8 may be percent-encoded in a path.
+  "query": ["key", ...]; a GraphQL rule never does. Only %20 may be percent-encoded in a path, and a path is ASCII.
   Redirects are never followed.
-Exit codes: 0 ok; 3 broker refused (manifest invalid, outside the plan, too many plans); 4 denied by
+Exit codes: 0 ok; 3 broker refused (manifest invalid, too many plans); 4 denied by
 the human; 5 expired; 7 plan not usable (kind: ended|exhausted|closed|revoked|unknown): submit a new
-plan; 8 slow down (rate_limited or inflight_limit; prints retry_after_s); 2 usage.
+plan; 8 the call is outside the approved plan (no_rule, uses_exhausted, wrong_policy); 9 slow down
+(rate_limited or inflight_limit; prints retry_after_s); 2 usage.
 A plan is bound to this machine's own credential (run `asb enroll` first; the shared key cannot
 submit plans), has an absolute deadline, and ends when the broker restarts.
 example: asb plan submit manifest.json && asb http ledger POST https://ledger.example.com/v1/notes \\
@@ -257,7 +259,7 @@ The broker makes the HTTP call itself and replaces {{VAR}} in the URL, headers a
 body with the credential. Waits for the human's approval (up to ~5 min).
 Prints "HTTP <status>" on stderr and the response body on stdout; exit 22 if status >= 400.
 --plan ID (or ASB_PLAN=ID) makes the call under an approved plan: no prompt if it matches a rule,
-refused (exit 3) if not, exit 7 if the plan is not usable, exit 8 to slow down. See `asb help plan`.
+refused (exit 8) if not, exit 7 if the plan is not usable, exit 9 to slow down. See `asb help plan`.
 example: asb http grafana GET https://grafana.example.com/api/health \\
              -H 'Authorization: Bearer {{GRAFANA_TOKEN}}'""",
     "run": """usage: asb NAME[,NAME] -- command [args...]
@@ -2314,7 +2316,7 @@ def _plan_refusal(code, r):
     if code == 403 and r.get("error") == "outside plan":
         why = f", why: {_safe_text(r['why'])}" if r.get("why") else ""
         die(f"refused: this call is outside the plan (reason: {_safe_text(r.get('reason', 'no_rule'))}{why}). "
-            "No prompt was sent. Make the call without --plan to ask the human.", EXIT_BROKER)
+            "No prompt was sent. Make the call without --plan to ask the human.", EXIT_OUTSIDE)
     die(err, EXIT_BROKER)
 
 

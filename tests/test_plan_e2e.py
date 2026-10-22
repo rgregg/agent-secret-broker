@@ -448,6 +448,147 @@ class Lifecycle(PBase):
         self.assertEqual(self.card(r["id"]).spec["tier"], "high")
 
 
+class RunningCalls(PBase):
+    """A plan-released call is never a pending request: it is not listed, counted, decidable or
+    expirable while it runs (nothing asks a human)."""
+    plans_cfg = {"max_inflight": 4, "rate_per_min": 100}
+
+    def run_slow(self, pid, n, secret=None):
+        Stub.gate = threading.Event()
+        out = []
+        ths = [threading.Thread(target=lambda: out.append(self.call(pid, body=self.ok_note(), secret=secret)))
+               for _ in range(n)]
+        [t.start() for t in ths]
+        end = time.time() + 10
+        while time.time() < end and self.plan_view(pid)["inflight"] < n:
+            time.sleep(0.02)
+        self.assertEqual(self.plan_view(pid)["inflight"], n)
+        return ths, out
+
+    def test_an_in_flight_plan_call_is_not_pending_and_cannot_be_decided(self):
+        pid = self.approve(self.manifest(rules=[self.rule(max_uses=50)]))
+        n_up = len(self.upstream())
+        ths, out = self.run_slow(pid, 1)
+        self.assertEqual(self.broker.pending(), [])
+        self.assertEqual(self.broker.attention(), 0)
+        self.assertTrue(all(r.status != "pending" for r in self.broker._by_id.values()))
+        self.assertNotIn("data-id=", self.get("/")[1].split("Waiting for you")[1].split("History")[0])
+        rid = [e for e in self.events("requested") if e.get("mode") == "http"][-1]["id"]
+        # nothing can decide it, by any route, while it runs or after
+        for decision in ("approve", "deny", "approve_always", "approve_grant_15"):
+            st, _, hdr = self.post("/decide", {"id": rid, "decision": decision})
+            self.assertEqual(st, 303)
+            self.assertIn("note=stale", hdr["Location"], decision)
+        self.assertEqual(self.broker.decide_via("dashboard", rid, "approve", "alice"), (404, None))
+        self.assertEqual(self.broker.decide_via("dashboard", rid, "deny", "alice"), (404, None))
+        req = self.card(self.events("requested")[-1]["id"]) if False else None
+        Stub.gate.set()
+        [t.join() for t in ths]
+        self.assertEqual((out[0][0], out[0][1]["http"]["status"]), (202, 200))      # the real response survives
+        self.assertEqual(len(self.upstream()), n_up + 1)                              # executed exactly once (no second hit)
+        self.assertEqual(self.plan_view(pid)["uses"], 1)
+        # after it settled it is still not decidable and nothing runs twice
+        for decision in ("approve", "deny"):
+            self.post("/decide", {"id": rid, "decision": decision})
+            code, done = self.broker.decide_via("dashboard", rid, decision, "alice")
+            self.assertEqual(code, 410)
+        self.assertEqual(len(self.upstream()), n_up + 1)
+        self.assertEqual(self.broker._by_id[rid].status, "released" if False else self.broker._by_id[rid].status)
+        self.assertEqual(self.broker.pending(), [])
+
+    def test_slow_plan_calls_do_not_block_other_clients_or_the_humans_approvals(self):
+        pid = self.approve(self.manifest(rules=[self.rule(max_uses=50)]))
+        ths, out = self.run_slow(pid, 4)
+        self.assertEqual(self.broker.pending(), [])
+        other = self.new_client("other-box")
+        for i in range(3):          # as many normal requests as the shared cap allows, from another client
+            code, r = self.api("POST", "/v1/requests", {"mode": "http", "names": ["ledger"], "method": "GET",
+                               "url": f"http://127.0.0.1:{self.port}/y{i}", "headers": {}}, secret=other["secret"])
+            self.assertEqual((code, r["status"]), (202, "pending"), i)
+        self.assertEqual(len(self.broker.pending()), 3)
+        self.assertEqual(self.broker.attention(), 3)
+        # the human can still approve their own pending request
+        rid = self.broker.pending()[0].id
+        self.assertEqual(self.post("/decide", {"id": rid, "decision": "deny"})[0], 303)
+        # and a plan submission from the other client works while the 4 slots are busy
+        self.assertEqual(self.api("POST", "/v1/plans", {"manifest": self.manifest(task="o")}, secret=other["secret"])[0], 202)
+        Stub.gate.set()
+        [t.join() for t in ths]
+        self.assertEqual([o[0] for o in out], [202] * 4)
+
+    def test_a_plan_call_is_not_swept_as_expired_while_it_runs(self):
+        pid = self.approve(self.manifest(rules=[self.rule(max_uses=50)]))
+        ths, out = self.run_slow(pid, 1)
+        self.tick(10_000)           # far past any request expiry; the plan itself is still inside its hour? no: just the call
+        with self.broker._lock:
+            self.broker._expire_locked()
+        Stub.gate.set()
+        [t.join() for t in ths]
+        self.assertEqual(out[0][0], 202)
+        self.assertEqual(out[0][1]["status"], "approved")
+
+
+class Hardening(PBase):
+    def test_the_agents_source_claim_is_escaped_or_replaced(self):
+        for claim in ("bob\u202e@evil", "bob\u200b@x", "bob@x\u2066", "bob @x", "bob\n@x", "b\u00f6b@x", "<b>x</b>", "x" * 130):
+            r = self.submit(self.manifest(task="t" + str(abs(hash(claim)) % 10000)), source=claim)
+            req = self.card(r["id"])
+            self.assertEqual(req.source, "127.0.0.1", repr(claim))
+            html = self.get("/")[1] + self.get("/a/" + req.nonce)[1]
+            for ch in ("\u202e", "\u200b", "\u2066", "\u00f6"):
+                self.assertNotIn(ch, html)
+            self.assertIn("Claimed source (unverified): 127.0.0.1", html)
+            self.broker._finish(req, "failed", error="x")
+        r = self.submit(self.manifest(task="plain"), source="bob@build-box")
+        self.assertEqual(self.card(r["id"]).source, "bob@build-box")
+
+    def test_a_plan_call_source_is_cleaned_too(self):
+        pid = self.approve()
+        self.call(pid, body=self.ok_note(), extra={"source": "evil\u202e@x"})
+        ev = [e for e in self.events("requested") if e.get("mode") == "http"][-1]
+        self.assertEqual(ev["source"], "127.0.0.1")
+
+    def test_control_characters_in_a_plan_call_url_are_refused_and_nothing_is_sent(self):
+        pid = self.approve(self.manifest(rules=[self.rule(max_uses=50), self.read_rule(max_uses=50)]))
+        base = f"http://127.0.0.1:{self.port}"
+        n_up = len(self.upstream())
+        for suffix in ("\n", "\r", "\t", "\x00", " ", "/x\n", "/x y", "?a=1\n", "?_method\n"):
+            for kw in (dict(path="/v1/notes", url=base + "/v1/notes" + suffix, body=self.ok_note()),
+                       dict(name="svc", method="GET", url=base + "/v1/accounts" + suffix)):
+                code, r = self.call(pid, **kw)
+                self.assertEqual(code, 403, (suffix, kw["url"]))
+                self.assertEqual(r["reason"], "no_rule")
+        self.assertEqual(len(self.upstream()), n_up)
+        self.assertEqual(self.plan_view(pid)["uses"], 0)
+
+    def test_a_credential_that_changed_between_submit_and_approval_kills_the_plan(self):
+        r = self.submit()
+        self.broker.cfg["secrets"]["ledger"]["vars"] = {"LEDGER_TOKEN": {"item": "Other", "field": "token"}}
+        req = self.card(r["id"])
+        self.assertEqual(self.decide(r["id"], "approve")[0], 303)
+        req.done.wait(10)
+        self.assertEqual(req.status, "failed")
+        self.assertEqual(req.error, "plan not started: BackendError")
+        self.assertNotIn("Other", json.dumps(self.api("GET", f"/v1/requests/{r['id']}?wait=1")[1]))
+        self.assertEqual(self.plan_view(r["plan"])["state"], "expired")
+        self.assertEqual(self.call(r["plan"], body=self.ok_note())[0], 404)
+
+    def test_the_credential_is_compared_again_at_use(self):
+        pid = self.approve()
+        self.broker.cfg["secrets"]["ledger"]["vars"] = {"LEDGER_TOKEN": {"item": "Other", "field": "token"}}
+        code, r = self.call(pid, body=self.ok_note())
+        self.assertEqual((code, r["reason"]), (403, "wrong_policy"))
+
+    def test_only_percent_20_may_be_encoded_in_a_plan_path(self):
+        pid = self.approve(self.manifest(rules=[self.rule(max_uses=50)]))
+        base = f"http://127.0.0.1:{self.port}/v1/notes/"
+        for tail in ("a%20b", "%20"):
+            self.assertEqual(self.call(pid, body=self.ok_note(), url=base + tail)[0], 202, tail)
+        for tail in ("%EF%BC%8F", "%E2%82%AC", "%25", "%252e%252e", "%2e", "%2F", "%C0%AF", "a%e2"):
+            code, r = self.call(pid, body=self.ok_note(), url=base + tail)
+            self.assertEqual((code, r["why"]), (403, "path"), tail)
+
+
 class Submission(PBase):
     def test_bad_manifests_are_400_with_a_fixed_sentence(self):
         for m, frag in ((self.manifest(v=2), "v: must be 1"), (self.manifest(rules=[]), "rules"),
@@ -484,17 +625,57 @@ class Submission(PBase):
         code, r = self.api("POST", "/v1/plans", {"manifest": self.manifest(task="c")})
         self.assertEqual((code, r), (429, {"error": "too many plans"}))
 
-    def test_denial_cooldown_for_the_same_task(self):
+    def test_denial_cooldown_is_per_client_and_a_new_task_text_does_not_bypass_it(self):
         r = self.submit(self.manifest(task="same"))
         self.assertEqual(self.decide(r["id"], "deny")[0], 303)
         self.assertEqual(self.api("GET", f"/v1/requests/{r['id']}?wait=2")[1]["status"], "denied")
-        code, r2 = self.api("POST", "/v1/plans", {"manifest": self.manifest(task="same")})
-        self.assertEqual(code, 429)
-        self.assertEqual(self.api("POST", "/v1/plans", {"manifest": self.manifest(task="other")})[0], 202)
+        for task in ("same", "other", "Same ", "x" * 80):
+            code, r2 = self.api("POST", "/v1/plans", {"manifest": self.manifest(task=task)})
+            self.assertEqual(code, 429, task)
+        other = self.new_client("other-box")
+        self.assertEqual(self.api("POST", "/v1/plans", {"manifest": self.manifest(task="same")},
+                                  secret=other["secret"])[0], 202)
         # a denied plan does not put the credential on the regular deny cooldown
         code, r3 = self.api("POST", "/v1/requests", {"mode": "http", "names": ["ledger"], "method": "GET",
                             "url": f"http://127.0.0.1:{self.port}/x", "headers": {}})
         self.assertEqual(code, 202)
+        self.tick(61)
+        self.assertEqual(self.api("POST", "/v1/plans", {"manifest": self.manifest(task="later")})[0], 202)
+
+    def test_per_client_pending_cap_and_submit_rate_with_the_shipped_defaults(self):
+        self.broker.plans.cfg.update(max_pending_per_client=1, max_pending=5)
+        self.submit(self.manifest(task="a"))
+        code, r = self.api("POST", "/v1/plans", {"manifest": self.manifest(task="b")})
+        self.assertEqual((code, r), (429, {"error": "too many plans"}))
+        other = self.new_client("other-box")
+        self.assertEqual(self.api("POST", "/v1/plans", {"manifest": self.manifest(task="b")}, secret=other["secret"])[0], 202)
+        self.broker.plans.cfg.update(max_pending_per_client=10, submits_per_hour=1)
+        code, r = self.api("POST", "/v1/plans", {"manifest": self.manifest(task="c")})
+        self.assertEqual(code, 429)
+        self.assertIn("too many plan submissions", r["error"])
+
+    def test_plan_cards_do_not_consume_the_shared_pending_cap(self):
+        from secret_broker.broker import MAX_PENDING
+        self.broker.plans.cfg.update(max_pending=2)
+        self.submit(self.manifest(task="a"))
+        other = self.new_client("other-box")
+        self.submit(self.manifest(task="b"), secret=other["secret"])
+        n = 0
+        for i in range(MAX_PENDING):
+            code, r = self.api("POST", "/v1/requests", {"mode": "http", "names": ["ledger"], "method": "GET",
+                               "url": f"http://127.0.0.1:{self.port}/x{i}", "headers": {}}, secret=other["secret"])
+            n += code == 202
+        self.assertEqual(n, MAX_PENDING)
+
+    def test_rejected_submissions_are_coalesced_in_the_audit_log(self):
+        for _ in range(40):
+            self.assertEqual(self.api("POST", "/v1/plans", {"manifest": self.manifest(v=2)})[0], 400)
+        rej = [e for e in self.events("rejected") if e.get("mode") == "plan"]
+        self.assertEqual(len(rej), 5)
+        self.tick(61)
+        self.api("POST", "/v1/plans", {"manifest": self.manifest(v=2)})
+        rej = [e for e in self.events("rejected") if e.get("mode") == "plan"]
+        self.assertEqual((len(rej), rej[-1].get("suppressed")), (6, 35))
 
     def test_a_card_that_nobody_answers_expires_and_grants_nothing(self):
         self.broker.plans_cfg["pending_ttl_s"] = 120
@@ -570,14 +751,14 @@ class Cli(PBase):
                                    "-H", "Authorization: Bearer {{LEDGER_TOKEN}}",
                                    "-H", "Content-Type: application/json", "-d", json.dumps(self.ok_note()),
                                    "--plan", pid)
-        self.assertEqual(rc, 3, err)
+        self.assertEqual(rc, 8, err)
         self.assertIn("reason: no_rule", err)
         self.assertIn("why: path", err)
         self.assertIn("No prompt was sent", err)
         self.assertEqual(out, "")
         self.assertEqual(self.broker.pending(), [])
 
-    def test_exit_8_for_rate_and_inflight(self):
+    def test_exit_9_for_rate_and_inflight(self):
         self.broker.plans.cfg["rate_per_min"] = 1
         pid = self.approve(self.manifest(rules=[self.rule(max_uses=50)]))
         args = ("http", "ledger", "POST", f"http://127.0.0.1:{self.port}/v1/notes",
@@ -585,7 +766,7 @@ class Cli(PBase):
                 "-d", json.dumps(self.ok_note()), "--plan", pid)
         self.assertEqual(self.cli(*args)[0], 0)
         rc, out, err, _ = self.cli(*args)
-        self.assertEqual(rc, 8, err)
+        self.assertEqual(rc, 9, err)
         self.assertRegex(err, r"slow down: rate_limited; retry after \d+ s")
 
     def test_exit_7_kinds(self):

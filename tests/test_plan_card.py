@@ -205,7 +205,7 @@ class SecondConfirmation(CardBase):
                                         ({"body": {"any": True}}, "send any content"))):
             r = self.submit(self.manifest(task="t%d" % i, rules=[self.rule(**kw)]))
             self.assertIn(frag, self.page(r["id"]))
-            self.decide(r["id"], "deny")
+            self.broker._finish(self.card(r["id"]), "failed", error="x")       # not a denial (no cooldown)
 
     def test_medium_and_low_plans_need_one_step(self):
         r = self.submit()

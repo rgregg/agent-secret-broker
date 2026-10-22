@@ -179,16 +179,18 @@ prompt-injection stance are in
 For a job that runs with nobody at the phone: the agent writes a manifest of the calls it will make, you
 read a rendering of every rule once and approve the whole plan (for a duration you may shorten), and calls
 that match a rule then run with no prompt until the deadline. A call that does not match is **refused**
-(exit 3, with a reason class such as `no_rule` and `why: path`), never turned into a prompt; making it
+(exit 8, with a reason class such as `no_rule` and `why: path`), never turned into a prompt; making it
 without `--plan` asks as usual. Do not submit a plan for one call. Plans need this machine's own credential
 (`asb enroll`; the shared key cannot submit), end at their absolute deadline, cannot be renewed and are lost
 when the broker restarts (exit 7, `kind: unknown`: submit again). `asb help plan` has the manifest format and
 the matching rules (exact host, segment-aligned path, no query string on a write unless its keys are listed,
-only `%20` and UTF-8 percent-encoding, a fixed header allowlist, exact GraphQL documents, no redirects); the
+ASCII paths with only `%20` percent-encoded, a fixed header allowlist, exact GraphQL documents, no redirects); the
 full description is in [reference.md](reference.md#plans-task-scoped-grants-for-unattended-jobs).
 
-Plan exit codes: 7 the plan is not usable (`kind` is `ended`, `exhausted`, `closed`, `revoked` or `unknown`):
-stop and submit a new plan; 8 slow down (`rate_limited` or `inflight_limit`), retry after the printed seconds.
+Plan exit codes: 7 the plan has ended or is not usable (`kind` is `ended`, `exhausted`, `closed`, `revoked` or
+`unknown`): stop and submit a new plan; 8 the call is outside the approved plan (`no_rule`, `uses_exhausted`,
+`wrong_policy`): do not retry it; 9 slow down (`rate_limited` or `inflight_limit`), retry after the printed
+seconds. These match the http-sessions exit codes.
 
 ### Exit codes
 
@@ -201,8 +203,9 @@ stop and submit a new plan; 8 slow down (`rate_limited` or `inflight_limit`), re
 | 4 | Denied by you or by policy |
 | 5 | Expired or timed out waiting for approval |
 | 6 | Env mode: a script changed between the request and the run (`asb: script PATH changed after it was reviewed`); nothing was executed |
-| 7 | `plan` / `http --plan`: the plan is not usable (`ended`, `exhausted`, `closed`, `revoked`, `unknown`); submit a new plan |
-| 8 | `http --plan`: rate or in-flight limit; retry after the printed seconds |
+| 7 | `plan` / `http --plan`: the plan has ended or is not usable (`ended`, `exhausted`, `closed`, `revoked`, `unknown`); submit a new plan |
+| 8 | `http --plan`: the call is outside the approved plan (reason printed); never turned into a prompt |
+| 9 | `http --plan`: rate or in-flight limit; retry after the printed seconds |
 | 22 | `http`: the upstream answered with status 400 or more (body still printed) |
 | other | Env mode returns the wrapped command's own exit code |
 

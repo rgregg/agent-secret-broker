@@ -122,14 +122,18 @@ class PlansMixin:
 
     # -- submit -----------------------------------------------------------------------
     def _plan_reject(self, client, source, peer, code, msg, cls):
-        self.log("rejected", reason=f"plan: {cls}", mode="plan", names=[], source=source, peer=peer,
-                 **self._client_fields(client))
+        # coalesced like plan_miss: a client cannot flood the log with refused submissions
+        write, supp = self.plans.note_miss("reject:" + client["id"])
+        if write:
+            extra = {"suppressed": supp} if supp else {}
+            self.log("rejected", reason=f"plan: {cls}", mode="plan", names=[], source=source, peer=peer,
+                     **self._client_fields(client), **extra)
         raise PlanRefused(code, {"error": msg})
 
     def submit_plan(self, raw, source, peer=None, client=None):
         """POST /v1/plans. `raw` is the parsed manifest. Returns the pending card (a Request with
         mode "plan"); raises PlanRefused with a ready response."""
-        from .broker import MAX_PENDING, Request
+        from .broker import Request
         client = client or dict(clients_mod.ClientStore.LEGACY_VIEW)
         cid, cfg = client["id"], self.plans_cfg
         rej = lambda code, msg, cls: self._plan_reject(client, source, peer, code, msg, cls)  # noqa: E731
@@ -142,7 +146,7 @@ class PlansMixin:
         self._refresh_if(0 if any(n not in self.cfg["secrets"] for n in _named(raw)) else self.CATALOG_TTL)
         try:
             man = plans_mod.validate_manifest(raw, cfg, self.plan_max_minutes(cid))
-            self._plan_check(man["rules"])
+            sigs = self._plan_check(man["rules"])
         except plans_mod.ManifestError as e:
             rej(e.status, str(e), "invalid" if e.status == 400 else "policy")
         rules = man["rules"]
@@ -151,20 +155,19 @@ class PlansMixin:
         spec = {"task": man["task"], "description": man["description"], "rules": rules,
                 "manifest_hash": man["manifest_hash"], "rules_hash": man["rules_hash"],
                 "requested_s": man["ttl_s"], "tier": tier, "flags": plans_mod.plan_flags(rules),
-                "rate_per_min": cfg["rate_per_min"],
+                "rate_per_min": cfg["rate_per_min"], "sigs": sigs,
                 "surface": {n: sorted(self.cfg["secrets"][n].get("allowed_hosts") or []) for n in names}}
         err = None
         with self._lock:
             self._expire_locked()
             if not self.clients.is_active(cid):
                 err = (403, "this client has been revoked")
-            elif sum(r.status == "pending" and r.mode != "guidance" for r in self._by_id.values()) >= MAX_PENDING:
-                err = (429, "too many pending requests")
             else:
                 plan, perr = self.plans.submit(client, man, None, man["ttl_s"])
                 if perr is not None:
                     err = (429, {"too_many": "too many plans", "full": "too many plans",
-                                 "cooldown": "that plan was denied recently; try again later"}[perr])
+                                 "rate": "too many plan submissions; try again later",
+                                 "cooldown": "a plan from this client was denied recently; try again later"}[perr])
             if err is None:
                 req = Request("plan", names, spec, source, cfg["pending_ttl_s"], peer, client)
                 req.plan_id = plan.id
@@ -172,8 +175,11 @@ class PlansMixin:
                 self._by_id[req.id] = req
                 self._by_nonce[req.nonce] = req
         if err is not None:
-            self.log("rejected", reason="plan: " + ("busy" if err[0] == 429 else "client_revoked"), mode="plan",
-                     names=names, source=source, peer=peer, **self._client_fields(client))
+            write, supp = self.plans.note_miss("reject:" + cid)
+            if write:
+                self.log("rejected", reason="plan: " + ("busy" if err[0] == 429 else "client_revoked"), mode="plan",
+                         names=names, source=source, peer=peer, **self._client_fields(client),
+                         **({"suppressed": supp} if supp else {}))
             raise PlanRefused(err[0], {"error": err[1]})
         self.audit("requested", req)
         req.risk = {"level": tier, "model": None, "reasons": plans_mod.tier_reasons(rules)}
@@ -206,6 +212,8 @@ class PlansMixin:
             sigs = self._plan_check(sp["rules"])
         except plans_mod.ManifestError:
             raise BackendError("plan no longer valid") from None
+        if sigs != sp["sigs"]:              # a credential's vault source changed between submit and approval
+            raise BackendError("plan no longer valid")
         if not self.plan_client_ok(req.client["id"]):
             raise BackendError("plan no longer valid")
         view, err = self.plans.approve(
@@ -277,12 +285,13 @@ class PlansMixin:
         if isinstance(m, plans_mod.Miss):
             self._plan_miss(client, plan_id, m)
         try:
-            req = Request("http", list(names), spec, source, self.cfg.get("ttl_seconds", 120), peer, client)
+            req = Request("http", list(names), spec, clean_source(source, peer), self.cfg.get("ttl_seconds", 120),
+                          peer, client)
             req.frozen = frozen
-            with self._lock:
-                self._expire_locked()
-                self._by_id[req.id] = req
-                self._by_nonce[req.nonce] = req
+            # A plan call is never "pending": nothing asks a human, so it is not listed, counted,
+            # decidable or expirable while it runs. It is registered (for the agent's poll) only
+            # once it has settled.
+            req.status = "deciding"
             self.audit("requested", req)
             self._retain_details(req)
             self.log("plan_used", id=req.id, plan_id=m.plan_id, rule=m.rule_index,
@@ -297,6 +306,10 @@ class PlansMixin:
                 self._finish(req, "failed", error=_RELEASE_TEXT[cat], **extra)
             else:
                 self._finish(req, "approved", result=result, **extra)
+            with self._lock:
+                self._expire_locked()
+                self._by_id[req.id] = req
+                self._by_nonce[req.nonce] = req
             return req
         finally:
             m.release()
@@ -340,6 +353,12 @@ def _named(raw):
     rules = raw.get("rules") if isinstance(raw, dict) else None
     return [r["secret"] for r in rules if isinstance(r, dict) and isinstance(r.get("secret"), str)] \
         if isinstance(rules, list) else []
+
+
+def clean_source(src, peer):
+    """The client's own user@host claim, only if it is plain (the same check as client names and
+    enrollment claims); otherwise the socket address. Nothing hidden or bidi can reach a card."""
+    return src if isinstance(src, str) and clients_mod.CLAIM_RE.fullmatch(src) else (peer or "unknown")
 
 
 def plans_mod_iso(t):
@@ -413,7 +432,7 @@ def _submit(h, broker, _json):
         _json(h, 400, {"error": "manifest: the request must be an object with a manifest"})
         return True
     src = body.get("source", h.client_address[0])
-    src = (src if isinstance(src, str) else h.client_address[0])[:80]
+    src = clean_source(src, h.client_address[0])
     req = broker.submit_plan(body["manifest"], src, peer=h.client_address[0], client=h.client)
     _json(h, 202, {"id": req.id, "plan": req.plan_id, "status": req.status,
                    "expires_in": int(req.expires - time.time())})

@@ -848,8 +848,8 @@ def plans_scenario(rh, g):
                                                        "-d", '{"x": 1, "kind": "other"}'] + hdr),
                         ("an encoded dot segment", ["GET", up_url(rh, "/plan/read/%2e%2e/secret")] + hdr)):
         rc, o, e = rh.asb(b, "http", "stub", *args, "--plan", pid, extra_env=env2, timeout=30)
-        rh.check(g, f"plans: off-manifest ({label}) is refused, exit 3, no prompt",
-                 rc == 3 and "outside the plan" in e and set(b.ap.cards()) == seen, f"rc={rc} {e.strip()[:80]}")
+        rh.check(g, f"plans: off-manifest ({label}) is refused, exit 8, no prompt",
+                 rc == 8 and "outside the plan" in e and set(b.ap.cards()) == seen, f"rc={rc} {e.strip()[:80]}")
     rh.check(g, "plans: no refused call reached the upstream", len(Upstream.hits) == n_up, "")
     # 4. the same call without --plan still asks the human (left undecided)
     rc, o, e, rid2 = rh.asb_decided(b, ["http", "stub", "GET", up_url(rh, "/plan/noplan")] + hdr, decision=None, timeout=60,
@@ -859,7 +859,7 @@ def plans_scenario(rh, g):
     rc, o, e = rh.asb(b, "http", "stub", "GET", up_url(rh, "/plan/read"), *hdr, "--plan", pid, extra_env=env2, timeout=30)
     rc2, o2, e2 = rh.asb(b, "http", "stub", "GET", up_url(rh, "/plan/read"), *hdr, "--plan", pid, extra_env=env2, timeout=30)
     rh.check(g, "plans: max_uses holds (the third read is refused, uses_exhausted)",
-             rc == 0 and rc2 == 3 and "uses_exhausted" in e2, f"rc={rc} rc2={rc2} {e2.strip()[:80]}")
+             rc == 0 and rc2 == 8 and "uses_exhausted" in e2, f"rc={rc} rc2={rc2} {e2.strip()[:80]}")
     rc, o, e = rh.asb(b, "plan", "status", pid, extra_env=env2)
     rh.check(g, "plans: asb plan status shows the uses", rc == 0 and "state:   active" in o and "uses:    3 / 4" in o, o.strip()[:120])
     # 6. close

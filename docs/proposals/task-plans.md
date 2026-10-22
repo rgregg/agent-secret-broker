@@ -271,7 +271,7 @@ the 3xx comes back masked and a follow-up is a new call that needs its own rule.
 equals the prefix, or begins with the prefix plus `/`. Matched as sent. Non-match for: dot segments
 (`.`, `..`, percent-encoded forms), `%2f`, `%5c`, `%00`, other percent-encoded unreserved
 characters, backslash, `;`, control characters, a `//` run. **Percent-encoding is an allowlist**: only
-`%20` and non-ASCII UTF-8 sequences in uppercase hex (strictly valid, so no overlong forms) may appear; every
+`%20` may appear (no UTF-8 at all, so a normalizing upstream cannot read `%EF%BC%8F` as `/`); every
 other encoded byte, including `%25` (which can double-decode upstream), `%2e`, `%2f`, `%5c`, `%00`, encoded
 unreserved characters and lowercase hex, is a non-match. A prefix of only `/` needs `plans.allow_root_prefix`
 (default false). **`query`**: a rule that writes defaults to `"none"` (any URL query string is a non-match)
@@ -535,16 +535,17 @@ Unknown, expired, closed and **wrong-client** plans are **always 404** with the 
 | Manifest invalid or over a cap | 400 | fixed message naming field and class | 3 |
 | Disabled, legacy client, never-auto client, `plans: false`/`deny_secrets` | 403 | fixed | 3 |
 | Submit over `max_pending` or `max_active_per_client` | **429** | `{"error": "too many plans"}` | 3 |
-| Plan call outside the plan (`no_rule`, `uses_exhausted`, `session_ended`, `wrong_policy`) | 403 | `{"error": "outside plan", "reason": class}` | 3 |
-| `rate_limited` | **429** | `{"error": "outside plan", "reason": "rate_limited", "retry_after_s": N}` | **8** |
-| `inflight_limit` | **429** | `{"error": "outside plan", "reason": "inflight_limit", "retry_after_s": 1}` | **8** |
+| Plan call outside the plan (`no_rule`, `uses_exhausted`, `session_ended`, `wrong_policy`) | 403 | `{"error": "outside plan", "reason": class}` | **8** |
+| `rate_limited` | **429** | `{"error": "outside plan", "reason": "rate_limited", "retry_after_s": N}` | **9** |
+| `inflight_limit` | **429** | `{"error": "outside plan", "reason": "inflight_limit", "retry_after_s": 1}` | **9** |
 | Plan not usable (unknown, foreign, ended, closed, revoked, exhausted, lost to restart) | 404 | `{"error": "plan not usable", "kind": "ended"\|"exhausted"\|"closed"\|"revoked"\|"unknown"}` | **7** |
 | Denied by the human | | | 4 |
 | Expired while pending | | | 5 |
 | Upstream status 400 or more | | | 22 (unchanged) |
 
-Exit 8 means "slow down and retry"; `asb` prints `retry_after_s`. Exit 7 means "stop; submit a new
-plan". No exception text anywhere; internal errors are `{"error": "plan error"}` plus an audit
+Exit 9 means "slow down and retry"; `asb` prints `retry_after_s`. Exit 8 means "this call is outside the
+approved plan" (never retry it as is). Exit 7 means "stop; submit a new plan". The numbers match the http
+sessions design (7 ended, 8 out of scope). No exception text anywhere; internal errors are `{"error": "plan error"}` plus an audit
 record with the exception class name only.
 
 ## 11. Test plan
@@ -598,7 +599,7 @@ masked upstream response; and every emitted `plan_*` event is whitelisted or hid
 
 **Overnight-job scenario** (e2e, fake clock, local stub): approve a plan for 6 h at 22:05; at 02:00
 the job runs a GraphQL read 40 times and one note POST; a 41st call with a different document is
-refused (exit 3, no prompt, no notification); the rate limit holds at a burst; at 03:00 the broker
+refused (exit 8, no prompt, no notification); the rate limit holds at a burst; at 03:00 the broker
 restarts, calls get exit 7 `kind: unknown` and release nothing; a re-submitted plan stays pending
 until approved; a plain `asb http` without a plan still prompts; at the deadline calls get exit 7
 `kind: ended` and `asb plan status` is `ended`.
@@ -664,7 +665,7 @@ All earlier open questions were decided (see "Decisions"). One remains:
 Everything above holds except the following, each decided while building it.
 
 1. **Query string and percent-encoding** are stricter than first written (item D above): writes and GraphQL
-   default to no query string; only `%20` and uppercase-hex UTF-8 may be percent-encoded.
+   default to no query string; only `%20` may be percent-encoded (revised again in item 13).
 2. **Rule keys `port` and `scheme`** were added (defaults 443 / `https`; `http` only for a private IP literal
    host), so a rule states exactly what it matches and a loopback stub can be used in tests. The credential
    metadata pin for plain http to a named host is **not** implemented: plain http is private IP literals only.
@@ -689,5 +690,17 @@ Everything above holds except the following, each decided while building it.
 10. **Per-client `plans.max_minutes`** replaces the global ceiling for that client (1-720); it can be higher
     than the global value.
 11. `asb http --plan` sends the method uppercased (ASCII); a plan call's method is matched exactly as sent.
+13. **Review hardening (revision 4).** (a) A plan-released call is never registered as a pending request: it
+    is created `deciding` and registered only once settled, so it is not listed, counted against the shared
+    pending cap, decidable or expirable while running. (b) The denial cooldown is keyed on the client id only
+    and escalates 60 s / 5 min / 30 min, reset after a quiet day; `plans.max_pending_per_client` (1) and
+    `plans.submits_per_hour` (6) were added; plan cards never use the shared pending cap. (c) The card's
+    claimed source must match the plain claim pattern or the socket address is shown. (d) Every matcher
+    pattern is a full match, control characters and whitespace are refused anywhere in the URL and matched
+    strings, and the object handed to the sender is compared with the matched one. (e) The credential's vault
+    source signature is recorded at submit and compared at approval and at use. (f) The refused-submission
+    audit record is coalesced. (g) **Paths are ASCII and only `%20` may be percent-encoded** (supersedes the
+    UTF-8 allowance in item D and deviation 1). (h) Exit codes follow the sessions contract: 7 ended (with
+    `kind`), **8 outside the approved plan** (was 3), **9 retry later** (was 8).
 12. Plan cards expire through the same request expiry; the plan record follows its card (denied, expired,
     failed all end it).

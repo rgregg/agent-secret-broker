@@ -1055,7 +1055,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, planflow.Plan
                     err = "too many pending guidance proposals"
                 ttl = self.proposals_cfg["ttl_s"]
             else:
-                if sum(r.status == "pending" and r.mode != "guidance"
+                if sum(r.status == "pending" and r.mode not in ("guidance", "plan")
                        for r in self._by_id.values()) >= MAX_PENDING:
                     err = "too many pending requests"
                 if mode == "credential":
@@ -2807,6 +2807,7 @@ def _exchange_frozen(frozen, values, tls):
     """Send the frozen plan request EXACTLY as matched: its url, method, headers and body bytes."""
     req = urllib.request.Request(frozen.url, data=frozen.body or None, method=frozen.method,
                                  headers=dict(frozen.headers))
+    plans_mod.assert_sent_is_matched(frozen, req)
     return _exchange(req, values, tls, strip_cookies=True)
 
 

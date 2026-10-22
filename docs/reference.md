@@ -1885,11 +1885,14 @@ the filled header values treated as opaque).
   masked, without `Set-Cookie`, and a follow-up is a new call that needs its own rule.
 - **Method.** Exact and uppercase, one method per rule.
 - **Path.** `path_prefix` is absolute, segment aligned (the path equals it or continues after a `/`), as
-  sent. Refused: dot segments, an empty segment (`//`), `;`, backslash, control characters. **Percent-encoding
-  is an allowlist**: only `%20` and non-ASCII UTF-8 sequences in uppercase hex (a valid, non-overlong
-  sequence) may appear; every other encoded byte (`%25`, `%2e`, `%2f`, `%5c`, `%00`, encoded letters and
-  digits, lowercase hex) is a non-match, so nothing can double-decode into another path upstream. The broker
-  never decodes anything before comparing. A prefix of only `/` needs `plans.allow_root_prefix`.
+  sent. Refused: dot segments, an empty segment (`//`), `;`, backslash, any control character or whitespace.
+  **A path is ASCII and the only percent-encoding allowed is `%20`**: every other encoded byte (`%25`, `%2e`,
+  `%2f`, `%5c`, `%00`, `%EF%BC%8F` and any other UTF-8, encoded letters and digits, lowercase hex) and every
+  byte of 0x80 or more is a non-match, so nothing can double-decode, or be read as another character by a
+  Unicode-normalizing upstream. The broker never decodes anything before comparing. Every pattern the matcher
+  uses is a full match (a trailing newline never passes), no control character or whitespace is accepted in
+  the URL or any matched string, and just before sending, the request object actually handed to the sender is
+  compared with the frozen matched one (URL, target, method, body, headers). A prefix of only `/` needs `plans.allow_root_prefix`.
 - **Query string.** A rule that writes (anything but GET, HEAD, OPTIONS) defaults to `"query": "none"`: any
   query string is a non-match. It may instead list the allowed key names (`"query": ["dry_run", "page"]`,
   values unconstrained, up to 16); the card shows them. A GraphQL rule must be `"none"`. Read rules default to
@@ -1958,8 +1961,17 @@ token or the link page's old form: only the SSO approval pages, with CSRF.
 
 Hard caps (a manifest over one is a 400 naming the field): `max_rules` 20, `max_uses_per_rule`,
 `max_total_uses`, `max_minutes`, `rate_per_min`, `max_body_bytes`, no any-body, no `/` prefix, no GraphQL
-mutation, `deny_secrets`. Fatigue limits: a card waits `pending_ttl_s` (900), `max_pending` 2 pending plans,
-`max_active_per_client` 2 active (excess: 429), 60 s cooldown after denying the same client's same task name.
+mutation, `deny_secrets`. Approver-fatigue limits (all 429): a card waits `pending_ttl_s` (900); `max_pending`
+2 pending plans overall and `max_pending_per_client` 1 per client; `max_active_per_client` 2 active;
+`submits_per_hour` 6 per client; and a **denial cooldown keyed on the client id only** (never the
+agent-chosen task text, so rewording a task bypasses nothing) that escalates 60 s, 5 min, 30 min with each
+further denial and is forgotten after a quiet day. Plan cards have their own pending caps and never consume
+the shared limit on pending requests. The refused-submission audit record is coalesced like `plan_miss`.
+The card's "claimed source" is shown only if it is a plain user@host claim (letters, digits and `@._:+()[]-`);
+otherwise the socket address is shown.
+
+A plan-released call is never a pending request: while it runs it is not listed, counted, decidable or
+expirable (nothing asks a human), and it appears (for the agent's poll) only once it has settled.
 
 **A plan makes a client effectively exempt from its own `auto_approve_max` for exactly the approved calls; that
 is the point**, and it is why you approve each plan. A plan never widens a credential's `allowed_hosts`,
@@ -1994,8 +2006,8 @@ channel holds a secret, header value, body, document, `task`, `description` or e
 
     "plans": {"enabled": true, "default_minutes": 30, "max_minutes": 480, "pending_ttl_s": 900,
               "max_rules": 20, "max_uses_per_rule": 500, "max_total_uses": 2000, "rate_per_min": 30,
-              "max_inflight": 4, "max_body_bytes": 16384, "max_pending": 2, "max_active_per_client": 2,
-              "allow_any_body": false, "allow_root_prefix": false, "allow_graphql_mutation": false,
+              "max_inflight": 4, "max_body_bytes": 16384, "max_pending": 2, "max_pending_per_client": 1, "max_active_per_client": 2,
+              "submits_per_hour": 6, "allow_any_body": false, "allow_root_prefix": false, "allow_graphql_mutation": false,
               "allow_legacy": false,
               "allowed_request_headers": ["Accept", "Content-Type", "Content-Length", "If-None-Match", "User-Agent"],
               "deny_secrets": []}
@@ -2016,9 +2028,9 @@ only the owner's retained record gets a specific `kind` (`ended`, `exhausted`, `
 | Manifest invalid or over a cap | 400 | 3 |
 | Disabled, legacy client, never-auto client, `plans: false` or `deny_secrets` | 403 | 3 |
 | Too many pending or active plans, or the same task denied recently | 429 | 3 |
-| Call outside the plan (`no_rule` with `why`, `uses_exhausted`, `wrong_policy`) | 403 `{"error": "outside plan", "reason": ...}` | 3 |
-| `rate_limited`, `inflight_limit` | 429 with `retry_after_s` | 8 |
-| Plan not usable | 404 | 7 |
+| Call outside the plan (`no_rule` with `why`, `uses_exhausted`, `wrong_policy`) | 403 `{"error": "outside plan", "reason": ...}` | 8 |
+| `rate_limited`, `inflight_limit` | 429 with `retry_after_s` | 9 |
+| Plan not usable (`ended`, `exhausted`, `closed`, `revoked`, `unknown`) | 404 | 7 |
 | Denied / expired while pending | | 4 / 5 |
 | Upstream status 400 or more | | 22 |
 

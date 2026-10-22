@@ -51,24 +51,26 @@ MAX_PREFIX = 200
 RATE_WINDOW_S = 60
 MISS_PER_MIN = 5                     # plan_miss records written per key per minute
 MISS_KEYS_MAX = 4096
-DENY_COOLDOWN_S = 60                 # same client + same task name after a denial
+DENY_BACKOFF_S = (60, 300, 1800)     # after the 1st, 2nd, 3rd+ denial by the same client ...
+DENY_RESET_S = 86400                 # ... forgotten after a quiet day (keyed on the client, never the task text)
+SUBMIT_WINDOW_S = 3600
 TWO_53 = 2 ** 53
 STANDARD_MINUTES = (480, 240, 60, 30, 15)     # the durations the card offers, never above the request
-_ID_RE = re.compile(r"^[0-9a-f]{32}$")
-_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,40}$")
-_KEY_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
-_OPNAME_RE = re.compile(r"^[_A-Za-z][_0-9A-Za-z]{0,63}$")
-_HOSTNAME_RE = re.compile(r"^(?=.{1,253}$)[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$")
-_PREFIX_RE = re.compile(r"^/[A-Za-z0-9._~!$&'()*+,=:@/-]*$")
-_HDR_NAME_RE = re.compile(r"^[A-Za-z0-9!#$%&'*+.^_`|~-]{1,64}$")
-_URL_RE = re.compile(r"^[\x21-\x7e]{1,4096}$")
+_ID_RE = re.compile(r"^[0-9a-f]{32}\Z")
+_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,40}\Z")
+_KEY_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}\Z")
+_OPNAME_RE = re.compile(r"^[_A-Za-z][_0-9A-Za-z]{0,63}\Z")
+_HOSTNAME_RE = re.compile(r"^(?=.{1,253}\Z)[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*\Z")
+_PREFIX_RE = re.compile(r"^/[A-Za-z0-9._~!$&'()*+,=:@/-]*\Z")
+_HDR_NAME_RE = re.compile(r"^[A-Za-z0-9!#$%&'*+.^_`|~-]{1,64}\Z")
+_URL_RE = re.compile(r"^[\x21-\x7e]{1,4096}\Z")
 _URL_BAD = re.compile(r"[\\\"<>^`{}|]")
 _PCT_RE = re.compile(r"%([0-9A-Fa-f]{2})")
-_NETLOC_RE = re.compile(r"^(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+)(?::([0-9]{1,5}))?$")
-_PLACEHOLDER_HDR = re.compile(r"^(?:([A-Za-z][A-Za-z0-9_-]{0,19}) )?\{\{ ?([A-Z][A-Z0-9_]{0,60}) ?\}\}$")
-_CT_JSON = re.compile(r"^application/json(?:; ?charset=utf-8)?$")
-_DIGITS = re.compile(r"^(0|[1-9][0-9]{0,15})$")
-_QKEY_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+_NETLOC_RE = re.compile(r"^(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+)(?::([0-9]{1,5}))?\Z")
+_PLACEHOLDER_HDR = re.compile(r"^(?:([A-Za-z][A-Za-z0-9_-]{0,19}) )?\{\{ ?([A-Z][A-Z0-9_]{0,60}) ?\}\}\Z")
+_CT_JSON = re.compile(r"^application/json(?:; ?charset=utf-8)?\Z")
+_DIGITS = re.compile(r"^(0|[1-9][0-9]{0,15})\Z")
+_QKEY_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}\Z")
 # URL query parameters that can override the method or replace parts of a body upstream. Refused in
 # every plan call, whatever the rule says.
 _QUERY_OVERRIDES = frozenset((
@@ -89,6 +91,7 @@ DEFAULTS = {
     "enabled": True, "default_minutes": 30, "max_minutes": 480, "pending_ttl_s": 900,
     "max_rules": 20, "max_uses_per_rule": 500, "max_total_uses": 2000, "rate_per_min": 30,
     "max_inflight": 4, "max_body_bytes": 16384, "max_pending": 2, "max_active_per_client": 2,
+    "max_pending_per_client": 1, "submits_per_hour": 6,
     "allow_any_body": False, "allow_root_prefix": False, "allow_graphql_mutation": False,
     "allow_legacy": False,
     "allowed_request_headers": ["Accept", "Content-Type", "Content-Length", "If-None-Match", "User-Agent"],
@@ -99,7 +102,8 @@ _BOOLS = ("enabled", "allow_any_body", "allow_root_prefix", "allow_graphql_mutat
 _RANGES = {"default_minutes": (1, MINUTES_CEILING), "max_minutes": (1, MINUTES_CEILING),
            "pending_ttl_s": (120, 3600), "max_rules": (1, 50), "max_uses_per_rule": (1, 10000),
            "max_total_uses": (1, 100000), "rate_per_min": (1, 600), "max_inflight": (1, 32),
-           "max_body_bytes": (1, 262144), "max_pending": (1, 10), "max_active_per_client": (1, 10)}
+           "max_body_bytes": (1, 262144), "max_pending": (1, 10), "max_active_per_client": (1, 10),
+           "max_pending_per_client": (1, 10), "submits_per_hour": (1, 100)}
 
 # Why a call did not match (the coarse class the agent sees).
 REASONS = ("no_rule", "uses_exhausted", "session_ended", "wrong_policy", "rate_limited", "inflight_limit")
@@ -454,14 +458,6 @@ def is_private_ip(host):
     return ip.is_private or ip.is_loopback or ip.is_link_local
 
 
-def _utf8_ok(raw):
-    try:
-        bytes(raw).decode("utf-8")      # strict: overlong forms, surrogates and truncation fail
-        return True
-    except UnicodeDecodeError:
-        return False
-
-
 def path_problem(path, prefix=False):
     """None when `path` is acceptable for matching, else a short class. Checked as sent: no
     normalisation, so nothing is ever decoded before it is compared."""
@@ -474,32 +470,22 @@ def path_problem(path, prefix=False):
     for seg in path.split("/"):
         if seg in (".", ".."):
             return "dot segment"
-    # Percent-encoding is allowed only for a space (%20) and for non-ASCII UTF-8 sequences, with
-    # UPPERCASE hex. Everything else encoded (%25, %2e, %2f, %5c, %00, unreserved, reserved...) is
-    # refused, so nothing can double-decode or change meaning at the upstream.
-    i, run = 0, bytearray()
+    # Percent-encoding is allowed only for a space (%20). Everything else encoded (%25, %2e, %2f,
+    # %5c, %00, unreserved characters, UTF-8 such as %EF%BC%8F that an NFKC-normalising upstream could
+    # read as "/", lowercase hex) is refused, and so is any non-ASCII character: nothing can
+    # double-decode or be reinterpreted upstream.
+    if not path.isascii():
+        return "non-ASCII"
+    i = 0
     while i < len(path):
-        if path[i] != "%":
-            if run and not _utf8_ok(run):
-                return "bad percent-encoding"
-            run = bytearray()
-            i += 1
-            continue
-        m = _PCT_RE.match(path, i)
-        if not m or m.group(1) != m.group(1).upper():
-            return "bad percent-encoding"
-        b = int(m.group(1), 16)
-        if b == 0x20:
-            if run and not _utf8_ok(run):
-                return "bad percent-encoding"
-            run = bytearray()
-        elif b >= 0x80:
-            run.append(b)
+        if path[i] == "%":
+            if path[i:i + 3] != "%20":
+                return "encoded special character"
+            i += 3
         else:
-            return "encoded special character"
-        i += 3
-    if run and not _utf8_ok(run):
-        return "bad percent-encoding"
+            if ord(path[i]) < 0x21 or ord(path[i]) == 0x7f:
+                return "control or space"
+            i += 1
     return None
 
 
@@ -866,7 +852,7 @@ def _norm_headers(frozen, cfg, own_vars, opaque, post=False):
             raise NoMatch("headers")
         if low in out:
             raise NoMatch("headers")            # duplicate (Content-Type exactly once, and the rest too)
-        if len(value) > 4000 or re.search(r"[\x00-\x08\x0a-\x1f\x7f]", value):
+        if len(value) > 4000 or re.search(r"[\x00-\x1f\x7f]", value):
             raise NoMatch("headers")
         out[low] = value
         if low in opaque:
@@ -957,6 +943,20 @@ def _match_body(spec, body, hdrs):
     if vs is not None:
         if not isinstance(vs, dict) or not set(vs) <= set(g["variables_keys"]):
             raise NoMatch("body")
+
+
+def assert_sent_is_matched(frozen, req):
+    """The request object urllib will send must be the matched one: same URL text, same request
+    target, method, body and header set. Raises NoMatch("url") on any difference (a parser
+    differential would otherwise send something other than what was matched)."""
+    scheme, host, port, path, has_q, q = _parse_url(frozen.url)
+    want_sel = path + ("?" + q if has_q else "")
+    if (req.full_url != frozen.url or req.selector != want_sel or req.get_method() != frozen.method
+            or (req.data or b"") != frozen.body or req.fragment):
+        raise NoMatch("url")
+    sent = {k.lower(): v for k, v in req.header_items()}
+    if len(sent) != len(frozen.headers) or any(sent.get(n.lower()) != v for n, v in frozen.headers):
+        raise NoMatch("url")
 
 
 def own_placeholder_headers(frozen):
@@ -1068,7 +1068,8 @@ class PlanStore:
         self.mono = mono or clock_mod.mono
         self._lock = threading.Lock()
         self._plans = {}
-        self._denied = {}               # (client id, task) -> time of denial
+        self._denied = {}               # client id -> {"t": last denial, "n": denials in the current run}
+        self._submits = {}              # client id -> deque of submit times (last hour)
         self._miss = {}                 # key -> {"t", "n", "supp"}
 
     # -- helpers (lock held) ---------------------------------------------------
@@ -1118,11 +1119,21 @@ class PlanStore:
             cid = client["id"]
             if sum(p.state == "pending" for p in self._plans.values()) >= self.cfg["max_pending"]:
                 return None, "too_many"
+            if sum(p.state == "pending" and p.client_id == cid for p in self._plans.values()) >= \
+                    self.cfg["max_pending_per_client"]:
+                return None, "too_many"
             if sum(p.state == "active" and p.client_id == cid for p in self._plans.values()) >= \
                     self.cfg["max_active_per_client"]:
                 return None, "too_many"
-            if now - self._denied.get((cid, manifest["task"]), -1e9) < DENY_COOLDOWN_S:
+            d = self._denied.get(cid)
+            if d is not None and now - d["t"] < DENY_BACKOFF_S[min(d["n"], len(DENY_BACKOFF_S)) - 1]:
                 return None, "cooldown"
+            q = self._submits.setdefault(cid, deque())
+            while q and now - q[0] >= SUBMIT_WINDOW_S:
+                q.popleft()
+            if len(q) >= self.cfg["submits_per_hour"]:
+                return None, "rate"
+            q.append(now)
             p = Plan(secrets.token_hex(16), client, manifest, request_id, requested_s, now, self.mono(),
                      self.cfg["pending_ttl_s"])
             self._plans[p.id] = p
@@ -1132,8 +1143,10 @@ class PlanStore:
         for pid in [k for k, p in self._plans.items()
                     if p.ended_at is not None and now - p.ended_at > MAX_ID_AGE_S]:
             del self._plans[pid]
-        for k in [k for k, t in self._denied.items() if now - t > DENY_COOLDOWN_S]:
+        for k in [k for k, d in self._denied.items() if now - d["t"] > DENY_RESET_S]:
             del self._denied[k]
+        for k in [k for k, q in self._submits.items() if not q or now - q[-1] >= SUBMIT_WINDOW_S]:
+            del self._submits[k]
 
     def set_request(self, pid, request_id):
         with self._lock:
@@ -1150,7 +1163,9 @@ class PlanStore:
             p.state = "denied" if state == "denied" else "expired"
             p.ended_at = self.now()
             if p.state == "denied":
-                self._denied[(p.client_id, p.task)] = self.now()
+                d = self._denied.get(p.client_id)
+                n = (d["n"] + 1) if d is not None and self.now() - d["t"] < DENY_RESET_S else 1
+                self._denied[p.client_id] = {"t": self.now(), "n": n}
             return True
 
     def approve(self, pid, by, channel, granted_s, item_sigs, extra=None):

@@ -77,8 +77,8 @@ class PBase(tc.CBase):
 
     def tweak(self, cfg):
         super().tweak(cfg)
-        if self.plans_cfg is not None:
-            cfg["plans"] = self.plans_cfg
+        # tests submit several plans from one client; the defaults for those caps are exercised explicitly
+        cfg["plans"] = {"max_pending_per_client": 5, "submits_per_hour": 100, **(self.plans_cfg or {})}
         cfg["_vault"]["Ledger"] = {"token": LEDGER_VALUE}
         cfg["secrets"]["ledger"] = {"vars": {"LEDGER_TOKEN": {"item": "Ledger", "field": "token"}},
                                     "allowed_hosts": ["127.0.0.1"]}
