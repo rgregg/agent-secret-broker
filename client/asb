@@ -207,7 +207,9 @@ Manifest (JSON):
   A GraphQL call must send exactly the declared document. Send the same Content-Type
   application/json and use only these headers: Accept, Content-Type, Content-Length, If-None-Match,
   User-Agent, plus Authorization-style headers whose whole value is the credential's own {{VAR}}.
-  No {{VAR}} in the URL or body. Redirects are never followed.
+  No {{VAR}} in the URL or body. A rule that writes allows no URL query string unless it lists
+  "query": ["key", ...]; a GraphQL rule never does. Only %20 and UTF-8 may be percent-encoded in a path.
+  Redirects are never followed.
 Exit codes: 0 ok; 3 broker refused (manifest invalid, outside the plan, too many plans); 4 denied by
 the human; 5 expired; 7 plan not usable (kind: ended|exhausted|closed|revoked|unknown): submit a new
 plan; 8 slow down (rate_limited or inflight_limit; prints retry_after_s); 2 usage.
