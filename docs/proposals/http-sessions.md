@@ -221,12 +221,17 @@ pending open requests per client plus the general pending cap and deny cooldown;
 ## Headers and method override (fail closed)
 
 **Header allowlist.** A denylist is not enough: a caller-supplied `Content-Length` shorter than the body puts the surplus on the wire as a
-second pipelined request, with the credential already substituted. Session calls therefore accept only an allowlist of headers (Accept,
-Accept-Language, one plain Content-Type, User-Agent, Authorization, If-None-Match, If-Modified-Since, X-CSRF-Token,
-X-Updated-CSRF-Token, other `X-Name` headers outside the routing/override family, and headers that carry a credential placeholder) and
-refuse everything else (Content-Length, Connection, Expect, TE, Upgrade, Trailer, Transfer-Encoding, Content-Encoding, Host, Cookie, Proxy-*,
-Forwarded, X-Forwarded-*, X-Original-*, X-Rewrite-*, duplicates). urllib sets Content-Length from the bytes it sends, which are the
-substituted body; a raw-socket test asserts the upstream receives exactly one request with that length.
+second pipelined request, with the credential already substituted. Session calls therefore accept only an exact-name allowlist (Accept,
+Accept-Language, Content-Type, User-Agent, If-None-Match, If-Modified-Since, Authorization, X-CSRF-Token, X-Updated-CSRF-Token,
+X-Requested-With, X-API-Key) and refuse every other name and any duplicate. Content-Type is one of application/json,
+application/x-www-form-urlencoded, text/plain, application/graphql or multipart/form-data with a boundary, with no parameter except
+charset=utf-8 (so the decode forms below match what the upstream reads). A value containing a placeholder must be exactly one placeholder,
+optionally after Bearer/Basic/Token. urllib sets Content-Length from the bytes it sends, which are the substituted body; a raw-socket
+test asserts the upstream receives exactly one request with that length.
+
+**No secret-dependent outcome.** All of these checks run on the agent's own text with credential placeholders neutralised to a fixed token, so a
+refusal can never reveal whether a credential contains some text. Captured values are checked when captured and again where they are substituted.
+Credential values are only checked for characters illegal in a header, with one generic error.
 
 **Method override.** A session's methods are the verbs the human approved, and many servers let a request change its verb with a header,
 a `_method` field or a path suffix. Any filter that parses the request (regex, key sets, per-content-type parsers) is a differential against

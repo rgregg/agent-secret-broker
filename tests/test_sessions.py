@@ -159,6 +159,12 @@ class SBase(CBase):
         cfg["secrets"]["unifi"] = {"vars": {"UNIFI_USERNAME": {"item": "Unifi", "field": "username"},
                                             "UNIFI_PASSWORD": {"item": "Unifi", "field": "password"}},
                                    "allowed_hosts": list(self.unifi_hosts)}
+        cfg["_vault"]["Methcred"] = {"token": "tok-method-xyz"}
+        cfg["secrets"]["methcred"] = {"vars": {"METHCRED_TOKEN": {"item": "Methcred", "field": "token"}},
+                                      "allowed_hosts": ["127.0.0.1"]}
+        cfg["_vault"]["Crlfcred"] = {"token": "a\r\nb"}
+        cfg["secrets"]["crlfcred"] = {"vars": {"CRLFCRED_TOKEN": {"item": "Crlfcred", "field": "token"}},
+                                      "allowed_hosts": ["127.0.0.1"]}
         cfg["_vault"]["Envonly"] = {"password": "ENVONLY-CANARY"}
         cfg["secrets"]["envonly"] = {"vars": {"ENVONLY_PW": {"item": "Envonly", "field": "password"}},
                                      "allowed_hosts": []}
@@ -915,7 +921,7 @@ class Scope(SBase):
         self.assertEqual((code, r["code"]), (403, "session_refused"))
         code, r = self.call(sid, "GET", "/", names=("unifi", "other"))
         self.assertEqual(code, 403)
-        code, r = self.call(sid, "GET", "/", headers={"X": "{{OTHER_TOKEN}}"})
+        code, r = self.call(sid, "GET", "/", headers={"X-API-Key": "{{OTHER_TOKEN}}"})
         self.assertEqual(r["code"], "session_refused")
         self.assertEqual(self.events("session_refused")[-1]["reason_class"], "placeholder")
 
@@ -1018,7 +1024,7 @@ class Scope(SBase):
 
     def test_a_call_that_never_left_the_broker_is_not_charged(self):
         sid = self.open()
-        for headers in ({"X-A": "a\r\nInjected: 1"}, {"X-A": "caf\u00e9"}, {"X-A": "a\x00b"}):
+        for headers in ({"X-API-Key": "a\r\nInjected: 1"}, {"X-API-Key": "caf\u00e9"}, {"X-API-Key": "a\x00b"}):
             code, r = self.call(sid, "GET", "/", headers=headers)
             self.assertEqual(r["error"], "upstream call failed (invalid_request)", headers)
         self.assertEqual(self.sess(sid).calls, 0)
@@ -1447,7 +1453,7 @@ class Hardening(SBase):
                 if where == "url":
                     code, r = self.call(sid, "GET", "/?q=" + nasty)
                 elif where == "header":
-                    code, r = self.call(sid, "GET", "/", headers={"X-A": nasty})
+                    code, r = self.call(sid, "GET", "/", headers={"X-API-Key": nasty})
                 else:
                     code, r = self.call(sid, "POST", "/echo", body=nasty)
                 self.assertLess(time.time() - t0, 3.0, (where, nasty[:8]))
@@ -1965,32 +1971,87 @@ class Review3(SBase):
 
     def test_header_allowlist(self):
         sid = self.rsid()
+        mp = "multipart/form-data; boundary=b"
         bad = [{"Connection": "keep-alive"}, {"Expect": "100-continue"}, {"TE": "trailers"}, {"Upgrade": "h2c"},
                {"Trailer": "X"}, {"Transfer-Encoding": "chunked"}, {"Content-Encoding": "gzip"}, {"Host": "x"},
                {"Cookie": "a=b"}, {"Proxy-Authorization": "x"}, {"Proxy-Connection": "x"}, {"Forwarded": "for=1"},
                {"X-Forwarded-For": "1.2.3.4"}, {"X-Forwarded-Host": "x"}, {"X-Original-URL": "/admin"},
                {"X-Original-Verb": "DELETE"}, {"X-Rewrite-URL": "/x"}, {"X-HTTP-Method-Override": "GET"},
                {"X-Real-IP": "1.1.1.1"}, {"Referer": "x"}, {"Origin": "x"}, {"Range": "bytes=0-1"}, {"Via": "x"},
-               {"Keep-Alive": "x"}, {"Content-Length": "0"},
-               {"Content-Type": "text/plain", "content-type": "text/html"},            # two Content-Types
-               {"Content-Type": "text/plain, text/html"}, {"Content-Type": "a b"}, {"Content-Type": "text"},
-               {"Content-Type": "{{UNIFI_PASSWORD}}"}, {"X-": "v"}, {"X-" + "a" * 50: "v"}, {"Bad Name": "v"},
-               {"Api-Key": "plain value"}]
+               {"Keep-Alive": "x"}, {"Content-Length": "0"}, {"Accept-Encoding": "gzip"}, {"X-Foo": "v"},
+               {"Api-Key": "{{UNIFI_PASSWORD}}"}, {"X-Custom": "{{UNIFI_PASSWORD}}"}, {"Bad Name": "v"},
+               {"X-": "v"}, {"X-" + "a" * 50: "v"},
+               # a placeholder must BE the whole value (optionally after Bearer/Basic/Token)
+               {"Authorization": "x {{UNIFI_PASSWORD}}"}, {"X-API-Key": "{{UNIFI_PASSWORD}}x"},
+               {"Authorization": "Bearer {{A}} {{B}}"}, {"Authorization": "Bearer  {{A}}"}, {"Authorization": "Bearer{{A}}"},
+               {"Authorization": "bearer {{" + "a" * 70 + "}}"}, {"Authorization": "Bearer {{a b}}"},
+               # content types: one, from the list, with at most charset=utf-8 (and a boundary for multipart)
+               {"Content-Type": "text/plain", "content-type": "text/html"}, {"Content-Type": "text/plain, text/html"},
+               {"Content-Type": "a b"}, {"Content-Type": "text"}, {"Content-Type": "{{UNIFI_PASSWORD}}"},
+               {"Content-Type": "text/html"}, {"Content-Type": "application/vnd.api+json"},
+               {"Content-Type": "application/json; charset=utf-16"}, {"Content-Type": "application/json; charset=latin-1"},
+               {"Content-Type": "application/json; foo=bar"}, {"Content-Type": "application/json; boundary=b"},
+               {"Content-Type": "application/json; charset=utf-8; charset=utf-8"},
+               {"Content-Type": "multipart/form-data"}, {"Content-Type": "multipart/form-data; charset=utf-8"},
+               {"Content-Type": "multipart/form-data; boundary=b; boundary=c"},
+               {"Content-Type": "multipart/mixed; boundary=b"}, {"Content-Type": "application/json;;"}]
         for hdr in bad:
             code, r = self.rcall(sid, headers=hdr, body="x")
             self.assertEqual((code, r.get("code")), (403, "session_refused"), hdr)
-            self.assertEqual(self.events("session_refused")[-1]["reason_class"] in ("header", "method"), True, hdr)
+            self.assertEqual(self.events("session_refused")[-1]["reason_class"] in ("header", "method", "placeholder"), True, hdr)
         good = [{"Accept": "application/json"}, {"Accept-Language": "en"}, {"User-Agent": "t"},
-                {"Authorization": "Bearer {{UNIFI_PASSWORD}}"}, {"X-CSRF-Token": "t"}, {"X-Updated-CSRF-Token": "t"},
+                {"Authorization": "Bearer {{UNIFI_PASSWORD}}"}, {"Authorization": "Basic {{UNIFI_PASSWORD}}"},
+                {"Authorization": "Token {{UNIFI_PASSWORD}}"}, {"Authorization": "{{UNIFI_PASSWORD}}"},
+                {"X-CSRF-Token": "t"}, {"X-Updated-CSRF-Token": "t"}, {"x-requested-with": "XMLHttpRequest"},
                 {"If-None-Match": "abc"}, {"If-Modified-Since": "Wed, 21 Oct 2015 07:28:00 GMT"},
-                {"X-Api-Key": "k"}, {"Api-Key": "{{UNIFI_PASSWORD}}"},
-                {"Content-Type": "application/json; charset=utf-8"}, {"content-type": "text/plain"}]
+                {"X-API-Key": "k"}, {"X-Api-Key": "{{UNIFI_PASSWORD}}"},
+                {"Content-Type": "application/json; charset=utf-8"}, {"content-type": "text/plain"},
+                {"Content-Type": "application/x-www-form-urlencoded"}, {"Content-Type": "application/graphql"},
+                {"Content-Type": "TEXT/PLAIN; CHARSET=UTF-8"}, {"Content-Type": mp},
+                {"Content-Type": mp + "; charset=utf-8"}, {"Content-Type": 'multipart/form-data; boundary="b-1"'}]
         for hdr in good:
             code, r = self.rcall(sid, headers=hdr, body="x")
             self.assertEqual(r.get("http", {}).get("status"), 200, (hdr, r))
         time.sleep(0.3)
         self.assertEqual(len(self.raw_up.conns), len(good))
         self.assertTrue(all(c["extra"] == b"" for c in self.raw_up.conns))
+
+    def test_a_secret_containing_method_changes_nothing_and_a_bad_secret_has_one_generic_error(self):
+        # outcomes depend on what the agent wrote, never on a credential's content
+        self.broker.sessions_cfg["max_per_client"] = 10
+        results = {}
+        for cred, var in (("other", "OTHER_TOKEN"), ("methcred", "METHCRED_TOKEN")):
+            sid = self.open(cred=cred)
+            code, r = self.call(sid, "POST", "/echo", names=(cred,), headers={"Authorization": "Bearer {{%s}}" % var},
+                                body="v={{%s}}" % var)
+            results[cred] = (code, r.get("http", {}).get("status"), r.get("code"), r.get("error"))
+            self.assertEqual(self.sess(sid).calls, 1)
+        self.assertEqual(results["other"], results["methcred"])
+        self.assertEqual(results["methcred"][:2], (200, 200))
+        self.assertEqual(self.events("session_refused"), [])
+        self.assertEqual(self.st["seen"][-1]["body"], "v=tok-method-xyz")        # it really was sent
+        # a value with a line break is refused with the same fixed class whatever the value is
+        sid = self.open(cred="crlfcred")
+        code, r = self.call(sid, "POST", "/echo", names=("crlfcred",), headers={"Authorization": "Bearer {{CRLFCRED_TOKEN}}"})
+        code2, r2 = self.call(self.open(), "POST", "/echo", headers={"X-API-Key": "a\r\nb"})
+        self.assertEqual(r["error"], r2["error"])
+        self.assertEqual(r["error"], "upstream call failed (invalid_request)")
+        self.assertNotIn("a\r\nb", json.dumps(self.records()))
+
+    def test_agent_text_is_scanned_with_placeholders_neutralised(self):
+        # a placeholder NAME is not secret content, but it must not matter either: P replaces it
+        sid = self.open(cred="methcred")
+        code, r = self.call(sid, "POST", "/echo", names=("methcred",), body="{{METHCRED_TOKEN}}")
+        self.assertEqual(r["http"]["status"], 200)
+        self.assertEqual(S.neutralize("a {{X}} b {{ session.Y }}", {"session.Y": "yy"}), "a P b yy")
+        self.assertEqual(S.neutralize("{{unclosed"), "{{unclosed")
+
+    def test_a_captured_value_joined_to_template_text_is_scanned(self):
+        sid = self.open()
+        self.sess(sid).captures["T"] = "thod"
+        code, r = self.call(sid, "POST", "/echo", body="me{{session.T}}")
+        self.assertEqual((code, r["code"]), (403, "session_refused"))      # "me" + "thod" after substitution
+        self.assertEqual(self.st["seen"], [])
 
     def test_the_whole_url_and_every_header_value_are_scanned(self):
         sid = self.rsid()
@@ -2001,8 +2062,8 @@ class Review3(SBase):
         for url in (f"http://user:pw@127.0.0.1:{self.port}/", f"http://@127.0.0.1:{self.port}/"):
             code, r = self.call(sid, "GET", "/", url=url)
             self.assertEqual((code, r["code"]), (403, "session_refused"), url)
-        for hdr in ({"X-Foo": "_method=DELETE"}, {"X-Foo": "x%5Fmethod"}, {"Accept": "&#x6d;ethod"},
-                    {"X-Foo": "{{session.NOPE}}_method"}):
+        for hdr in ({"X-API-Key": "_method=DELETE"}, {"X-API-Key": "x%5Fmethod"}, {"Accept": "&#x6d;ethod"},
+                    {"X-API-Key": "{{session.NOPE}}_method"}):
             code, r = self.call(sid, "GET", "/", headers=hdr)
             self.assertEqual((code, r["code"]), (403, "session_refused"), hdr)
         self.assertEqual(self.st["seen"], [])

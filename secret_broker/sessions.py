@@ -88,17 +88,14 @@ _QP_ESC = re.compile(r"=([0-9A-Fa-f]{2})")
 _ENTITY = re.compile(r"&#([xX][0-9a-fA-F]{1,6}|[0-9]{1,7});?")
 DECODE_ROUNDS = 5
 MAX_FREE_REFUSALS = 10          # refusals that cost the caller nothing (it never left the broker), per session
-ALLOWED_HEADERS = ("accept", "accept-language", "content-type", "user-agent", "authorization", "x-csrf-token",
-                   "x-updated-csrf-token", "if-none-match", "if-modified-since")
-_XNAME = re.compile(r"^[Xx]-[A-Za-z0-9-]{1,40}$")
-_OTHER_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9-]{0,40}$")
-_ROUTING_BITS = ("forward", "original", "rewrite", "override", "method", "proxy", "host", "url", "uri", "path",
-                 "route", "ip", "verb", "http", "real", "scheme", "port", "length", "encoding", "transfer")
-_HARD_DENY = ("content-length", "connection", "expect", "te", "upgrade", "trailer", "transfer-encoding",
-              "content-encoding", "host", "cookie", "forwarded", "keep-alive", "via", "proxy-authorization",
-              "proxy-connection")
-_CTYPE_RE = re.compile(r"^[A-Za-z0-9!#$&^_.+-]{1,60}/[A-Za-z0-9!#$&^_.+-]{1,60}"
-                       r"(; ?[A-Za-z0-9_-]{1,30}=\"?[A-Za-z0-9._+/-]{0,100}\"?){0,3}$")
+ALLOWED_HEADERS = ("accept", "accept-language", "content-type", "user-agent", "if-none-match", "if-modified-since",
+                   "authorization", "x-csrf-token", "x-updated-csrf-token", "x-requested-with", "x-api-key")
+# (the catalog has no "declared auth header" metadata, so no credential adds names to this list)
+CONTENT_TYPES = ("application/json", "application/x-www-form-urlencoded", "text/plain", "application/graphql",
+                 "multipart/form-data")
+_BOUNDARY_RE = re.compile(r"^boundary=\"?[A-Za-z0-9'()+_,./:=?-]{1,70}\"?$", re.I)
+_CHARSET_RE = re.compile(r"^charset=\"?utf-8\"?$", re.I)
+_PLACEHOLDER_VALUE = re.compile(r"^(Bearer |Basic |Token )?\{\{[A-Za-z0-9_.]{1,64}\}\}$")
 _HOSTPORT_RE = re.compile(r"^([A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?)(?::([0-9]{1,5}))?$")
 _ILLEGAL_HEADER_VALUE = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")
 _HEADER_TOKEN = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
@@ -499,35 +496,60 @@ def _has_method_text(data):
     return any("method" in f for f in _decoded_forms(data))
 
 
-HEADER_REFUSED = ("a session call may use only Accept, Accept-Language, Content-Type, User-Agent, Authorization, "
-                  "If-None-Match, If-Modified-Since, X- headers that are not routing or override headers, and "
-                  "headers that carry a credential placeholder")
+HEADER_REFUSED = "a session call may use only a fixed set of plain headers (see `asb help session`)"
+
+
+def _content_type_ok(value):
+    parts = [p.strip() for p in value.split(";")]
+    media, params = parts[0].lower(), parts[1:]
+    if media not in CONTENT_TYPES or len(params) > 2 or len(value) > 200:
+        return False
+    boundary = charset = 0
+    for prm in params:
+        if _CHARSET_RE.match(prm):
+            charset += 1
+        elif media == "multipart/form-data" and _BOUNDARY_RE.match(prm):
+            boundary += 1
+        else:
+            return False
+    return charset <= 1 and boundary == (1 if media == "multipart/form-data" else 0)
 
 
 def header_problem(headers):
-    """A fixed reason unless every header is on the allowlist, else None. Fail closed: Content-Length,
+    """A fixed reason unless every header is on the exact-name allowlist, else None. Fail closed: Content-Length,
     Connection, Expect, TE, Upgrade, Trailer, Transfer-Encoding, Content-Encoding, Host, Cookie, Proxy-*,
-    Forwarded and X-Forwarded-*, X-Original-*, X-Rewrite-*, override and routing headers are all refused
-    (urllib sets Content-Length itself, from the bytes it sends). Content-Type must be a single, plain
-    media type."""
+    Forwarded, X-Forwarded-*, X-Original-*, X-Rewrite-*, Accept-Encoding, duplicates and every other name are
+    refused (urllib sets Content-Length itself, from the bytes it sends). Content-Type is one of CONTENT_TYPES
+    with at most `charset=utf-8` (and, for multipart, a boundary). A value containing a placeholder must BE a
+    placeholder, optionally after Bearer/Basic/Token. Checked on the template: it never depends on a secret."""
     seen = set()
     for k, v in headers.items():
         low = k.lower()
-        if low in seen:
+        if low in seen or low not in ALLOWED_HEADERS:
             return HEADER_REFUSED
         seen.add(low)
-        if low in ALLOWED_HEADERS:
-            if low == "content-type" and not _CTYPE_RE.match(v):
+        if low == "content-type":
+            if not _content_type_ok(v):
                 return HEADER_REFUSED
-            continue
-        routing = any(bit in low for bit in _ROUTING_BITS)
-        if _XNAME.match(k) and not routing:
-            continue
-        if ("{{" in v and _OTHER_NAME.match(k) and low not in _HARD_DENY and not routing
-                and not low.startswith(("proxy-", "x-"))):
-            continue
-        return HEADER_REFUSED
+        elif "{{" in v and not _PLACEHOLDER_VALUE.match(v):
+            return HEADER_REFUSED
     return None
+
+
+def neutralize(text, values=None):
+    """`text` with every {{NAME}} replaced by `values[NAME]` when given, else by the neutral token P. Linear.
+    Used so that scans of the agent's own text never depend on a credential's secret content."""
+    out, i = [], 0
+    while True:
+        a = text.find("{{", i)
+        b = text.find("}}", a + 2) if a >= 0 else -1
+        if a < 0 or b < 0:
+            out.append(text[i:])
+            return "".join(out)
+        out.append(text[i:a])
+        name = text[a + 2:b].strip()
+        out.append((values or {}).get(name, "P"))
+        i = b + 2
 
 
 def override_problem(methods, url, headers, body):
@@ -600,7 +622,14 @@ def run_http(sess, spec, env, tls, allowed_now, opener_for, clock, state):
         headers = {k: fill(v, values) for k, v in spec["headers"].items()}
     except (KeyError, ValueError, UnicodeError):
         raise NotSent("a placeholder or value in this call cannot be used", "session_refused") from None
-    problem = header_problem(spec["headers"]) or override_problem(sess.methods, url, headers, data)
+    # The header and method checks run on what the AGENT wrote: credential placeholders become a neutral token, so
+    # the outcome never depends on a secret's content; captured values are substituted because an upstream chose them.
+    cap_values = {k: v for k, v in values.items() if k.startswith("session.")}
+    scan_data = data if spec.get("body_b64") is not None else (
+        neutralize(spec["body"], cap_values).encode("utf-8") if spec.get("body") else None)
+    problem = header_problem(spec["headers"]) or override_problem(
+        sess.methods, neutralize(spec["url"], cap_values), {k: neutralize(v, cap_values) for k, v in spec["headers"].items()},
+        scan_data)
     if problem:
         raise NotSent(problem)
     scheme, host, port, path = _origin(url)
@@ -696,8 +725,9 @@ def scope_problem(s, sc, names, method, spec, capture_names=()):
         import base64
         body = base64.b64decode(spec["body_b64"])
     elif isinstance(body, str):
-        body = body.encode("utf-8", "replace")
-    why = override_problem(s.methods, spec["url"], spec["headers"], body)
+        body = neutralize(body).encode("utf-8", "replace")
+    why = override_problem(s.methods, neutralize(spec["url"]), {k: neutralize(v) for k, v in spec["headers"].items()},
+                           body)
     if why:
         return "method", why
     names_in = set(capture_names)

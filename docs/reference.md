@@ -1890,15 +1890,20 @@ ends its sessions at once.
 - **Redirects are never followed.** A 3xx is returned to the agent with its `Location` (masked); `Set-Cookie` on it is stored in the jar
   and stripped as usual. The agent makes a new call, which is scope-checked and counted like any other. This also means no redirect can
   change the method, port or host, and no hop goes uncounted. TLS verification, pinning and `tls_verify` are as for plain http calls.
-- **Headers are allowlisted.** A session call may use only `Accept`, `Accept-Language`, `Content-Type` (one, a plain media type),
-  `User-Agent`, `Authorization`, `If-None-Match`, `If-Modified-Since`, `X-CSRF-Token`, `X-Updated-CSRF-Token`, other `X-Name` headers that are
-  not routing or override headers (no name containing forward, original, rewrite, override, method, proxy, host, url, uri, path, route, ip,
-  verb, http, real, scheme, port, length, encoding or transfer), and any other header that carries a `{{VAR}}` credential placeholder
-  (for example `Api-Key`). Everything else is refused: `Content-Length` (urllib sets it from the bytes it sends, so the body on the wire is
-  exactly the substituted body, never a second pipelined request), `Connection`, `Expect`, `TE`, `Upgrade`, `Trailer`,
-  `Transfer-Encoding`, `Content-Encoding`, `Host`, `Cookie`, `Proxy-*`, `Forwarded`, `X-Forwarded-*`, `X-Original-*`, `X-Rewrite-*`, duplicates,
-  and so on. `Cookie` is the jar's.
-- **Method override is refused by one fail-closed rule.** A session call is refused (fixed message, not charged) if its URL path, parameters,
+- **Headers are allowlisted by exact name** (case-insensitive): `Accept`, `Accept-Language`, `Content-Type`, `User-Agent`, `If-None-Match`,
+  `If-Modified-Since`, `Authorization`, `X-CSRF-Token`, `X-Updated-CSRF-Token`, `X-Requested-With`, `X-API-Key`. (The catalog has no
+  "declared auth header" metadata, so no credential adds names.) Everything else is refused with one fixed message: `Content-Length` (urllib
+  sets it from the bytes it sends, so the body on the wire is exactly the substituted body and never a second pipelined request),
+  `Accept-Encoding`, `Connection`, `Expect`, `TE`, `Upgrade`, `Trailer`, `Transfer-Encoding`, `Content-Encoding`, `Host`, `Cookie` (the jar's), `Proxy-*`,
+  `Forwarded`, `X-Forwarded-*`, `X-Original-*`, `X-Rewrite-*`, other `X-` names, duplicates, and so on. `Content-Type` must be one of
+  `application/json`, `application/x-www-form-urlencoded`, `text/plain`, `application/graphql` or `multipart/form-data` with a `boundary`,
+  with no parameter except `charset=utf-8`. A header value that contains a placeholder is allowed only if the whole value is
+  `{{NAME}}`, optionally preceded by `Bearer `, `Basic ` or `Token `.
+- **The checks never depend on a secret.** The header and method-override checks run on what the agent wrote, with credential placeholders replaced
+  by a neutral token; captured values (chosen by the upstream, scanned when captured and again after substitution) are substituted. A credential
+  whose value contains `method` neither changes the outcome nor produces a different error; a credential value with a line break or other illegal
+  header character gets the same generic `invalid_request` error as any other bad header.
+- **Method override is refused by one fail-closed rule.** A session call is refused (fixed message, not charged) if the agent's URL path, parameters,
   query or fragment, any header name or value, or its body contains the text `method` (case-insensitive) in any decoded form: raw, up to 5
   rounds of percent-, HTML numeric entity (`&#109;`, `&#x6d;`), `\uXXXX`, `\xNN` and quoted-printable (`=6D`) decoding with NFKC
   normalisation, and each of those with every non-letter removed. Userinfo in the URL is refused. A multipart body that declares a
