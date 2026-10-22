@@ -19,6 +19,8 @@
                                               broker makes the call itself
   asb guidance propose FILE|- | --from-dir DIR  propose risk guidance; the human reviews it
   asb guidance status ID                      outcome of a proposal (no approval)
+  asb agent-setup [--agent claude|codex|copilot|all] [--scope user|project] [--dry-run] [--remove]
+                                              install/remove the broker instructions in the agents' instruction files (local only)
 
 Config: SECRET_BROKER_URL / SECRET_BROKER_KEY, or
 ~/.config/secret-broker/client.json {"url": ..., "key": ...}.
@@ -27,7 +29,9 @@ asb help COMMAND    usage and an example for one command
 asb guide           the manual for agents: workflow, placeholders, approvals, exit codes
 """
 import base64
+import difflib
 import hashlib
+import shutil
 import shlex
 import json
 import os
@@ -131,8 +135,18 @@ Debugging
   but never risk verdicts or reasons, approval policy, or values. No approval needed;
   exit 1 if nothing matches, 3 if the broker is unreachable or refuses the key.
 
+Setting up a machine (local only; no broker call, never reads client.json)
+  asb agent-setup                    put a short, marked "use asb" block in the instruction
+                                     files of the coding agents it finds (Claude Code, Codex,
+                                     GitHub Copilot); --agent NAME|all, --scope user|project
+  asb agent-setup --dry-run          print the diff, write nothing
+  asb agent-setup --remove           delete only the marked block
+  Re-runs replace the block between the begin/end markers in place; text outside them is
+  never touched; a changed file gets a timestamped backup (FILE.asb-bak-STAMP). A damaged
+  marker (begin without end, duplicates) is refused with an explanation, exit 2.
+
 Exit codes
-  0 ok            1 nothing found (which/list/audit)     2 usage or config error
+  0 ok            1 nothing found (which/list/audit; agent-setup found no agent)     2 usage or config error
   3 broker unreachable or refused the request
   4 denied by the human (or the policy)            5 expired or timed out waiting
   6 env: a script changed between the request and the run (nothing was executed)
@@ -251,6 +265,27 @@ entry was applied, 4 denied, 5 expired, 3 broker problem, 2 usage.
 `status ID` prints the same for a proposal you already sent (no approval); "pending"
 while the human has not decided. There is no command to read current guidance.
 example: asb guidance propose --from-dir ./guidance""",
+    "agent-setup": """usage: asb agent-setup [--agent claude|codex|copilot|all] [--scope user|project]
+                      [--dry-run] [--remove]
+
+Install a short block telling a coding agent to use asb (which/list/http, never read
+credential files, a denial is final, request-credential when nothing covers a service,
+`asb guide` for the rest) into its instruction file. Local only: no broker call, and
+client.json is never read.
+  claude   user: ~/.claude/CLAUDE.md          project: ./CLAUDE.md (or ./.claude/CLAUDE.md if only that exists)
+  codex    user: $CODEX_HOME or ~/.codex/AGENTS.md   project: ./AGENTS.md
+  copilot  user: $COPILOT_HOME or ~/.copilot/copilot-instructions.md
+           project: ./.github/copilot-instructions.md
+--agent defaults to auto-detect (config directory or program on PATH, or an existing
+project file); it says what it found and only creates files in directories that exist.
+An explicit --agent (or all) also creates missing files and directories. --scope
+defaults to user; project means the current directory.
+The block sits between "<!-- asb:agent-setup begin vN -->" and "... end -->" markers;
+re-runs replace it in place, text outside is never touched, and a changed file is
+backed up first (FILE.asb-bak-STAMP). --dry-run prints a diff and writes nothing;
+--remove deletes only the block. Damaged markers or an unwritable file: nothing is
+written, exit 2. Exit 0 ok, 1 no agent found, 2 usage or refused.
+example: asb agent-setup --agent claude --scope user --dry-run""",
     "guide": "usage: asb guide\n\nPrint the manual for agents.",
 }
 
@@ -1717,6 +1752,275 @@ def mask(text, values):
     return text
 
 
+# -- agent-setup: instruction block for coding agents (local only) --------------
+AGENT_BLOCK_VERSION = 1
+AGENT_MARK = "asb:agent-setup"
+AGENT_BLOCK_BODY = """## Credentials (asb)
+
+Use the secret broker CLI `asb` (on PATH) for any credential. Never read credential
+files or hunt for API keys, and never ask for a secret in chat.
+- `asb which HOST|URL` / `asb list` find the credential and its {{VAR}} names (no approval).
+- `asb http NAME METHOD URL -H 'Authorization: Bearer {{VAR}}'` makes the call; the value
+  never reaches you.
+- No credential covers the service: run `asb request-credential`. The human enters the
+  value; you never see it.
+- Every use asks the human to approve. A denial or timeout is final: stop and tell them
+  what you needed.
+- Run `asb guide` for the full manual."""
+_BEGIN_RE = re.compile(r"<!-- " + AGENT_MARK + r" begin v(\d+) -->")
+_END_RE = re.compile(r"<!-- " + AGENT_MARK + r" end -->")
+_ANY_MARK_RE = re.compile(r"<!--\s*" + AGENT_MARK + r"\b")
+AGENT_NAMES = ("claude", "codex", "copilot")
+
+
+class SetupError(Exception):
+    pass
+
+
+def agent_block(eol="\n"):
+    lines = [f"<!-- {AGENT_MARK} begin v{AGENT_BLOCK_VERSION} -->",
+             f"<!-- managed by `asb agent-setup`; edits between the markers are replaced -->"]
+    lines += AGENT_BLOCK_BODY.split("\n")
+    lines.append(f"<!-- {AGENT_MARK} end -->")
+    return eol.join(lines)
+
+
+def find_block(text):
+    """(start, end, version) of the marked block, or None. Raises SetupError if damaged."""
+    marks = _ANY_MARK_RE.findall(text)
+    begins, ends = list(_BEGIN_RE.finditer(text)), list(_END_RE.finditer(text))
+    if not marks and not begins and not ends:
+        return None
+    if len(marks) != len(begins) + len(ends):
+        raise SetupError("a marker line is malformed (expected exactly "
+                         f"'<!-- {AGENT_MARK} begin vN -->' and '<!-- {AGENT_MARK} end -->')")
+    if len(begins) > 1 or len(ends) > 1:
+        raise SetupError("more than one begin/end marker (duplicated block)")
+    if begins and not ends:
+        raise SetupError("begin marker without an end marker")
+    if ends and not begins:
+        raise SetupError("end marker without a begin marker")
+    b, e = begins[0], ends[0]
+    if e.start() < b.end():
+        raise SetupError("end marker comes before the begin marker")
+    return b.start(), e.end(), int(b.group(1))
+
+
+def apply_block(text, remove):
+    """New text and a status word. Text outside the markers is preserved byte for byte."""
+    found = find_block(text)
+    eol = "\r\n" if "\r\n" in text else "\n"
+    if remove:
+        if not found:
+            return text, "absent"
+        s, e, _ = found
+        tail = text[e:]
+        for nl in ("\r\n", "\n"):
+            if tail.startswith(nl):
+                tail = tail[len(nl):]
+                break
+        head = text[:s]
+        if not tail.strip() and head.endswith(eol + eol):
+            head = head[:-len(eol)]   # drop the blank separator install added
+        return head + tail, "removed"
+    block = agent_block(eol)
+    if found:
+        s, e, v = found
+        new = text[:s] + block + text[e:]
+        if new == text:
+            return text, "unchanged"
+        return new, f"updated (v{v} -> v{AGENT_BLOCK_VERSION})"
+    if not text:
+        return block + eol, "installed"
+    sep = "" if text.endswith(("\n", "\r")) else eol
+    return text + sep + eol + block + eol, "installed"
+
+
+def agent_targets(agent, scope, home, cwd, env):
+    """(config dir that shows the agent is installed, instruction file path)."""
+    if agent == "claude":
+        if scope == "user":
+            return os.path.join(home, ".claude"), os.path.join(home, ".claude", "CLAUDE.md")
+        top, alt = os.path.join(cwd, "CLAUDE.md"), os.path.join(cwd, ".claude", "CLAUDE.md")
+        use = alt if (not os.path.lexists(top) and os.path.lexists(alt)) else top
+        return cwd, use
+    if agent == "codex":
+        base = env.get("CODEX_HOME") or os.path.join(home, ".codex")
+        if scope == "user":
+            return base, os.path.join(base, "AGENTS.md")
+        return cwd, os.path.join(cwd, "AGENTS.md")
+    base = env.get("COPILOT_HOME") or os.path.join(home, ".copilot")
+    if scope == "user":
+        return base, os.path.join(base, "copilot-instructions.md")
+    return cwd, os.path.join(cwd, ".github", "copilot-instructions.md")
+
+
+def detect_agents(scope, home, cwd, env):
+    """[(agent, why)] for agents that look installed."""
+    found = []
+    for a in AGENT_NAMES:
+        cfg, path = agent_targets(a, scope, home, cwd, env)
+        user_cfg = agent_targets(a, "user", home, cwd, env)[0]
+        why = None
+        if os.path.isdir(user_cfg):
+            why = f"config dir {user_cfg}"
+        elif shutil.which({"claude": "claude", "codex": "codex", "copilot": "copilot"}[a], path=env.get("PATH")):
+            why = f"'{a}' on PATH"
+        elif scope == "project" and os.path.lexists(path):
+            why = f"existing {path}"
+        if why:
+            found.append((a, why))
+    return found
+
+
+def plan_target(agent, path, remove, create_ok):
+    """Read-only planning. Returns dict(path, real, old, new, status, error, exists)."""
+    r = {"agent": agent, "path": path, "real": os.path.realpath(path), "old": "", "new": "",
+         "status": "", "error": None, "exists": False}
+    real = r["real"]
+    try:
+        if os.path.exists(real):
+            if os.path.isdir(real):
+                raise SetupError("is a directory")
+            r["exists"] = True
+            try:
+                with open(real, "rb") as f:
+                    raw = f.read()
+            except OSError as e:
+                raise SetupError(f"cannot read: {e.strerror or e}")
+            try:
+                r["old"] = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                raise SetupError("not valid UTF-8 text; leaving it alone")
+        elif os.path.islink(path):
+            raise SetupError("dangling symlink")
+        else:
+            parent = os.path.dirname(real)
+            if remove:
+                r["status"] = "absent (no file)"
+                r["new"] = r["old"]
+                return r
+            if not create_ok and not os.path.isdir(parent):
+                r["status"] = "skipped (directory does not exist; use --agent " + agent + " to create it)"
+                r["new"] = r["old"]
+                r["skip"] = True
+                return r
+        r["new"], r["status"] = apply_block(r["old"], remove)
+        if r["new"] != r["old"]:
+            if r["exists"]:
+                if not (os.stat(real).st_mode & 0o222) or not os.access(real, os.W_OK):
+                    raise SetupError("file is read-only; not changed")
+            else:
+                d = os.path.dirname(real)
+                while d and not os.path.isdir(d):
+                    d = os.path.dirname(d)
+                if not os.access(d or ".", os.W_OK):
+                    raise SetupError(f"cannot create file: {d} is not writable")
+    except SetupError as e:
+        r["error"] = str(e)
+    return r
+
+
+def write_target(r):
+    """Backup (if the file exists) and write atomically through any symlink."""
+    real = r["real"]
+    os.makedirs(os.path.dirname(real), exist_ok=True)
+    mode = 0o644
+    if r["exists"]:
+        mode = os.stat(real).st_mode & 0o7777
+        stamp = time.strftime("%Y%m%d%H%M%S")
+        bak, n = f"{real}.asb-bak-{stamp}", 1
+        while os.path.exists(bak):
+            n += 1
+            bak = f"{real}.asb-bak-{stamp}-{n}"
+        shutil.copy2(real, bak)
+        r["backup"] = bak
+    tmp = f"{real}.asb-tmp-{os.getpid()}"
+    try:
+        with open(tmp, "wb") as f:
+            f.write(r["new"].encode("utf-8"))
+        os.chmod(tmp, mode)
+        os.replace(tmp, real)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def run_agent_setup(args):
+    agent, scope, dry, remove = None, "user", False, False
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--dry-run":
+            dry = True
+        elif a == "--remove":
+            remove = True
+        elif a in ("-h", "--help"):
+            print(HELP["agent-setup"])
+            return 0
+        elif a in ("--agent", "--scope") and i + 1 < len(args):
+            if a == "--agent":
+                agent = args[i + 1]
+            else:
+                scope = args[i + 1]
+            i += 1
+        else:
+            die(f"unexpected argument {a!r}\n" + HELP["agent-setup"])
+        i += 1
+    if agent is not None and agent not in AGENT_NAMES + ("all",):
+        die("--agent must be claude, codex, copilot or all")
+    if scope not in ("user", "project"):
+        die("--scope must be user or project")
+    home, cwd, env = os.path.expanduser("~"), os.getcwd(), os.environ
+    if agent is None:
+        det = detect_agents(scope, home, cwd, env)
+        if not det:
+            print("asb: no coding agent found (looked for Claude Code, Codex, GitHub Copilot: "
+                  "config directories and programs on PATH); name one with --agent", file=sys.stderr)
+            return EXIT_NOT_FOUND
+        for a, why in det:
+            print(f"found {a}: {why}")
+        names, explicit = [a for a, _ in det], False
+    else:
+        names, explicit = (list(AGENT_NAMES) if agent == "all" else [agent]), True
+    plans = [plan_target(a, agent_targets(a, scope, home, cwd, env)[1], remove, explicit) for a in names]
+    for a, p in zip(names, plans):
+        if a == "codex" and scope == "user":
+            ov = os.path.join(os.path.dirname(p["path"]), "AGENTS.override.md")
+            if os.path.exists(ov) and os.path.getsize(ov) > 0:
+                print(f"note: {ov} is non-empty and takes precedence over AGENTS.md; "
+                      "Codex will not read the block there")
+    bad = False
+    for p in plans:
+        label = f"{p['agent']} ({scope}): {p['path']}"
+        if p["error"]:
+            bad = True
+            print(f"{label}: REFUSED: {p['error']}", file=sys.stderr)
+            if "marker" in p["error"]:
+                print("  fix or delete the damaged asb:agent-setup marker lines by hand, then re-run",
+                      file=sys.stderr)
+            continue
+        print(f"{label}: {p['status']}" + (" (dry run)" if dry and p["new"] != p["old"] else ""))
+        if dry and p["new"] != p["old"]:
+            fromf = f"a/{p['path']}" if p["exists"] else "/dev/null"
+            diff = difflib.unified_diff(p["old"].splitlines(), p["new"].splitlines(),
+                                        fromf, f"b/{p['path']}", lineterm="")
+            print("\n".join(diff))
+    if bad:
+        print("asb: nothing was written", file=sys.stderr)
+        return EXIT_USAGE
+    if not dry:
+        for p in plans:
+            if p["new"] != p["old"]:
+                try:
+                    write_target(p)
+                except OSError as e:
+                    die(f"cannot write {p['path']}: {e.strerror or e}")
+                if p.get("backup"):
+                    print(f"backup: {p['backup']}")
+    return 0
+
+
 def main(argv):
     if not argv or argv[0] in ("-h", "--help"):
         print(__doc__)
@@ -1724,6 +2028,8 @@ def main(argv):
     if argv[0] == "guide":
         print(GUIDE)
         return 0
+    if argv[0] == "agent-setup":
+        return run_agent_setup(argv[1:])
     if argv[0] == "help":
         topic = argv[1] if len(argv) > 1 else None
         if topic is None:
