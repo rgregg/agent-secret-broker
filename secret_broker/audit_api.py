@@ -128,7 +128,7 @@ HIDDEN = frozenset({
     # authentication failure can name a revoked client; none of it is the agent's business
     "enroll_requested", "enroll_decided", "enroll_refused", "enroll_notify_failed",
     "client_revoked", "client_renamed", "client_rename_refused", "client_removed",
-    "client_auth_failed", "clients_file_corrupt", "clients_file_write_failed",
+    "client_auth_failed", "clients_file_corrupt", "clients_file_write_failed", "clients_file_recovered",
 })
 
 def error_class(text):
@@ -180,8 +180,10 @@ def iso(ts):
         "+00:00", "Z")
 
 
-def redact(rec):
-    """The agent-visible form of one audit record, or None when it must not be shown."""
+def redact(rec, show_client=False):
+    """The agent-visible form of one audit record, or None when it must not be shown.
+    `show_client` keeps the client's own name on its `requested` events; it is False for the
+    legacy shared key, which is many machines and so is told no client names at all."""
     if not isinstance(rec, dict):
         return None
     event, seq, ts = rec.get("event"), rec.get("seq"), rec.get("ts")
@@ -205,6 +207,8 @@ def redact(rec):
     # A decision made by policy has no channel and no approver, whatever else was logged.
     if event in ("approved", "denied", "expired", "failed") and rec.get("via") == "policy":
         out["channel"], out["approver"] = None, None
+    if not show_client:
+        out.pop("client", None)
     return out
 
 
@@ -445,8 +449,11 @@ class AuditView:
             return False
         return True
 
-    def query(self, p):
-        """The response dict for parse_params output `p`."""
+    def query(self, p, scope=None):
+        """The response dict for parse_params output `p`. `scope` is a client id: only events
+        stamped with exactly that client_id are returned (events of other clients and events
+        with no client, such as system events, are dropped). None (the legacy shared key) keeps
+        the unscoped view."""
         base, nxt, started_mid = self.bounds()
         res = {"events": [], "next": None, "truncated": False, "count": 0}
         if base is None:
@@ -471,7 +478,9 @@ class AuditView:
                     break
             scanned += 1
             last = rec.get("seq")
-            ev = redact(rec)
+            ev = redact(rec, show_client=scope is not None)
+            if scope is not None and rec.get("client_id") != scope:
+                ev = None
             if ev is not None and self._matches(p, ev, rec):
                 events.append(ev)
                 if len(events) >= limit:
@@ -552,7 +561,7 @@ class AuditApi:
             st["n"] += 1
             return st["n"] <= self.rate_per_min
 
-    def handle(self, subpath, query, key_id):
+    def handle(self, subpath, query, key_id, scope=None):
         """-> (status, json-able body, extra headers)."""
         if not self.rate_ok(key_id):
             return 429, {"error": "audit rate limit: try again in a minute"}, {"Retry-After": "30"}
@@ -575,6 +584,6 @@ class AuditApi:
         except BadParam as e:
             return 400, {"error": str(e)}, {}
         try:
-            return 200, self.view.query(p), {}
+            return 200, self.view.query(p, scope), {}
         except OSError:
             return 503, {"error": "audit log unavailable"}, {}

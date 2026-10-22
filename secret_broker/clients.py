@@ -69,6 +69,7 @@ SUBMIT_MIN = (3, 10)
 SUBMIT_HOUR = (6, 20)
 POLL_MIN = (90, 600)
 STATS_FLUSH_S = 30
+RETRY_S = 5                     # after a failed write, retry on the next operation this much later
 FAIL_LOG_S = 30                 # one auth-failure audit record per source per window
 RATE_MAP_CAP = 4096
 LEGACY_VALUES = ("allow", "deny")
@@ -216,17 +217,27 @@ class ClientStore:
         self._dirty = False
         self._saved_at = 0.0
         self._lapsed = []               # enrollments that expired and are not yet audited
+        self._revoked = set()           # ids revoked in this process: wins over any loaded or saved state
+        self._failing = False           # the last write failed; a retry is due
+        self._retry_at = 0.0
+        self.unreadable = False         # the file exists but cannot be read
         self._fail_log = {}             # source -> {"t", "n"}
         self.broken = False             # the file exists but could not be read: never overwritten
         self._load()
 
     # -- persistence -------------------------------------------------------
     def _load(self):
-        if not self._path or not os.path.exists(self._path):
+        if not self._path:
             return
         try:
             with open(self._path) as f:
                 data = json.load(f)
+        except FileNotFoundError:
+            return                      # a fresh install: no clients yet
+        except (OSError, ValueError):
+            self._fail_closed()
+            return
+        try:
             if not isinstance(data, dict) or not isinstance(data.get("clients"), list):
                 raise ValueError("shape")
             clients = {}
@@ -242,11 +253,17 @@ class ClientStore:
                                 "last_source": src[:64] if src.isascii() and src.isprintable() else "",
                                 "requests": max(0, leg.get("requests", 0))}
             self._clients = clients
-        except (OSError, ValueError, TypeError, KeyError):
-            self.broken = True
-            self._clients = {}
-            self._log("clients_file_corrupt", warning="clients file ignored and left untouched: "
-                      "per-client credentials and enrollment are off until it is fixed or removed")
+        except (ValueError, TypeError, KeyError):
+            self._fail_closed()
+
+    def _fail_closed(self):
+        """The client list cannot be trusted: no per-client credential is accepted (a missing or
+        unreadable list must never read as 'nobody was revoked'), enrollment is off and the file
+        is never overwritten. The legacy shared key follows its own setting."""
+        self.broken = self.unreadable = True
+        self._clients = {}
+        self._log("clients_file_corrupt", warning="clients file unreadable and left untouched: "
+                  "per-client credentials and enrollment are off until it is fixed or removed")
 
     def _save_locked(self):
         """Atomic write. True when the file now holds the current state (or there is no
@@ -256,6 +273,9 @@ class ClientStore:
             return True
         if self.broken:
             return False
+        for cid in self._revoked:       # an in-memory revocation always wins over what was loaded
+            if cid in self._clients:
+                self._clients[cid]["state"] = "revoked"
         data = {"version": 1, "clients": sorted(self._clients.values(), key=lambda c: c["created"]),
                 "legacy": self._legacy}
         tmp = f"{self._path}.tmp"
@@ -266,11 +286,22 @@ class ClientStore:
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp, self._path)
-        except OSError:
+            dfd = os.open(os.path.dirname(os.path.abspath(self._path)), os.O_RDONLY)
+            try:
+                os.fsync(dfd)           # the rename itself must survive a power cut
+            finally:
+                os.close(dfd)
+        except OSError as e:
             self._dirty = True
-            self._log("clients_file_write_failed", warning="client changes are kept in memory only "
-                      "and retried")
+            self._retry_at = self.clock() + RETRY_S
+            if not self._failing:       # one record per failure streak; the class only, never the text
+                self._log("clients_file_write_failed", error_class=type(e).__name__,
+                          warning="client changes are kept in memory only and retried")
+            self._failing = True
             return False
+        if self._failing:
+            self._log("clients_file_recovered")
+        self._failing = False
         self._dirty = False
         self._saved_at = self.clock()
         return True
@@ -281,6 +312,15 @@ class ClientStore:
             if self._dirty:
                 return self._save_locked()
             return True
+
+    def unsaved(self):
+        """True while a change (a revocation, say) is only in memory because the write failed."""
+        with self._lock:
+            return self._failing
+
+    def _retry_locked(self):
+        if self._failing and self.clock() >= self._retry_at:
+            self._save_locked()
 
     # -- authentication ----------------------------------------------------
     @staticmethod
@@ -302,7 +342,8 @@ class ClientStore:
                 if same:
                     found = rec
             view = self.view(found) if found is not None else None
-            revoked = found is not None and found["state"] == "revoked"
+            revoked = found is not None and (found["state"] == "revoked" or found["id"] in self._revoked)
+            unavailable = self.unreadable
         is_legacy = bool(legacy_key) and hmac.compare_digest(
             presented.encode("utf-8", "replace"), legacy_key.encode("utf-8", "replace"))
         if view is not None:
@@ -311,6 +352,8 @@ class ClientStore:
             if self.cfg["legacy"] == "deny":
                 return None, "legacy_denied"
             return dict(self.LEGACY_VIEW), "ok"
+        if unavailable:
+            return None, "clients_unavailable"      # could be a per-client key we cannot check
         return None, "bad_key"
 
     def touch(self, view, source):
@@ -324,6 +367,7 @@ class ClientStore:
             tgt["last_seen"], tgt["requests"] = now, tgt["requests"] + 1
             tgt["last_source"] = str(source)[:64]
             self._dirty = True
+            self._retry_locked()
             if now - self._saved_at >= STATS_FLUSH_S:
                 self._save_locked()
 
@@ -362,7 +406,7 @@ class ClientStore:
             return self.cfg["legacy"] == "allow"
         with self._lock:
             rec = self._clients.get(cid)
-            return rec is not None and rec["state"] == "active"
+            return rec is not None and rec["state"] == "active" and cid not in self._revoked
 
     def names(self):
         """id -> name for every known client, for labels."""
@@ -569,6 +613,7 @@ class ClientStore:
                 return "missing", None
             if rec["state"] == "revoked":
                 return "already", dict(rec)
+            self._revoked.add(cid)      # in memory first, under the lock: effective before anything else
             rec.update(state="revoked", revoked_at=self.clock(), revoked_by=by[:120])
             saved = self._save_locked()
             return ("revoked" if saved else "memory_only"), dict(rec)
@@ -947,6 +992,14 @@ def clients_section(broker, csrf, now=None, flash=""):
             + ("Enrollment is turned off in the broker config." if not cfg["enabled"] else "")
             + "</small></p>")
     note = f"<div class=flash>{esc(flash)}</div>" if flash else ""
+    if broker.clients.unreadable:
+        note += ("<div class=crerr role=alert><b>The client list could not be read.</b> Every per-client "
+                 "credential is being refused (fail closed) until the file is fixed or removed.</div>")
+    elif broker.clients.unsaved():
+        note += ("<div class=crerr role=alert><b>The client list could not be saved.</b> A revoke, rename or "
+                 "enrollment is in effect now but is only in memory; if the broker restarts before the "
+                 "write succeeds, a revoked client would work again. The write is retried every few "
+                 "seconds. Check the disk.</div>")
     return (f"<h1>Clients</h1>{note}{hint}<div class=cl>{table}</div>"
             "<p><small class=muted>A rule made for one client never applies to another; rules for "
             "<i>any client</i> apply to all. Rules are listed per client above and in full on the Policies "

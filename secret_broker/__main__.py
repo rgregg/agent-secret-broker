@@ -78,7 +78,12 @@ def main():
           (bind, int(cfg.get("approval_port", 8801))),
           _read(cfg["client_key_file"]))
     print("secret-broker listening", flush=True)
-    signal.signal(signal.SIGTERM, lambda *a: os._exit(0))
+    def _stop(*a):
+        try:
+            broker.clients.flush()          # keep a revocation whose write failed earlier if the disk is back
+        finally:
+            os._exit(0)
+    signal.signal(signal.SIGTERM, _stop)
     threading.Event().wait()
 
 

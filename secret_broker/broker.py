@@ -513,7 +513,9 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin):
                          "guidance_proposals": bool(self.proposals_cfg["enabled"]),
                          "credential_requests": bool(self.credreq_cfg["enabled"]),
                          "client_enrollment": bool(self.clients_cfg["enrollment"]["enabled"]),
-                         "legacy_client_key": self.clients_cfg["legacy"]},
+                         "legacy_client_key": self.clients_cfg["legacy"],
+                     "client_list": "unreadable" if self.clients.unreadable else
+                                    ("unsaved" if self.clients.unsaved() else "ok")},
         }
 
     def _refresh_if(self, stale_after, wait=True):
@@ -1023,7 +1025,11 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin):
         with self._lock:
             self._expire_locked()
             err = None
-            if mode == "guidance":
+            # Revocation sets the client's state before it sweeps the pending requests under this
+            # same lock, so a request is either refused here or already pending when swept.
+            if not self.clients.is_active((client or clients_mod.ClientStore.LEGACY_VIEW)["id"]):
+                err = "this client has been revoked"
+            elif mode == "guidance":
                 # proposals have their own small cap and never count against (or get
                 # blocked by) the cap and deny cooldown of real credential requests
                 if sum(r.status == "pending" and r.mode == "guidance"
@@ -2017,7 +2023,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin):
         check = ch.token_required or token is not None
         digest = hashlib.sha256((token or "").encode()).digest()
         stale_log, refused_log, code, req = False, False, None, None
-        unoffered = None
+        unoffered = gone = None
         with self._lock:
             self._expire_locked()
             if nonce is not None:
@@ -2054,6 +2060,10 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin):
                         req = match
                 else:
                     req = cands[0]
+                if req is not None and approve and not self.clients.is_active(req.client["id"]):
+                    gone = req              # its client was revoked while it waited: never approvable
+                    req, code = None, 410
+                    gone.status = "deciding"
                 if req is not None and req.mode == "guidance":
                     sel = frozenset(apply or ()) if approve else frozenset()
                     n_ent = len(req.spec.get("entries") or ())
@@ -2080,6 +2090,8 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin):
                 if req is not None:
                     req.status = "deciding"     # claim it: a second submit must not also act
         if req is None:
+            if gone is not None:
+                self._finish(gone, "denied", error="this client was revoked", via="client_revoked")
             if rule_refused is not None:
                 self.audit("ssh_rule_refused", rule_refused[0], credential=rule_refused[0].names[0],
                            reason=rule_refused[1], channel=channel, approver=actor, approver_peer=peer,
@@ -2521,6 +2533,8 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin):
         return {"stored": {"name": name, "op": "create", "item": fin["item"], "field": fin["field"]}}
 
     def _release(self, req):
+        if not self.clients.is_active(req.client["id"]):
+            raise BackendError("this client was revoked")
         if req.mode == "credential":    # stored only by _credential_store, after a human decision
             raise BackendError("credential requests are stored only by a human decision")
         if req.mode == "guidance":      # applied only by _apply_proposal, after a human decision
@@ -3952,7 +3966,9 @@ def client_handler(broker, client_key):
 
         _AUTH_MSG = {"revoked": "this client has been revoked; run `asb enroll` to enroll it again",
                      "legacy_denied": "the shared client key is no longer accepted; run `asb enroll`",
-                     "bad_key": "bad client key"}
+                     "bad_key": "bad client key",
+                     "clients_unavailable": "per-client credentials are unavailable: the broker's client "
+                                            "list could not be read (ask the operator)"}
 
         def _authed(self):
             view, why = broker.client_auth(self.headers.get("X-Client-Key", ""), client_key,
@@ -4102,7 +4118,8 @@ def client_handler(broker, client_key):
                                     peer=self.client_address[0], client=self.client)
             except (ValueError, KeyError, TypeError, json.JSONDecodeError) as e:
                 if not str(e) or not isinstance(e, ValueError) or isinstance(e, json.JSONDecodeError):
-                    broker.log("bad_request", peer=self.client_address[0], error=str(e)[:200])
+                    broker.log("bad_request", peer=self.client_address[0], error=str(e)[:200],
+                               client_id=self.client["id"], client_name=self.client["name"])
                 return _json(self, 400, {"error": str(e)})
             except PermissionError as e:
                 return _json(self, 403, {"error": str(e)})
@@ -4124,7 +4141,8 @@ def client_handler(broker, client_key):
             if u.path == "/v1/status":
                 return _json(self, 200, broker.status())
             if u.path in ("/v1/audit", "/v1/audit/verify"):
-                code, body, hdrs = audit_view.handle(u.path, u.query, self.client["id"])
+                code, body, hdrs = audit_view.handle(
+                    u.path, u.query, self.client["id"], None if self.client["legacy"] else self.client["id"])
                 return _json(self, code, body, hdrs)
             if u.path == "/v1/secrets":
                 q = urllib.parse.parse_qs(u.query)
@@ -4133,7 +4151,8 @@ def client_handler(broker, client_key):
                     host = urllib.parse.urlsplit(q["url"][0]).hostname
                 found = broker.available(host)
                 broker.log("discovery", peer=self.client_address[0], host=host,
-                           found=[f["name"] for f in found])
+                           found=[f["name"] for f in found], client_id=self.client["id"],
+                           client_name=self.client["name"])
                 return _json(self, 200, {"host": host, "secrets": found})
             if not u.path.startswith("/v1/requests/"):
                 return _json(self, 404, {"error": "not found"})
