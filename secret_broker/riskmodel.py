@@ -456,8 +456,8 @@ class ChatAnalyzer(summarize.OpenRouterSummarizer):
         if self._prompt == "rubric":
             system = (RUBRIC + (SCRIPT_RUBRIC if (spec or {}).get("scripts") else "")
                       + "\n" + extra
-                      + 'Reply with ONLY a JSON object: {"summary": "<=12 words saying what '
-                      'the request does", "risk": "low|medium|high"}.')
+                      + 'Reply with ONLY a JSON object: {"summary": "1 or 2 plain sentences '
+                      '(about 15 to 40 words) saying what the request does and on which service", "risk": "low|medium|high"}.')
             return [{"role": "system", "content": system},
                     {"role": "user", "content": chat_user_text(mode, names, spec, self._max, self._send,
                                                                        self._max_script)}]
@@ -466,7 +466,7 @@ class ChatAnalyzer(summarize.OpenRouterSummarizer):
 
     def analyze(self, mode, names, spec, guidance=None):
         payload = {"model": self._model, "messages": self._messages(mode, names, spec, guidance),
-                   "max_tokens": 200, "temperature": 0, "reasoning": {"effort": "minimal"}}
+                   "max_tokens": 400, "temperature": 0, "reasoning": {"effort": "minimal"}}
         key = self._key.get()
         if not key:
             self.last_cost = None
@@ -490,7 +490,7 @@ class ChatAnalyzer(summarize.OpenRouterSummarizer):
                 summary, risk = str(obj.get("summary") or ""), str(obj.get("risk") or "").lower()
             except (json.JSONDecodeError, AttributeError):
                 pass
-        summary = " ".join(summary.split())[:100] or None
+        summary = " ".join(summary.split())[:summarize.MAX_SUMMARY] or None
         return {"summary": summary, "risk": risk if risk in LEVELS else None, "cost": self.last_cost}
 
 

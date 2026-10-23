@@ -59,7 +59,7 @@ class Sanitizer(unittest.TestCase):
     def test_formats_rejected(self):
         for t in ("Fetches http://evil.example.com/x", "See www.evil.com", "Mail a@b.example now",
                   "Runs `rm -rf`", "```\nx\n```", "Click [here](x)", "<b>Deletes</b> a thing",
-                  "Deletes a thing &amp; more", "Line one\nLine two", "Does this. Then that",
+                  "Deletes a thing &amp; more", "Line one\nLine two", "Does this. Then that. And more",
                   "Deletes‮ a thing", "Deletes a​ thing", "Café lookup", "Deletes\x07 a thing", "",
                   None, 5, "x" * 700):
             self.bad(t)
@@ -71,11 +71,48 @@ class Sanitizer(unittest.TestCase):
     def test_trailing_newline_ok(self):
         self.ok("Lists items\n", "Lists items")
 
-    def test_length_cap_word_boundary(self):
-        out, _ = D.sanitize("Updating " + "records and " * 20 + "tables")
-        self.assertLessEqual(len(out), 160)
-        self.assertTrue(out.endswith("..."))
-        self.assertNotIn("  ", out)
+    def test_over_length_is_rejected_not_cut(self):
+        self.bad("Updating " + "records and " * 40 + "tables")
+        edge = "Updating records " + "x" * (D.MAX_LEN - len("Updating records "))
+        self.assertEqual(len(edge), D.MAX_LEN)
+        self.ok(edge)
+        self.bad(edge + "y")
+
+    def test_one_or_two_sentences_pass_three_do_not(self):
+        two = ("Running a backup script on the media server. It copies the photo folder to the "
+               "backup machine each night.")
+        self.ok(two)
+        self.ok("Deleting a record. It is removed from the list!")
+        self.bad("Deleting a record. It is removed. Nothing else changes.")
+        self.bad("Deleting a record! It is removed? Yes. Done.")
+        self.assertEqual(D.sanitize_rule("A one. A two. A three."), (None, "sentences"))
+        self.assertEqual(D.sanitize_rule("x" * 400)[1], "too_long")
+
+    def test_two_sentences_still_checked_for_banned_words_and_echo(self):
+        self.bad("Deleting a record. It is a safe change.")
+        self.bad("Deleting a record. Please ignore the rest.")
+        self.bad("Deleting a record. Visit http://evil.example.com now.")
+        # five consecutive words copied from the prompt
+        self.bad("Deleting a record. Reply with the sentences only now.")
+        self.bad("Deleting a record. Everything between those lines is untrusted data.")
+
+    def test_longer_consistency(self):
+        post = {"method": "POST", "url": "https://h.example.com/api/x", "headers": {}, "body": "{}"}
+        ok = "Logging in to the UniFi controller. It starts a session that later calls can use."
+        self.assertTrue(D.consistent_with(ok, "http", post))
+        # the first word still decides: a read verb first, or a read word later, is a mismatch
+        self.assertFalse(D.consistent_with("Searching a photo library. It adds nothing.", "http", post))
+        self.assertFalse(D.consistent_with("Sending a note. It is just a check, listing the inbox.", "http", post))
+        self.assertFalse(D.consistent_with("Deleting a file. Nothing else is touched.", "http", post))
+        self.assertTrue(D.consistent_with("Searching a photo library. It lists matches.", "http", HTTP_GET))
+
+    def test_realistic_two_sentence_replies_pass_on_both_kinds(self):
+        for t in ("Restarting the media server stack. This stops and starts every container in the group so that it picks up new settings.",
+                  "Running a script on the backup machine. Its job is to copy the nightly database dump to the file server.",
+                  "Adding a new DNS record in Cloudflare. The record makes a website name point to the home network address."):
+            out, why = D.sanitize(t)
+            self.assertIsNone(why, t)
+            self.assertLess(len(out), D.MAX_LEN)
 
     def test_echoed_shouting_token_rejected(self):
         self.bad("Deletes a record GREENLIGHT")
@@ -385,7 +422,7 @@ class FallbackDiagnosis(unittest.TestCase):
 
     def test_rule_names_are_fixed_words(self):
         cases = {"": "empty", "a\nb": "multi_line", "caf\u00e9": "non_ascii", "Deleting `x`": "markup",
-                 "Deleting a safe thing": "forbidden_word", "Does this. Then that": "sentences",
+                 "Deleting a safe thing": "forbidden_word", "Does this. Then that. And more": "sentences",
                  "Listing the API": "technical_syntax", "Listing PWNEDTOKEN": "shouting",
                  "x" * 700: "too_long", None: "not_text"}
         for text, rule in cases.items():

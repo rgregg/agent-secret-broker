@@ -797,7 +797,6 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             "catalog": stats,
             "backend": {"type": btype, "ok": bool(self._backend_ok)},
             "notifiers": notifiers,
-            "descriptions": self._description_stats(),
             "features": {"ha_hook": self.ha_hook is not None, "ssh": has_ssh,
                          "webpush_actions": "webpush" in notifiers and self.push is not None,
                          "auto_approve_max": self._auto_max,
@@ -3578,6 +3577,7 @@ small,.muted{color:var(--muted)}
 .info{display:inline-grid;place-items:center;box-sizing:border-box;width:1.05rem;height:1.05rem;min-width:0;min-height:0;flex:none;padding:0;margin:0 .15rem;border:1px solid var(--muted);border-radius:50%;background:none;color:var(--muted);font:italic 700 .7rem/1 Georgia,serif;cursor:help;position:relative;vertical-align:baseline}
 .info:hover::after,.info:focus::after{content:attr(data-tip);position:absolute;left:0;top:1.5rem;z-index:30;width:max-content;max-width:min(16rem,70vw);padding:.4rem .6rem;border:1px solid var(--line);border-radius:.4rem;background:var(--card);color:var(--fg);font:normal .8rem/1.3 system-ui,sans-serif;text-align:left;box-shadow:0 4px 14px #0003}
 p,td,li{overflow-wrap:anywhere}
+.sumtxt{overflow-wrap:anywhere;word-break:break-word;line-height:1.4}
 .pill{display:inline-block;padding:0 .55rem;border-radius:99px;font-size:.75rem;font-weight:600;line-height:1.1rem;
 white-space:nowrap}
 .pill.ok{background:var(--okbg);color:var(--okfg)}.pill.warn{background:var(--wbg);color:var(--wfg)}
@@ -4507,7 +4507,7 @@ def _risk_html(req):
     if req.summary:
         out += (f"<p>{'Summary' if req.summary_source == 'deterministic' else 'AI summary'} "
                 f"{_info_icon(req.summary_model, req.summary_source, req.summary_reason, req.summary_rule)}:<br>"
-                f"<i>{html.escape(req.summary)}</i></p>")
+                f"<i class=sumtxt>{html.escape(req.summary)}</i></p>")
     return out
 
 
@@ -4790,7 +4790,7 @@ def _detail_html(r, evs, retained=""):
     add("Source (claimed by the client, unverified)", r["source"])
     add("Peer", r["peer"])
     if r["summary"]:
-        add("Summary", f"{e(r['summary'])} {_info_icon(r.get('summary_model'), r.get('summary_source'), r.get('summary_reason'), r.get('summary_rule'))}", True)
+        add("Summary", f"<span class=sumtxt>{e(r['summary'])}</span> {_info_icon(r.get('summary_model'), r.get('summary_source'), r.get('summary_reason'), r.get('summary_rule'))}", True)
     if r["risk"]:
         reasons = "; ".join(r["risk_reasons"] or [])
         add("Risk", f"<span class='risk {e(r['risk'])}'><b>{e(r['risk'].upper())}</b></span> "
@@ -5661,7 +5661,8 @@ def approval_handler(broker):
                   "(plans); a plan lasts at most until its deadline and ends on a restart.</small></div></div>"
                   "<div class=srow><div class=t><b>Standing approvals</b><small class=muted>"
                   f"{html.escape(grants_mod.describe(broker.grants_cfg, broker.auto_approve_max()))}. "
-                  "Durations are set in the broker config (timed_grants).</small></div></div></section>"
+                  "Durations are set in the broker config (timed_grants).</small></div></div>"
+                  + self._description_row() + "</section>"
                   "<section class=card><h2>This browser</h2>"
                   "<div class=srow><div class=t><b>Notifications while this page is open</b>"
                   "<small id=notify-state class=muted></small></div>"
@@ -5672,6 +5673,17 @@ def approval_handler(broker):
                   "<button id=notify-test class=btn type=button hidden>Send a test notification"
                   "</button></div>" + self._sw_block() + "</section>" + devices,
                   script=_DASH_JS, tab="settings", user=user)
+
+        def _description_row(self):
+            """Approver-only: how request descriptions were produced since start, by reason class and
+            by rejecting check (fixed names and counts; never any text). Not part of /v1/status or any
+            agent view, so an agent cannot use it to tune replies against the checks."""
+            ds = broker._description_stats()
+            fmt = lambda t: ", ".join(f"{html.escape(k)} {v}" for k, v in t.items()) or "none"
+            return ("<div class=srow><div class=t><b>Request descriptions since start</b><small class=muted>"
+                    f"{ds['model']} written by the AI model, {ds['deterministic']} plain auto lines. "
+                    f"Reasons: {fmt(ds['by_reason'])}. Checks that rejected a reply: {fmt(ds['by_rule'])}."
+                    "</small></div></div>")
 
         def _sw_block(self):
             # Filled in by _DASH_JS; the expected version comes from the same constant /sw.js serves

@@ -2128,9 +2128,15 @@ class HistoryPage(Harness):
             self.assertIn("the AI reply failed a safety or consistency check", d)
         # the aggregated numbers: names and counts only
         code, body = self.api("GET", "/v1/status")
-        ds = json.loads(body)["descriptions"]
-        self.assertEqual(ds, {"model": 0, "deterministic": 1, "by_reason": {"rejected": 1},
-                              "by_rule": {"first_word": 1}})
+        for leak in ("descriptions", "first_word", "rejected", "by_reason", "by_rule"):
+            self.assertNotIn(leak, body)           # agent-readable: no counters, no reason classes
+        code, page = req(self.abase + "/settings", headers={"X-authentik-username": "alice"})
+        self.assertEqual(code, 200)
+        self.assertIn("0 written by the AI model, 1 plain auto lines", page)
+        self.assertIn("rejected 1", page)
+        self.assertIn("first_word 1", page)
+        code, _ = req(self.abase + "/settings", headers={"Authorization": "Bearer " + KEY})
+        self.assertNotEqual(code, 200)
         # the agent's audit view never carries the reason, the rule or the assessment
         code, body = self.api("GET", f"/v1/audit?request={rid}")
         self.assertEqual(code, 200)
@@ -2751,7 +2757,7 @@ class StatusEndpoint(Harness):
     def test_shape_and_values(self):
         st, _ = self.status()
         self.assertEqual(set(st), {"version", "build_time", "started_at", "uptime_s", "catalog",
-                                   "backend", "notifiers", "descriptions", "features"})
+                                   "backend", "notifiers", "features"})
         self.assertEqual(set(st["catalog"]), {"count", "invalid", "adopted", "loaded_at"})
         self.assertEqual(st["catalog"]["count"], 1)
         self.assertEqual(st["catalog"]["invalid"], 1)

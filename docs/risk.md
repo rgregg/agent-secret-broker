@@ -166,14 +166,15 @@ Safety measures:
   path without query string, header names, a body or command excerpt of
   `max_content_chars`), inside a data block with a random per-call boundary.
   Never secret values, header values, query strings or key material.
-- The prompt asks for one 3-12 word action phrase in plain language and
-  forbids opinions and approvals; a request that speaks to the reviewer is
+- The prompt asks for 1 or 2 plain sentences (roughly 15 to 40 words): the first names the
+  action, what it acts on and the service, the optional second says in everyday words what the
+  script or call is for. It forbids opinions and approvals; a request that speaks to the reviewer is
   described as "Request contains text addressed to the reviewer".
 - Every reply is sanitized in code (`description.sanitize`): single line, ASCII
   only (control, bidi and zero-width characters are rejected), no markdown,
   HTML, URLs, emails, code, paths, hostnames, IPs, status codes, HTTP verbs or
   API jargon, no shouted tokens, no quote of the prompt, no safety or approval
-  language (`FORBIDDEN_PHRASES` and `FORBIDDEN_STEMS`: approv*, deny, authoris/z*, permit*, allow*), capped at 160 characters.
+  language (`FORBIDDEN_PHRASES` and `FORBIDDEN_STEMS`: approv*, deny, authoris/z*, permit*, allow*), at most 2 sentences and at most 320 characters (`MAX_LEN`; a longer reply is rejected, never cut).
 - Consistency (best effort): for a mutating request (POST/PUT/PATCH/DELETE other
   than a clean POST to an allowlisted read endpoint; a write-looking command, a store request or ssh signing) the description must START with a write-class gerund
   (`WRITE_VERBS`: Deleting, Opening, Syncing ...), contain no read gerund
@@ -190,8 +191,12 @@ Safety measures:
   technical `auto:` line unless allowlisted.
 - Any rejection, timeout, error or rate cap replaces the description with the
   deterministic `auto:` line. The audit `assessed` event records
-  `summary_source` (`model` or `deterministic`) and `summary_reason`
-  (`rejected`, `timeout`, `error`, `rate_limited`), never the rejected text.
+  `summary_source` (`model` or `deterministic`), `summary_reason`
+  (`rejected`, `timeout`, `error`, `rate_limited`, `empty`, `truncated`, `not_sent`, `disabled`) and,
+  for a rejected reply, `summary_rule` (the fixed name of the check: `forbidden_word`, `sentences`,
+  `first_word`, ...), never the rejected text. The `assessed` event is hidden from the agent audit
+  view. The approver sees the class in the (i) tooltip, the details pop-over and the Settings page
+  (counts since start); `/v1/status` and `asb status` carry no description counters.
 - Bounds: `summary_timeout` (4 s), `summary_concurrency` (4),
   `summary_max_per_minute` (30), responses capped at 16 KB. The key is never
   logged.
