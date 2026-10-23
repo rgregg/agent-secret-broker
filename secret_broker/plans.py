@@ -36,6 +36,7 @@ import threading
 import time
 from collections import deque
 
+from . import httpcheck
 from . import clock as clock_mod
 from . import guidance as guidance_mod
 from . import sessions as sessions_mod     # the header, Content-Type and override rules are shared, not copied
@@ -80,12 +81,8 @@ _UNRESERVED = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz012
 
 # Headers a plan call may never carry, whatever the configuration says: they change how the
 # request is routed, framed or interpreted.
-_FORBIDDEN_HEADERS = frozenset((
-    "host", "transfer-encoding", "te", "upgrade", "connection", "keep-alive", "trailer",
-    "proxy-authorization", "proxy-authenticate", "proxy-connection", "forwarded", "via",
-    "x-http-method-override", "x-http-method", "x-method-override", "x-real-ip", "x-original-url",
-    "x-rewrite-url", "expect", "content-encoding", "content-range", "range", "x-forwarded-for"))
-_FORBIDDEN_PREFIXES = ("x-forwarded-", "x-envoy-", "x-original-")
+_FORBIDDEN_HEADERS = httpcheck.FORBIDDEN_HEADERS      # one list for plain http, sessions and plans
+_FORBIDDEN_PREFIXES = httpcheck.FORBIDDEN_PREFIXES
 
 # Header names a plan may ever allow: the shared session allowlist, plus Content-Length (checked to equal the body).
 HEADER_NAMES = frozenset(sessions_mod.ALLOWED_HEADERS) | {"content-length"}

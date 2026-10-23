@@ -49,6 +49,7 @@ from email.utils import parsedate_to_datetime
 
 from .backends import BackendError
 from . import destguard
+from . import httpcheck
 from . import masking
 from . import clients as clients_mod
 from . import clock as clock_mod
@@ -567,7 +568,7 @@ def header_problem(headers):
     seen = set()
     for k, v in headers.items():
         low = k.lower()
-        if low in seen or low not in ALLOWED_HEADERS:
+        if low in seen or low not in ALLOWED_HEADERS or httpcheck.forbidden(low):
             return HEADER_REFUSED
         seen.add(low)
         if low == "content-type":

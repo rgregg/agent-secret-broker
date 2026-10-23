@@ -77,8 +77,21 @@ def check_header_value_template(value):
 
 # Headers an agent may not set on a plain http call: the transport owns framing and routing, the
 # broker owns its own marker, and cookies belong to sessions.
-_FORBIDDEN = frozenset({"content-length", "transfer-encoding", "connection", "cookie", "cookie2", "upgrade",
-                        "te", "trailer", "expect", "keep-alive", "http2-settings"})
+# ONE list, shared by plain http, sessions (whose allowlist excludes all of these anyway) and plans: headers that
+# route, frame, re-method or re-encode a request, or that can make an upstream answer with a partial body.
+FORBIDDEN_HEADERS = frozenset((
+    "host", "transfer-encoding", "te", "upgrade", "connection", "keep-alive", "trailer", "expect",
+    "proxy-authorization", "proxy-authenticate", "proxy-connection", "forwarded", "via", "http2-settings",
+    "x-http-method-override", "x-http-method", "x-method-override", "x-real-ip", "x-original-url",
+    "x-rewrite-url", "content-encoding", "content-range", "range", "if-range", "accept-encoding",
+    "x-forwarded-for"))
+FORBIDDEN_PREFIXES = ("x-forwarded-", "x-envoy-", "x-original-", "x-rewrite-", "proxy-", "x-secret-broker-")
+# plain http additionally: the transport frames the body, and cookies belong to sessions
+_PLAIN_ONLY = frozenset(("content-length", "cookie", "cookie2"))
+
+
+def forbidden(name_lower):
+    return name_lower in FORBIDDEN_HEADERS or name_lower.startswith(FORBIDDEN_PREFIXES)
 
 
 def clip(text, n=200):
@@ -102,7 +115,7 @@ def check_headers_template(headers, url=None, extra_forbidden=()):
         if low in seen:
             raise ValueError(GENERIC)            # urllib would silently keep only one of two spellings
         seen.add(low)
-        if (low in _FORBIDDEN or low.startswith(("proxy-", "x-secret-broker-"))
+        if ((forbidden(low) and low != "host") or low in _PLAIN_ONLY
                 or low in {h.lower() for h in extra_forbidden}):
             raise ValueError(GENERIC)
         check_header_value_template(v)
