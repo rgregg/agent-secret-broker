@@ -15,6 +15,7 @@ import json
 import os
 import re
 import secrets
+import collections
 import threading
 import time
 import urllib.parse
@@ -26,6 +27,10 @@ from .notify import (APPROVE_MAX_RISK, RISK_LEVELS, NotifyError, action_ids_for,
 PUSH_HOSTS = ("fcm.googleapis.com", "push.services.mozilla.com", "push.apple.com",
               "notify.windows.com")
 MAX_PER_USER = 20
+# outcomes a `resolved` push may carry; anything else is never sent
+RESOLVED_STATUSES = ("approved", "denied", "expired", "failed", "released")
+RESOLVED_TTL = 120          # a stale "it's settled" is worthless after a couple of minutes
+MAX_TRACKED = 500           # notified-and-still-open tags remembered (oldest dropped)
 _B64 = re.compile(r"^[A-Za-z0-9_=-]{8,256}$")
 
 
@@ -200,6 +205,11 @@ class WebPushNotifier:
     def __init__(self, store, actions=None):
         self.store = store
         self.action_policy = actions        # None: use the global notify_actions policy
+        # tag -> names text of requests this transport has pushed and not yet resolved;
+        # a request that was never pushed (held by presence, settled while queued, not
+        # delivered) has no entry, so `resolved` sends it nothing.
+        self._open = collections.OrderedDict()
+        self._open_lock = threading.Lock()
         self.actions = actions or parse_actions(None)
 
     def actions_for(self, risk):
@@ -216,6 +226,30 @@ class WebPushNotifier:
         ok, errors = self.store.send_all(payload)
         if not ok:
             raise NotifyError("; ".join(errors[:3]) or "push delivery failed")
+        if n.tag:
+            with self._open_lock:
+                self._open[n.tag] = body[:120]
+                self._open.move_to_end(n.tag)
+                while len(self._open) > MAX_TRACKED:
+                    self._open.popitem(last=False)
+
+    def resolved(self, n, status):
+        """Best effort: tell every subscribed device the request is settled so the
+        service worker can replace and close the notification. Names only; no
+        id, host, token or action. Nothing is sent for a request this transport
+        never delivered. The caller runs this off the settle path; failures are
+        swallowed (class name only) and never change the request outcome."""
+        if status not in RESOLVED_STATUSES or not n.tag:
+            return
+        with self._open_lock:
+            name = self._open.pop(n.tag, None)
+        if name is None:
+            return
+        try:
+            self.store.send_all({"type": "resolved", "tag": n.tag, "status": status,
+                                 "name": name}, ttl=RESOLVED_TTL)
+        except Exception:       # noqa: BLE001 -- best effort, never raises
+            pass
 
 
 def store_from_config(cfg):

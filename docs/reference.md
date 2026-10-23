@@ -1124,6 +1124,20 @@ the same panel; **Send a test push** checks the whole path.
 - A subscription is a URL the broker will POST to, so only known push services
   are accepted (Chrome/Edge via FCM, Firefox, Safari, Windows); add others with
   `webpush.endpoint_hosts`.
+- When a request settles (approved, denied, expired or failed, by any route:
+  dashboard, a notification button, or the link page) the broker sends one more
+  push to every subscribed device, `{type, tag, status, name}`: names only, no
+  id, host, token or action. The service worker replaces the notification under
+  the same tag with a brief silent one ("Approved: name") and closes it about a
+  second later, so the buttons cannot be tapped after the fact. A request that
+  was never pushed (held by presence, or not delivered) sends nothing. This is
+  best effort and runs off the settle path: a device that is offline keeps the
+  stale notification until it reconnects, and a failed or slow send never
+  changes the request's outcome. It cannot be a silent push: browsers (iOS in
+  particular) require every push to show a notification (`userVisibleOnly`) and
+  may revoke a subscription that shows none, hence the show-then-close. Existing
+  devices pick the new worker up automatically (version 8); Settings shows the
+  running version.
 - Delivery is weaker than the Home Assistant transport: a push service accepting
   a message is not proof that you saw it. Keep another transport configured as a
   backup; with several, a request is delivered if any one succeeds.
