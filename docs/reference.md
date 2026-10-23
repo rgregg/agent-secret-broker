@@ -9,6 +9,7 @@ How the broker works, in detail. For installing and configuring it see
     asb list [--json]             what credentials exist? name, vars, hosts
     asb which HOST|URL            is a credential available? (no approval, no push)
     asb http NAME METHOD URL [-H 'K: V']... [-d BODY | -d @file | -d @-]
+    asb http NAME METHOD URL ... --session ID     inside an approved http session (see "HTTP sessions")
     asb NAME[,NAME] -- command args...
     asb guidance propose FILE|- | --from-dir DIR   propose risk guidance for a human to review
     asb help COMMAND              usage + example for one command
@@ -1177,6 +1178,20 @@ the same panel; **Send a test push** checks the whole path.
 - A subscription is a URL the broker will POST to, so only known push services
   are accepted (Chrome/Edge via FCM, Firefox, Safari, Windows); add others with
   `webpush.endpoint_hosts`.
+- When a request settles (approved, denied, expired or failed, by any route:
+  dashboard, a notification button, or the link page) the broker sends one more
+  push to every subscribed device, `{type, tag, status, name}`: names only, no
+  id, host, token or action. The service worker replaces the notification under
+  the same tag with a brief silent one ("Approved: name") and closes it about a
+  second later, so the buttons cannot be tapped after the fact. A request that
+  was never pushed (held by presence, or not delivered) sends nothing. This is
+  best effort and runs off the settle path: a device that is offline keeps the
+  stale notification until it reconnects, and a failed or slow send never
+  changes the request's outcome. It cannot be a silent push: browsers (iOS in
+  particular) require every push to show a notification (`userVisibleOnly`) and
+  may revoke a subscription that shows none, hence the show-then-close. Existing
+  devices pick the new worker up automatically (version 8); Settings shows the
+  running version.
 - Delivery is weaker than the Home Assistant transport: a push service accepting
   a message is not proof that you saw it. Keep another transport configured as a
   backup; with several, a request is delivered if any one succeeds.
@@ -1883,6 +1898,412 @@ validated exactly as the catalog will read it back before anything is written. I
   `credential_provided` and `credential_refused` are hidden approver activity.
   History shows the request, follows a rename, and the detail view says the purpose is not retained.
 
+## Plans (task-scoped grants for unattended jobs)
+
+An unattended or long job (an overnight sync, a multi-step task while nobody is at the phone) can make
+exactly the calls it declared up front, after a human approved the whole list once. The alternative is
+one tap per call, or `approval: allow`, where the risk model is the only gate and the model reads text the
+agent controls. A plan replaces that with a **deterministic match against a manifest a human read**. No
+model is involved: not for the card, not for the match. Design and decisions:
+[proposals/task-plans.md](proposals/task-plans.md). Commands: [cli.md](cli.md#plans-for-unattended-jobs).
+
+    asb plan submit manifest.json          # waits for you; prints the plan id once approved
+    asb http NAME POST URL ... --plan ID   # released with no prompt if it matches a rule
+    asb plan status ID | list | close ID
+
+Mental model: you approve a job's shopping list, with a stopwatch, on one machine.
+
+### Plans and sessions
+
+Both are time-boxed approvals bound to one client, with an absolute deadline, no renewal, memory only,
+refused rather than prompted when a call is outside them, and both never follow a redirect. They differ in
+what they approve: an **HTTP session** (above) is a standing permission for a set of hosts and methods
+with a cookie jar and captured values, for login-style flows; a **plan** is an exact list of calls (host, method,
+path, body shape, uses) for an unattended job, matched deterministically. They share the in-flight status
+`running` (a running call is never pending: not listed, counted, decidable or expirable), the clock module
+(`clock.py`), the Clients tab (Active plans, then Active sessions) and the exit codes: 7 ended, 8 refused by
+the approved scope, and 9 retry later (plans). A plan with session steps is phase 2
+([design](proposals/task-plans.md#2-relationship-to-sessions)); today a plan call that names a session is refused.
+
+### The manifest
+
+    {"v": 1, "task": "nightly finance sync", "description": "pull balances, post one note",
+     "ttl_seconds": 28800,
+     "rules": [
+       {"secret": "monarch", "method": "POST", "host": "api.monarchmoney.com", "path_prefix": "/graphql/read",
+        "max_uses": 50, "body": {"graphql": {"document": "query Accounts { accounts { id balance } }",
+                                              "variables_keys": []}}},
+       {"secret": "ledger", "method": "POST", "host": "ledger.example.com", "path_prefix": "/v1/notes",
+        "max_uses": 5, "body": {"json": {"keys": ["text", "kind"], "pin": {"kind": "reconcile"}}}}]}
+
+Rule keys: `secret`, `method` (uppercase), `host` (lowercase ASCII, one of the credential's
+`allowed_hosts`), `path_prefix`, `max_uses`; optional `port` (default 443, or 80 for `http`), `scheme`
+(`https`, or `http` only for a private IP address host), `query`, `body`. `sessions`, `window` and
+`rules[].session` are recognized and refused ("not supported yet"). `task` (1-80 characters) and
+`description` (0-400) are **untrusted text**: hidden and control characters are refused (the same checks as
+credential-request purposes; the 400 names the class and offset, never the character), the card shows every
+non-ASCII character as `<U+XXXX>` in a box marked "written by the agent, not verified, not used for any
+decision", they never go into a notification, and the audit log keeps only their length and a hash prefix.
+`ttl_seconds` defaults to `plans.default_minutes`; more than `plans.max_minutes` is a 400.
+
+### The matcher
+
+A call made with `--plan ID` is built once into a frozen request (placeholders substituted as in any http
+call) and matched against the rules as sent. **Every** item must hold; any doubt or parse error is a
+non-match, and that exact object is what is sent (the matcher runs again on the substituted request with
+the filled header values treated as opaque).
+
+- **Placeholders.** `{{...}}` in the URL (path, query or host) or in the body is refused. In a header it is
+  allowed only if it is one of the rule's **own** credential's variables and is the **entire** value
+  (optionally behind a scheme word such as `Bearer `). Nothing may survive substitution.
+- **Host and URL.** One parse. Refused: userinfo, a fragment, a trailing dot, uppercase or non-ASCII
+  characters in the host (checked before comparing; no silent lowercasing), characters parsers disagree on
+  (backslash, spaces, control characters), an IP literal unless it is the rule's own host. Host and explicit
+  port must equal the rule's. The rule host must be in the credential's `allowed_hosts` at submit **and at
+  every use**. Scheme must equal the rule's; plain `http` only for a private/loopback/link-local IP literal
+  (a name such as `.lan` is never "private" for plans). **Redirects are never followed**: the 3xx comes back
+  masked, without `Set-Cookie`, and a follow-up is a new call that needs its own rule.
+- **Method.** Exact and uppercase, one method per rule.
+- **Path.** `path_prefix` is absolute, segment aligned (the path equals it or continues after a `/`), as
+  sent. Refused: dot segments, an empty segment (`//`), `;`, backslash, any control character or whitespace.
+  **A path is ASCII and the only percent-encoding allowed is `%20`**: every other encoded byte (`%25`, `%2e`,
+  `%2f`, `%5c`, `%00`, `%EF%BC%8F` and any other UTF-8, encoded letters and digits, lowercase hex) and every
+  byte of 0x80 or more is a non-match, so nothing can double-decode, or be read as another character by a
+  Unicode-normalizing upstream. The broker never decodes anything before comparing. Every pattern the matcher
+  uses is a full match (a trailing newline never passes), no control character or whitespace is accepted in
+  the URL or any matched string, and just before sending, the request object actually handed to the sender is
+  compared with the frozen matched one (URL, target, method, body, headers). A prefix of only `/` needs `plans.allow_root_prefix`.
+- **Query string.** A rule that writes (anything but GET, HEAD, OPTIONS) defaults to `"query": "none"`: any
+  query string is a non-match. It may instead list the allowed key names (`"query": ["dry_run", "page"]`,
+  values unconstrained, up to 16); the card shows them. A GraphQL rule must be `"none"`. Read rules default to
+  `"any"`. In every mode keys must be plain (`A-Za-z0-9_.-`, never percent-encoded, no `;`), and method or body
+  override parameters (`_method`, `method`, `operationName`, `variables`, `extensions`,
+  `x-http-method-override`, `body`) are always refused, so a matching body cannot be changed from the URL.
+- **Headers.** Exact names only, from the same allowlist the sessions use (`Accept`, `Accept-Language`,
+  `Content-Type`, `User-Agent`, `If-None-Match`, `If-Modified-Since`, `Authorization`, `X-Csrf-Token`,
+  `X-Updated-Csrf-Token`, `X-Requested-With`, `X-Api-Key`; plus `Content-Length`, checked to equal the body):
+  `plans.allowed_request_headers` (default `Accept`, `Content-Type`, `Content-Length`, `If-None-Match`,
+  `User-Agent`) chooses among them, and only `Authorization`, `X-Api-Key`, `X-Csrf-Token`,
+  `X-Updated-Csrf-Token` and `X-Requested-With` may carry a placeholder (whatever the configuration lists); the
+  first four must carry one, never a literal. A placeholder value must be exactly `(Bearer |Basic |Token )?{{NAME}}` with `NAME` a variable of
+  the rule's own credential. `Content-Type`, when present, is one of the five session types
+  (`application/json`, `application/x-www-form-urlencoded`, `text/plain`, `application/graphql`,
+  `multipart/form-data` with a boundary) with at most `charset=utf-8`; a json or GraphQL rule needs
+  `application/json`. All of this is checked on the TEMPLATE (a filled credential is a neutral token), so a refusal
+  never depends on a secret's value. Anything else (`Host`,
+  `X-HTTP-Method-Override`, `X-Forwarded-*`, `Transfer-Encoding`...) is a non-match, as is any duplicate
+  header (case-insensitive). `Content-Length`, when present, must equal the body's size in bytes; chunked
+  bodies are refused.
+- **Override scan.** The sessions' fail-closed rule applies: the text `method` (case-insensitive) in any decoded
+  form (percent, HTML entity, `\\u`/`\\x`/quoted-printable escapes, NFKC, up to five rounds, non-letters
+  removed) anywhere in the URL after the host, in a header name or value, or in the body refuses the call
+  (`why: override`). The only exceptions are text the rule itself declares and the approver sees on the card: a
+  path prefix, listed query keys, listed top-level json keys and GraphQL variable keys that contain `method`, and the
+  exact GraphQL document. Values and nested keys are always scanned. The code is the sessions' own
+  (`sessions.override_problem`, `header_problem`'s Content-Type and placeholder rules), imported, not copied.
+- **Body.** `none` (empty), `json` (top-level keys a subset of `keys`; every `pin` present with exactly the
+  pinned string, boolean, integer or null; unpinned values are free and the card says so; nested values are
+  never pinned), `graphql` (see below) or `any` (opt-in with `plans.allow_any_body`; shown in red). A rule with
+  no `body` accepts only an empty one; a write must declare a matcher. All JSON is parsed strictly:
+  duplicate keys at any depth, NaN/Infinity, integers beyond 2^53, lone surrogates, a BOM, trailing data,
+  nesting over 8 and more than 64 members per object are non-matches. `Content-Type` must be exactly
+  `application/json` (optionally `; charset=utf-8`). Strings compare byte-exact after decoding. A body over
+  `plans.max_body_bytes` never matches.
+- **GraphQL.** `query` must be **byte-equal** to the declared `document` (at most 4096 characters), with
+  only `query`, `operationName` and `variables` in the object: a batch (an array), `extensions` (including
+  persisted-query hashes) or any other key is a non-match. `variables` keys must be a subset of
+  `variables_keys`; values are free. `operation_name` is required when the document has more than one
+  operation. A document containing `mutation` or `subscription` anywhere (strings and comments too, on
+  purpose) or that cannot be parsed is a **write**; it is accepted only with
+  `plans.allow_graphql_mutation` (default false) and is then high.
+- **Uses, rate, in-flight.** Every rule needs `max_uses`. A use is **reserved under the plan lock when the
+  match succeeds, before the upstream call**; a failed or timed-out call still counts (no refunds). At most
+  `plans.rate_per_min` released calls per plan in a sliding 60 s (`rate_limited`, with `retry_after_s`; it
+  does not consume a use) and at most `plans.max_inflight` calls executing per plan (`inflight_limit`; the
+  slot is released in a `finally`, and the 15 s sweep reconciles it against live threads). Check order: plan
+  state and client, rule match, rate, in-flight, uses.
+
+Nothing user-supplied is ever compiled as a regular expression. Not in v1: regex, JSON-pointer pins, wildcards,
+schema matching, windows, sessions, renewal.
+
+### Time, binding and revocation
+
+- **Absolute deadline.** `expires_at = approved_at + granted_s`, fixed at approval, never moved by use, no
+  renewal and no extend button. On the card you may pick a **shorter** duration than requested, never longer.
+  A plan is dead if **either** the wall clock or the monotonic clock says so (a clock set back cannot revive
+  it; suspend is covered by the wall check); expiry is enforced on every use and by the 15 s sweeper.
+- **Per client.** A plan belongs to the authenticated client id; every operation re-checks it under the plan
+  lock. The plan id (128 random bits, hex) is an identifier, never a bearer: it authorizes nothing without the
+  client credential. Unknown, expired, foreign and malformed ids all get the **same 404**. The shared legacy
+  key cannot submit plans (`plans.allow_legacy`, default false). Revoking a client revokes its plans.
+- **Memory only.** A restart drops every plan (fail closed): calls get exit 7 `kind: unknown` and the job must
+  submit again, which needs you.
+- **Before and after sending.** Immediately before the request is sent (after the vault read and header
+  substitution, which can take seconds) the plan's liveness is checked again: client active, plan active and
+  inside its deadline on both clocks; if not, nothing is sent, the use is
+  given back and the call fails with the fixed text "release failed: plan or client ended". The upstream timeout is
+  `min(30 s, time left to the plan deadline)`. After the upstream answers the same check runs and a response for an
+  ended plan or revoked client is discarded (answer 404 `plan not usable`, exit 7; the use of a call stopped before
+  sending is given back, `plan_used` is audited only for a call cleared to go out, and no `http_failed` is logged for
+  a call that never left). A plan becomes `exhausted` (terminal) only when every rule is used up and nothing is in
+  flight, so a plan on its last use stays listed, revocable and counted against `max_active_per_client` until its call
+  finishes; an exhausted plan answers 403 `uses_exhausted` (exit 8), like an exhausted rule. A deadline noticed by any operation (even a submit) is audited as `plan_closed`.
+- **Revoke.** Clients tab, **Active plans** table (above Active sessions), Revoke (SSO, CSRF, same-origin). It takes effect before the
+  next call; a call already released finishes. Terminal plans stay visible to their owner and History for an
+  hour.
+- **Per credential.** `"plans": false` in the credential's broker metadata refuses it in plans, checked at
+  submit and at use. Per client: `clients.<id>.plans` with `enabled` and `max_minutes`.
+
+### The card
+
+Requests tab and the link page, behind SSO, CSRF and same-origin. It shows, generated by code from the
+validated structure: each rule (method, URL, uses, body fixed / partly pinned / "not constrained", that a path
+prefix covers a **subtree**), the worst case (calls, credentials, sites, per minute, whether anything changes
+data, deletes or accepts any content), each credential's `allowed_hosts` surface, and the deterministic tier:
+read-only rules low; rules that write medium; **high** for DELETE, an any-content body, a GraphQL mutation or
+a **shallow prefix** (one path segment or fewer). A high plan needs a **second confirmation** (Approve, then
+"This plan can ... Approve anyway?"); the server enforces it, so a forged plain approve is refused. A long
+duration is not a reason. The card cannot be approved from a notification, a push or Home Assistant button, a
+token or the link page's old form: only the SSO approval pages, with CSRF.
+
+Hard caps (a manifest over one is a 400 naming the field): `max_rules` 20, `max_uses_per_rule`,
+`max_total_uses`, `max_minutes`, `rate_per_min`, `max_body_bytes`, no any-body, no `/` prefix, no GraphQL
+mutation, `deny_secrets`. Approver-fatigue limits (all 429): a card waits `pending_ttl_s` (900); `max_pending`
+4 pending plans overall (`max_pending`) and `max_pending_per_client` 1 per client, validated so that
+`max_pending` is at least `2 * max_pending_per_client + 1` (two clients can never hold every pending slot; the
+effective ceiling is the smaller of `max_pending` and clients times the per-client cap); `max_active_per_client` 2 active;
+`submits_per_hour` 6 per client; and a **denial cooldown keyed on the client id only** (never the
+agent-chosen task text, so rewording a task bypasses nothing) that escalates 60 s, 5 min, 30 min with each
+further denial and is forgotten after a quiet day. Plan cards have their own pending caps and never consume
+the shared limit on pending requests. The refused-submission audit record is coalesced like `plan_miss`.
+The card's "claimed source" is shown only if it is a plain user@host claim (letters, digits and `@._:+()[]-`);
+otherwise the socket address is shown.
+
+A plan-released call is never a pending request: while it runs it is not listed, counted, decidable or
+expirable (nothing asks a human), and it appears (for the agent's poll) only once it has settled.
+
+**A plan makes a client effectively exempt from its own `auto_approve_max` for exactly the approved calls; that
+is the point**, and it is why you approve each plan. A plan never widens a credential's `allowed_hosts`,
+`deny_secrets`, `plans: false`, a client's `auto_approve_max: "none"` or a client-level `plans.enabled: false`:
+each is checked at submit and again at every use (a per-client deny wins over a plan). A catalog change in the
+vault is seen within `CATALOG_TTL` (60 s); changes made through the broker apply at once.
+
+### Notifications
+
+Push, Home Assistant, Telegram and ticker carry **no Approve or Deny**: the text is
+`Plan requested: <client name>, <n> rule(s): <secret names>` plus a link to the card. Every token channel
+refuses mode `plan`.
+
+### Audit and History
+
+| Event | Fields |
+|---|---|
+| `plan_issued` | `id` (the card), `plan_id`, rule count, `names`, `granted_s`, `expires_at`, approver, channel, peer, `manifest_hash`, `rules_hash`, task and description length and hash prefix |
+| `plan_closed` | `plan_id`, `cause` (`agent`, `deadline`, `exhausted`), `uses` |
+| `plan_revoked` | `plan_id`, `by`, `left_s`, `cause` (`human`, `client_revoked`), peer, client IP |
+| `plan_used` | `id` (the call), `plan_id`, `rule` (index), `uses_left_rule`, `uses_left_plan`, `left_s` |
+| `plan_miss` | `plan_id` (only the owner's), `reason`, `why` (the item that failed), `suppressed`; **coalesced** to 5 a minute per plan |
+
+`plan_internal_error` (class name only) is hidden from agents. A plan-released call also writes the normal
+`requested`, `approved` (`via: policy`, `decision_source: plan`, `plan_id`), `http_executed`, `delivered`, so
+History shows "Decided by: plan abcd1234 (auto-approved), 3 h 12 min left". The agent audit view is a
+deny-by-default whitelist: it sees `plan_id`, the rule index, uses left and a coarse reason, never the
+approver, channel, cause, hashes or any text, and a plan-released call is a plain `approved`. Nothing in any
+channel holds a secret, header value, body, document, `task`, `description` or exception text.
+
+### Config
+
+    "plans": {"enabled": true, "default_minutes": 30, "max_minutes": 480, "pending_ttl_s": 900,
+              "max_rules": 20, "max_uses_per_rule": 500, "max_total_uses": 2000, "rate_per_min": 30,
+              "max_inflight": 4, "max_body_bytes": 16384, "max_pending": 4, "max_pending_per_client": 1, "max_active_per_client": 2,
+              "submits_per_hour": 6, "allow_any_body": false, "allow_root_prefix": false, "allow_graphql_mutation": false,
+              "allow_legacy": false,
+              "allowed_request_headers": ["Accept", "Content-Type", "Content-Length", "If-None-Match", "User-Agent"],
+              "deny_secrets": []}
+
+Validated at startup naming the field (unknown keys refused; `max_minutes` 1-720, the ceiling; routing and
+framing headers cannot be allowed). `enabled: false` makes `POST /v1/plans` a 403 and every plan call a 404
+`kind: unknown` (it is never turned into a prompt). `GET /v1/status` reports `features.plans`.
+Per client: `"clients": {"c-1a2b3c4d": {"plans": {"enabled": true, "max_minutes": 60}}}`.
+
+### Errors and exit codes
+
+Unknown, expired, closed and wrong-client plans are always `404 {"error": "plan not usable", "kind": ...}`;
+only the owner's retained record gets a specific `kind` (`ended`, `closed`, `revoked`), else
+`unknown`.
+
+| Situation | HTTP | `asb` exit |
+|---|---|---|
+| Manifest invalid or over a cap | 400 | 3 |
+| Disabled, legacy client, never-auto client, `plans: false` or `deny_secrets` | 403 | 3 |
+| Too many pending or active plans, or the same task denied recently | 429 | 3 |
+| Call outside the plan (`no_rule` with `why`, `uses_exhausted` for a rule or the whole plan, `wrong_policy`) | 403 `{"error": "outside plan", "reason": ...}` | 8 |
+| `rate_limited`, `inflight_limit` | 429 with `retry_after_s` | 9 |
+| Plan not usable (`ended`, `closed`, `revoked`, `unknown`; also a call stopped mid-flight) | 404 | 7 |
+| Denied / expired while pending | | 4 / 5 |
+| Upstream status 400 or more | | 22 |
+
+### Threat model for plans
+
+An injected agent can submit a broad manifest: the caps refuse the widest shapes, every plan needs you to read
+a code-rendered worst case, a high plan needs a second confirmation, and it can never reach beyond
+`allowed_hosts`. The residual is approving without reading: treat an unexpected plan card as a possible
+injection and deny it. A stolen plan id is useless without the client credential. A compromised client holds
+the credential and can use its own live plans within their rules, caps, rate and deadline, nothing more; revoke
+the client and its plans die at once. Not protected: what a matched call does at the target (the match
+constrains the request, not the API's behavior), which is why every write is labelled "can change data".
+## HTTP sessions (multi-step flows with one approval)
+
+`asb http` is one call per approval. A flow that needs several related calls (log in and reuse a
+session cookie, carry a CSRF token from one response into the next call) used to push agents into env
+mode, where a program holds the raw secret. An **HTTP session** keeps the secret and the session state in
+the broker instead. The design and its rationale are in
+[proposals/http-sessions.md](proposals/http-sessions.md).
+
+    asb session open NAME --for "purpose" --host H [--host H2]... [--methods GET,HEAD,POST] [--ttl 15m] [--max-calls N]
+    asb http NAME METHOD URL ... [--session ID] [--capture NAME=header:X|cookie:NAME|json:$.a.b]...
+    asb session status ID | asb session close ID
+
+**What the human is approving.** A session is a time-boxed standing permission for one client, one
+http credential, specific hosts and specific methods. The card says it plainly: this client may make
+these calls with this credential to these hosts, without asking again, until the time runs out or the
+call cap is used; each call is logged but is not shown to you as it happens. It lists the credential, hosts,
+methods (anything beyond GET and HEAD is called out), the time limit (counted from the moment you
+approve), the call cap and the client's name; the agent's purpose text is shown as its unverified claim
+with every non-ASCII character escaped. You may shorten the time and the cap on the card; you cannot
+lengthen them.
+
+**Opening always needs a human.** The open request is high by code (no model sees it), never
+auto-approved (`approval: allow`, Always, timed grants and SSH rules do not apply), has no Always or timed
+chips, and no notification button, token or Home Assistant hook can decide it: only the authenticated approval
+site can. It follows the other approval requests' rules for pending caps (3 requests, 2 session requests per
+client), the deny cooldown per credential and the request TTL (`ttl_seconds`).
+
+**Time-bound, abandoned at the deadline.** The deadline is `approval time + ttl` and is never moved:
+no sliding extension, no renewal, no idle refresh. Default 15 minutes, hard maximum `sessions.max_ttl_s`
+(default 60 minutes, ceiling 24 hours), minimum 30 seconds. At the deadline the cookie jar and captured values
+are dropped, the session is marked expired, every further call with its id fails (HTTP 410, `session_expired`,
+`asb` exit 7) and `session_expired` is audited. A sweeper does this every few seconds even when nobody
+calls, and a lookup ends an overdue session itself. A session nobody uses still expires. A broker restart drops
+all sessions (they are memory only). You can revoke one at any time on the Clients tab (immediate, audited) and
+the agent can `asb session close ID`.
+
+**Client-bound.** A session is bound to the authenticated client that opened it (see
+[Clients](#clients-per-client-credentials-and-enrollment)). A call from any other client, including the legacy
+shared key when the session belongs to an enrolled client, gets exactly the answer an unknown id gets (404,
+`session_unknown`): no oracle on whether an id exists. Ids are 192 random bits, looked up by their SHA-256 and
+compared in constant time. The legacy shared key counts as one client, `legacy`: it cannot tell machines apart, so
+machines that share it share each other's sessions; enroll each machine to separate them. Revoking a client
+ends its sessions at once.
+
+**Scope (guardrails).**
+
+- Hosts are required, each `HOST` or `HOST:PORT`, and the host must sit inside the credential's `allowed_hosts`: a session can only narrow, never widen
+  (re-checked on every call, so narrowing the credential later also narrows the session). Http credentials only:
+  ssh keys and credentials without `allowed_hosts` (env-only) are refused with a clear error. The manifest records and the card shows
+  the port: a bare `HOST` means ports 80 (http) and 443 (https) only, `HOST:PORT` means exactly that port for either scheme. A call to
+  any other port of an allowed host is refused.
+- Methods default to GET and HEAD; others must be declared on open. A call outside the hosts, methods or call cap
+  (`--max-calls`, default and cap `sessions.max_calls` 200) is **refused** with a specific error (exit 8), never
+  prompted: the agent must open a new session, which you read in full. Refusals do not count as calls.
+- A session call names exactly the session's credential and may not set a `Host` header. It is released
+  without a prompt and without a model verdict. `asb http` without `--session` behaves exactly as before.
+- **Redirects are never followed.** A 3xx is returned to the agent with its `Location` (masked); `Set-Cookie` on it is stored in the jar
+  and stripped as usual. The agent makes a new call, which is scope-checked and counted like any other. This also means no redirect can
+  change the method, port or host, and no hop goes uncounted. TLS verification, pinning and `tls_verify` are as for plain http calls.
+- **Headers are allowlisted by exact name** (case-insensitive): `Accept`, `Accept-Language`, `Content-Type`, `User-Agent`, `If-None-Match`,
+  `If-Modified-Since`, `Authorization`, `X-CSRF-Token`, `X-Updated-CSRF-Token`, `X-Requested-With`, `X-API-Key`. (The catalog has no
+  "declared auth header" metadata, so no credential adds names.) Everything else is refused with one fixed message: `Content-Length` (urllib
+  sets it from the bytes it sends, so the body on the wire is exactly the substituted body and never a second pipelined request),
+  `Accept-Encoding`, `Connection`, `Expect`, `TE`, `Upgrade`, `Trailer`, `Transfer-Encoding`, `Content-Encoding`, `Host`, `Cookie` (the jar's), `Proxy-*`,
+  `Forwarded`, `X-Forwarded-*`, `X-Original-*`, `X-Rewrite-*`, other `X-` names, duplicates, and so on. `Content-Type` must be one of
+  `application/json`, `application/x-www-form-urlencoded`, `text/plain`, `application/graphql` or `multipart/form-data` with a `boundary`,
+  with no parameter except `charset=utf-8`. A header value that contains a placeholder is allowed only if the whole value is
+  `{{NAME}}`, optionally preceded by `Bearer `, `Basic ` or `Token `.
+- **The checks never depend on a secret.** The header and method-override checks run on what the agent wrote, with credential placeholders replaced
+  by a neutral token; captured values (chosen by the upstream, scanned when captured and again after substitution) are substituted. A credential
+  whose value contains `method` neither changes the outcome nor produces a different error; a credential value with a line break or other illegal
+  header character gets the same generic `invalid_request` error as any other bad header.
+- **Method override is refused by one fail-closed rule.** A session call is refused (fixed message, not charged) if the agent's URL path, parameters,
+  query or fragment, any header name or value, or its body contains the text `method` (case-insensitive) in any decoded form: raw, up to 5
+  rounds of percent-, HTML numeric entity (`&#109;`, `&#x6d;`), `\uXXXX`, `\xNN` and quoted-printable (`=6D`) decoding with NFKC
+  normalisation, and each of those with every non-letter removed. Bodies are scanned as UTF-8, latin-1, UTF-16/32 (when NUL bytes or a BOM suggest it) and double-encoded text, so fullwidth or mojibake spellings cannot hide; a body that is not valid UTF-8 is refused unless it is multipart/form-data or sent as `body_b64` (then all views are still scanned). Userinfo in the URL is refused. A multipart body that declares a
+  Content-Transfer-Encoding is refused. This covers `_method` fields in a query, path, form, JSON or multipart, encoded and mixed-case
+  variants and `;` separators, without any parser that could disagree with the upstream's. It deliberately also refuses legitimate fields such
+  as `payment_method`: a call that needs one must use plain `asb http` without `--session` (one approval per call). The check runs once per call on the agent's text, and again on the substituted text only when the call uses `{{session.NAME}}`. A GET or HEAD call cannot carry a body. A captured value containing `method` (same
+  forms) is not stored, so an upstream cannot poison a later call.
+- **Refusals are metered and the audit log cannot be flooded.** A refused call is not charged against the call cap, but every refusal (scope, method,
+  header, override, missing capture, call cap used, and a refund for a call that never left the broker) counts against a per-session budget of 10;
+  the 11th ends the session (`session_ended`, `reason: refusal_budget`, exit 7). `session_refused` audit lines are coalesced: the first 5 per minute
+  per session (or per client for unknown ids), then a counter that rides on the next logged line as `suppressed`.
+- **Memory.** A session call's body and headers are not kept after the request details are retained; finished results are pruned 30 s after they
+  settle, at most 4 uncollected results are kept per session (older ones turn into a "discarded" failure), and a client that never polls cannot pin memory.
+- **Masking set.** A response is masked with the values held before it (a deleted or rotated cookie or token may be echoed), those it sets or offers
+  (even if the jar, the cap or the method-text rule rejects them) and those held after. One rule for https-only values: every capture taken from an https response (header, cookie or JSON, whatever its source) is only ever
+  substituted into a call whose final url is https; this is enforced where the capture values are read, under the same lock, so a concurrent rotation cannot
+  flip the outcome (a refusal before anything is sent, not charged). `set-cookie` headers cannot be captured (use `cookie:NAME`), and a Secure cookie is never
+  sent over http.
+- **No free oracle on a secret.** Characters and length of the url and headers are checked on what the agent wrote, before the call is charged. After the
+  credential is substituted the call is charged whatever happens, with one generic `invalid_request` error for any content-dependent failure. At most 100
+  placeholders per call in total (a metered refusal). Overdue sessions are swept before the per-client and total caps apply, and an upstream error after
+  the deadline or a revoke is `session_expired` (exit 7); the body read is bounded by the deadline.
+- **Bounded work.** URL and header values up to 8192 characters, 50 headers, 100 placeholders of up to 64 characters, body up to 256 KB (a larger body is refused with a fixed message; use plain `asb http` for big uploads: every session body is scanned, so its size is bounded).
+  Placeholders are scanned in linear time, and the store lock is held only for dictionary work (never for a scope check or an upstream
+  call), so one hostile or slow call cannot delay another client's lookup, revoke, close or sweep.
+- **In-flight calls do not outlive the session.** A call runs with a timeout of at most 30 seconds and never past the deadline. When the
+  upstream answers, the session is checked again: a revoke, close, client revoke or the deadline in the meantime discards the response
+  (the agent gets the fixed `session_expired` error, the cookies it set are not kept). A session call has status `running`, never
+  `pending`: it is not an approvable request, no card or button exists for it, and `decide` refuses it.
+- **Clock.** Deadlines use the monotonic clock; wall time is only for display and the audit log. A wall-clock step backward neither
+  extends nor shortens a session.
+
+**State held per session (memory only).**
+
+- A **cookie jar**: cookies from upstream responses are stored per exact host and sent only to that host. `Domain` is
+  ignored (it never widens), `Path` is honoured, `Secure` cookies are neither accepted from nor sent over plain http,
+  `Max-Age` and `Expires` are honoured. At most 50 cookies of 4096 bytes. `Set-Cookie` headers are removed from every
+  response the agent sees.
+- **Captured values**: `--capture NAME=header:X-CSRF-Token | cookie:NAME | json:$.a.b[0]` stores a value from the final
+  response (the minimal JSONPath allows dotted keys and array indexes only; anything else is a usage error and nothing
+  is sent). A value must be short text without control characters. At most 16 per session and 8 expressions per call;
+  repeating a name replaces it, which is how a rotating CSRF token is followed. They are used as `{{session.NAME}}` in the
+  URL, headers and body (substituted in one pass), never returned. A capture that finds nothing is reported by name
+  (`NOT captured`), and a `{{session.NAME}}` that was never captured refuses the call. A value must be printable ASCII (anything else is not stored and is reported as not captured).
+- Credential, cookie and captured values are masked in the response body and headers if the upstream echoes them
+  (exact-match masking like http mode, but for values of 4 or more characters; shorter values are not masked because that would corrupt ordinary words and numbers in a response, and the card says so). A response header the agent did not
+  capture (for example a CSRF header) is an ordinary header and is visible.
+
+**Errors and exit codes.** Messages are fixed text; no exception text reaches an agent, a log, the audit log, history or a
+page (only class names and coarse categories such as `timeout`, `connection`, `tls`, `dns`, `invalid_request`).
+
+| Situation | HTTP | `code` | `asb` exit |
+|---|---|---|---|
+| unknown id, malformed id, another client's id | 404 | `session_unknown` | 7 |
+| expired, closed or revoked (told to the owner only) | 410 | `session_expired` | 7 |
+| out of scope (host, port, method, credential), method override, body on GET/HEAD, call cap used, missing `{{session.NAME}}`, bad placeholder | 403 | `session_refused` | 8 |
+| bad capture expression or open parameters | 400 | none | 2 (client-side) or 3 |
+
+**Config** (validated at startup, naming the field):
+`"sessions": {"enabled": true, "default_ttl_s": 900, "max_ttl_s": 3600, "max_calls": 200, "max_per_client": 3}`.
+`GET /v1/status` shows `features.http_sessions` with these values. There is also a fixed cap of 20 open sessions in total.
+
+**Audit events.** `session_requested`, `session_opened` (client, hosts, methods, ttl, max calls, expiry; `shortened`
+when you lowered the limits), `session_used` (call number and cap, host; the call itself is also an ordinary request:
+`requested`, `approved` with `via: session`, `secret_read`, `http_executed`, `delivered`), `session_refused` (reason
+class: `max_calls`, `method`, `body`, `host`, `credential`, `placeholder`, `missing_value`, `header`, `unknown`, `expired`,
+`closed`, `revoked`, `presend`), `session_closed`, `session_expired`, `session_revoked` (who), `session_ended` (`reason: refusal_budget`). Only the first 8 characters of
+the id are ever logged (and a host string at most 255 characters); no cookie, captured value or credential is in any record. The agent's own audit view
+([above](#what-a-client-sees-of-the-audit-log)) shows its client's session events through a deny-by-default whitelist
+(no approver, no policy). The Clients tab has an **Active sessions** list: credential, client, hosts, methods, live
+time left, calls used and the cap, and Revoke (CSRF-protected, audited).
+
+**Threat model.** A session is a time-boxed standing permission: size it by what the card says. A stolen id is
+useless without the owning client's key; with the key it can do only what the card allowed until the deadline. A
+prompt-injected agent can spend the session inside its scope but cannot widen it, extend it, or turn out-of-scope
+calls into prompts. A malicious upstream cannot redirect the credential or cookies anywhere: redirects are not followed. What
+masking cannot stop: an upstream that echoes a value in a transformed form (encoded or split), and a program on the
+agent's machine that has its own access to the broker's client key.
+
 ## Vault session lifetime
 
 The vault is not kept open (the local backend drops its decrypted contents after
@@ -2191,7 +2612,7 @@ values, header values or bodies (those live in the separate, short-lived
 Events: `startup` (policies in force), `requested`, `assessed`, `notified`,
 `secret_read`, `approved`/`denied`/`expired`/`failed` (with `via` user or
 policy, approver, reported client IP, latency), `http_executed`, `delivered`,
-`escalated`, `stored`, `request_detail_viewed`, `grant_created`/`grant_used`/`grant_revoked`/`grant_expired` (see Standing approvals), `standing_change_failed`, `config_warning`, `policy_changed`, `policy_change_refused`, `policy_change_failed`, `guidance_changed`
+`escalated`, `stored`, `request_detail_viewed`, `plan_issued`/`plan_used`/`plan_miss`/`plan_closed`/`plan_revoked` (see Plans), `grant_created`/`grant_used`/`grant_revoked`/`grant_expired` (see Standing approvals), `standing_change_failed`, `config_warning`, `policy_changed`, `policy_change_refused`, `policy_change_failed`, `guidance_changed`
 (secret, user, peer, length, sha256 prefixes of the old and new text, never the
 text), `guidance_change_refused`, `guidance_change_failed`, and
 security events `auth_failed` (Home Assistant hook), `client_auth_failed`, `rejected`, `approval_viewed`,
@@ -2340,6 +2761,12 @@ or `expired` mean a human was asked (the agent also learns that from its own req
   needs you to match the code. An attacker who can race a pending enrollment gains nothing unless
   you approve a card you did not start. Rate limits are per socket address, so behind a proxy they
   are global. Until `legacy_client_key` is `deny`, anyone with the old shared key still works.
+- **Plans** are one human approval for a deterministic list of calls with an absolute deadline; they do not
+  stop what an approved call does at the target. See [Plans](#plans-task-scoped-grants-for-unattended-jobs).
+- **HTTP sessions are standing permissions.** Approving a session lets that client make any call inside its hosts,
+  methods and call cap, without asking, until a deadline that nothing can move. Read the card's methods
+  (POST, PUT, PATCH and DELETE change things) and hosts as the worst case, keep the time short, and revoke on the
+  Clients tab if in doubt. See [HTTP sessions](#http-sessions-multi-step-flows-with-one-approval).
 - Output masking is exact-match; a program that transforms a secret before
   printing it (base64, splitting) defeats it.
 

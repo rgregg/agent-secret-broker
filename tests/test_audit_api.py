@@ -39,7 +39,7 @@ def rec(event, seq=1, **fields):
 def event_names_in_broker():
     """Every audit event name the broker source can emit."""
     src = ""
-    for mod in ("broker.py", "sshrules.py"):         # modules that emit audit events
+    for mod in ("broker.py", "sshrules.py", "sessions.py"):         # modules that emit audit events
         with open(os.path.join(ROOT, "secret_broker", mod)) as f:
             src += f.read()
     names = set(re.findall(r'\.(?:log|audit)\(\s*"([a-z_]+)"', src))
@@ -47,6 +47,7 @@ def event_names_in_broker():
               for c in ("dashboard", "push", "ha", "link")}
     names |= set(re.findall(r'self\._finish\(\s*req,\s*"([a-z]+)"', src))
     names |= {"approved", "denied", "expired", "failed"}      # via _finish(status)
+    names |= {"session_expired", "session_closed", "session_revoked", "session_ended"}   # sessions.py: "session_" + reason
     return names
 
 

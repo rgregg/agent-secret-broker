@@ -674,12 +674,12 @@ class PushDecide(t.Dashboard):
         code, page = self.get("/")
         self.assertNotIn(d["token"], page)
 
-    def test_service_worker_has_v7_decide_and_fallbacks(self):
+    def test_service_worker_has_v8_decide_and_fallbacks(self):
         import urllib.request
         js = urllib.request.urlopen(urllib.request.Request(
             self.abase + "/sw.js", headers={"X-authentik-username": "alice"})).read().decode()
-        self.assertEqual(broker_mod.SW_VERSION, "7")
-        self.assertIn("SW_VERSION='7'", js)
+        self.assertEqual(broker_mod.SW_VERSION, "8")
+        self.assertIn("SW_VERSION='8'", js)
         for needle in ("/push/decide", "X-Requested-With", "credentials:'same-origin'",
                        "redirect:'manual'", "action_click", "action_decide",
                        "Could not '+verb+' - tap to review", "'Approved'", "'Denied'",
@@ -800,6 +800,245 @@ new Function(src).call(global);
         out = self.run_worker("ok", "open")
         self.assertEqual(self.decide_fetches(out), [])
         self.assertIn("open /", out["fetches"])
+
+
+class ResolvedPush(t.Dashboard):
+    """A settled request sends one names-only `resolved` push per subscription."""
+    EP2 = "https://updates.push.services.mozilla.com/wpush/v2/second"
+
+    def setUp(self):
+        super().setUp()
+        self.sender = Sender()
+        self.store = make_store(self.sender)
+        self.broker.push = self.store
+        self.store.add("alice", EP, P256DH, AUTH)
+        self.store.add("alice", self.EP2, P256DH, AUTH)
+        self.broker.notifier = webpush.WebPushNotifier(self.store)
+
+    pd = PushDecide.pd
+
+    def payloads(self):
+        return [json.loads(c["data"]) for c in self.sender.calls]
+
+    def wait_notified(self):
+        end = time.time() + 5
+        while len(self.sender.calls) < 2 and time.time() < end:
+            time.sleep(0.05)
+        self.assertGreaterEqual(len(self.sender.calls), 2)
+
+    def resolved_calls(self, want=0):
+        end = time.time() + 5
+        def cur():
+            return [c for c in self.sender.calls if json.loads(c["data"]).get("type") == "resolved"]
+        while want and len(cur()) < want and time.time() < end:
+            time.sleep(0.05)
+        time.sleep(0.4)             # let any (wrong) extra push arrive
+        return cur()
+
+    def check_one_per_sub(self, status, rid):
+        calls = self.resolved_calls(2)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(sorted(c["endpoint"] for c in calls), sorted([EP, self.EP2]))
+        for c in calls:
+            d = json.loads(c["data"])
+            self.assertEqual(sorted(d), ["name", "status", "tag", "type"])
+            self.assertEqual((d["type"], d["status"], d["name"], d["tag"]),
+                             ("resolved", status, "svc", f"secret-{rid[:8]}"))
+            for leak in (rid, "127.0.0.1", "SVC_TOKEN", "token", "rid", "http"):
+                self.assertNotIn(leak, c["data"])
+
+    def test_dashboard_approve(self):
+        rid = self.ask()
+        self.wait_notified()
+        self.assertEqual(self.decide(rid, "approve")[0], 303)
+        self.assertEqual(self.result(rid)["status"], "approved")
+        self.check_one_per_sub("approved", rid)
+
+    def test_dashboard_deny(self):
+        rid = self.ask()
+        self.wait_notified()
+        self.assertEqual(self.decide(rid, "deny")[0], 303)
+        self.check_one_per_sub("denied", rid)
+
+    def test_push_decide(self):
+        rid = self.ask()
+        self.wait_notified()
+        d = self.payloads()[0]
+        self.assertEqual(self.pd({"rid": rid, "token": d["token"], "decision": "deny"})[0], 200)
+        self.check_one_per_sub("denied", rid)
+
+    def test_expiry(self):
+        rid = self.ask()
+        self.wait_notified()
+        self.broker._by_id[rid].expires = time.time() - 1
+        with self.broker._lock:
+            self.broker._expire_locked()
+        self.check_one_per_sub("expired", rid)
+
+    def test_failed(self):
+        rid = self.ask()
+        self.wait_notified()
+        self.broker._finish(self.broker._by_id[rid], "failed", error="release failed: SEKRIT")
+        self.check_one_per_sub("failed", rid)
+        self.assertNotIn("SEKRIT", json.dumps(self.payloads()))
+
+    def test_a_resolved_push_is_sent_only_once(self):
+        rid = self.ask()
+        self.wait_notified()
+        self.decide(rid, "deny")
+        self.resolved_calls(2)
+        self.broker.notifier.resolved(self.broker._by_id[rid].notification, "denied")
+        self.assertEqual(len(self.resolved_calls()), 2)
+
+    def test_never_notified_sends_nothing(self):
+        n = t.N("t", "m", "u", "secret-never", names=["svc"])
+        webpush.WebPushNotifier(self.store).resolved(n, "approved")
+        self.assertEqual(self.sender.calls, [])
+
+    def test_not_delivered_sends_nothing_later(self):
+        self.sender.fail = {EP: 500, self.EP2: 500}
+        n = t.N("t", "m", "u", "secret-x", names=["svc"])
+        notifier = webpush.WebPushNotifier(self.store)
+        with self.assertRaises(NotifyError):
+            notifier.send(n)
+        self.sender.calls.clear()
+        notifier.resolved(n, "approved")
+        self.assertEqual(self.sender.calls, [])
+
+    def test_unknown_status_sends_nothing(self):
+        n = t.N("t", "m", "u", "secret-y", names=["svc"])
+        notifier = webpush.WebPushNotifier(self.store)
+        notifier.send(n)
+        self.sender.calls.clear()
+        notifier.resolved(n, "pending")
+        notifier.resolved(n, "<script>")
+        self.assertEqual(self.sender.calls, [])
+
+    def test_dead_subscription_is_pruned(self):
+        rid = self.ask()
+        self.wait_notified()
+        self.sender.fail = {self.EP2: 410}
+        self.decide(rid, "approve")
+        self.resolved_calls(2)
+        self.assertEqual(len(self.store.devices()), 1)
+
+    def test_failing_transport_does_not_change_the_outcome(self):
+        def sender(sub, data, *a):
+            if json.loads(data).get("type") == "resolved":
+                raise RuntimeError("SEKRIT")
+        rid = self.ask()
+        self.wait_notified()
+        self.store._send = sender
+        self.assertEqual(self.decide(rid, "approve")[0], 303)
+        self.assertEqual(self.result(rid)["status"], "approved")
+        time.sleep(0.4)
+        with open(self.audit) as f:
+            self.assertNotIn("SEKRIT", f.read())
+
+    def test_slow_transport_does_not_block_the_settle_path(self):
+        def sender(sub, data, *a):
+            if json.loads(data).get("type") == "resolved":
+                time.sleep(3)
+        rid = self.ask()
+        self.wait_notified()
+        self.store._send = sender
+        t0 = time.time()
+        self.assertEqual(self.decide(rid, "deny")[0], 303)
+        self.assertLess(time.time() - t0, 2.5)
+        self.assertEqual(self.result(rid)["status"], "denied")
+
+    def test_transport_that_did_not_send_is_not_told(self):
+        rid = self.ask()
+        self.wait_notified()
+        req = self.broker._by_id[rid]
+        req._sent_to = []                   # as for a presence-held transport
+        self.sender.calls.clear()
+        self.broker._call_resolved(req, "denied")
+        self.assertEqual(self.resolved_calls(), [])
+
+
+class ResolvedWorker(unittest.TestCase):
+    """The service worker side of a resolved push (source assertions and a node simulation)."""
+
+    RESOLVED_HARNESS = r"""
+const fs=require('fs');
+const src=fs.readFileSync(process.argv[2],'utf8');
+const old=process.argv[3]==='old', payload=JSON.parse(process.argv[4]);
+const listeners={}, shown=[], closed=[], fetches=[];
+let live=old?[{tag:payload.tag,close(){closed.push('old');}}]:[];
+global.setTimeout=(f,ms)=>{return setImmediate(f);};
+const reg={showNotification:(t,o)=>{shown.push({t,o,liveAtShow:live.length});
+    live=[{tag:o.tag,close(){closed.push('new');live=[];}}];return Promise.resolve();},
+  getNotifications:()=>Promise.resolve(live.slice())};
+global.self={addEventListener:(n,f)=>{listeners[n]=f;},registration:reg,
+  clients:{matchAll:()=>Promise.resolve([]),claim:()=>Promise.resolve()},skipWaiting:()=>Promise.resolve()};
+global.fetch=(u,o)=>{fetches.push(u+' '+(o&&o.body||''));return Promise.resolve({status:204});};
+new Function(src).call(global);
+(async()=>{
+  let p;
+  listeners.push({data:{json:()=>payload},waitUntil:(x)=>{p=x;}});
+  await p;
+  console.log(JSON.stringify({shown,closed,fetches,left:live.length}));
+})();
+"""
+
+    def run_resolved(self, old, payload):
+        import subprocess
+        import shutil
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is not installed")
+        d = tempfile.mkdtemp()
+        with open(os.path.join(d, "sw.js"), "w") as f:
+            f.write(broker_mod._SERVICE_WORKER)
+        with open(os.path.join(d, "h.js"), "w") as f:
+            f.write(self.RESOLVED_HARNESS)
+        r = subprocess.run([node, os.path.join(d, "h.js"), os.path.join(d, "sw.js"),
+                            "old" if old else "none", json.dumps(payload)],
+                           capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.loads(r.stdout.strip().splitlines()[-1])
+
+    def test_version_bumped_and_old_version_gone(self):
+        self.assertEqual(broker_mod.SW_VERSION, "8")
+        self.assertIn("SW_VERSION='8'", broker_mod._SERVICE_WORKER)
+        self.assertNotIn("SW_VERSION='7'", broker_mod._SERVICE_WORKER)
+
+    def test_source_has_replace_then_close_logic(self):
+        js = broker_mod._SERVICE_WORKER
+        for needle in ("d.type==='resolved'", "getNotifications({tag:tag})", "renotify:false",
+                       "silent:true", "setTimeout(res,1000)", "n.close()",
+                       "e.waitUntil(resolvedPush(d))"):
+            self.assertIn(needle, js)
+        for needle in ("notificationclose", "notificationclick", "/push/decide", "action_decide"):
+            self.assertIn(needle, js)
+
+    def test_resolved_replaces_then_closes_names_only(self):
+        for status, word in (("approved", "Approved"), ("denied", "Denied"), ("expired", "Expired"),
+                             ("failed", "Failed"), ("released", "Released")):
+            out = self.run_resolved(True, {"type": "resolved", "tag": "secret-abc",
+                                           "status": status, "name": "svc"})
+            (n,) = out["shown"]
+            self.assertEqual(n["t"], f"{word}: svc")
+            o = n["o"]
+            self.assertEqual((o["tag"], o["renotify"], o["silent"], o["requireInteraction"]),
+                             ("secret-abc", False, True, False))
+            self.assertNotIn("actions", o)
+            self.assertEqual(n["liveAtShow"], 1)
+            self.assertEqual(out["left"], 0)            # closed again, nothing lingers
+            self.assertEqual(out["closed"], ["new"])
+
+    def test_resolved_without_an_old_notification_still_shows_then_closes(self):
+        out = self.run_resolved(False, {"type": "resolved", "tag": "secret-abc",
+                                        "status": "denied", "name": "svc"})
+        self.assertEqual(len(out["shown"]), 1)
+        self.assertEqual(out["left"], 0)
+
+    def test_unknown_status_is_plain_and_does_not_throw(self):
+        out = self.run_resolved(True, {"type": "resolved", "tag": "secret-abc",
+                                       "status": "constructor", "name": ""})
+        self.assertEqual(out["shown"][0]["t"], "Closed")
+        self.assertEqual(out["left"], 0)
 
 
 if __name__ == "__main__":
