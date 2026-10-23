@@ -15,6 +15,7 @@ import urllib.parse
 import urllib.request
 
 from . import guidance as guidance_mod
+from . import keyprovider
 from . import scripts as scripts_mod
 from . import sshkey
 
@@ -69,7 +70,7 @@ def describe(mode, names, spec, max_content_chars=300, send_content=True):
 class OpenRouterSummarizer:
     def __init__(self, api_key, model, timeout=4.0, max_content_chars=300, send_content=True,
                  base_url="https://openrouter.ai/api/v1"):
-        self._key, self._model, self._timeout = api_key, model, timeout
+        self._key, self._model, self._timeout = keyprovider.as_provider(api_key), model, timeout
         self._max, self._send, self._base = max_content_chars, send_content, base_url.rstrip("/")
 
     def analyze(self, mode, names, spec, guidance=None):
@@ -86,9 +87,12 @@ class OpenRouterSummarizer:
             "temperature": 0,
             "reasoning": {"effort": "minimal"},
         }
+        key = self._key.get()
+        if not key:
+            return None             # no usable key: same as a provider failure
         req = urllib.request.Request(
             f"{self._base}/chat/completions", data=json.dumps(payload).encode(),
-            headers={"Authorization": f"Bearer {self._key}", "Content-Type": "application/json"})
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
         try:
             with urllib.request.urlopen(req, timeout=self._timeout) as r:
                 text = json.load(r)["choices"][0]["message"]["content"]
