@@ -3509,7 +3509,7 @@ _DASH_JS = _KEEP_JS + _DASH_JS + proposals_mod.JS_INIT
 
 # Single source of truth for the worker version: rendered into the worker, the
 # X-SW-Version header on /sw.js, and the Settings page ("expected" version).
-SW_VERSION = "7"
+SW_VERSION = "8"
 
 _SERVICE_WORKER = r"""
 var SW_VERSION='__SW_VERSION__';
@@ -3539,8 +3539,33 @@ self.addEventListener('install',function(e){
 self.addEventListener('activate',function(e){
   e.waitUntil(self.clients.claim().then(function(){return rep('sw_activate');},
     function(){return rep('sw_activate',{ok:false});}));});
+// A settled request: replace the notification under its tag with a brief,
+// silent, button-less one and close it. Every push must show something
+// (userVisibleOnly; iOS revokes subscriptions that do not), so even with no
+// old notification to clear we show then close.
+function resolvedPush(d){
+  var tag=String(d.tag||'secret-resolved').slice(0,64),t0=Date.now();
+  var words={approved:'Approved',denied:'Denied',expired:'Expired',failed:'Failed',released:'Released'};
+  var word=Object.prototype.hasOwnProperty.call(words,d.status)?words[d.status]:'Closed';
+  var name=String(d.name||'').slice(0,120);
+  delete T0[tag];
+  function closeAll(){return self.registration.getNotifications({tag:tag}).then(function(ns){
+    ns.forEach(function(n){try{n.close();}catch(x){}});return ns.length;},function(){return 0;});}
+  var p=self.registration.getNotifications({tag:tag}).then(function(old){return old.length;},
+    function(){return 0;}).then(function(had){
+    return self.registration.showNotification(word+(name?': '+name:''),{body:'',tag:tag,
+      renotify:false,silent:true,requireInteraction:false,data:{url:'/'}}).then(function(){
+      return new Promise(function(res){setTimeout(res,1000);});
+    }).then(closeAll).then(function(){
+      return rep('resolved',{ok:true,tag:tag,note:String(d.status||'').slice(0,12)+(had?'':' none'),
+        ms:Date.now()-t0});
+    },function(err){return rep('resolved',{ok:false,tag:tag,err:em(err),ms:Date.now()-t0});});
+  });
+  return p.catch(function(){});
+}
 self.addEventListener('push',function(e){
   var d={},parsed=true;try{d=e.data.json();}catch(x){parsed=false;}
+  if(parsed&&d&&d.type==='resolved'){e.waitUntil(resolvedPush(d));return;}
   var tag=d.tag||'secret-request',t0=Date.now();T0[tag]=t0;
   tell({type:'diag',what:'push received',v:SW_VERSION});
   var r1=rep('push',{ok:parsed,tag:tag});
