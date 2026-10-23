@@ -368,7 +368,9 @@ class PlansMixin:
         out = _exchange_frozen(done, list(env.values()), self._tls_policy(req.names),
                                timeout=max(1, min(30, math.ceil(left))), guard=self.dest_guard,
                                entries=self._dest_entries(req.names))
-        self.audit("http_executed", req, upstream_status=out["status"], response_bytes=len(out["body"]),
+        over = out.pop("_over_budget", False)
+        self.audit("http_executed", req, masked_over_budget=over, upstream_status=out["status"],
+                   response_bytes=len(out["body"]),
                    duration_ms=int((time.time() - t0) * 1000))
         # Re-check after the upstream answered (the sessions rule): a revoked client, or a plan that was
         # revoked, closed or ran out of time mid-flight, never gets the response.

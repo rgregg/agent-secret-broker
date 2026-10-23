@@ -3230,7 +3230,8 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         if cat is not None:     # raised outside the handler: nothing is chained to the original exception
             self.audit("http_failed", req, error=errclass.public(cat), reason_class=cat)   # reason: operator only
             raise errclass.ReleaseFailed(cat)
-        self.audit("http_executed", req, upstream_status=out["status"],
+        over = out.pop("_over_budget", False)
+        self.audit("http_executed", req, masked_over_budget=over, upstream_status=out["status"],
                    response_bytes=len(out["body"]), duration_ms=int((time.time() - t0) * 1000))
         return {"http": out}
 
@@ -3427,7 +3428,7 @@ def _exchange(req, values, tls, strip_cookies=False, timeout=30, guard=None, ent
     masked BEFORE it is cut to MAX_RESPONSE_BYTES, and a straddling prefix of a secret is masked too."""
     if guard is None:
         guard = destguard.DestGuard.from_config({})
-    masker = masking.Masker(list(values) + list(guard.mask_values))
+    masker = masking.get_masker(list(values) + list(guard.mask_values))
     want = MAX_RESPONSE_BYTES + masker.margin
     try:
         with _opener_for(tls, guard, entries).open(req, timeout=timeout) as r:
@@ -3439,6 +3440,7 @@ def _exchange(req, values, tls, strip_cookies=False, timeout=30, guard=None, ent
         "status": status,
         "headers": {k: masker.mask(v) for k, v in headers.items()},
         "body": masker.body(body, MAX_RESPONSE_BYTES),
+        "_over_budget": masker.over_budget,       # popped by the caller: operator audit only, never the agent
     }
 
 

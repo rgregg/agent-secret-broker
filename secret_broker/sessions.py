@@ -736,7 +736,7 @@ def run_http(sess, spec, env, tls, allowed_now, opener_for, clock, state):
         timeout = min(CALL_TIMEOUT_S, max(0.1, sess.expires - clock()))
     r = urllib.request.Request(url, data=data, method=method, headers=headers)
     t0 = time.monotonic()
-    margin = masking.Masker(list(env.values()) + before).margin + 4096    # read past the cut: mask, then cut
+    margin = masking.get_masker(list(env.values()) + before).margin + 4096    # read past the cut: mask, then cut
     try:
         with opener_for(tls).open(r, timeout=timeout) as resp:
             status, msg, body = resp.status, resp.headers, _read_bounded(resp, sess, clock, t0, READ_LIMIT + margin)
@@ -787,14 +787,14 @@ def run_http(sess, spec, env, tls, allowed_now, opener_for, clock, state):
         # set or offered (even if a cap or rule rejected it), and what is held now
         secret_values = (list(env.values()) + before + seen_values + sess.jar.values()
                          + list(sess.captures.values()))
-    masker = masking.Masker(secret_values)
+    masker = masking.get_masker(secret_values)
     out_headers = {}
     for k, v in msg.items():
         if k.lower() in ("set-cookie", "set-cookie2"):
             continue
         out_headers[k] = masker.mask(v)
     out = {"status": status, "headers": out_headers, "body": masker.body(body, READ_LIMIT)}
-    return out, {"captured": sorted(caps), "missing": sorted(set(missing))}
+    return out, {"captured": sorted(caps), "missing": sorted(set(missing)), "_over_budget": masker.over_budget}
 
 
 def scope_problem(s, sc, names, method, spec, capture_names=()):
@@ -1397,7 +1397,8 @@ class SessionsMixin:
             err = OSError("upstream call failed (" + cls + ")")
             err.public = "upstream call failed (" + cls + ")"
             raise err from None
-        self.audit("http_executed", req, upstream_status=out["status"], response_bytes=len(out["body"]),
+        over = info.pop("_over_budget", False)
+        self.audit("http_executed", req, masked_over_budget=over, upstream_status=out["status"], response_bytes=len(out["body"]),
                    duration_ms=int((clock_mod.now() - t0) * 1000), session=s.pid)
         left = max(0, int(s.expires - self.sessions_clock()))
         return {"http": out, "session": {**info, "calls_left": max(0, s.max_calls - s.calls), "expires_in": left}}

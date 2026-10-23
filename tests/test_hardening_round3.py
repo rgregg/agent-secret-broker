@@ -81,27 +81,54 @@ class MaskerSpellings(unittest.TestCase):
                         self.assertEqual(m.mask("x" + enc + "y"), "x***y", (v, name))
 
     def test_every_form_is_used_and_it_is_fast(self):
-        values = [f"secret-value-number-{i:03d}-" + "xyz" * 5 for i in range(100)]
+        values = [f"secret-value-number-{i:03d}-" + "xyz" * 5 for i in range(40)]
         t0 = time.time()
         m = masking.Masker(values)
         want = set()
         for v in values:
             want |= masking.forms_of(v)
         self.assertEqual(set(m.forms), want)                       # nothing dropped
-        self.assertGreater(len(m.forms), 400)
+        self.assertFalse(m.over_budget)
         body = ("lorem ipsum dolor sit amet " * 80000)[:2_000_000]
-        out = m.mask(body + values[7] + " " + base64.b64encode(values[42].encode()).decode())
+        out = m.mask(body + values[7] + " " + base64.b64encode(values[22].encode()).decode())
         elapsed = time.time() - t0
         self.assertTrue(out.endswith("*** ***"), out[-30:])
-        self.assertLess(elapsed, 0.8, elapsed)                     # (about 0.4 s on an idle machine, 100 secrets)
+        self.assertLess(elapsed, 0.6, elapsed)                     # (about 0.25 s on an idle machine)
 
-    def test_over_budget_fails_closed(self):
-        with mock.patch.object(masking, "OVER_BUDGET", 5):
-            m = masking.Masker([S])
+    def test_over_budget_withholds_instead_of_dropping_forms(self):
+        many = [f"secret-value-number-{i:03d}-" + "xyz" * 5 for i in range(100)]      # ~3000 forms
+        m = masking.Masker(many)
         self.assertTrue(m.over_budget)
+        self.assertEqual(m.forms, [])
         self.assertEqual(m.body(b"harmless text", 100), masking.WITHHELD)
         self.assertEqual(m.mask("any header value"), "***")
         self.assertEqual(m.mask(""), "")
+        for knob, val in (("MAX_VALUES", 2), ("MAX_FORMS", 5), ("MAX_TOTAL_CHARS", 50)):
+            with mock.patch.object(masking, knob, val):
+                mm = masking.Masker([S, S + "x", S + "y"])
+            self.assertTrue(mm.over_budget, knob)
+            self.assertEqual(mm.body((S + " ").encode() * 10, 1000), masking.WITHHELD, knob)
+        with mock.patch.object(masking, "MAX_SPANS", 3):                  # too many occurrences in one text
+            mm = masking.Masker([S])
+            self.assertFalse(mm.over_budget)
+            self.assertEqual(mm.mask((S + " ") * 10), "***")
+            self.assertEqual(mm.mask(S + " " + S), "*** ***")             # (under the span cap: masked normally)
+
+    def test_construction_never_raises(self):
+        for vals in ([], [""], [None, 5, b"x"], ["abc"], [S] * 1000 + [None]):
+            m = masking.Masker(vals)
+            self.assertIsInstance(m.mask("hello"), str)
+            self.assertIsInstance(m.body(b"hello", 3), str)
+        self.assertEqual(masking.Masker([]).mask("abc"), "abc")
+        self.assertEqual(masking.Masker([]).body(b"abc", 10), "abc")
+        self.assertEqual(masking.get_masker([]).mask_head("abcdef"), "abcdef")
+
+    def test_cache_returns_the_same_masker_and_is_bounded(self):
+        a = masking.get_masker([S, "other-secret-value"])
+        self.assertIs(a, masking.get_masker(["other-secret-value", S]))
+        for i in range(20):
+            masking.get_masker([f"unique-secret-{i}-value"])
+        self.assertLessEqual(len(masking._CACHE), masking._CACHE_SIZE)
 
     def test_leading_suffix_and_trailing_prefix(self):
         m = masking.Masker([S])
@@ -109,6 +136,94 @@ class MaskerSpellings(unittest.TestCase):
         self.assertEqual(m.body(b"abcd and more", 1000), "abcd and more")
         out = m.body(b"A" * 20 + S.encode(), 20 + 9)
         self.assertNotIn(S[:4], out)
+
+
+class MaskerProperties(unittest.TestCase):
+    ALPHA = "ab+/"
+
+    @staticmethod
+    def reference(text, forms):
+        """Per position: how far the longest form starting there reaches; mask the union."""
+        cover = [False] * len(text)
+        for i in range(len(text)):
+            reach = max((len(f) for f in forms if text.startswith(f, i)), default=0)
+            for j in range(i, i + reach):
+                cover[j] = True
+        out, run = [], False
+        for ch, c in zip(text, cover):
+            if c:
+                if not run:
+                    out.append("***")
+                run = True
+            else:
+                out.append(ch)
+                run = False
+        return "".join(out)
+
+    def test_against_a_naive_reference(self):
+        import random
+        rnd = random.Random(7)
+        for case in range(4000):
+            forms = {"".join(rnd.choice(self.ALPHA) for _ in range(rnd.randint(4, 9))) for _ in range(rnd.randint(1, 6))}
+            if rnd.random() < 0.5:                                        # forms that are substrings of other forms
+                big = max(forms, key=len)
+                forms.add(big[1:-1] if len(big) >= 6 else big)
+            parts = []
+            for _ in range(rnd.randint(0, 8)):                            # overlapping, adjacent, nested occurrences
+                parts.append(rnd.choice(sorted(forms)) if rnd.random() < 0.7 else "".join(
+                    rnd.choice(self.ALPHA) for _ in range(rnd.randint(1, 5))))
+                if parts and rnd.random() < 0.4:
+                    parts[-1] = parts[-1][rnd.randint(0, 2):]             # clipped, so neighbours overlap
+            text = "".join(parts)
+            m = masking.Masker.from_forms(forms)
+            got = m.mask(text)
+            self.assertEqual(got, self.reference(text, m.forms), (case, forms, text))
+            for f in m.forms:
+                self.assertNotIn(f, got.replace("***", "\0"))
+
+    def test_start_end_and_cut(self):
+        m = masking.Masker.from_forms(["secretvalue"])
+        self.assertEqual(m.mask("secretvalue"), "***")
+        self.assertEqual(m.mask("secretvaluesecretvalue"), "***")
+        self.assertEqual(m.mask("xsecretvaluesecretvaluex"), "x***x")
+        for cut in range(5, 30):
+            body = (b"A" * 10 + b"secretvalue" + b"B" * 10)
+            out = m.body(body, cut)
+            self.assertNotIn("secr", out, cut)
+            self.assertNotIn("alue", out.replace("***", ""), cut)
+        for k in range(1, 11):                                            # a body that starts inside the secret
+            out = m.body(b"secretvalue"[k:] + b" rest", 100)
+            if len("secretvalue"[k:]) >= 4:
+                self.assertTrue(out.startswith("***"), (k, out))
+
+    def test_tail_and_head_agree_with_a_scan(self):
+        import random
+        rnd = random.Random(11)
+        for _ in range(2000):
+            forms = ["".join(rnd.choice("ab") for _ in range(rnd.randint(5, 9))) for _ in range(3)]
+            m = masking.Masker.from_forms(forms)
+            text = "".join(rnd.choice("ab") for _ in range(rnd.randint(0, 14)))
+            want_tail = max((k for f in m.forms for k in range(4, len(f)) if text.endswith(f[:k])), default=0)
+            got = m.mask_tail(text)
+            self.assertEqual(got, text[:len(text) - want_tail] + "***" if want_tail else text, (forms, text))
+            want_head = max((k for f in m.forms for k in range(4, len(f)) if text.startswith(f[-k:]) and len(text) >= k),
+                            default=0)
+            got = m.mask_head(text)
+            self.assertEqual(got, "***" + text[want_head:] if want_head else text, (forms, text))
+
+
+class OverBudgetIsAuditedForTheOperator(hf.lr.HttpBase):
+    def test_body_withheld_status_and_headers_kept(self):
+        masking._CACHE.clear()
+        with mock.patch.object(masking, "MAX_FORMS", 3):
+            fo = hf.FakeOpener(lambda req: hf.Resp(b"upstream body", 201, [("X-Thing", "v")]))
+            with hf.patched(fo):
+                code, got, rid = self.go()
+        masking._CACHE.clear()
+        self.assertEqual(got["http"]["status"], 201)
+        self.assertEqual(got["http"]["body"], masking.WITHHELD)
+        self.assertNotIn("_over_budget", json.dumps(got))
+        self.assertTrue(self.events("http_executed")[-1]["masked_over_budget"])
 
 
 class RangeEcho(unittest.TestCase):

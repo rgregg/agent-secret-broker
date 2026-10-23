@@ -9,8 +9,9 @@ alignments an embedded occurrence can have), base32, hex, another case, or one l
   the unambiguous encodings (hex, base64, base32, double URL-encoding) for every value of 4+ characters, and the
   spellings that collide with ordinary text (case folding, JSON, URL and HTML escapes) only for values of 6+, so a
   4-character secret such as `true` or `name` does not corrupt ordinary JSON. Values under 4 characters are never masked.
-* Every form is used. Many forms are searched with one compiled prefix tree; beyond OVER_BUDGET (20000) forms the
-  response is withheld whole (WITHHELD) rather than masked partly.
+* Every form is used, found with plain `str.find`; overlapping and adjacent spans are merged and replaced in one
+  pass. Beyond MAX_VALUES / MAX_FORMS / MAX_TOTAL_CHARS / MAX_SPANS the response is withheld whole (WITHHELD),
+  never masked partly.
 * Base64: the value, and `Bearer `/`Token `/`Basic ` + value, are encoded with 0, 1 and 2 unknown bytes before
   them; the leading characters that depend on those bytes and the trailing character of a partial group are
   dropped, in standard and URL-safe alphabets, so the remainder appears wherever the secret does. (Base32 is
@@ -22,14 +23,17 @@ alignments an embedded occurrence can have), base32, hex, another case, or one l
 import base64
 import html
 import json
-import re
+import threading
+from collections import OrderedDict
 import urllib.parse
 
 MIN_LEN = 4
 MIN_DERIVED = 8
 MIN_DERIVED_SOURCE = 6      # (and the value itself must have at least this many characters)
-OVER_BUDGET = 20000       # forms in one response; beyond this the whole response is withheld, never partly masked
-TRIE_ABOVE = 150          # more forms than this: one compiled prefix tree instead of a substring test per form
+MAX_VALUES = 200          # secret values in one response's masker
+MAX_FORMS = 2000          # forms in one response ...
+MAX_TOTAL_CHARS = 400_000     # ... and their summed length; beyond either the response is withheld, never partly masked
+MAX_SPANS = 200_000       # occurrences in one text
 MARK = "***"
 WITHHELD = "*** (response withheld: too many credential values to mask it safely)"
 
@@ -93,100 +97,155 @@ def forms_of(value):
     return raw | der
 
 
-def _trie_pattern(words):
-    root = {}
-    for w in words:
-        d = root
-        for c in w:
-            d = d.setdefault(c, {})
-        d[""] = 1
-
-    def rx(d):
-        if "" in d and len(d) == 1:
-            return ""
-        alts = [re.escape(c) + rx(sub) for c, sub in sorted(d.items()) if c != ""]
-        r = alts[0] if len(alts) == 1 else "(?:" + "|".join(alts) + ")"
-        return "(?:" + r + ")?" if "" in d else r
-    return rx(root)
-
-
 class Masker:
-    """Every form of every value is used: nothing is dropped to save time. Cost is bounded by how the
-    search is done (a substring test per form for a few forms, one compiled prefix tree for many), and
-    beyond OVER_BUDGET forms the response is withheld whole (`over_budget`) rather than masked partially."""
+    """Plain, auditable matching: for each form, find ALL its occurrences in the ORIGINAL text with
+    `str.find`, merge the overlapping and adjacent spans, replace the merged spans with the mark in one pass.
+    Nothing is leftmost-first, so overlapping or nested forms can never leave a fragment behind.
+
+    Bounded work: at most MAX_VALUES values, MAX_FORMS forms and MAX_TOTAL_CHARS summed form length per
+    response, and at most MAX_SPANS spans per text. Beyond any of them the response is WITHHELD whole
+    (`over_budget`); forms are never dropped. Construction never raises: an empty list is a masker that
+    matches nothing, and a failure while building the forms is an over-budget masker."""
 
     def __init__(self, values):
-        forms, seen = [], set()
-        for v in values:
-            r, d = split_forms(v)
-            for f in sorted(r) + sorted(d):
-                if f not in seen:
-                    seen.add(f)
-                    forms.append(f)
-        self.forms = sorted(forms, key=len, reverse=True)
+        self.forms, self.over_budget, self.max_len = [], False, 0
+        self._first, self._last = {}, {}
+        try:
+            vals = [v for v in values if isinstance(v, str) and len(v) >= MIN_LEN]
+            vals = list(dict.fromkeys(vals))
+            if len(vals) > MAX_VALUES:
+                self.over_budget = True
+                return
+            seen, total = set(), 0
+            for v in vals:
+                r, d = split_forms(v)
+                for f in sorted(r) + sorted(d):
+                    if f not in seen:
+                        seen.add(f)
+                        total += len(f)
+                if len(seen) > MAX_FORMS or total > MAX_TOTAL_CHARS:
+                    self.over_budget = True
+                    return
+            self.forms = sorted(seen, key=len, reverse=True)
+        except Exception:       # noqa: BLE001 -- fail closed, never raise from construction
+            self.forms, self.over_budget = [], True
+        self._index()
+
+    def _index(self):
         self.max_len = max((len(f) for f in self.forms), default=0)
-        self.over_budget = len(self.forms) > OVER_BUDGET
-        self._rx = None
-        self._long = []
-        if len(self.forms) > TRIE_ABOVE and not self.over_budget:
-            short = [f for f in self.forms if len(f) <= 300]
-            self._long = [f for f in self.forms if len(f) > 300]
-            try:
-                self._rx = re.compile(_trie_pattern(short))
-            except (re.error, RecursionError, OverflowError):
-                self._rx, self._long = None, []
+        self._first, self._last = {}, {}
+        for f in self.forms:
+            self._first.setdefault(f[:MIN_LEN], []).append(f)
+            self._last.setdefault(f[-MIN_LEN:], []).append(f)
+
+    @classmethod
+    def from_forms(cls, forms):
+        """A masker over exactly these forms (4+ characters each); the seam the property tests use."""
+        m = cls([])
+        m.forms = sorted({f for f in forms if isinstance(f, str) and len(f) >= MIN_LEN}, key=len, reverse=True)
+        m._index()
+        return m
 
     @property
     def margin(self):
         """Extra bytes to read past a cut so a secret straddling it is seen whole."""
         return 4 * self.max_len + 16
 
-    def mask(self, text):
-        if self.over_budget:
-            return MARK if text else text
-        if self._rx is not None:
-            text = self._rx.sub(MARK, text)
-            for f in self._long:
-                if f in text:
-                    text = text.replace(f, MARK)
-            return text
+    def _spans(self, text):
+        """Merged (start, end) spans of every occurrence of every form in `text`; None when over the span budget."""
+        spans = []
         for f in self.forms:
-            if f in text:
-                text = text.replace(f, MARK)
-        return text
+            i = text.find(f)
+            while i >= 0:
+                spans.append((i, i + len(f)))
+                if len(spans) > MAX_SPANS:
+                    return None
+                i = text.find(f, i + 1)
+        spans.sort()
+        merged = []
+        for st, en in spans:
+            if merged and st <= merged[-1][1]:          # overlapping or adjacent
+                if en > merged[-1][1]:
+                    merged[-1] = (merged[-1][0], en)
+            else:
+                merged.append((st, en))
+        return merged
+
+    def mask(self, text):
+        if not text:
+            return text
+        if self.over_budget:
+            return MARK
+        if not self.forms:
+            return text
+        spans = self._spans(text)
+        if spans is None:
+            return MARK
+        if not spans:
+            return text
+        out, pos = [], 0
+        for st, en in spans:
+            out.append(text[pos:st])
+            out.append(MARK)
+            pos = en
+        out.append(text[pos:])
+        return "".join(out)
 
     def mask_tail(self, text):
-        """Mask a trailing proper prefix (4+ chars) of any form at the end of `text`."""
-        for f in self.forms:
-            for n in range(min(len(f) - 1, len(text)), MIN_LEN - 1, -1):
-                if text.endswith(f[:n]):
-                    return text[:-n] + MARK
+        """Mask a trailing proper prefix (4+ chars) of any form at the end of `text` (the longest one)."""
+        for k in range(min(len(text), self.max_len - 1), MIN_LEN - 1, -1):
+            tail = text[-k:]
+            for f in self._first.get(tail[:MIN_LEN], ()):
+                if len(f) > k and f.startswith(tail):
+                    return text[:-k] + MARK
         return text
 
     def mask_head(self, text):
-        """Mask a leading proper suffix (4+ chars) of any form at the very start of `text`."""
-        for f in self.forms:
-            for n in range(min(len(f) - 1, len(text)), MIN_LEN - 1, -1):
-                if text.startswith(f[-n:]):
-                    return MARK + text[n:]
+        """Mask a leading proper suffix (4+ chars) of any form at the very start of `text` (the longest one)."""
+        for k in range(min(len(text), self.max_len - 1), MIN_LEN - 1, -1):
+            head = text[:k]
+            for f in self._last.get(head[-MIN_LEN:], ()):
+                if len(f) > k and f.endswith(head):
+                    return MARK + text[k:]
         return text
 
     def body(self, raw, cut):
-        """Decode `raw` bytes (read up to cut + margin), mask, cut to `cut` bytes, then mask a
-        straddling tail and a leading partial. Returns text."""
+        """Decode `raw` bytes (read up to cut + margin), mask, mask a leading partial, cut to `cut` bytes, then
+        mask a straddling tail. Returns text; WITHHELD when over budget."""
         if self.over_budget:
             return WITHHELD
         text = self.mask(raw.decode("utf-8", "replace"))
-        text = self.mask_head(text) if self.forms else text
+        text = self.mask_head(text)
         enc = text.encode("utf-8")
         if len(enc) > cut:
-            text = enc[:cut].decode("utf-8", "ignore")
-            text = self.mask_tail(text)
+            text = self.mask_tail(enc[:cut].decode("utf-8", "ignore"))
         return text
 
 
+_CACHE = OrderedDict()
+_CACHE_LOCK = threading.Lock()
+_CACHE_SIZE = 8
+
+
+def get_masker(values):
+    """A Masker for these values, from a small LRU keyed by the set of values (building forms is the costly
+    part; the key holds secrets in memory exactly as long as the broker already does)."""
+    key = tuple(sorted({v for v in values if isinstance(v, str) and len(v) >= MIN_LEN}))
+    with _CACHE_LOCK:
+        m = _CACHE.get(key)
+        if m is not None:
+            _CACHE.move_to_end(key)
+            return m
+    m = Masker(key)
+    with _CACHE_LOCK:
+        _CACHE[key] = m
+        while len(_CACHE) > _CACHE_SIZE:
+            _CACHE.popitem(last=False)
+    return m
+
+
 def mask_values(text, values):
-    return Masker(values).mask(text)
+    return get_masker(values).mask(text)
 
 
 def strip_one_newline(value):
