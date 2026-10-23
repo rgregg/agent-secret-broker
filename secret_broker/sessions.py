@@ -49,6 +49,7 @@ from email.utils import parsedate_to_datetime
 
 from .backends import BackendError
 from . import destguard
+from . import masking
 from . import clients as clients_mod
 from . import clock as clock_mod
 from . import credreq as credreq_mod
@@ -417,7 +418,7 @@ def coarse_class(exc):
     if isinstance(exc, destguard.DestinationRefused):
         return "destination not allowed"
     if isinstance(exc, (ValueError, http.client.InvalidURL)):
-        return "invalid_request"
+        return "invalid request"
     if isinstance(exc, (OSError, http.client.HTTPException)):
         return "connection"
     return "other"
@@ -460,9 +461,7 @@ def fill(text, values):
 def mask_values(text, values):
     """Replace every value of MASK_MIN or more characters (longest first) with ***. Shorter values are
     not masked: that would corrupt ordinary words and numbers in a response."""
-    for v in sorted({v for v in values if isinstance(v, str) and len(v) >= MASK_MIN}, key=len, reverse=True):
-        text = text.replace(v, "***")
-    return text
+    return masking.mask_values(text, values)
 
 
 def _origin(url):
@@ -645,12 +644,12 @@ def _alive(sess, clock):
         raise SessionError(*ENDED["expired"])
 
 
-def _read_bounded(resp, sess, clock, t0):
+def _read_bounded(resp, sess, clock, t0, limit=READ_LIMIT):
     """Read at most READ_LIMIT bytes, giving up (TimeoutError) when the session deadline or CALL_TIMEOUT_S passes, so a
     slow-drip upstream cannot hold a call past either. Best effort on the per-read socket timeout too."""
     read = getattr(resp, "read1", None) or resp.read
     chunks, n = [], 0
-    while n < READ_LIMIT:
+    while n < limit:
         left = min(CALL_TIMEOUT_S - (time.monotonic() - t0), sess.expires - clock())
         if left <= 0:
             raise TimeoutError("deadline")
@@ -659,7 +658,7 @@ def _read_bounded(resp, sess, clock, t0):
             sock.settimeout(max(0.1, left))
         except AttributeError:
             pass
-        chunk = read(min(65536, READ_LIMIT - n))
+        chunk = read(min(65536, limit - n))
         if not chunk:
             break
         chunks.append(chunk)
@@ -691,8 +690,9 @@ def run_http(sess, spec, env, tls, allowed_now, opener_for, clock, state):
             data = fill(spec["body"], values).encode("utf-8")
         else:
             data = None
-        url = fill(spec["url"], values)
-        headers = {k: fill(v, values) for k, v in spec["headers"].items()}
+        hvalues = {k: masking.strip_one_newline(v) for k, v in values.items()}   # a header / url never ends in one
+        url = fill(spec["url"], hvalues)
+        headers = {k: fill(v, hvalues) for k, v in spec["headers"].items()}
     except (KeyError, ValueError, UnicodeError):
         raise NotSent("a placeholder or value in this call cannot be used", "session_refused") from None
     # ONE rule: a capture taken from an https response is only ever substituted into an https call (its final url)
@@ -735,12 +735,13 @@ def run_http(sess, spec, env, tls, allowed_now, opener_for, clock, state):
         timeout = min(CALL_TIMEOUT_S, max(0.1, sess.expires - clock()))
     r = urllib.request.Request(url, data=data, method=method, headers=headers)
     t0 = time.monotonic()
+    margin = masking.Masker(list(env.values()) + before).margin + 4096    # read past the cut: mask, then cut
     try:
         with opener_for(tls).open(r, timeout=timeout) as resp:
-            status, msg, body = resp.status, resp.headers, _read_bounded(resp, sess, clock, t0)
+            status, msg, body = resp.status, resp.headers, _read_bounded(resp, sess, clock, t0, READ_LIMIT + margin)
     except urllib.error.HTTPError as e:
         try:
-            status, msg, body = e.code, e.headers, _read_bounded(e, sess, clock, t0)
+            status, msg, body = e.code, e.headers, _read_bounded(e, sess, clock, t0, READ_LIMIT + margin)
         finally:
             e.close()
     caps, missing = {}, []
@@ -785,13 +786,13 @@ def run_http(sess, spec, env, tls, allowed_now, opener_for, clock, state):
         # set or offered (even if a cap or rule rejected it), and what is held now
         secret_values = (list(env.values()) + before + seen_values + sess.jar.values()
                          + list(sess.captures.values()))
+    masker = masking.Masker(secret_values)
     out_headers = {}
     for k, v in msg.items():
         if k.lower() in ("set-cookie", "set-cookie2"):
             continue
-        out_headers[k] = mask_values(v, secret_values)
-    out = {"status": status, "headers": out_headers,
-           "body": mask_values(body.decode("utf-8", "replace"), secret_values)}
+        out_headers[k] = masker.mask(v)
+    out = {"status": status, "headers": out_headers, "body": masker.body(body, READ_LIMIT)}
     return out, {"captured": sorted(caps), "missing": sorted(set(missing))}
 
 
@@ -1356,7 +1357,8 @@ class SessionsMixin:
             elif isinstance(e, BackendError):
                 err = "release failed (credential store)"
             else:
-                err = "upstream call failed (" + coarse_class(e) + ")"
+                err = "upstream call failed (" + ("connection" if coarse_class(e) == "destination not allowed"
+                                                  else coarse_class(e)) + ")"
             self._finish(req, "failed", error=err, via="session")
             return req
         req.call_spec = None
@@ -1378,7 +1380,7 @@ class SessionsMixin:
         s, t0 = req.session, clock_mod.now()
         sc = self.cfg["secrets"].get(req.names[0]) or {}
         try:
-            out, info = run_http(s, req.call_spec, env, self._tls_policy(req.names), set(sc.get("allowed_hosts") or []),
+            out, info = run_http(s, req.call_spec, {**env, **{f"\x00m{i}": v for i, v in enumerate(self.dest_guard.mask_values)}}, self._tls_policy(req.names), set(sc.get("allowed_hosts") or []),
                                  lambda tls: broker_mod._opener_for(tls, self.dest_guard, self._dest_entries(req.names)),
                                  lambda: self.sessions_clock(), req.sess_state)
             with s.lock:                            # last look: nothing survives a revoke, close or the deadline
@@ -1388,8 +1390,9 @@ class SessionsMixin:
         except Exception as e:  # noqa: BLE001 -- class only, never the exception's text
             with s.lock:                            # revoked, closed or past the deadline: say so (exit 7), not a timeout
                 _alive(s, self.sessions_clock)
-            cls = coarse_class(e)
-            self.audit("http_failed", req, error=cls, session=s.pid)
+            real = coarse_class(e)
+            cls = "connection" if real == "destination not allowed" else real    # the agent never learns a guard refusal
+            self.audit("http_failed", req, error=cls, reason_class=real, session=s.pid)
             err = OSError("upstream call failed (" + cls + ")")
             err.public = "upstream call failed (" + cls + ")"
             raise err from None

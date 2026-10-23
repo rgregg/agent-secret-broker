@@ -121,7 +121,7 @@ HIDDEN = frozenset({
     "ssh_hosts_changed", "ssh_hosts_change_refused", "ssh_hosts_change_failed",
     "ha_hook_any_device", "config_warning", "session_sweep_error",
     # destination guard and listener hardening: operator-side events about the broker's own network
-    "dest_guard_config_error", "egress_marker_refused",
+    "dest_guard_config_error", "egress_marker_refused", "config_error", "client_peer_refused",
     # time-boxed grants are approval policy context: a grant-approved request shows as plain "approved"
     "grant_created", "grant_refused", "grant_used", "grant_skipped", "grant_revoked", "grant_expired",
     "grant_dropped", "grants_file_corrupt", "grants_file_write_failed", "standing_change_failed",

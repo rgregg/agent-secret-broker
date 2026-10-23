@@ -334,8 +334,9 @@ class PlansMixin:
                 self._plan_miss(client, plan_id, plans_mod.Miss("no_rule", why=e.why, plan_id=m.plan_id))
             except Exception as e:  # noqa: BLE001 -- the request must always settle; class only
                 cat = error_class(e)
-                self.audit("http_failed", req, error=cat)
-                self._finish(req, "failed", error=_RELEASE_TEXT[cat], **extra)
+                pub = errclass.public(cat)
+                self.audit("http_failed", req, error=pub, reason_class=cat)   # the real reason: operator only
+                self._finish(req, "failed", error=_RELEASE_TEXT[pub], **extra)
             else:
                 self._finish(req, "approved", result=result, **extra)
             return req

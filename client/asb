@@ -69,7 +69,7 @@ EXIT_HTTP_ERROR = 22
 GUIDE = """asb guide (for agents)
 
 Use this instead of reading credential files. Real values never reach you: the
-broker adds them to the call, and output is masked. Every use asks the human to
+broker adds them to the call, and output is masked (set-cookie headers are removed; use a session for cookie flows). Every use asks the human to
 approve on their phone (a few secrets are pre-approved; low-risk ones may be too).
 
 No credential for it yet? If `asb which HOST` / `asb list` show nothing that covers the

@@ -1137,7 +1137,14 @@ them all.
 Peer trust, in order: `"approval_trust_any_peer": true` trusts everyone (the old behaviour; a loud warning
 is logged at every start); otherwise loopback, link-local and every address of the broker's own host or
 container are **never** trusted, whatever `approval_trusted_peers` lists; then `approval_trusted_peers`
-if set; if unset, only private-range peers are accepted (a startup warning recommends setting it). The
+if set; else, if `approval_proxy_secret_file` is set, any other peer (the secret is the check); else NOBODY:
+the listener fails closed (403 to everything, a `config_error` and an ERROR log line at start, no crash).
+`approval_proxy_secret_file` (+ optional `approval_proxy_secret_header`, default `X-ASB-Proxy-Secret`)
+makes every approval-listener request carry that header with a constant-time-equal value, in addition to the
+peer rule when a peer list is set. The secret is deleted from any agent-supplied outbound header, masked in every
+response, and never written to the audit log, logs, status or errors. `/push/decide`, `/presence` and
+`/push/event` also require an `Origin` header (a browser sends one on every same-origin POST, from the page and
+the service worker alike) unless the request carries the secret. Setup has the Authentik recipe. The
 dashboard's CSRF token is bound to an HttpOnly, SameSite=Strict cookie the first page load issues (see
 "Security notes" below), and both listeners refuse any request carrying the broker's own egress marker
 header (`X-Secret-Broker-Egress`, added to every outbound call).
@@ -2269,7 +2276,7 @@ ends its sessions at once.
 - **The checks never depend on a secret.** The header and method-override checks run on what the agent wrote, with credential placeholders replaced
   by a neutral token; captured values (chosen by the upstream, scanned when captured and again after substitution) are substituted. A credential
   whose value contains `method` neither changes the outcome nor produces a different error; a credential value with a line break or other illegal
-  header character gets the same generic `invalid_request` error as any other bad header.
+  header character gets the same generic `invalid request` error as any other bad header.
 - **Method override is refused by one fail-closed rule.** A session call is refused (fixed message, not charged) if the agent's URL path, parameters,
   query or fragment, any header name or value, or its body contains the text `method` (case-insensitive) in any decoded form: raw, up to 5
   rounds of percent-, HTML numeric entity (`&#109;`, `&#x6d;`), `\uXXXX`, `\xNN` and quoted-printable (`=6D`) decoding with NFKC
@@ -2290,7 +2297,7 @@ ends its sessions at once.
   flip the outcome (a refusal before anything is sent, not charged). `set-cookie` headers cannot be captured (use `cookie:NAME`), and a Secure cookie is never
   sent over http.
 - **No free oracle on a secret.** Characters and length of the url and headers are checked on what the agent wrote, before the call is charged. After the
-  credential is substituted the call is charged whatever happens, with one generic `invalid_request` error for any content-dependent failure. At most 100
+  credential is substituted the call is charged whatever happens, with one generic `invalid request` error for any content-dependent failure. At most 100
   placeholders per call in total (a metered refusal). Overdue sessions are swept before the per-client and total caps apply, and an upstream error after
   the deadline or a revoke is `session_expired` (exit 7); the body read is bounded by the deadline.
 - **Bounded work.** URL and header values up to 8192 characters, 50 headers, 100 placeholders of up to 64 characters, body up to 256 KB (a larger body is refused with a fixed message; use plain `asb http` for big uploads: every session body is scanned, so its size is bounded).
@@ -2320,7 +2327,7 @@ ends its sessions at once.
   capture (for example a CSRF header) is an ordinary header and is visible.
 
 **Errors and exit codes.** Messages are fixed text; no exception text reaches an agent, a log, the audit log, history or a
-page (only class names and coarse categories such as `timeout`, `connection`, `tls`, `dns`, `invalid_request`).
+page (only class names and coarse categories such as `timeout`, `connection`, `tls`, `dns`, `invalid request`).
 
 | Situation | HTTP | `code` | `asb` exit |
 |---|---|---|---|
@@ -2851,9 +2858,40 @@ only to the user, never rotated) out of the page and then POST `/decide` for any
   unspecified / own address or a non-canonical IP spelling (`2130706433`, `0x7f.1`, `0177.0.0.1`). Human-edited
   catalog entries keep working unless they name one of those (the host is dropped and `dest_guard_config_error`
   is logged). An IP literal on a port other than 80/443 needs an explicit `host:port` entry in `allowed_hosts`.
-* **Approval listener trust.** Loopback and the broker's own addresses are never trusted; unset
-  `approval_trusted_peers` now means private-range peers only (startup warning);
-  `approval_trust_any_peer: true` restores the old behaviour (loud warning). See Setup, "Upgrading".
+* **Approval listener trust.** Loopback and the broker's own addresses are never trusted. The listener fails
+  closed unless `approval_trusted_peers` and/or `approval_proxy_secret_file` is set (see Setup, "Upgrading"):
+  an RFC 1918 peer is no longer enough, because the agent's own VM is usually inside such a range.
+  `approval_trust_any_peer: true` restores the old behaviour (loud warning). The Docker bridge gateway is not
+  trusted unless listed.
+* **Guard refusals look like failures.** An agent sees a refused destination as `connection` (HTTP, plans,
+  sessions); the real reason (`destination not allowed`) is the `reason_class` of the operator-only `http_failed`
+  audit event, so a call cannot be used to probe which addresses the broker will reach. (Timing still differs
+  from a real connect failure.) `own_ports` adds listener ports for published-port setups. Also blocked: IPv4-mapped
+  and SIIT forms as raw IPv6, `64:ff9b:1::/48`, ISATAP-embedded addresses, 192.0.0.192 (Oracle), 168.63.129.16 (Azure).
+* **Header rules.** On the plain http path an agent may not set `Host` (unless it equals the URL authority),
+  `Content-Length`, `Transfer-Encoding`, `Connection`, `Cookie`, `Upgrade`, `TE`, `Proxy-*` or `X-Secret-Broker-*`,
+  nor two spellings of one header. Sessions and plans keep their allowlists. Error text echoed to the agent and
+  to the `rejected` audit event is printable ASCII, at most 200 characters.
+* **One masker** (`secret_broker/masking.py`) for http, sessions and plans: each credential, cookie and capture
+  value is masked in its raw, JSON-escaped (also with `\/`), URL-encoded, base64 (standard and URL-safe, padded or
+  not, of the value and of `Bearer `/`Token `/`Basic ` + value), hex, lower- and upper-case forms and per line of
+  a multi-line value. Values under 4 characters are never masked. A body is masked before it is cut to the limit
+  (extra bytes are read for that), and a trailing prefix of a secret (4+ characters) at the cut is masked. Not
+  caught: base64 of a substring that starts at another byte alignment, other encodings, a transformed secret. One
+  trailing newline of a credential is dropped when it is placed in a URL or header. `Set-Cookie` is removed from
+  plain http and plan responses (use a session). Request-details and cards replace bidi and zero-width characters
+  for display only. Non-ASCII in URL and header templates is rejected by design (punycode hosts, `%C3%A9` in queries).
+  Failure labels are spelled the same everywhere (`invalid request`, which only means a filled value broke the request).
+* **Real client addresses.** `trusted_proxies` (CIDRs, default none): from those socket peers only, the audit
+  `peer`/`client_ip`, all per-source limits and caps and the enrollment card's source use the first untrusted hop
+  of `X-Forwarded-For` read from the right (a malformed header falls back to the proxy's address). It never feeds a
+  trust decision; loopback and own addresses are ignored with a warning. The CSRF cookie nonce is re-issued when a
+  request arrives without the cookie (a SameSite=Strict cookie is not sent on a cross-site navigation, so the first
+  click from another site shows a freshly minted page; submits from that page work).
+* **Client API gate.** With `trusted_proxies` set, the client API answers 403 `forbidden` to any socket peer outside
+  it (before authentication and before enrollment), audits `client_peer_refused` (once a minute per peer, operator
+  only), and serves `GET /healthz` (`ok`) to loopback / own addresses only. `client_api_allow_direct: true` opts out
+  with a startup warning. The check uses the real peer; also restrict the published port at the host firewall.
 * **Defence in depth.** Every outbound call carries `X-Secret-Broker-Egress: 1` (the agent cannot remove or set
   it); both listeners answer 403 to any request that has it. The CSRF token is derived from the user **and** a
   server-issued HttpOnly, SameSite=Strict cookie nonce (set on the first dashboard GET, bound to the user,

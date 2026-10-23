@@ -85,7 +85,7 @@ Settings are a JSON object in the `BROKER_CONFIG` environment variable of
 | `approve_extra_origins` | Optional. Up to 4 more origins the approval site is reached under (`https://host[:port]`, no path or wildcard). Origin checks accept these as well as `approve_base_url`; links and push stay on `approve_base_url` |
 | `allowed_user` | The SSO username that may approve |
 | `identity_header` | Header your proxy sets with that username (for example `X-authentik-username`, `X-Forwarded-User`) |
-| `approval_trusted_peers` | CIDR of the proxy's network, for example `["172.23.0.0/16"]`. The listener refuses every other caller. **Set this.** Loopback and this host's or container's own addresses are never trusted, whatever you list. When it is unset only peers on private-range addresses are accepted (a secure default that logs a startup warning); see "Upgrading" below |
+| `approval_trusted_peers` and/or `approval_proxy_secret_file` | **Set at least one**, or the approval listener answers 403 to everyone. CIDR of the proxy's network, for example `["172.23.0.0/16"]`, and/or a file with a shared token the proxy adds as `X-ASB-Proxy-Secret`. Loopback and the broker's own addresses are never trusted. See "Upgrading" below |
 | `notify` | One or more transports, see step 5 |
 
 Useful optional keys: `risk.auto_approve_max` (`low`, the default, is
@@ -187,30 +187,72 @@ with "Nothing is waiting for approval". If you get a 403 your proxy is not in
 
 ### Upgrading: who the approval listener trusts, and where the broker may connect
 
-Two defaults changed for security (see the reference, "Security notes"). Check both before you upgrade.
+Defaults changed for security (see the reference, "Security notes"). Check them before you upgrade.
 
-1. **Approval listener peers.** The listener believes the identity header, so it must only hear from your SSO
-   proxy. Before, an unset `approval_trusted_peers` meant "trust every peer". Now:
-   * loopback and every address of the broker's own host or container are **never** trusted, whatever
-     `approval_trusted_peers` lists (the broker's own outbound calls come from there);
-   * `approval_trusted_peers` set: only those CIDRs (minus the addresses above);
-   * unset: only peers on private-range addresses (10/8, 172.16/12, 192.168/16, fc00::/7) are accepted, and a
-     `config_warning` is logged at start. Put the proxy's network in `approval_trusted_peers` to narrow it.
-   * `"approval_trust_any_peer": true` restores the old behaviour (any peer). It logs a loud warning at every
-     start. Use it only while you migrate.
-   If your proxy reaches the broker from a public address, or from `127.0.0.1` (a proxy on the same host with
-   `network_mode: host`, or a published port with the proxy on the Docker host), the approval page now answers
-   403: list the proxy's address in `approval_trusted_peers` (a loopback proxy needs a different topology:
-   put the proxy on the compose network), or set `approval_trust_any_peer` temporarily.
-2. **Destinations.** The broker refuses to connect to loopback, link-local (including 169.254.169.254),
-   unspecified and multicast addresses, to any address of its own interfaces, and to its own listener ports
-   on private addresses; it connects to the address it validated (not a second DNS answer). LAN addresses
-   (10/8, 172.16/12, 192.168/16, 100.64/10) keep working. A credential whose `allowed_hosts` names
-   `localhost`, a loopback or link-local address, or one of the broker's own addresses loses that host at
-   load (a `dest_guard_config_error` is logged); credentials created through requests cannot name them, nor
-   dotless names. An IP-literal destination on a port other than 80 or 443 needs an explicit `host:port`
-   entry in `allowed_hosts` (`"allowed_hosts": ["10.0.0.5:8080"]`). Optional `destination_deny_cidrs` adds
-   ranges of your own to refuse. No outbound call uses an HTTP proxy from the environment any more.
+1. **The approval listener fails closed.** It believes the identity header, so it must only hear
+   from your SSO proxy. It now answers 403 to every request unless you configure at least one of:
+   * `approval_trusted_peers`: the proxy's CIDR(s). May include `100.64.0.0/10` (Tailscale) or any other space.
+   * `approval_proxy_secret_file`: a file holding a long random token (`openssl rand -hex 32`) that your
+     proxy adds to every request in the header `X-ASB-Proxy-Secret` (change the name with
+     `approval_proxy_secret_header`). Every approval-listener request must carry it. With a peer list also set
+     the request must pass both; with only the secret, any peer except loopback and the broker's own
+     addresses is accepted if the secret is right.
+   * or, explicitly, `"approval_trust_any_peer": true` (the old behaviour; a loud warning at every start).
+   Loopback and the broker's own addresses are never trusted, whatever you list. With none of these set the
+   broker still starts and logs a `config_error` / ERROR line ("approval listener is CLOSED").
+   A secret alone is the strongest simple setup if the proxy can add a header; a peer list alone trusts
+   every host in the CIDR (including an agent's VM if it is in it); use both when you can. The Docker bridge
+   gateway is **not** trusted unless you list it.
+
+   *Authentik* (checked against the Authentik docs, "Custom headers"): in the proxy provider's scope, add a
+   **scope mapping** (Customization, Property Mappings) whose expression is
+
+        return {"ak_proxy": {"user_attributes": {"additionalHeaders": {"X-ASB-Proxy-Secret": "<the token>"}}}}
+
+   then select it under the provider's **Additional scopes**. (Static headers can also be set as the
+   `additionalHeaders` attribute of a group or user: `additionalHeaders: {X-ASB-Proxy-Secret: <token>}`;
+   a property mapping's value wins over the attribute.) Not verified here: that the outpost adds the header
+   to every path including its own error pages, and that no Authentik user can edit the attribute for
+   themselves; restrict who may edit user and group attributes. Test with `curl -i` through the proxy
+   and directly (the direct call must be 403). For any other proxy: a plain `proxy_set_header` /
+   `RequestHeader set` of the same header.
+
+   Example live migration: put the proxy's address in `approval_trusted_peers` (for example
+   `["172.23.0.0/16"]`, or `["100.64.0.0/10"]` for a Tailscale proxy), create the secret file, mount it in
+   `compose.yaml`, set `"approval_proxy_secret_file": "/run/secrets/approval_proxy_secret"`, add the header in
+   the proxy, restart, open the approval site and the History page, and check `docker compose logs broker`
+   for no `config_error` lines.
+2. **Real client addresses behind a reverse proxy.** If every client request reaches the broker from your
+   reverse proxy (for example nginx proxy manager at 10.0.0.100), set `"trusted_proxies": ["10.0.0.100/32"]`.
+   From those peers only, the effective client address for the audit log, per-source rate limits and caps
+   (enrollment, auth failures, plan submits, presence), and the "from ..." shown on enrollment cards is taken
+   from `X-Forwarded-For`, walking from the right past other trusted proxies and taking the first
+   untrusted hop (a missing or malformed header means the proxy's own address). It never decides trust:
+   `approval_trusted_peers`, the proxy secret, the destination guard and the egress marker use the real
+   socket peer. Loopback and the broker's own addresses are ignored here too. The same trusted peers
+   may also set `X-Forwarded-Proto: https` so the CSRF cookie gets the Secure flag.
+   **Setting `trusted_proxies` also closes the client API (port 8800) to everyone else.** Connections whose
+   real socket peer is not in `trusted_proxies` get `403 forbidden` before authentication and before the
+   unauthenticated enrollment endpoints, and a rate-limited operator-only `client_peer_refused` audit event
+   names the peer; `X-Forwarded-For` is never consulted for this. So everything must reach the client API through
+   the proxy: otherwise list the address in `trusted_proxies`, or set `"client_api_allow_direct": true` (a startup
+   WARNING says direct clients bypass the proxy). The approval listener is not affected (it has its own rule).
+   `GET /healthz` returns `ok` to loopback and the container's own address only, for a container healthcheck
+   (see `deploy/compose.yaml`). Also restrict the published port at the host firewall to the proxy's address:
+   published Docker ports and source NAT can change the peer address the broker sees (a request that looks like
+   it comes from the Docker gateway), and the firewall does not depend on that.
+3. **Destinations.** The broker refuses to connect to loopback, link-local (including 169.254.169.254),
+   unspecified and multicast addresses, to any address of its own interfaces, to cloud metadata addresses,
+   and to its own listener ports on private addresses; it connects to the address it validated. LAN
+   addresses (10/8, 172.16/12, 192.168/16, 100.64/10) keep working. If the listener ports are published as
+   other host ports (for example `9801:8801`), add them as `"own_ports": [9801, 9800]` so a call to
+   `lan-host:9801` is refused. A credential whose `allowed_hosts` names `localhost`, a loopback or
+   link-local address, or one of the broker's own addresses loses that host at load (a
+   `dest_guard_config_error` is logged); credentials created through requests cannot name them, nor dotless
+   names. An IP-literal destination on a port other than 80 or 443 needs an explicit `host:port` entry in
+   `allowed_hosts` (`"allowed_hosts": ["10.0.0.5:8080"]`). Optional `destination_deny_cidrs` adds ranges of your
+   own. No outbound call uses an HTTP proxy from the environment any more, and the broker's own clients
+   (notifications, model calls, the local vault CLI) ignore `HTTP_PROXY` too.
 
 ## 7. Add a first credential and try it
 
