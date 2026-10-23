@@ -26,6 +26,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 from secret_broker import description as D  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+SHIPPED_CORPUS = os.path.join(HERE, "corpus.json")
 NO_MODEL = "no model description by design"
 
 
@@ -77,10 +78,20 @@ def start_stub():
     return srv, handler
 
 
-def run_model(model, cases, key, base_url, timeout, read_endpoints, stub=None):
-    """-> list of result rows, one per case, in corpus order."""
+def run_model(model, cases, key, base_url, timeout, read_endpoints, stub=None, keep_raw=False,
+              replies=None):
+    """-> list of result rows, one per case, in corpus order. keep_raw stores the model's own text
+    in row["raw"] (only main() allows that, and only for the shipped scrubbed corpus). `replies`
+    maps case id -> stub reply (or {model: reply}), overriding the corpus' stub_reply."""
     d = D.Describer(key, model=model, timeout=timeout, base_url=base_url, max_per_minute=100000,
                     concurrency=1, read_endpoints=read_endpoints)
+    captured = {}
+    inner_finish = d.finish
+
+    def finish(text, *a, **kw):
+        captured["raw"] = text
+        return inner_finish(text, *a, **kw)
+    d.finish = finish
     rows = []
     for c in cases:
         row = {"id": c["id"], "label": c["label"], "mode": c["mode"], "model": model}
@@ -95,7 +106,11 @@ def run_model(model, cases, key, base_url, timeout, read_endpoints, stub=None):
             continue
         if stub is not None:
             r = c.get("stub_replies", {}).get(model, c.get("stub_reply"))
+            if replies and c["id"] in replies:
+                r = replies[c["id"]]
+                r = r.get(model, r.get("default")) if isinstance(r, dict) else r
             stub.queue.append("" if r is None else r)
+        captured.clear()
         t0 = time.monotonic()
         got = d.describe(c["mode"], list(c["names"]), json.loads(json.dumps(c["spec"])))
         dt = time.monotonic() - t0
@@ -103,6 +118,8 @@ def run_model(model, cases, key, base_url, timeout, read_endpoints, stub=None):
         row.update(kind="model" if got["source"] == "model" else "fallback", text=got["text"],
                    reason=got["reason"], rule=got.get("rule"), latency=dt, cost=d.last_cost,
                    prompt_tokens=u.get("prompt_tokens"), completion_tokens=u.get("completion_tokens"))
+        if keep_raw:
+            row["raw"] = captured.get("raw")
         rows.append(row)
     return rows
 
@@ -154,6 +171,8 @@ def report(models, results):
             elif r["kind"] == "fallback":
                 rule = f"/{r['rule']}" if r.get("rule") else ""
                 what = f"FALLBACK ({r['reason']}{rule}): {r['text']}"
+                if r.get("raw") is not None:
+                    what += f"  [rejected text: {r['raw']!r}]"
             else:
                 what = r["text"]
             lat = f" ({r['latency']:.2f}s)" if r.get("latency") is not None else ""
@@ -180,10 +199,24 @@ def main(argv=None):
     ap.add_argument("--corpus", default=os.path.join(HERE, "corpus.json"))
     ap.add_argument("--stub", action="store_true", help="serve scripted replies locally; no key, no network")
     ap.add_argument("--json", help="also write the raw rows (no key) to this file")
+    ap.add_argument("--show-rejected", action="store_true",
+                    help="print (and save with --json) the model's rejected text and the rule. Only allowed "
+                         "with the shipped scrubbed corpus; never use it on real requests")
+    ap.add_argument("--stub-replies", help="JSON {case id: reply or {model: reply}} served by --stub")
     ap.add_argument("--only", help="comma separated case ids")
     args = ap.parse_args(argv)
     models = [m.strip() for m in (",".join(args.model) if args.model else args.models).split(",") if m.strip()]
+    if args.show_rejected and os.path.realpath(args.corpus) != os.path.realpath(SHIPPED_CORPUS):
+        print("error: --show-rejected only works with the shipped corpus file", file=sys.stderr)
+        return 2
     data = load_corpus(args.corpus)
+    replies = None
+    if args.stub_replies:
+        if not args.stub:
+            print("error: --stub-replies needs --stub", file=sys.stderr)
+            return 2
+        with open(args.stub_replies) as f:
+            replies = json.load(f)
     cases = data["cases"]
     if args.only:
         want = set(args.only.split(","))
@@ -198,7 +231,8 @@ def main(argv=None):
             print(f"error: no API key: set {args.key_env} (e.g. run under `asb openrouter -- ...`) or use "
                   "--key-file, or try --stub", file=sys.stderr)
             return 2
-    results = {m: run_model(m, cases, key, base, args.timeout, data.get("read_endpoints", []), stub)
+    results = {m: run_model(m, cases, key, base, args.timeout, data.get("read_endpoints", []), stub,
+                         keep_raw=args.show_rejected, replies=replies)
                for m in models}
     print(report(models, results))
     if args.json:

@@ -194,7 +194,8 @@ Safety measures:
   `summary_source` (`model` or `deterministic`), `summary_reason`
   (`rejected`, `timeout`, `error`, `rate_limited`, `empty`, `truncated`, `not_sent`, `disabled`) and,
   for a rejected reply, `summary_rule` (the fixed name of the check: `forbidden_word`, `sentences`,
-  `first_word`, ...), never the rejected text. The `assessed` event is hidden from the agent audit
+  `first_word`, `technical_host`, `technical_http_verb`, `technical_jargon`, `technical_path`,
+  `technical_ip`, `technical_status`, `prompt_echo`, ...), never the rejected text. The `assessed` event is hidden from the agent audit
   view. The approver sees the class in the (i) tooltip, the details pop-over and the Settings page
   (counts since start); `/v1/status` and `asb status` carry no description counters.
 - Bounds: `summary_timeout` (4 s), `summary_concurrency` (4),
@@ -203,6 +204,25 @@ Safety measures:
 - Endpoint: descriptions go to `summary_base_url` (default OpenRouter). If
   `base_url` is custom and `summary_base_url` is not set, descriptions are
   disabled (startup warning) instead of using the default endpoint.
+
+## What the sanitizer allows, and why
+
+A live comparison (35 shapes, three models) fell back on 43% of requests, mostly on the technical
+syntax check, so the validator was the main cause of `auto:` lines, not the models. Changes, each
+with a test that the dangerous variants are still rejected:
+
+- The words API, request and response are allowed: ordinary English, no markup or instruction.
+  Endpoint, payload, JSON, URL, HTTP, header, curl and the like are still refused.
+- A host name is allowed only if it is the request's own host (taken from the request, not from the
+  reply), and an HTTP method name only if it is the request's own method. Any other host, a path, an
+  address, a link, `www.`, a status code or number in the 100-599 range is still refused.
+- The prompt-copy check needs 6 copied words (it was 5, which flagged ordinary phrases).
+- The prompt now tells the model not to write URLs, domain names, paths, methods or numbers, and
+  lists the banned words, so most replies never reach the check.
+- Reasoning: `description.REASONING_BY_PREFIX` sets the `reasoning` field per model family. Default
+  `{"effort": "minimal"}` (unchanged for every model except the one listed); `google/gemini-2.5-flash-lite`
+  gets `{"effort": "none"}` because "minimal" left it spending its 400-token budget on hidden
+  reasoning. A 400 reply from the provider is retried once without the field.
 
 ## Late descriptions and late ratings
 

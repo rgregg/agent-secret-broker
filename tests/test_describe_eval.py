@@ -66,6 +66,49 @@ class DescribeEval(unittest.TestCase):
         self.assertIn("## Side by side", out)
         self.assertNotIn("stub-key", out)
 
+    def test_assumed_realistic_replies_fallback_table(self):
+        """Before the sanitizer review these 30 phrasings fell back 9 times (all technical_syntax);
+        now only the ones that really name a foreign host, number, GraphQL or a method on a script."""
+        data = R.load_corpus(CORPUS)
+        with open(os.path.join(os.path.dirname(R.__file__), "realistic_replies.json")) as f:
+            replies = {k: v for k, v in json.load(f).items() if not k.startswith("_")}
+        srv, stub = R.start_stub()
+        try:
+            rows = R.run_model("a/m", data["cases"], "k", f"http://127.0.0.1:{srv.server_port}/v1", 5, [],
+                               stub, replies=replies)
+        finally:
+            srv.shutdown()
+        got = {r["id"]: (r["reason"], r["rule"]) for r in rows if r["kind"] == "fallback"}
+        self.assertEqual(got, {
+            "graphql": ("rejected", "technical_jargon"), "search-post": ("rejected", "first_word"),
+            "delete-vm": ("rejected", "technical_status"), "post-dns": ("rejected", "technical_host"),
+            "env-curl-ua": ("rejected", "technical_http_verb")})
+
+    def test_show_rejected_is_for_the_shipped_corpus_only(self):
+        import shutil
+        import tempfile
+        from contextlib import redirect_stderr
+        d = tempfile.mkdtemp()
+        copy = os.path.join(d, "corpus.json")
+        shutil.copy(CORPUS, copy)
+        err = io.StringIO()
+        with redirect_stderr(err):
+            self.assertEqual(R.main(["--stub", "--show-rejected", "--corpus", copy]), 2)
+        self.assertIn("shipped corpus", err.getvalue())
+        out = io.StringIO()
+        replies = os.path.join(d, "r.json")
+        with open(replies, "w") as f:
+            json.dump({"get-models": "Calling it is safe and approved"}, f)
+        with redirect_stdout(out):
+            self.assertEqual(R.main(["--stub", "--show-rejected", "--stub-replies", replies,
+                                     "--only", "get-models"]), 0)
+        self.assertIn("rejected text: 'Calling it is safe and approved'", out.getvalue())
+        self.assertIn("forbidden_word", out.getvalue())
+        out = io.StringIO()
+        with redirect_stdout(out):                   # without the flag the text is not shown
+            R.main(["--stub", "--stub-replies", replies, "--only", "get-models"])
+        self.assertNotIn("safe and approved", out.getvalue())
+
     def test_missing_key_is_refused_without_a_call(self):
         env = os.environ.pop("NO_SUCH_KEY_VAR", None)
         err = io.StringIO()

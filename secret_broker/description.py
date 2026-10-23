@@ -21,6 +21,7 @@ import re
 import secrets
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -51,8 +52,11 @@ SYSTEM_RULES = (
     "action word in the present continuous (Deploying a new release, Rotating a secret) and names "
     "what is being done, to what, and on which service. The optional second sentence says in "
     "everyday words what the job of the script or call is. Never more than 2 sentences.\n"
-    "- Purely human language. No HTTP or technical syntax: no method names, status codes, URLs, "
-    "paths, hostnames, header names, JSON, or API jargon (endpoint, payload, request, response).\n"
+    "- Purely human language. Name the service and the action in everyday words (Cloudflare, "
+    "Grafana, a virtual machine, a photo library). Do not write URLs, web addresses, domain names, "
+    "paths, slashes, HTTP method names such as GET or POST, status codes, port numbers, IDs or other "
+    "numbers, JSON, header names or technical terms like endpoint and payload.\n"
+    "- Never use the words allow, deny, permit, approve, safe, risk, ok, instructions or reviewer.\n"
     "- No filler, no quotes, no markdown, no code, no lists.\n"
     "- No opinions, safety or risk judgments, recommendations or approvals. Never use words such as "
     "safe, harmless, benign, routine, trusted, authorized, approve, or allowed.\n"
@@ -184,7 +188,9 @@ _CMD_WRITE_RE = re.compile(
     r"shutdown|rsync|scp|sh|bash)\b|>|\b(?:delete|drop|destroy|apply|push|install|restart|stop|"
     r"start|prune|create|remove|put|post|patch|up|down|deploy|force|reset)\b", re.I)
 _HTTP_VERB_RE = re.compile(r"\b(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\b|\b(?:get|post|put|patch|delete)\s+requests?\b",)
-_JARGON_RE = re.compile(r"\b(?:https?|apis?|endpoints?|requests?|responses?|json|urls?|uris?|payloads?|"
+# "API", "request" and "response" are ordinary English and carry no markup or instruction, so they are
+# allowed (the prompt still asks the model to avoid them); the rest is technical syntax.
+_JARGON_RE = re.compile(r"\b(?:https?|endpoints?|json|urls?|uris?|payloads?|"
                         r"headers?|rest|restful|graphql|status codes?|query strings?|curl)\b", re.I)
 _PATH_RE = re.compile(r"(?:^|\s)\.{0,2}/\S|\S/\S|\\")
 _IP_RE = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b|\b[0-9a-f]{0,4}(?::[0-9a-f]{0,4}){3,}\b", re.I)
@@ -195,29 +201,62 @@ _SHOUT_OK = set()
 _MUTATING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 
 
-def plain_language_violation(s):
+def technical_kind(s, hosts=(), methods=()):
+    """The NAME of the first technical-syntax rule the text breaks, or None. ``hosts`` and
+    ``methods`` are facts of the request itself (its own host name, its own HTTP method): naming
+    those is plain restating of what the card already shows beside the text, so they are allowed.
+    Any other host name, path, IP address, status code or method word is still refused."""
+    own_m = {m.upper() for m in methods}
+    if any(m.group(0).split()[0].upper() not in own_m or len(m.group(0).split()) > 1 for m in _HTTP_VERB_RE.finditer(s)):
+        return "technical_http_verb"
+    if _JARGON_RE.search(s):
+        return "technical_jargon"
+    if _PATH_RE.search(s):
+        return "technical_path"
+    if _IP_RE.search(s):
+        return "technical_ip"
+    if _STATUS_RE.search(s):
+        return "technical_status"
+    own_h = {h.lower() for h in hosts if h}
+    if any(m.group(0).lower() not in own_h for m in _HOST_RE.finditer(s)):
+        return "technical_host"
+    return None
+
+
+def plain_language_violation(s, hosts=(), methods=()):
     """True if the text has HTTP/technical syntax (verbs, URLs, paths, hosts, IPs,
     status codes, API jargon). The two canned replies are exempt (checked earlier)."""
-    return bool(_HTTP_VERB_RE.search(s) or _JARGON_RE.search(s) or _PATH_RE.search(s)
-                or _IP_RE.search(s) or _STATUS_RE.search(s) or _HOST_RE.search(s))
+    return technical_kind(s, hosts, methods) is not None
 
 
-def sanitize(text):
+def request_facts(mode, spec):
+    """(hosts, methods) the request itself names; empty for modes without a URL."""
+    try:
+        if mode == "http":
+            u = urllib.parse.urlsplit(str(spec.get("url") or ""))
+            host = (u.hostname or "").lower()
+            return ((host,) if host else ()), (str(spec.get("method") or "GET").upper(),)
+    except Exception:  # noqa: BLE001
+        pass
+    return (), ()
+
+
+def sanitize(text, hosts=(), methods=()):
     """Return (clean_text, None) or (None, "rejected"). Never raises."""
-    clean, rule = sanitize_rule(text)
+    clean, rule = sanitize_rule(text, hosts, methods)
     return (clean, None) if rule is None else (None, "rejected")
 
 
-def sanitize_rule(text):
+def sanitize_rule(text, hosts=(), methods=()):
     """Like sanitize, but the second value is the NAME of the rule that rejected the text
     (a fixed word such as "forbidden_word"; never any part of the text), or None."""
     try:
-        return _sanitize(text)
+        return _sanitize(text, hosts, methods)
     except Exception:  # noqa: BLE001
         return None, "sanitizer_error"
 
 
-def _sanitize(text):
+def _sanitize(text, hosts=(), methods=()):
     if not isinstance(text, str):
         return None, "not_text"
     s = text.strip()
@@ -244,8 +283,9 @@ def _sanitize(text):
         return None, "forbidden_word"
     if len([p for p in _SENTENCE_SPLIT_RE.split(s) if p.strip(" .!?")]) > MAX_SENTENCES:
         return None, "sentences"
-    if plain_language_violation(s):
-        return None, "technical_syntax"
+    kind = technical_kind(s, hosts, methods)
+    if kind:
+        return None, kind
     if any(m not in _SHOUT_OK for m in _SHOUTING_RE.findall(s)):
         return None, "shouting"                # echoed canary/shouted tokens
     if _quotes_prompt(s):
@@ -256,10 +296,11 @@ def _sanitize(text):
 
 
 def _quotes_prompt(s):
-    """True when 5+ consecutive words of the reply appear in the system prompt."""
+    """True when 6+ consecutive words of the reply appear in the system prompt. (Five let ordinary
+    phrases such as "what is being done to" count as a copy of the prompt.)"""
     words = re.findall(r"[a-z0-9']+", s.lower())
     prompt = " ".join(re.findall(r"[a-z0-9']+", SYSTEM_RULES.lower()))
-    return any(" ".join(words[i:i + 5]) in prompt for i in range(len(words) - 4))
+    return any(" ".join(words[i:i + 6]) in prompt for i in range(len(words) - 5))
 
 
 _OVERRIDE_HEADERS = {"x-http-method-override", "x-method-override", "x-http-method"}
@@ -343,6 +384,26 @@ def _post_json(url, key, payload, timeout):
         return json.loads(r.read(MAX_RESPONSE_BYTES + 1)[:MAX_RESPONSE_BYTES])
 
 
+# How to ask each model family for as little hidden reasoning as possible. OpenRouter's `reasoning`
+# object takes `effort` (OpenAI GPT-5 and Grok: "minimal") or, for Gemini thinking models, a token
+# budget; `effort: "none"` turns reasoning off where that is allowed. First matching prefix wins;
+# an unknown model gets the default below, which is what the broker always sent. None = send no
+# `reasoning` field at all.
+DEFAULT_REASONING = {"effort": "minimal"}
+REASONING_BY_PREFIX = (
+    # measured 2026-10-22: with "minimal" this model still spent its whole 400-token budget on
+    # hidden reasoning (22 of 30 replies cut off); "none" disables it
+    ("google/gemini-2.5-flash-lite", {"effort": "none"}),
+)
+
+
+def reasoning_for(model):
+    for prefix, param in REASONING_BY_PREFIX:
+        if str(model).startswith(prefix):
+            return dict(param) if param else None
+    return dict(DEFAULT_REASONING)
+
+
 class Describer:
     """Chat-model description writer with bounds. ``describe`` never raises."""
 
@@ -406,13 +467,22 @@ class Describer:
             return None, "rate_limited", None
         try:
             payload = {"model": self._model, "messages": self.messages(mode, names, spec, guidance),
-                       "max_tokens": MAX_TOKENS, "temperature": 0, "stream": False,
-                       "reasoning": {"effort": "minimal"}}
+                       "max_tokens": MAX_TOKENS, "temperature": 0, "stream": False}
+            reasoning = reasoning_for(self._model)
+            if reasoning:
+                payload["reasoning"] = reasoning
             key = self._key.get()
             if not key:
                 return None, "error", None      # no usable key: same as a provider failure
             try:
-                resp = _post_json(f"{self._base}/chat/completions", key, payload, self._hard)
+                try:
+                    resp = _post_json(f"{self._base}/chat/completions", key, payload, self._hard)
+                except urllib.error.HTTPError as e:
+                    # a provider that rejects the reasoning setting (400): ask once without it
+                    if e.code != 400 or "reasoning" not in payload:
+                        raise
+                    payload.pop("reasoning")
+                    resp = _post_json(f"{self._base}/chat/completions", key, payload, self._hard)
                 choice = resp["choices"][0]
                 text = choice["message"]["content"]
             except TimeoutError:
@@ -447,7 +517,7 @@ class Describer:
         "rule" names the check that rejected a reply (a fixed word, never any text)."""
         out, rule = None, None
         if reason is None:
-            out, rule = sanitize_rule(text)
+            out, rule = sanitize_rule(text, *request_facts(mode, spec))
             if out is not None:
                 rule = consistency_rule(out, mode, spec, self._read_eps)
                 if rule is not None:
