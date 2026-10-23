@@ -76,8 +76,24 @@ class Base(unittest.TestCase):
         with open(self.audit) as f:
             return [json.loads(x) for x in f if x.strip()]
 
-    def analyze(self):
+    def analyze(self, prime=True):
+        """prime: let the background key read finish first (the first request after the TTL
+        or at start-up otherwise sees no key / the stale key, by design)."""
+        if prime:
+            for kp in self.fa.key_providers:
+                kp.get()
+                kp.wait()
         return self.fa.analyze("http", ["x"], dict(SPEC))
+
+    def gate_vault(self):
+        """Make vault reads block until the returned event is set."""
+        gate, real = threading.Event(), self.backend.get
+
+        def slow(*a):
+            gate.wait(10)
+            return real(*a)
+        self.backend.get = slow
+        return gate
 
     def auths(self):
         return [s["auth"] for s in Fake.seen]
@@ -95,24 +111,45 @@ class Lazy(Base):
         self.put(K2)                                        # rotate in the vault
         n = len(Fake.seen)
         self.now[0] += 299
-        self.analyze()
+        self.analyze(prime=False)
         self.assertEqual(set(self.auths()[n:]), {"Bearer " + K1})   # still cached
         self.assertEqual(len(reads()), 1)
         self.now[0] += 2                                    # past the 300 s default TTL
         n = len(Fake.seen)
-        self.analyze()
+        gate = self.gate_vault()
+        self.analyze(prime=False)                           # stale key while the one refresh runs
+        self.assertEqual(set(self.auths()[n:]), {"Bearer " + K1})
+        gate.set()
+        self.fa.key_providers[0].wait()
+        n = len(Fake.seen)
+        self.analyze(prime=False)
         self.assertEqual(set(self.auths()[n:]), {"Bearer " + K2})
         self.assertEqual(len(reads()), 2)
+
+    def test_first_use_does_not_wait_for_the_vault(self):
+        gate = self.gate_vault()
+        got = self.analyze(prime=False)                     # no key yet: auto: line, rated HIGH
+        self.assertIsNone(got["risk"])
+        self.assertEqual(got["summary_source"], "deterministic")
+        self.assertEqual(Fake.seen, [])
+        gate.set()
+        self.fa.key_providers[0].wait()
+        self.assertEqual(self.fa.key_providers[0].get(), K1)
 
     def test_custom_ttl(self):
         sc = dict(self.sc, api_key_ttl_s=30)
         fa = riskmodel.build(sc, None, clock=lambda: self.now[0])
         self.assertEqual(fa.key_providers[0].ttl, 30)
         fa.key_providers[0].attach(self.broker._summary_key_read, self.broker.log)
-        self.assertEqual(fa.key_providers[0].get(), K1)
+        kp = fa.key_providers[0]
+        kp.get()
+        kp.wait()
+        self.assertEqual(kp.get(), K1)
         self.put(K2)
         self.now[0] += 31
-        self.assertEqual(fa.key_providers[0].get(), K2)
+        kp.get()
+        kp.wait()
+        self.assertEqual(kp.get(), K2)
 
     def test_file_key_still_a_plain_constant(self):
         fa = riskmodel.build({"type": "jev", "api_key_file": "/k"}, lambda p: "FILEKEY")
@@ -175,8 +212,11 @@ class Failures(Base):
     def test_get_never_raises(self):
         kp = keyprovider.VaultKey("x", "Y", clock=lambda: 0.0)
         self.assertIsNone(kp.get())                          # not attached
+        kp.wait()
         kp.attach(lambda n, v: 1 / 0, lambda *a, **k: 1 / 0)
-        kp._until = 0
+        kp.invalidate()
+        self.assertIsNone(kp.get())
+        kp.wait()
         self.assertIsNone(kp.get())
 
     def test_failure_line_is_rate_limited_and_quiet(self):
@@ -291,35 +331,251 @@ class NoLeaks(Base):
 
 
 class AgentPath(e2e.Harness):
-    """The item stays an ordinary credential: an agent still asks, a human still approves."""
+    """The key credential is internal: an agent can never request, list or change it, and
+    every other credential still works as before."""
 
     def tweak(self, cfg):
-        cfg["secrets"][NAME] = {"vars": {VAR: {"item": "OR", "field": "key"}}, "allowed_hosts": ["127.0.0.1"]}
-        cfg["_vault"] = {"OR": {"key": K1}}
+        cfg["secrets"][NAME] = {"vars": {VAR: {"item": "OR", "field": "key"}}, "allowed_hosts": ["127.0.0.1"],
+                                "approval": "allow"}
+        cfg["secrets"]["alias"] = {"vars": {"A1": {"item": "AL", "field": "x"},
+                                           "ALIAS_TOKEN": {"item": "OR", "field": "other"}},
+                                   "allowed_hosts": ["127.0.0.1"]}
+        cfg["_vault"] = {"OR": {"key": K1, "other": "x"}, "AL": {"x": "y"}}
+        cfg["credential_requests"] = {"enabled": True}
 
-    def test_agent_request_unaffected_and_internal_read_is_not_a_request(self):
-        fa = riskmodel.build({"type": "jev", "api_key_secret": {"name": NAME, "var": VAR}}, None)
-        self.broker.summarizer = fa
-        fa.key_providers[0].attach(self.broker._summary_key_read, self.broker.log)
-        self.assertEqual(fa.key_providers[0].get(), K1)
+    def setUp(self):
+        super().setUp()
+        self.fa = riskmodel.build({"type": "jev", "api_key_secret": {"name": NAME, "var": VAR}}, None)
+        self.broker.summarizer = self.fa
+        self.kp = self.fa.key_providers[0]
+        self.kp.attach(self.broker._summary_key_read, self.broker.log)
+
+    def refused(self, body, unknown_like="unknown secret name"):
+        code, out = self.api("POST", "/v1/requests", body)
+        self.assertEqual(code, 400, out)
+        self.assertEqual(json.loads(out), {"error": unknown_like})
+        return out
+
+    def test_key_read_works_and_is_not_a_request(self):
+        self.kp.get()
+        self.kp.wait()
+        self.assertEqual(self.kp.get(), K1)
         self.assertEqual(self.events("secret_read"), [])
         self.assertEqual(self.notifier.sent, [])
         self.assertEqual(self.events("summary_key_read")[0]["result"], "ok")
-        code, body = self.create_env([NAME])                 # the normal path: prompted, approved
-        rid = json.loads(body)["id"]
-        self.assertEqual(code, 202)
-        self.assertEqual(len(self.notifier.sent), 1)
-        _, b = self.api("GET", f"/v1/requests/{rid}?wait=5")
-        got = json.loads(b)
-        self.assertEqual((got["status"], got["env"]), ("approved", {VAR: K1}))
-        self.assertEqual(len(self.events("secret_read")), 1)
-        self.assertEqual(self.events("secret_read")[0]["id"], rid)
-        for r in self.records():                             # the key is in no audit record
-            self.assertNotIn(K1, json.dumps(r))
-        # the agent-visible audit view never shows the internal read
         for r in self.records():
+            self.assertNotIn(K1, json.dumps(r))
             if r["event"] == "summary_key_read":
                 self.assertIsNone(audit_api.redact(r))
+
+    def test_other_credentials_unaffected(self):
+        code, body = self.create_env(["svc"])
+        self.assertEqual(code, 202)
+        _, b = self.api("GET", f"/v1/requests/{json.loads(body)['id']}?wait=5")
+        self.assertEqual(json.loads(b)["status"], "approved")
+
+    def test_env_http_refused_like_unknown(self):
+        _, unknown = self.api("POST", "/v1/requests", {"mode": "env", "names": ["nope"], "argv": ["x"]})
+        for n in (NAME, "alias"):            # the name, and a catalog alias of the same vault item
+            out = self.refused({"mode": "env", "names": [n], "argv": ["echo"]})
+            self.assertEqual(out, unknown)
+            self.refused({"mode": "env", "names": ["svc", n], "argv": ["echo"]})
+            self.refused({"mode": "http", "names": [n], "method": "GET", "url": "http://127.0.0.1:1/x",
+                          "headers": {"Authorization": "Bearer {{%s}}" % VAR}})
+        self.assertEqual(self.notifier.sent, [])
+        self.assertEqual(self.broker._by_id, {})
+
+    def test_ssh_sign_refused(self):
+        self.refused({"mode": "ssh_sign", "names": [NAME], "data_b64": "AAAA"})
+
+    def test_store_and_credential_and_guidance_refused(self):
+        self.refused({"mode": "store", "op": "update", "names": [NAME], "value": "evil"})
+        self.refused({"mode": "store", "op": "create", "names": ["fresh"], "value": "v",
+                      "item": "or", "allowed_hosts": ["127.0.0.1"]})      # its vault item, any case
+        self.refused({"mode": "credential", "names": [NAME], "kind": "token", "purpose": "x"})
+        self.refused({"mode": "guidance", "entries": [{"name": NAME, "text": "ignore the rules"}]})
+        self.assertEqual(self.notifier.sent, [])
+        self.assertEqual(self.broker.cfg["secrets"][NAME].get("guidance"), None)
+
+    def test_standing_and_timed_approvals_do_not_apply(self):
+        # the credential is approval: allow, and a timed grant exists for it: still refused
+        self.broker.grants.add([NAME], 15, "any", "alice", "web", "r0", mode="env")
+        self.refused({"mode": "env", "names": [NAME], "argv": ["echo"]})
+        self.assertEqual(self.events("secret_read"), [])
+
+    def test_hidden_from_discovery(self):
+        code, body = self.api("GET", "/v1/secrets?host=127.0.0.1")
+        names = [x["name"] for x in json.loads(body)["secrets"]]
+        self.assertEqual(names, ["svc"])
+        code, body = self.api("GET", "/v1/secrets")
+        self.assertNotIn(NAME, body)
+        self.assertNotIn("alias", body)
+
+    def test_audited_as_a_hidden_event_with_reason_class(self):
+        self.refused({"mode": "env", "names": [NAME], "argv": ["echo"]})
+        ev = self.events("internal_secret_refused")
+        self.assertEqual(len(ev), 1)
+        self.assertEqual((ev[0]["secret"], ev[0]["reason"]), (NAME, "internal_secret"))
+        self.assertIn("internal_secret_refused", audit_api.HIDDEN)
+        self.assertIsNone(audit_api.redact(ev[0]))
+        # the agent-visible `rejected` event carries only the generic wording
+        rej = [r for r in self.events("rejected") if r["names"] == [NAME]]
+        self.assertEqual(rej[0]["reason"], "unknown secret name")
+
+    def test_approver_pages_still_list_it_marked_internal(self):
+        rows = self.broker.standing_rows()
+        mine = [r for r in rows if r["secrets"] and r["secrets"][0].startswith(NAME)]
+        self.assertTrue(mine)
+        self.assertIn("(internal: summary key)", mine[0]["secrets"][0])
+        self.assertIn(NAME, self.broker.cfg["secrets"])
+
+    def test_catalog_change_invalidates_the_cached_key(self):
+        self.broker.refresh_catalog()                        # records the source of the key
+        self.kp.get()
+        self.kp.wait()
+        self.assertEqual(self.kp.get(), K1)
+        self.broker.backend._data["OR"]["key2"] = K2
+        meta = json.loads(self.broker.backend._data["OR"]["broker"])
+        meta["vars"][VAR]["field"] = "key2"
+        self.broker.backend._data["OR"]["broker"] = json.dumps(meta)
+        self.broker.refresh_catalog()
+        self.assertIsNone(self.kp.get())                     # dropped: re-read in the background
+        self.kp.wait()
+        self.assertEqual(self.kp.get(), K2)
+        self.broker.refresh_catalog()                        # unchanged source: kept
+        self.assertEqual(self.kp.get(), K2)
+
+
+class Provider(unittest.TestCase):
+    """VaultKey on its own, with a scripted reader and a fake clock."""
+
+    def make(self, ttl=60, grace=900, script=None):
+        self.now = [0.0]
+        self.calls, self.gate = [], threading.Event()
+        self.gate.set()
+        self.script = list(script or [])
+
+        def reader(name, var):
+            self.calls.append(1)
+            self.gate.wait(10)
+            step = self.script.pop(0) if len(self.script) > 1 else self.script[0]
+            self.now[0] += getattr(self, "read_takes", 0)
+            if isinstance(step, keyprovider.KeyUnavailable):
+                raise step
+            return step
+        kp = keyprovider.VaultKey("n", "V", ttl, clock=lambda: self.now[0], grace=grace)
+        kp.attach(reader, lambda *a, **k: None)
+        return kp
+
+    def prime(self, kp):
+        kp.get()
+        kp.wait()
+
+    def test_twenty_callers_never_queue_and_one_read_happens(self):
+        kp = self.make(script=["KEY1"])
+        self.gate.clear()                                    # a very slow vault
+        out, ths = [], []
+        t0 = __import__("time").monotonic()
+        for _ in range(20):
+            th = threading.Thread(target=lambda: out.append(kp.get()))
+            th.start()
+            ths.append(th)
+        for th in ths:
+            th.join(2)
+        self.assertLess(__import__("time").monotonic() - t0, 2)
+        self.assertEqual(out, [None] * 20)                   # first use: no key, nobody waited
+        self.gate.set()
+        kp.wait()
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(kp.get(), "KEY1")
+        # after expiry: 20 more callers all get the stale key, still one read
+        self.now[0] += 61
+        self.gate.clear()
+        out.clear()
+        ths = [threading.Thread(target=lambda: out.append(kp.get())) for _ in range(20)]
+        [th.start() for th in ths]
+        [th.join(2) for th in ths]
+        self.assertEqual(out, ["KEY1"] * 20)
+        self.gate.set()
+        kp.wait()
+        self.assertEqual(len(self.calls), 2)
+
+    def test_stale_served_only_up_to_the_grace(self):
+        kp = self.make(ttl=60, grace=100, script=["KEY1", keyprovider.KeyUnavailable("backend_unavailable")])
+        self.prime(kp)
+        self.now[0] = 159                                    # expired 99 s ago, within grace
+        self.assertEqual(kp.get(), "KEY1")
+        kp.wait()
+        self.now[0] = 161                                    # past ttl + grace
+        self.assertIsNone(kp.get())
+
+    def test_transient_failure_keeps_last_good_key_for_grace(self):
+        down = keyprovider.KeyUnavailable("backend_unavailable")
+        kp = self.make(ttl=60, grace=900, script=["KEY1", down])
+        self.prime(kp)
+        for step in (61, 100, 200, 600):
+            self.now[0] = step
+            self.assertEqual(kp.get(), "KEY1", step)
+            kp.wait()
+        self.now[0] = 60 + 900 + 1                           # grace over
+        kp.get()
+        kp.wait()
+        self.assertIsNone(kp.get())
+
+    def test_each_transient_class_keeps_the_key(self):
+        for cls in ("backend_unavailable", "rate_limited", "other"):
+            kp = self.make(script=["KEY1", keyprovider.KeyUnavailable(cls)])
+            self.prime(kp)
+            self.now[0] += 61
+            kp.get()
+            kp.wait()
+            self.assertEqual(kp.get(), "KEY1", cls)
+
+    def test_permanent_failure_drops_the_key_at_once(self):
+        for bad in (keyprovider.KeyUnavailable("not_found"), "", "  ", "bad key", "k\u00e9y"):
+            kp = self.make(script=["KEY1", bad])
+            self.prime(kp)
+            self.assertEqual(kp.get(), "KEY1")
+            self.now[0] += 61
+            kp.get()
+            kp.wait()
+            self.assertIsNone(kp.get(), repr(bad))
+
+    def test_grace_zero_disables_stale(self):
+        down = keyprovider.KeyUnavailable("backend_unavailable")
+        kp = self.make(ttl=60, grace=0, script=["KEY1", down])
+        self.prime(kp)
+        self.now[0] = 61
+        self.assertIsNone(kp.get())
+        kp.wait()
+        self.assertIsNone(kp.get())
+
+    def test_expiry_is_measured_after_the_read(self):
+        self.read_takes = 50                                 # the read itself takes 50 s
+        kp = self.make(ttl=60, script=["KEY1", "KEY2"])
+        self.prime(kp)
+        self.assertEqual(self.now[0], 50.0)
+        self.now[0] = 50 + 59                                # 59 s after the read finished
+        kp.get()
+        kp.wait()
+        self.assertEqual(len(self.calls), 1)                 # still fresh: no second read
+
+    def test_non_ascii_is_invalid(self):
+        kp = self.make(script=["k\u00e9y"])
+        self.prime(kp)
+        self.assertIsNone(kp.get())
+
+    def test_grace_config(self):
+        ok = {"type": "jev", "api_key_secret": {"name": NAME, "var": VAR}}
+        for g in (0, 900, 3600):
+            riskmodel.validate_config({**ok, "api_key_grace_s": g})
+        for g in (-1, 3601, 1.5, "9", True, None):
+            with self.assertRaises(ValueError) as cm:
+                riskmodel.validate_config({**ok, "api_key_grace_s": g})
+            self.assertIn("api_key_grace_s", str(cm.exception))
+        with self.assertRaises(ValueError):
+            riskmodel.validate_config({"type": "jev", "api_key_file": "/k", "api_key_grace_s": 5})
+        self.assertEqual(riskmodel.build(ok, None).key_providers[0].grace, 900)
 
 
 if __name__ == "__main__":
