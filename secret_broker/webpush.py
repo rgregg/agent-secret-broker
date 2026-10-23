@@ -11,6 +11,7 @@ Subscriptions live in a small JSON file (not in the vault); the VAPID private
 key sits next to it. A subscription's endpoint is a URL the broker will POST
 to, so it is accepted only for known push-service hosts.
 """
+import hashlib
 import json
 import os
 import re
@@ -149,7 +150,10 @@ class PushStore:
 
     def devices(self):
         """What the UI may show: no endpoint, no keys."""
-        return [{k: s.get(k) for k in ("id", "user", "agent", "created", "last_ok", "last_error")}
+        # "ep" is a short one-way hash of the endpoint: the Settings page compares it with the hash of this
+        # browser's own subscription to tag "this device". The endpoint itself is never shown.
+        return [{**{k: s.get(k) for k in ("id", "user", "agent", "created", "last_ok", "last_error")},
+                 "ep": hashlib.sha256(str(s.get("endpoint") or "").encode()).hexdigest()[:16]}
                 for s in self._load()["subs"]]
 
     def send_all(self, payload, ttl=300):

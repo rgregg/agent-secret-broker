@@ -974,7 +974,7 @@ def actions_html(broker, req):
         "<button class='btn deny' name=decision value=deny>Deny</button></div>"
         "<p class=scope><small class=muted>Always needs you: no standing approval, grant or Always "
         "covers a session, and no notification button can approve it. Revoke it any time on the "
-        "Clients tab.</small></p>")
+        "Requests tab, under Running now.</small></p>")
 
 
 def sessions_section(broker, csrf, now=None):
@@ -1100,7 +1100,7 @@ class SessionsMixin:
         return n
 
     def active_sessions(self):
-        """Rows for the Clients tab, soonest-expiring first."""
+        """Rows for Running now (Requests tab), soonest-expiring first."""
         self.sweep_sessions()
         now = self.sessions_clock()
         with self._sess_lock:

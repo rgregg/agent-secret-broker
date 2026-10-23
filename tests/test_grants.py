@@ -199,7 +199,8 @@ class Creation(Base):
     def test_dashboard_card_has_the_chips_only_for_eligible_requests(self):
         self.http()
         _, page = self.get("/")
-        self.assertIn("Automatically approve...", page)
+        self.assertIn("<div class=timed>", page)           # one-tap timed approvals, no label above them
+        self.assertNotIn("Automatically approve", page)
         for m in (5, 15, 30):
             self.assertIn(f"name=decision value='approve_grant_{m}'", page)
             self.assertIn(f">{m} min</button>", page)
@@ -540,19 +541,20 @@ class CardLayout(Base):
         _, page = self.get("/")
         card = self.card(page)
         row = re.search(r"<div class=decide-row>(.*?)</div>", card, re.S).group(1)
-        self.assertIn("class='btn approve' name=decision value=approve>Approve", row)
-        self.assertIn("class='btn deny' name=decision value=deny>Deny", row)
-        self.assertRegex(page, r"\.btn\.deny\{background:var\(--danger\)")
-        self.assertNotRegex(page, r"\.btn\.deny\{color:var\(--bad\)\}")
+        self.assertIn("class='btn approve' name=decision value=approve>Approve once</button>", row)
+        self.assertIn("class='btn deny' name=decision value=deny>Deny</button>", row)
+        self.assertLess(row.index("Deny"), row.index("Approve once"))      # Deny left, wide Approve once right
+        self.assertRegex(page, r"\.btn\.deny\{background:var\(--dnb\);border-color:var\(--dnl\);color:var\(--dnt\)\}")
         self.assertNotIn("<details class=more", page)
 
     def test_http_card_offers_chips_and_a_confirmed_always(self):
         self.http()
         _, page = self.get("/")
         card = self.card(page)
-        self.assertLess(card.index("Approve</button>"), card.index("Automatically approve..."))
+        self.assertLess(card.index("Approve once</button>"), card.index("<div class=timed>"))
         self.assertLess(card.index(">5 min<"), card.index(">15 min<"))
-        self.assertLess(card.index(">30 min<"), card.index(">Always</summary>"))
+        self.assertLess(card.index(">30 min<"), card.index(">Always allow this...</summary>"))
+        self.assertNotIn("Automatically approve", card)
         # Always is behind a confirmation: the submit button lives inside the opened <details>
         det = re.search(r"<details class=alw>(.*?)</details>", card, re.S).group(1)
         self.assertIn("name=decision value=approve_always>Confirm", det)
@@ -565,7 +567,7 @@ class CardLayout(Base):
                 self.assertIn("aria-label=", m)
         _, lp = self.get(f"/a/{next(iter(self.broker._by_nonce))}")
         self.assertIn("<div class=decide-row>", lp)
-        self.assertIn("Automatically approve...", lp)
+        self.assertIn("<div class=timed>", lp)
         self.assertIn("value=approve_always>Confirm", lp)
         self.assertNotIn(" title=", self.card_link(lp))
 
@@ -583,7 +585,7 @@ class CardLayout(Base):
         card = self.card(page)
         self.assertIn(">5 min</button>", card)
         self.assertNotIn("approve_always", card)
-        m = re.search(r"<span class='chip off'[^>]*>Always</span>", card)
+        m = re.search(r"<span class='chip off linkish'[^>]*>Always allow this...</span>", card)
         self.assertTrue(m)
         self.assertIn("data-tip='Always not offered:", m.group(0))
         self.assertNotIn(" title=", card[card.index("<div class=decide-row>"):])
@@ -593,7 +595,7 @@ class CardLayout(Base):
         _, page = self.get("/")
         card = self.card(page)
         self.assertIn("<div class=decide-row>", card)
-        self.assertIn("Automatically approve", card)
+        self.assertIn("<div class=timed>", card)
         self.assertIn("approve_grant_5", card)
         self.assertIn("released to the requesting machine for the chosen time", card)
 
@@ -607,7 +609,7 @@ class CardLayout(Base):
 
     def test_markup_is_deterministic_for_a_fixed_state(self):
         self.http()
-        strip = lambda c: re.sub(r"expires in \d+s|data-exp='\d+'", "", c)
+        strip = lambda c: re.sub(r"\d+:\d\d left|data-exp='\d+'", "", c)
         a = strip(self.card(self.get("/")[1]))
         b = strip(self.card(self.get("/")[1]))
         self.assertEqual(a, b)

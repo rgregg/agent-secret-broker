@@ -160,7 +160,7 @@ class CardChip(Base):
         rid = self.ask_ok(login(SID_A), [HOST.bind(SID_A)])
         for page in (self.link_page(rid), self.dashboard()):
             self.assertEqual(page.count("approve_ssh_rule"), 1)
-            self.assertIn("Automatically approve...", page)
+            self.assertIn("<div class=timed>", page)
             self.assertIn("Always: this host", page)
             self.assertIn("Always approve deploy@web.example.com with this key?", page)
             self.assertIn("name=ssh_rule_expiry", page)

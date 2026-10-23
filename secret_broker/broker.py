@@ -43,7 +43,7 @@ from . import notify as notify_mod
 from . import presence as presence_mod
 from .notify import NotifyError
 from . import grants as grants_mod
-from . import icon as icon_mod
+from . import ui_theme
 from . import standing as standing_mod
 from . import guidance as guidance_mod
 from . import proposals as proposals_mod
@@ -56,6 +56,7 @@ from . import sessions as sessions_mod
 from . import sshhosts as sshhosts_mod
 from . import sshrules as sshrules_mod
 from . import risk as risk_mod
+from . import riskmodel as riskmodel_mod
 from . import request_details as details_mod
 from . import scripts as scripts_mod
 from . import sshkey
@@ -2898,12 +2899,6 @@ def _json(h, code, obj, headers=None):
 
 
 _CSS = """
-:root{color-scheme:light dark;--bg:#f6f8fa;--card:#fff;--fg:#1f2328;--muted:#656d76;--line:#d0d7de;
---accent:#2563eb;--ok:#1a7f37;--warn:#9a6700;--bad:#cf222e;--danger:#cf222e;--dangerh:#a40e26;--okbg:#dcfce7;--okfg:#166534;
---wbg:#fef3c7;--wfg:#92400e;--badbg:#ffebe9;--hov:#f3f4f6}
-@media (prefers-color-scheme:dark){:root{--bg:#0d1117;--card:#161b22;--fg:#e6edf3;--muted:#8b949e;
---line:#30363d;--accent:#4c8dff;--ok:#3fb950;--warn:#d29922;--bad:#f85149;--danger:#da3633;--dangerh:#b62324;--okbg:#12301c;--okfg:#3fb950;
---wbg:#3a2a0a;--wfg:#e3b341;--badbg:#3d1418;--hov:#1c2230}}
 *{box-sizing:border-box}
 html{-webkit-text-size-adjust:100%}
 body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
@@ -3141,7 +3136,7 @@ def sanitize_client_event(obj):
 # arrives); the keys below (request id, kind, position) let the poll put open ones back.
 _KEEP_JS = proposals_mod.JS + r'''
 function asbDetailKeys(root,fn){root.querySelectorAll('article[data-id]').forEach(function(a){
-  a.querySelectorAll('details.reqdetails,details.asent,details.scripts,details.gentry').forEach(function(d,i){
+  a.querySelectorAll('details.reqdetails,details.asent,details.scripts,details.gentry,details.dx,details.alw').forEach(function(d,i){
     fn(d,a.getAttribute('data-id')+'|'+d.className+'|'+i);});});}
 function asbOpenKeys(root){var o=[];asbDetailKeys(root,function(d,k){if(d.open)o.push(k);});return o;}
 function asbReopen(root,keys){asbDetailKeys(root,function(d,k){if(keys.indexOf(k)>=0)d.open=true;});}
@@ -3242,17 +3237,17 @@ _DASH_JS = r'''
       last=cards?cards.getAttribute('data-version'):null,
       hl=document.getElementById('hlist'), hform=document.getElementById('hform'),
       hs={all:hl?hl.getAttribute('data-all')==='1':false,limit:hl?+hl.getAttribute('data-limit'):0},
-      hseq=0, hmore=25;
+      hseq=0, hmore=25, hraw=hl?hl.innerHTML:'';
   function secs(){document.querySelectorAll('time[data-exp]').forEach(function(t){
     var s=Math.max(0,Math.floor(t.getAttribute('data-exp')-Date.now()/1000));
-    t.textContent='expires in '+s+'s';});}
+    t.textContent=Math.floor(s/60)+':'+('0'+(s%60)).slice(-2)+' left';});}
   function title(){if(!cards)return;var n=cards.querySelectorAll('article').length;
     document.title=(n?'('+n+') ':'')+'Agent Secret Broker';}
   function parse(h){return new DOMParser().parseFromString(h,'text/html');}
   var nbtn=document.getElementById('notify'), nmsg=document.getElementById('notify-state'),
       seen={};
   function ids(root){var o={};root.querySelectorAll('article[data-id]').forEach(function(a){
-    o[a.getAttribute('data-id')]=a.querySelector('h2')?a.querySelector('h2').textContent:'';});return o;}
+    o[a.getAttribute('data-id')]=a.getAttribute('data-names')||(a.querySelector('h2')?a.querySelector('h2').textContent:'');});return o;}
   function want(){try{return localStorage.getItem('notify')==='1';}catch(e){return false;}}
   function remember(v){try{localStorage.setItem('notify',v?'1':'0');}catch(e){}}
   function nshow(){
@@ -3307,11 +3302,19 @@ _DASH_JS = r'''
       if(pbtn){pbtn.hidden=true;pst.textContent='This browser cannot receive push notifications.';}return;}
     navigator.serviceWorker.getRegistration('/').then(function(reg){
       return reg?reg.pushManager.getSubscription():null;}).then(function(sub){
-      pushOn=!!sub;if(!pbtn)return;pbtn.hidden=false;
+      pushOn=!!sub;thisdev(sub);if(!pbtn)return;pbtn.hidden=false;
       pbtn.textContent=sub?'Register this device again':'Enable on this device';
       pst.textContent=sub?'This device has a subscription. It receives notifications with the '
         +'browser closed, as long as the browser is allowed to run in the background.':
         'Not enabled on this device.';});}
+  // Settings: tag the row whose endpoint hash equals this browser's own subscription ("this device")
+  function thisdev(sub){
+    if(!sub||!window.crypto||!crypto.subtle||!window.TextEncoder||!document.querySelector('[data-ep]'))return;
+    crypto.subtle.digest('SHA-256',new TextEncoder().encode(sub.endpoint)).then(function(b){
+      var h=Array.prototype.map.call(new Uint8Array(b),function(x){return ('0'+x.toString(16)).slice(-2);})
+        .join('').slice(0,16);
+      document.querySelectorAll('[data-ep]').forEach(function(li){
+        var t=li.querySelector('.thisdev');if(t)t.hidden=li.getAttribute('data-ep')!==h;});},function(){});}
   if(pbtn)pbtn.addEventListener('click',function(){
     pst.textContent='Working...';
     Notification.requestPermission().then(function(p){
@@ -3418,32 +3421,46 @@ _DASH_JS = r'''
         var el=hform&&hform.elements[k];if(el&&el.value)p.set(k,el.value);});
       if(hs.limit>hmore)p.set('limit',hs.limit);}
     return p.toString();}
+  // The Requests page polls the cards; the History page polls its list.
   function poll(){
-    if(!cards||A.out)return Promise.resolve();
-    var seq=hseq,q=hq();
+    var onC=!!cards, onH=!onC&&!!hl;
+    if((!onC&&!onH)||A.out)return Promise.resolve();
+    var seq=hseq,q=onH?hq():'';
     // redirect:'manual': an SSO login redirect must not look like a network error
-    return fetch('/?fragment=1'+(q?'&'+q:''),{credentials:'same-origin',cache:'no-store',redirect:'manual'})
+    return fetch((onC?'/?fragment=1':'/history?fragment=1')+(q?'&'+q:''),
+        {credentials:'same-origin',cache:'no-store',redirect:'manual'})
       .then(function(r){if(A.expired(r,true)){A.mark();return null;}if(!r.ok)throw 0;return r.text();})
       .then(function(h){if(h===null)return;
         var d=parse(h),c=d.getElementById('cards'),nl=d.getElementById('hlist');
-        if(!c){A.mark();return;}      // a 200 without the cards is the login page
-        if(c.getAttribute('data-version')!==last){
-          last=c.getAttribute('data-version');var wasopen=asbOpenKeys(cards),wasck=asbChecked(cards);
-          cards.innerHTML=c.innerHTML;asbReopen(cards,wasopen);asbRecheck(cards,wasck);asbGSync(cards);bind();
-          track(ids(c));}
-        if(hl&&nl&&seq===hseq&&nl.innerHTML!==hl.innerHTML)hl.innerHTML=nl.innerHTML;
+        if(onC){
+          if(!c){A.mark();return;}      // a 200 without the cards is the login page
+          if(c.getAttribute('data-version')!==last){
+            last=c.getAttribute('data-version');var wasopen=asbOpenKeys(cards),wasck=asbChecked(cards);
+            cards.innerHTML=c.innerHTML;asbReopen(cards,wasopen);asbRecheck(cards,wasck);asbGSync(cards);bind();
+            track(ids(c));}
+        }else{
+          if(!nl){A.mark();return;}
+          if(seq===hseq&&nl.innerHTML!==hraw){hraw=nl.innerHTML;hl.innerHTML=hraw;}
+        }
         off.hidden=true;secs();title();})
       .catch(function(){if(!A.out)off.hidden=false;});}
   function hload(){
-    hseq++;if(hform)hform.hidden=!hs.all;
-    try{var q=hq();history.replaceState(null,'',q?'/?'+q:'/');}catch(x){}
+    hseq++;
+    try{var q=hq();history.replaceState(null,'',q?'/history?'+q:'/history');}catch(x){}
     return poll();}
   var htimer=null;
   if(hform){
     hform.addEventListener('submit',function(e){e.preventDefault();hs.limit=hmore;hload();});
     hform.addEventListener('change',function(){hs.limit=hmore;hload();});
     hform.addEventListener('input',function(e){if(e.target.name!=='q')return;
-      clearTimeout(htimer);htimer=setTimeout(function(){hs.limit=hmore;hload();},300);});}
+      clearTimeout(htimer);htimer=setTimeout(function(){hs.limit=hmore;hload();},300);});
+    // filter chips are links that work without scripts; with scripts they refilter in place
+    hform.addEventListener('click',function(e){var c=e.target.closest('a[data-outcome]');if(!c)return;
+      e.preventDefault();hform.elements.outcome.value=c.getAttribute('data-outcome');
+      hform.querySelectorAll('a[data-outcome]').forEach(function(x){
+        var on=x===c;x.classList.toggle('on',on);if(on)x.setAttribute('aria-current','true');
+        else x.removeAttribute('aria-current');});
+      hs.limit=hmore;hload();});}
   // Detail pop-over: the server renders (and escapes) the fragment; it is the
   // only thing put into the dialog, and the dialog sits outside the polled areas.
   var dlg=document.getElementById('hdlg'), dbody=document.getElementById('hbody'),
@@ -3473,9 +3490,7 @@ _DASH_JS = r'''
   if(recent)recent.addEventListener('click',function(e){
     var a=e.target.closest('[data-hact]');
     if(a){e.preventDefault();var k=a.getAttribute('data-hact');
-      if(k==='all'){hs.all=true;hs.limit=hmore;}
-      else if(k==='less'){hs.all=false;hs.limit=0;}
-      else if(k==='more'){hs.limit+=hmore;}
+      if(k==='more'){hs.limit+=hmore;}
       hload();return;}
     var b=e.target.closest('button.hrow');if(b)opendetail(b);});
   function bind(){document.querySelectorAll('form.decide').forEach(function(f){
@@ -3494,7 +3509,8 @@ _DASH_JS = r'''
           last=null;return poll();})
         .catch(function(){last=null;poll();});});});}
   seen=cards?ids(cards):{};nshow();pshow();
-  bind();secs();title();if(cards){setInterval(secs,1000);setInterval(poll,3000);}
+  bind();secs();title();if(cards){setInterval(secs,1000);}
+  if(cards||hl){setInterval(poll,3000);}
   document.addEventListener('visibilitychange',function(){
     report('visibility',{visible:!document.hidden,state:document.visibilityState},5000);
     if(!document.hidden)poll();});
@@ -3700,11 +3716,6 @@ def _agent_label(ua):
     return browser
 
 
-_ICON = ("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E"
-         "%3Crect width='32' height='32' rx='8' fill='%232563eb'/%3E%3Ctext x='16' y='23' "
-         "font-family='system-ui,Arial,sans-serif' font-size='20' font-weight='700' fill='white' "
-         "text-anchor='middle'%3EA%3C/text%3E%3C/svg%3E")
-
 # Manual reload for the home-screen app (it has no browser chrome); shown by the page script in
 # standalone mode only, so a normal tab's header is unchanged.
 _RELOAD_BTN = ("<button type=button id=asb-reload class=rl hidden aria-label='Reload this page' "
@@ -3715,24 +3726,24 @@ _SIGNED_OUT = ("<div id=signedout class='flash offline signedout' role=alert hid
                "<button type=button id=so-btn class='btn approve'>Sign in again</button></div>")
 
 # Page colours for the status bar / address bar: the header surface (--card) in each scheme.
-_THEME_LIGHT, _THEME_DARK = "#ffffff", "#161b22"
+_THEME_LIGHT, _THEME_DARK = "#f3f6f1", "#0c140f"
 _MANIFEST = {
     "name": "Agent Secret Broker", "short_name": "Secret Broker", "description": "Approve secret requests",
     "start_url": "/", "scope": "/", "display": "standalone",
     "background_color": _THEME_LIGHT, "theme_color": _THEME_LIGHT,
-    "icons": [{"src": "/apple-touch-icon.png", "sizes": "180x180", "type": "image/png", "purpose": "any"}],
+    "icons": [{"src": "/apple-touch-icon.png", "sizes": "180x180", "type": "image/png", "purpose": "any"},
+              {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any"}],
 }
-_ICON_PNG_URI = "data:image/png;base64," + base64.b64encode(icon_mod.PNG).decode()
 
-_TABS = (("requests", "/", "Requests"), ("policies", "/policies", "Policies"),
-         ("clients", "/clients", "Clients"), ("settings", "/settings", "Settings"))
+_TABS = (("requests", "/", "Requests"), ("history", "/history", "History"),
+         ("policies", "/policies", "Policies"), ("settings", "/settings", "Settings"))
 
 
 def _chrome(tab, badge, user):
-    who = f"<span class=who>{html.escape(user)}</span>" if user else ""
-    head = ("<header class=top><div class=bar><span class=logo>A</span>"
-            "<b class=brand>Agent Secret Broker</b><span class='pill ok'>&#9679; online</span>"
-            f"{who}{_RELOAD_BTN}</div></header>")
+    head = ("<header class=top><div class=bar>"
+            f"<img class=logo src=\"{ui_theme.LOGO_URI}\" width=30 height=30 alt=''>"
+            "<b class=brand>Secret Broker</b><span class=online><i></i>online</span>"
+            f"{_RELOAD_BTN}</div></header>")
     if tab is None:
         return head
     links = "".join(
@@ -3748,6 +3759,8 @@ def _page(h, code, body, wide=False, nav=True, script=None, tab=None, badge=0, u
     if nav:             # signed-out handling + the reload button live on every page with the header
         page = json.dumps({"get": getattr(h, "command", "GET") == "GET"})
         scr = f"<script nonce='{nonce}'>window.ASB_PAGE={page};{_SESSION_JS}</script>" + scr
+    if nav:             # local-time formatting for every <time datetime> (theme choice is set in the head)
+        scr += f"<script nonce='{nonce}'>{ui_theme.TIME_JS}</script>"
     pcfg = getattr(h, "presence_page_cfg", None) if nav else None
     if pcfg:            # enabled: every approval page sends the presence heartbeat
         scr += (f"<script nonce='{nonce}'>window.ASB_PRESENCE={json.dumps(pcfg)};{_PRESENCE_JS}</script>")
@@ -3761,11 +3774,12 @@ def _page(h, code, body, wide=False, nav=True, script=None, tab=None, badge=0, u
            "<meta name=apple-mobile-web-app-capable content=yes><meta name=mobile-web-app-capable content=yes>"
            "<meta name=apple-mobile-web-app-status-bar-style content=default>"
            "<meta name=apple-mobile-web-app-title content='Secret Broker'>"
+           + (f"<script nonce='{nonce}'>{ui_theme.THEME_JS}</script>" if nav else "") +
            "<title>Agent Secret Broker</title>"
-           f"<link rel=icon href=\"{_ICON}\">"
-           f"<link rel=apple-touch-icon sizes=180x180 href=\"{_ICON_PNG_URI}\">"
+           f"<link rel=icon type=image/png sizes=32x32 href=\"{ui_theme.FAVICON_URI}\">"
+           f"<link rel=apple-touch-icon sizes=180x180 href=\"{ui_theme.TOUCH_URI}\">"
            "<link rel=manifest href=/manifest.webmanifest crossorigin=use-credentials>"
-           f"<style>{_CSS}{scripts_mod.CSS}{details_mod.CSS}{proposals_mod.CSS}{credreq_mod.CSS}{clients_mod.CSS}{sessions_mod.CSS}{plans_mod.CSS}</style><body>{_chrome(tab, badge, user) if nav else ''}"
+           f"<style>{ui_theme.TOKENS}{_CSS}{scripts_mod.CSS}{details_mod.CSS}{proposals_mod.CSS}{credreq_mod.CSS}{clients_mod.CSS}{sessions_mod.CSS}{plans_mod.CSS}{ui_theme.CSS}</style><body>{_chrome(tab, badge, user) if nav else ''}"
            f"<main class='{'wide' if wide else 'narrow'}'>{_SIGNED_OUT if nav else ''}{body}</main>{scr}</body></html>").encode()
     h.send_response(code)
     h.send_header("Content-Type", "text/html; charset=utf-8")
@@ -3814,6 +3828,83 @@ def _describe(req):
             "command shown is what it <em>said</em> it would run.")
 
 
+_COMPLEX_MODES = ("guidance", "credential", "plan", "session")     # the whole card body is the review
+
+
+def _plain_line(req):
+    """The one-line description of a request when no summary exists yet: built from request fields only."""
+    names = ", ".join(req.names)
+    if req.mode == "guidance":
+        return f"Proposed guidance for {len(req.names)} credential{'' if len(req.names) == 1 else 's'}."
+    if req.mode == "credential":
+        return "An agent asks you to supply a credential."
+    if req.mode == "plan":
+        n = len(req.spec.get("rules") or ())
+        return f"A plan of {n} call rule{'' if n == 1 else 's'} using {names}."
+    if req.mode == "session":
+        return f"An http session using {names}."
+    line = riskmodel_mod.deterministic_summary(req.mode, req.names, req.spec) or ""
+    return (line[6:] if line.startswith("auto: ") else line) or f"A request using {names}."
+
+
+def _call_line(req):
+    """The raw call as one plain string (escaped by the caller); '' for modes whose body is the review."""
+    sp = req.spec
+    if req.mode == "http":
+        return f"{sp['method']} {sp['url']}"
+    if req.mode == "env":
+        return "run " + " ".join(sp.get("argv") or [])
+    if req.mode == "ssh_sign":
+        return str(sp["ssh"]["text"])
+    if req.mode == "store":
+        return f"{sp['op']} {sp['item']}.{sp['field']}"
+    return ""
+
+
+def _card_when(ts):
+    return ui_theme.time_tag(ts, "clock")
+
+
+_HIST_STATUS = {"approved": ("ok", "&#10003;", "Approved"), "auto-approved": ("ok", "&#10003;", "Auto-approved"),
+                "denied": ("no", "&#10005;", "Denied"), "failed": ("no", "&#10005;", "Failed"),
+                "expired": ("ex", "&#8943;", "Expired, nobody answered")}
+
+
+def _hist_what(r):
+    """A short plain description of a history row's request (escaped by the caller)."""
+    if r["mode"] == "http":
+        return f"{r['method'] or ''} {r['url'] or ''}".strip()
+    if r["mode"] == "store":
+        return f"{r['op'] or 'store'} credential"
+    if r["mode"] == "ssh_sign":
+        return r.get("ssh_what") or "ssh signature"
+    if r["mode"] == "credential":
+        return "credential request"
+    if r["mode"] == "plan":
+        return "plan"
+    if r["mode"] == "session":
+        return "http session for " + ", ".join(r["names"])
+    if r["mode"] == "guidance":
+        return f"guidance proposal ({len(r['names'])} credential{'' if len(r['names']) == 1 else 's'})"
+    return "env"
+
+
+def _hist_row(r):
+    """One History list row: status circle (icon, colour), the sentence, status and time, risk chip."""
+    e = html.escape
+    cls, icon, word = _HIST_STATUS.get(r["outcome"], ("ex", "&#8943;", "Unknown"))
+    if r["outcome"] in ("approved", "denied") and r["approver"] and r["via"] != "policy":
+        word += " by you"
+    line = (r["summary"] or "")
+    line = line[6:] if line.startswith("auto: ") else line
+    line = line or _hist_what(r)[:120]
+    return (f"<li data-ts='{int(r['ts'])}'><button type=button class=hrow data-id='{e(r['id'])}' "
+            f"aria-haspopup=dialog><span class='hic {cls}' aria-hidden=true>{icon}</span>"
+            f"<span class=what><b>{e(line)}</b><small>{word} &middot; "
+            f"{ui_theme.time_tag(r['ts'], 'when')} &middot; {e(', '.join(r['names']))}</small></span>"
+            f"{ui_theme.risk_chip(r['risk']) if r['risk'] else ''}</button></li>")
+
+
 def _info_icon(model, source=None):
     """The (i) icon whose tooltip says which model wrote a description (or that
     a plain line was built from the request details, with no model involved)."""
@@ -3827,11 +3918,12 @@ def _info_icon(model, source=None):
 
 
 def _risk_html(req):
+    """Risk chip (icon, word, colour) and the reasons, for the link-approval pages."""
     if not req.risk:        # the assessment has not been attached yet: say so, never guess a level
-        return ("<div class='risk assessing'><b>ASSESSING</b>"
-                "<small>rating this request...</small></div>")
+        return ("<div class='risk assessing'>" + ui_theme.risk_chip(None)
+                + "<small>rating this request...</small></div>")
     lvl = req.risk["level"]
-    out = (f"<div class='risk {lvl}'><b>{lvl.upper()} RISK</b><small>"
+    out = (f"<div class='risk {lvl}'>{ui_theme.risk_chip(lvl)}<small>"
            + html.escape("; ".join(req.risk["reasons"]) if req.risk else "") + "</small></div>")
     if req.summary:
         out += (f"<p>{'Summary' if req.summary_source == 'deterministic' else 'AI summary'} "
@@ -3877,8 +3969,8 @@ def _approve_actions(broker, req):
         return sessions_mod.actions_html(broker, req)
     e = html.escape
     names = e(", ".join(req.names))
-    row1 = ("<div class=decide-row><button class='btn approve' name=decision value=approve>"
-            "Approve</button><button class='btn deny' name=decision value=deny>Deny</button></div>")
+    row1 = ("<div class=decide-row><button class='btn deny' name=decision value=deny>Deny</button>"
+            "<button class='btn approve' name=decision value=approve>Approve once</button></div>")
     ok_g, _ = broker.grant_eligibility(req)
     mins = broker.grant_durations() if ok_g else []
     ok_a, why = broker.always_allow_eligibility(req)
@@ -3886,50 +3978,51 @@ def _approve_actions(broker, req):
     if not mins and not ok_a and not rule_chip:
         return row1
     scope = grants_mod.scope_for(req.mode, req.spec)
-    chips = []
     env_note = (", releasing the secret value to the requesting machine without asking"
                 if req.mode == "env" else "")
-    for m in mins:
-        label = _fmt_minutes(m)
-        chips.append(
-            f"<button class=chip name=decision value='approve_grant_{m}' "
+    out = row1
+    if mins:        # one tap approves this request and further identical ones for that long
+        out += "<div class=timed>" + "".join(
+            f"<button class='btn t' name=decision value='approve_grant_{m}' "
             f"aria-label='Approve this request, and approve further requests for exactly {names} "
-            f"for {label}{env_note}'>{label}</button>")
+            f"for {_fmt_minutes(m)}{env_note}'>{_fmt_minutes(m)}</button>" for m in mins) + "</div>"
+    links = []
     if ok_a:
         what = standing_mod.scope_phrase(req.mode, scope)
         mx = broker.auto_approve_max(req.client["id"])
         tip = (f"Approve this request and approve future requests for this secret without asking: "
                f"{what}, when the request is rated {mx} or lower. "
-               "Applies to the client chosen above. Revoke any time under Policies.")
+               "Applies to the client chosen in the confirmation. Revoke any time under Policies.")
         ask = standing_mod.confirm_text(req.names[0], req.mode, scope, mx)
-        chips.append(
-            f"<details class=alw><summary class='chip always' data-tip='{e(tip)}' "
-            f"aria-label='Always approve {e(req.names[0])}: {e(tip)}'>Always</summary>"
+        cname = req.client["name"]
+        links.append(
+            f"<details class=alw><summary class='chip always linkish' data-tip='{e(tip)}' "
+            f"aria-label='Always approve {e(req.names[0])}: {e(tip)}'>Always allow this...</summary>"
             f"<div class=confirm><span>{e(ask)}</span>"
-            "<button class='btn sm approve' name=decision value=approve_always>Confirm</button>"
-            "<span class=muted>Click Always again to cancel.</span></div></details>")
+            "<label class=rscope>Applies to <select name=rule_scope aria-label='Whom a standing approval applies to'>"
+            f"<option value=client selected>only this client ({e(cname)})</option>"
+            "<option value=any>any client (every machine)</option></select></label>"
+            "<button class='btn sm approve' name=decision value=approve_always>Confirm</button></div></details>")
     elif mins:
         tip = f"Always not offered: {why}."
-        chips.append(f"<span class='chip off' tabindex=0 role=img data-tip='{e(tip)}' "
-                     f"aria-label='{e(tip)}'>Always</span>")
+        links.append(f"<span class='chip off linkish' tabindex=0 role=img data-tip='{e(tip)}' "
+                     f"aria-label='{e(tip)}'>Always allow this...</span>")
     if rule_chip:
-        chips.append(sshrules_mod.chip_html(*rule_chip))
-    cname = req.client["name"]
-    out = ("<div class=auto><span class=lbl>Automatically approve...</span>"
-           "<label class=rscope>Applies to <select name=rule_scope aria-label='Whom a standing approval applies to'>"
-           f"<option value=client selected>only this client ({e(cname)})</option>"
-           "<option value=any>any client (every machine)</option></select></label>"
-           f"<div class=chips>{''.join(chips)}</div>")
-    if mins and req.mode == "env":
-        out += (f"<p class=scope><small class=muted>Applies to exactly: {names}, run-with-secret "
-                "requests only. The secret value will be released to the requesting machine for "
-                "the chosen time without asking. Requests whose script text is not visible "
-                "still ask. Revoke any time under Policies.</small></p>")
-    if mins and req.mode != "env":
-        out += (f"<p class=scope><small class=muted>Applies to exactly: {names}. "
-                f"{'Reads only (GET, HEAD, OPTIONS)' if scope == 'read' else 'Any method'}. "
-                "Revoke any time under Policies.</small></p>")
-    return row1 + out + "</div>"
+        links.append(sshrules_mod.chip_html(*rule_chip))
+    if links:
+        out += f"<div class=alwrow>{''.join(links)}</div>"
+    if mins:
+        if req.mode == "env":
+            cov = (f"Applies to exactly: {names}, run-with-secret requests only. The secret value will be "
+                   "released to the requesting machine for the chosen time without asking. Requests whose "
+                   "script text is not visible still ask. Revoke any time under Policies.")
+        else:
+            cov = (f"Applies to exactly: {names}. "
+                   f"{'Reads only (GET, HEAD, OPTIONS)' if scope == 'read' else 'Any method'}. "
+                   "Revoke any time under Policies.")
+        out += ("<div class=dxrow><details class=dx><summary>Covers</summary>"
+                f"<div class=dxbody><p class=scope><small class=muted>{cov}</small></p></div></details></div>")
+    return out
 
 
 def _rule_scope(form):
@@ -4168,10 +4261,12 @@ def _detail_html(r, evs, retained=""):
         add("Decided by", r["approver"])
     if esc:
         add("Auto-approve", esc.get("reason"))
-    add("Requested", _utc(t0))
-    add("Decided", _utc((decided or final or {}).get("ts")))
-    add("Released", _utc((ran or {}).get("ts")))
-    add("Delivered to client", _utc((deliv or {}).get("ts")))
+    def utc(ts):
+        return ui_theme.time_tag(ts, "full") if ts else ""
+    add("Requested", utc(t0), True)
+    add("Decided", utc((decided or final or {}).get("ts")), True)
+    add("Released", utc((ran or {}).get("ts")), True)
+    add("Delivered to client", utc((deliv or {}).get("ts")), True)
     add("Time to decision", _secs(t0, (decided or final or {}).get("ts")))
     if r["latency_ms"] is not None:
         add("Total until final", f"{r['latency_ms'] / 1000:.1f}s")
@@ -4184,12 +4279,36 @@ def _detail_html(r, evs, retained=""):
         extra = " ".join(f"{k}={_ev_val(v)}" for k, v in x.items() if k not in ("event", "ts", "time"))
         t = (x.get("time") or "")[11:19]
         dt = _secs(t0, x.get("ts"))
-        tl.append(f"<li><time>{e(t)}</time><b>{e(x['event'])}</b>"
+        tm = (ui_theme.time_tag(x["ts"], "secs") if isinstance(x.get("ts"), (int, float)) and t
+              else f"<time>{e(t)}</time>")
+        tl.append(f"<li>{tm}<b>{e(x['event'])}</b>"
                   + (f" <small class=muted>+{e(dt)}</small>" if dt and x.get("ts") != t0 else "")
                   + (f"<span class=ev>{e(extra)}</span>" if extra else "") + "</li>")
-    return (f"<div class=dtitle><b>{e(', '.join(r['names']))}</b>"
-            f"<span class='pill {kind}'>{e(label)}</span></div>"
-            f"<dl class=kv>{''.join(rows)}</dl>{retained}<h3>Timeline</h3><ol class=tl>{''.join(tl)}</ol>")
+    cls, icon, word = _HIST_STATUS.get(outcome, ("ex", "&#8943;", outcome.capitalize()))
+    if outcome in ("approved", "denied") and r["approver"] and r["via"] != "policy":
+        word += " by you"
+    took = _secs(t0, (decided or {}).get("ts")) if decided else ""
+    gm = (decided or {}).get("grant_minutes")
+    sub = " &middot; ".join(x for x in (
+        f"{e(took)} to decide" if took else "", f"for {e(str(gm))} min" if gm else "",
+        e(label) if label != outcome else "", e(r["error"]) if r["error"] else "") if x)
+    line = (r["summary"] or "")
+    line = line[6:] if line.startswith("auto: ") else line
+    line = line or _hist_what(r)[:200]
+    model = (r["summary"] and r.get("summary_source") != "deterministic")
+    chips = (f"<details class=dx><summary>Timeline</summary><div class=dxbody><ol class=tl>{''.join(tl)}</ol>"
+             f"</div></details>{retained}")
+    return (f"<div class='dcard'><div class=glance>{ui_theme.risk_chip(r['risk']) if r['risk'] else ''}"
+            f"<span class=gwho>{e(', '.join(r['names']))}"
+            + (f" &middot; {e(r['client_name'])}" if r.get("client_name") else "") + "</span>"
+            f"<span class=left>{ui_theme.time_tag(t0, 'when')}</span></div>"
+            f"<h2 class=sent>{e(line)}"
+            + (f" {_info_icon(r.get('summary_model'), r.get('summary_source'))}" if r["summary"] else "") + "</h2>"
+            + ("<div class=rqmeta>Written by a model, unverified.</div>" if model else "")
+            + f"<div class=band><span class='hic {cls}' aria-hidden=true>{icon}</span><div class=t>"
+            f"<b>{word}</b>" + (f"<div class=muted>{sub}</div>" if sub else "") + "</div></div>"
+            f"<div class=line></div><dl class='kv facts'>{''.join(rows)}</dl>"
+            f"<div class=dxrow>{chips}</div></div>")
 
 
 def client_handler(broker, client_key):
@@ -4507,6 +4626,8 @@ def approval_handler(broker):
                      "push_removed": "Device removed.",
                      "push_test_ok": "Test push sent. It should arrive even with the browser closed.",
                      "push_failed": "The test push was not delivered to any device.",
+                     "planrevoked": _CLIENT_NOTES["planrevoked"], "plangone": _CLIENT_NOTES["plangone"],
+                     "sesrevoked": _CLIENT_NOTES["sesrevoked"], "sesgone": _CLIENT_NOTES["sesgone"],
                      "bad": "That request could not be processed."}
             reqs = broker.pending()
             token = broker.csrf_token(user)
@@ -4516,32 +4637,21 @@ def approval_handler(broker):
             for e in enrolls:       # a new client waits above the requests: a human-only decision
                 cards.append(clients_mod.enroll_card_html(e, token, now, broker.clients.name_in_use(e["name"])))
             for r in reqs:
-                what, rnote = _describe(r)
-                cards.append(
-                    f"<article class=req data-id='{html.escape(r.id)}'>"
-                    f"<div class=reqhead><h2>"
-                    f"{'Guidance proposal' if r.mode == 'guidance' else 'Plan: ' + html.escape(', '.join(r.names)) if r.mode == 'plan' else html.escape(', '.join(r.names))}</h2>"
-                    f"<time data-exp='{int(r.expires)}'>expires in "
-                    f"{max(0, int(r.expires - time.time()))}s</time></div>{_risk_html(r)}"
-                    f"<div class=box>{clients_mod.from_html(r)}<br>{what}</div>"
-                    f"{details_mod.html(broker.details_view(r))}"
-                    f"<p><small>{rnote}</small></p>"
-                    f"<form method=post action='{'/plans/decide' if r.mode == 'plan' else '/decide'}' class=decide>"
-                    f"<input type=hidden name=id value='{html.escape(r.id)}'>"
-                    f"<input type=hidden name=csrf value='{token}'>"
-                    f"{_approve_actions(broker, r)}</form></article>")
+                cards.append(self._request_card(r, token, now))
+            running, run_ids = self._running_now(token, now)
             # the card must refresh when its assessment arrives, not only when requests come and go
             version = hashlib.sha256(
-                "|".join([f"{r.id}:{1 if r.risk else 0}" for r in reqs]
-                         + [f"enroll:{e['id']}" for e in enrolls]).encode()).hexdigest()[:16]
+                "|".join([f"{r.id}:{1 if r.risk else 0}:{1 if r.summary else 0}" for r in reqs]
+                         + [f"enroll:{e['id']}" for e in enrolls]
+                         + [f"run:{i}" for i in run_ids]).encode()).hexdigest()[:16]
             inner = ("".join(cards) if cards else
                      "<div class='card empty'>Nothing is waiting for approval.</div>")
-            block = f"<div id=cards class=cards data-version='{version}'>{inner}</div>"
+            block = f"<div id=cards class=cards data-version='{version}'>{inner}{running}</div>"
             pend_ids = broker.open_ids()
             a = self._hist_args(q or {})
             if fragment:
-                return _page(self, 200, block + self._hist_list(a, pend_ids), nav=False)
-            recent = self._recent_history(a, pend_ids)
+                # the card poll; a caller that still asks for the history list (view=all) gets it too
+                return _page(self, 200, block + (self._hist_list(a, pend_ids) if a["all"] else ""), nav=False)
             msg = notes.get(note, "")
             n_ent = ((q or {}).get("n") or [""])[0]
             if note == "gapplied" and n_ent.isascii() and n_ent.isdigit() and len(n_ent) < 4:
@@ -4549,9 +4659,99 @@ def approval_handler(broker):
             _page(self, 200,
                   f"<div id=flash class=flash{'' if msg else ' hidden'}>{html.escape(msg)}</div>"
                   "<div id=offline class='flash offline' hidden>Cannot reach the broker. "
-                  "Retrying; reload this page if it does not recover.</div><h3 style='margin-top:0'>Waiting for you</h3>"
-                  + block + recent + self._detail_dialog(), script=_DASH_JS, tab="requests",
-                  badge=len(reqs), user=user)
+                  "Retrying; reload this page if it does not recover.</div><div class=sec>Waiting for you</div>"
+                  + block, script=_DASH_JS, tab="requests", badge=len(reqs), user=user)
+
+        def _request_card(self, r, token, now):
+            """One waiting request: the glance row, the description, the one-tap actions, then the
+            details behind disclosure chips. Everything agent-supplied is escaped."""
+            e = html.escape
+            what, rnote = _describe(r)
+            complex_ = r.mode in _COMPLEX_MODES
+            lvl = r.risk["level"] if r.risk else None
+            names = ", ".join(r.names)
+            label = ("Guidance proposal" if r.mode == "guidance" else
+                     "Plan: " + names if r.mode == "plan" else names)
+            sentence = r.summary or _plain_line(r)
+            if sentence.startswith("auto: "):
+                sentence = sentence[6:]
+            reason = (r.risk["reasons"][0] if r.risk and r.risk.get("reasons") else "")
+            call = "" if complex_ else _call_line(r)
+            card = [
+                f"<article class=req data-id='{e(r.id)}' data-names='{e(names)}'>",
+                f"<div class=glance>{ui_theme.risk_chip(lvl)}"
+                f"<span class=gwho>{e(label)} &middot; {e(r.client['name'])}</span>"
+                f"<span class=left><time data-exp='{int(r.expires)}'>"
+                f"{ui_theme.left_text(r.expires - now)}</time></span></div>",
+                f"<h2 class=sent>{e(sentence)}"
+                + (f" {_info_icon(r.summary_model, r.summary_source)}" if r.summary else "") + "</h2>",
+                f"<div class=rqmeta>Requested {_card_when(r.created)}"
+                + (f" &middot; {e(reason)}" if reason else "") + "</div>"]
+            if not r.risk:
+                card.append("<div class=pend>Rating this request...</div>")
+            if call:
+                card.append(f"<div class='callline trunc'>{e(call[:300])}</div>")
+            if complex_:        # a plan, session, proposal or credential form is the review itself
+                card.append(f"<div class=box>{clients_mod.from_html(r)}<br>{what}</div>"
+                            f"{details_mod.html(broker.details_view(r))}<p><small>{rnote}</small></p>")
+            card.append(
+                f"<form method=post action='{'/plans/decide' if r.mode == 'plan' else '/decide'}' class=decide>"
+                f"<input type=hidden name=id value='{e(r.id)}'>"
+                f"<input type=hidden name=csrf value='{token}'>"
+                f"{_approve_actions(broker, r)}</form>")
+            chips = []
+            if not complex_:
+                chips.append(
+                    "<details class=dx><summary>Details</summary><div class=dxbody>"
+                    f"<dl class=facts><dt>Requested</dt><dd>{ui_theme.time_tag(r.created, 'full')}</dd>"
+                    f"<dt>Expires</dt><dd>{ui_theme.time_tag(r.expires, 'secs')}</dd></dl>"
+                    f"<div class=box>{clients_mod.from_html(r)}<br>{what}</div>"
+                    f"<p><small>{rnote}</small></p></div></details>")
+            if r.risk:
+                chips.append(
+                    f"<details class=dx><summary>Why {lvl.upper()}</summary><div class=dxbody><ul>"
+                    + "".join(f"<li>{e(x)}</li>" for x in r.risk.get("reasons") or ["no reason given"])
+                    + "</ul></div></details>")
+            if not complex_:
+                chips.append(details_mod.html(broker.details_view(r)))
+            if any(chips):
+                card.append(f"<div class=dxrow>{''.join(chips)}</div>")
+            card.append("</article>")
+            return "".join(card)
+
+        def _running_now(self, token, now):
+            """The 'Running now' section: active http sessions and plans with time left and Revoke.
+            Returns (html, ids); empty when nothing runs."""
+            e = html.escape
+            rows, ids = [], []
+            for v in broker.active_plans():
+                ids.append("p" + v["id"])
+                rows.append(
+                    "<div class=runrow><div class=t>"
+                    f"<b>Plan &middot; {e(', '.join(v['names']))}</b>"
+                    f"<small class='muted trunc'>{e(v['client_name'])} &middot; "
+                    f"{v['uses']} of {v['uses_max']} calls &middot; {plans_mod._esc(v['task'])}</small></div>"
+                    f"<span class=left><time data-exp='{int(v['expires_at'] or 0)}'>"
+                    f"{ui_theme.left_text(v['left_s'])}</time></span>"
+                    "<form method=post action='/plans/revoke'>"
+                    f"<input type=hidden name=csrf value='{e(token)}'><input type=hidden name=plan value='{e(v['id'])}'>"
+                    "<button class='btn sm deny'>Revoke</button></form></div>")
+            for v in broker.active_sessions():
+                ids.append("s" + v["pid"])
+                rows.append(
+                    "<div class=runrow><div class=t>"
+                    f"<b>Session &middot; {e(v['cred'])}</b>"
+                    f"<small class='muted trunc'>{e(v['client_name'])} &middot; {v['calls']} of {v['max_calls']} calls"
+                    f" &middot; {e('; '.join(sessions_mod.host_label(h) for h in v['hosts']))}</small></div>"
+                    f"<span class=left><time data-exp='{int(v['expires_at'])}'>"
+                    f"{ui_theme.left_text(v['left_s'])}</time></span>"
+                    "<form method=post action='/sessions/revoke'>"
+                    f"<input type=hidden name=csrf value='{e(token)}'><input type=hidden name=pid value='{e(v['pid'])}'>"
+                    "<button class='btn sm deny'>Revoke</button></form></div>")
+            if not rows:
+                return "", ids
+            return ("<section class=running><div class=sec>Running now</div><div class=card>"
+                    + "".join(rows) + "</div></section>"), ids
 
         def _hist_args(self, q):
             """History list state from a query string: view=all turns on the search
@@ -4561,8 +4761,11 @@ def approval_handler(broker):
             a = {"all": arg("view") == "all", "q": arg("q").strip(), "outcome": "", "secret": "",
                  "mode": ""}
             if a["all"]:
-                if arg("outcome") in OUTCOMES + ("unknown",) and arg("outcome") != "pending":
-                    a["outcome"] = arg("outcome")
+                oc = arg("outcome")
+                if oc in OUTCOMES + ("unknown",) and oc != "pending":
+                    a["outcome"] = oc
+                elif oc == "approved,auto-approved":        # the History tab's "Approved" chip
+                    a["outcome"] = oc
                 a["secret"] = arg("secret")
                 if arg("mode") in ("http", "env", "store", "ssh_sign", "guidance", "credential", "plan", "session"):
                     a["mode"] = arg("mode")
@@ -4576,78 +4779,58 @@ def approval_handler(broker):
         def _hist_list(self, a, pend_ids):
             """The `#hlist` block: rows, then the footer. The same markup for the
             first view, filtered views, "show more" and the live poll."""
+            group = a["outcome"] if "," in a["outcome"] else ""
             rows = [r for r in broker.history.rows(
-                pend_ids, a["outcome"] or None, a["secret"] or None, a["mode"] or None,
-                a["q"] or None) if r["outcome"] != "pending"]
+                pend_ids, None if group else (a["outcome"] or None), a["secret"] or None, a["mode"] or None,
+                a["q"] or None) if r["outcome"] != "pending"
+                and (not group or r["outcome"] in group.split(","))]
             total, rows = len(rows), rows[:a["limit"]]
-            good, bad = ("approved", "auto-approved"), ("denied", "failed")
-            today = time.strftime("%Y-%m-%d", time.gmtime())
-            items = []
-            for r in rows:
-                if r["mode"] == "http":
-                    what = f"{r['method'] or ''} {r['url'] or ''}".strip()
-                elif r["mode"] == "store":
-                    what = f"{r['op'] or 'store'} credential"
-                elif r["mode"] == "ssh_sign":
-                    what = r.get("ssh_what") or "ssh signature"
-                elif r["mode"] == "credential":
-                    what = "credential request"
-                elif r["mode"] == "plan":
-                    what = "plan"
-                elif r["mode"] == "session":
-                    what = "http session for " + ", ".join(r["names"])
-                elif r["mode"] == "guidance":
-                    what = f"guidance proposal ({len(r['names'])} credential{'' if len(r['names']) == 1 else 's'})"
-                else:
-                    what = "env"
-                kind = "ok" if r["outcome"] in good else "bad" if r["outcome"] in bad else "plain"
-                when = r["time"][11:16] if r["time"][:10] == today else r["time"][5:10] + " " + r["time"][11:16]
-                items.append(
-                    f"<li><button type=button class=hrow data-id='{html.escape(r['id'])}' "
-                    f"aria-haspopup=dialog><span class=what><b>{html.escape(', '.join(r['names']))}</b>"
-                    f"<small>{html.escape(what[:120])}</small></span>"
-                    f"<span class='pill {kind}'>{html.escape(r['outcome'])}</span>"
-                    f"<span class=when title='{html.escape(r['time'])}'>{html.escape(when)}</span>"
-                    "</button></li>")
+            items = [_hist_row(r) for r in rows]
             if items:
                 body = "".join(items)
             else:
                 body = ("<li class='muted empty'>No requests match.</li>" if a["all"] or a["q"] else
                         "<li class='muted empty'>No requests yet.</li>")
+            foot = ""
             if a["all"]:
                 qs = urllib.parse.urlencode(
                     [("view", "all")] + [(k, a[k]) for k in ("q", "outcome", "secret", "mode") if a[k]])
-                foot = ""
                 if total > len(rows):
-                    foot += (f"<a class=more-link data-hact=more href='/?{html.escape(qs)}"
+                    foot += (f"<a class=more-link data-hact=more href='/history?{html.escape(qs)}"
                              f"&amp;limit={a['limit'] + HIST_PAGE}'>Show more "
                              f"({total - len(rows)} older)</a>")
-                foot += "<a class=more-link data-hact=less href='/'>Show recent only</a>"
                 foot += f"<span class=muted>{total} request{'' if total == 1 else 's'}</span>"
-            else:
-                foot = ("<a class=more-link data-hact=all href='/?view=all'>"
-                        "Search and filter all history</a>")
             return (f"<div id=hlist data-all={'1' if a['all'] else '0'} data-limit={a['limit']}>"
                     f"<ul class=hist>{body}</ul><div class=hfoot>{foot}</div></div>")
 
-        def _recent_history(self, a, pend_ids):
-            def opt(vals, cur, label):
-                o = "".join(f"<option value='{html.escape(v)}'{' selected' if v == cur else ''}>"
-                            f"{html.escape(v)}</option>" for v in vals)
-                return f"<option value=''>{label}</option>{o}"
-            outcomes = tuple(o for o in OUTCOMES if o != "pending") + ("unknown",)
-            form = (f"<form id=hform class=hfilters method=get action='/'{'' if a['all'] else ' hidden'}>"
-                    "<input type=hidden name=view value=all>"
+        def _history_page(self, user, q, fragment):
+            """GET /history: filter chips, search, the day-grouped list; a row opens the detail card."""
+            q = dict(q)
+            q["view"] = ["all"]
+            a = self._hist_args(q)
+            pend_ids = broker.open_ids()
+            if fragment:
+                return _page(self, 200, self._hist_list(a, pend_ids), nav=False)
+            chips = []
+            for label, val in (("All", ""), ("Approved", "approved,auto-approved"), ("Denied", "denied"),
+                               ("Expired", "expired"), ("Failed", "failed")):
+                qs = urllib.parse.urlencode([("q", a["q"])] * bool(a["q"]) + [("outcome", val)] * bool(val))
+                on = a["outcome"] == val
+                chips.append(f"<a class='chip{' on' if on else ''}' data-outcome='{html.escape(val)}' "
+                             f"href='/history{'?' + html.escape(qs) if qs else ''}'"
+                             f"{' aria-current=true' if on else ''}>{label}</a>")
+            form = ("<form id=hform class=hfilters method=get action='/history'>"
+                    f"<input type=hidden name=outcome value='{html.escape(a['outcome'])}'>"
                     f"<input type=search name=q value='{html.escape(a['q'])}' maxlength=60 "
-                    "placeholder='Search secret, URL, source, id' aria-label='Search history'>"
-                    f"<select name=outcome aria-label=Outcome>{opt(outcomes, a['outcome'], 'any outcome')}</select>"
-                    f"<select name=secret aria-label=Secret>"
-                    f"{opt(broker.history.secrets_seen(), a['secret'], 'any secret')}</select>"
-                    f"<select name=mode aria-label=Mode>"
-                    f"{opt(('http', 'env', 'store', 'ssh_sign', 'guidance', 'credential', 'plan'), a['mode'], 'any mode')}</select>"
-                    "<noscript><button>Filter</button></noscript></form>")
-            return ("<section id=recent><h3>History</h3><div class='card flush'>"
-                    f"{form}{self._hist_list(a, pend_ids)}</div></section>")
+                    "placeholder='Search' aria-label='Search history'>"
+                    f"<div class=chips>{''.join(chips)}</div>"
+                    "<noscript><button>Search</button></noscript></form>")
+            _page(self, 200,
+                  "<div id=flash class=flash hidden></div>"
+                  "<div id=offline class='flash offline' hidden>Cannot reach the broker. "
+                  "Retrying; reload this page if it does not recover.</div>"
+                  f"<section id=recent>{form}{self._hist_list(a, pend_ids)}</section>" + self._detail_dialog(),
+                  script=_DASH_JS, tab="history", badge=broker.attention(), user=user)
 
         def _detail_dialog(self):
             return ("<dialog id=hdlg class=dlg aria-labelledby=hdt><div class=dhead>"
@@ -4666,7 +4849,7 @@ def approval_handler(broker):
                 msg = "Request not found." if row is None else "That request is still waiting."
                 if fragment:
                     return self._fragment(code, f"<p class=muted>{msg}</p>")
-                return _page(self, code, f"<h1>{msg}</h1>", tab="requests",
+                return _page(self, code, f"<h1>{msg}</h1>", tab="history",
                              badge=broker.attention(), user=user)
             broker.log("request_detail_viewed", peer=self.client_address[0],
                        client_ip=self._fwd(), request_id=rid)
@@ -4674,7 +4857,7 @@ def approval_handler(broker):
             if fragment:
                 return self._fragment(200, body)
             _page(self, 200, "<h1>Request</h1><div class=card>" + body + "</div>",
-                  tab="requests", badge=broker.attention(), user=user)
+                  tab="history", badge=broker.attention(), user=user)
 
         def _retry_html(self, row, user):
             """For a settled guidance proposal with failed entries whose text is still held:
@@ -4734,7 +4917,7 @@ def approval_handler(broker):
             one = lambda k: (form.get(k) or [""])[0]  # noqa: E731
             if path == "/plans/revoke":
                 done = broker.revoke_plan(one("plan")[:40], user, peer, fwd)
-                return self._redirect("/clients?note=" + ("planrevoked" if done else "plangone"))
+                return self._redirect("/?note=" + ("planrevoked" if done else "plangone"))
             decision = one("decision")
             gs = one("granted")
             nonce, rid = one("nonce")[:64] or None, one("id")[:64] or None
@@ -4857,35 +5040,58 @@ def approval_handler(broker):
                      "push_test_ok": "Test push sent. It should arrive even with the browser closed.",
                      "push_failed": "The test push was not delivered to any device."}
             msg = notes.get(note, "")
-            auto = _AUTO_LABEL[broker.auto_approve_max()]
+            mx = broker.auto_approve_max()
+            seg = "".join(f"<span{' class=on' if k == mx else ''}>{lab}</span>"
+                          for k, lab in (("none", "None"), ("low", "Low"), ("medium", "Medium"), ("high", "High")))
+            clients = broker.clients.rows()
+            active = sum(1 for c in clients if c["state"] == "active")
+            pc = broker.presence_cfg
+            e = html.escape
             push_row = self._push_enable_row(token) if broker.push is not None else ""
             devices = self._push_devices(token) if broker.push is not None else ""
+            ver = (os.environ.get("BROKER_GIT_SHA") or "unknown")[:7]
             _page(self, 200,
-                  "<h1>Settings</h1>"
-                  f"<div class=flash{'' if msg else ' hidden'}>{html.escape(msg)}</div>"
-                  "<section class=card><h2>Broker</h2><div class=srow><div class=t>"
-                  "<b>Auto-approve</b><small class=muted>"
-                  f"{html.escape(auto[0].upper() + auto[1:])}."
-                  " The ceiling for Always approvals and secrets set to always allow; set in the "
-                  "broker config (risk.auto_approve_max).</small></div></div>"
-                  "<div class=srow><div class=t><b>Notifications</b><small class=muted>"
-                  f"{html.escape(presence_mod.describe(broker.presence_cfg))}</small></div></div>"
-                  "<div class=srow><div class=t><b>Plans</b><small class=muted>"
-                  f"{html.escape(plans_mod.describe_config(broker.plans_cfg))}. Set in the broker config "
-                  "(plans); a plan lasts at most until its deadline and ends on a restart.</small></div></div>"
-                  "<div class=srow><div class=t><b>Standing approvals</b><small class=muted>"
-                  f"{html.escape(grants_mod.describe(broker.grants_cfg, broker.auto_approve_max()))}. "
-                  "Durations are set in the broker config (timed_grants).</small></div></div></section>"
-                  "<section class=card><h2>This browser</h2>"
-                  "<div class=srow><div class=t><b>Notifications while this page is open</b>"
+                  f"<div class=flash{'' if msg else ' hidden'}>{e(msg)}</div>"
+                  "<div class=sec>Notifications on this device</div><section class=card>"
+                  + push_row +
+                  "<div class=srow><div class=t><b>Notify me while this page is open</b>"
                   "<small id=notify-state class=muted></small></div>"
                   "<button id=notify class=btn type=button hidden></button></div>"
-                  + push_row +
-                  "<div class=srow><div class=t><b>Test</b>"
-                  "<small id=notify-why class=muted>Shows a notification on this device.</small></div>"
-                  "<button id=notify-test class=btn type=button hidden>Send a test notification"
-                  "</button></div>" + self._sw_block() + "</section>" + devices,
-                  script=_DASH_JS, tab="settings", user=user)
+                  "<div class=srow><div class=t><b>Skip the push while this page is open</b>"
+                  f"<small class=muted>Set in the broker config</small></div>"
+                  f"<span class='pill {'ok' if pc['enabled'] else 'plain'}'>{'On' if pc['enabled'] else 'Off'}</span></div>"
+                  "<div class=srow><div class=t><b>Send a test to this device</b>"
+                  "<small id=notify-why class=muted></small></div>"
+                  "<button id=notify-test class='btn sm' type=button hidden>Test</button></div>"
+                  "</section>" + devices +
+                  "<div class=sec>Default approval rules</div><section class=card>"
+                  "<div class=t><b>Auto-approve up to</b></div>"
+                  f"<div class=seg role=img aria-label='{e(_AUTO_LABEL[mx])}' style='margin-top:.4rem'>{seg}</div>"
+                  "<div class=line></div>"
+                  "<div class=srow style='padding:0'><div class=t><b>Machines</b>"
+                  f"<small class=muted>{active} enrolled</small></div>"
+                  "<a class='btn sm' href='/clients'>Manage</a></div>"
+                  "<div class=dxrow><details class=dx><summary>Broker configuration</summary><div class=dxbody>"
+                  f"<p><small class=muted>{e(_AUTO_LABEL[mx][0].upper() + _AUTO_LABEL[mx][1:])}. The ceiling for "
+                  "Always approvals and secrets set to always allow; set in the broker config "
+                  "(risk.auto_approve_max).</small></p>"
+                  f"<p><small class=muted>{e(presence_mod.describe(pc))}</small></p>"
+                  f"<p><small class=muted>{e(plans_mod.describe_config(broker.plans_cfg))}. Set in the broker "
+                  "config (plans); a plan lasts at most until its deadline and ends on a restart.</small></p>"
+                  f"<p><small class=muted>{e(grants_mod.describe(broker.grants_cfg, broker.auto_approve_max()))}. "
+                  "Durations are set in the broker config (timed_grants).</small></p>"
+                  "</div></details></div></section>"
+                  "<div class=sec>Appearance</div><section class=card>"
+                  "<div class=seg id=appearance role=group aria-label=Appearance>"
+                  "<button type=button data-theme-set=light>Light</button>"
+                  "<button type=button data-theme-set=dark>Dark</button>"
+                  "<button type=button data-theme-set=auto>Match phone</button></div></section>"
+                  "<div class=sec>About</div><section class=card>"
+                  f"<div class=srow><div class=t><b>Signed in as {e(user)}</b></div></div>"
+                  f"<div class=srow><div class=t><b>Broker</b><small class='muted mono'>build {e(ver)}</small></div></div>"
+                  "<div class=dxrow><details class=dx><summary>Troubleshooting</summary><div class=dxbody>"
+                  + self._sw_block() + "</div></details></div></section>",
+                  script=_DASH_JS + ui_theme.APPEARANCE_JS, tab="settings", user=user)
 
         def _sw_block(self):
             # Filled in by _DASH_JS; the expected version comes from the same constant /sw.js serves
@@ -4909,7 +5115,7 @@ def approval_handler(broker):
 
         def _push_enable_row(self, token):
             return (
-                "<div class=srow><div class=t><b>Notifications with the browser closed</b>"
+                "<div class=srow><div class=t><b>Push notifications</b>"
                 "<small id=push-state class=muted></small></div>"
                 f"<button id=push-enable class=btn type=button hidden data-key='"
                 f"{html.escape(broker.push.public_key())}' data-csrf='{token}'>Enable on this "
@@ -4918,15 +5124,15 @@ def approval_handler(broker):
         def _push_devices(self, token):
             rows = []
             for d in broker.push.devices():
-                when = time.strftime("%Y-%m-%d", time.gmtime(d["created"] or 0))
                 ok = d["last_ok"]
-                status = ("<span class='pill ok'>last delivery OK</span>" if ok else
+                status = (f"Last push {ui_theme.time_tag(ok, 'ago')}" if ok else
                           f"<span class='pill bad'>{html.escape(str(d['last_error']))[:60]}</span>"
-                          if d["last_error"] else "<span class='pill plain'>not used yet</span>")
+                          if d["last_error"] else "Not used yet")
                 rows.append(
-                    f"<li><div class=t><b>{html.escape(_agent_label(d['agent']))}</b>"
-                    f"<small class=muted>{html.escape(d['user'])}, added {when}</small></div>"
-                    f"{status}"
+                    f"<li data-ep='{html.escape(d['ep'])}' class=srow><div class=t><b>"
+                    f"{html.escape(_agent_label(d['agent']))} "
+                    "<span class='tagchip thisdev' hidden>this device</span></b>"
+                    f"<small class=muted>{status}</small></div>"
                     "<form method=post action='/push/revoke' class=inline>"
                     f"<input type=hidden name=id value='{html.escape(d['id'])}'>"
                     f"<input type=hidden name=csrf value='{token}'>"
@@ -4935,11 +5141,9 @@ def approval_handler(broker):
                     f"<input type=hidden name=csrf value='{token}'>"
                     "<button class='btn sm'>Send a test push</button></form>" if rows else "")
             return (
-                "<section class='card flush'><div class=chead><h2>Devices receiving push</h2>"
-                f"{test}</div>"
-                "<p class=cnote><small class=muted>The message carries only the secret names; "
-                "decisions still happen here, after you sign in.</small></p>"
+                "<div class=sec>All devices that get pushes</div><section class=card>"
                 f"<ul class=devices>{''.join(rows) or '<li class=muted>No devices yet.</li>'}</ul>"
+                f"{'<div style=margin-top:.5rem>' + test + '</div>' if test else ''}"
                 "</section>")
 
         def _json(self, code, obj):
@@ -4966,14 +5170,16 @@ def approval_handler(broker):
         def _static(self, path):
             """Manifest and home-screen icon: static, behind the same peer/identity check as every page
             (the manifest link sends credentials; the icon is also inlined in each page as a data: URI)."""
-            if path == "/apple-touch-icon.png":
-                raw, ctype = icon_mod.PNG, "image/png"
+            if path in ui_theme.ICON_ROUTES:
+                raw, ctype = ui_theme.ICON_ROUTES[path]
+                cache = ui_theme.ICON_CACHE
             else:
                 raw, ctype = json.dumps(_MANIFEST).encode(), "application/manifest+json; charset=utf-8"
+                cache = "no-cache"
             self.send_response(200)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(raw)))
-            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Cache-Control", cache)
             self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
             self.wfile.write(raw)
@@ -5001,11 +5207,9 @@ def approval_handler(broker):
 
         def _clients_page(self, user, note="", status=200):
             token = broker.csrf_token(user)
-            # the approvals that belong to a client live together under the clients: plans, then sessions
-            _page(self, status, clients_mod.clients_section(broker, token, flash=note)
-                  + plans_mod.active_table_html(broker.active_plans(), token)
-                  + sessions_mod.sessions_section(broker, token),
-                  script=_GRANTS_JS, tab="clients", badge=broker.attention(), user=user)
+            # running sessions and plans are under "Running now" on the Requests tab
+            _page(self, status, clients_mod.clients_section(broker, token, flash=note),
+                  script=_GRANTS_JS, tab="settings", badge=broker.attention(), user=user)
 
         def _standing_section(self, user):
             """'Standing approvals' on the Policies tab: every timed grant, Always
@@ -5028,7 +5232,7 @@ def approval_handler(broker):
                 else:
                     exp = (f"<time data-gexp='{int(r['expires_at'])}'>"
                            f"{e(_in_min(r['left_s']))}</time>")
-                who = e(r["created_by"]) + (f" <small class=muted>{e(r['created_at'])}</small>"
+                who = e(r["created_by"]) + (f" <small class=muted>{ui_theme.stamp_tag(r['created_at'])}</small>"
                                             if r["created_at"] else "")
                 if r["kind"] == "legacy":
                     form = ("<form method=post class=inline>"
@@ -5059,20 +5263,24 @@ def approval_handler(broker):
             u = urllib.parse.urlsplit(self.path)
             if u.path == "/sw.js" and broker.push is not None:
                 return self._service_worker()
-            if u.path in ("/manifest.webmanifest", "/apple-touch-icon.png"):
+            if u.path == "/manifest.webmanifest" or u.path in ui_theme.ICON_ROUTES:
                 return self._static(u.path)
             if u.path == "/":
                 q = urllib.parse.parse_qs(u.query)
                 frag = q.get("fragment", [""])[0] == "1"
+                if not frag and q.get("view", [""])[0] == "all":
+                    # the history list moved to its own tab: keep old links working
+                    keep = [(k, (q.get(k) or [""])[0][:60])
+                            for k in ("q", "outcome", "secret", "mode", "limit") if (q.get(k) or [""])[0]]
+                    return self._redirect("/history" + ("?" + urllib.parse.urlencode(keep) if keep else ""))
                 if not frag:
                     broker.log("dashboard_viewed", peer=self.client_address[0], client_ip=self._fwd())
                 return self._dashboard(user, fragment=frag, note=(q.get("note") or [""])[0][:12], q=q)
             if self.path.split("?")[0].rstrip("/") == "/history":
-                # the old standalone table: the same list now lives on the Requests tab
                 q = urllib.parse.parse_qs(u.query)
-                keep = [("view", "all")] + [(k, (q.get(k) or [""])[0][:60])
-                                            for k in ("outcome", "secret", "mode") if (q.get(k) or [""])[0]]
-                return self._redirect("/?" + urllib.parse.urlencode(keep))
+                if q.get("fragment", [""])[0] != "1":
+                    broker.log("history_viewed", peer=self.client_address[0], client_ip=self._fwd())
+                return self._history_page(user, q, q.get("fragment", [""])[0] == "1")
             if u.path.startswith("/credential/"):
                 return self._credential_get(user, u.path[len("/credential/"):][:64])
             if u.path.startswith("/request/"):
@@ -5295,7 +5503,7 @@ def approval_handler(broker):
             if path == "/sessions/revoke":
                 done = broker.revoke_session(form.get("pid", [""])[0][:16], user, self.client_address[0],
                                              self._fwd())
-                return self._redirect("/clients?note=" + ("sesrevoked" if done else "sesgone"))
+                return self._redirect("/?note=" + ("sesrevoked" if done else "sesgone"))
             if path == "/decide":
                 rid = form.get("id", [""])[0]
                 decision = form.get("decision", [""])[0]
@@ -5441,7 +5649,7 @@ def approval_handler(broker):
             if req.mode == "session":
                 return _page(self, 200, "<h1>Denied</h1>" if not approve else
                              "<h1>Session approved</h1><p>The clock started now and cannot be extended. "
-                             "Revoke it any time on the <a href='/clients'>Clients</a> tab.</p>")
+                             "Revoke it any time under Running now on the <a href='/'>Requests</a> tab.</p>")
             if req.mode == "guidance":
                 return _page(self, 200, "<h1>Denied</h1><p>Nothing was changed.</p>" if not approve else
                              f"<h1>Applying the selected guidance</h1><p>Applying {len(req.apply or ())} "

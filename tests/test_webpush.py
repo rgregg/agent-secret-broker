@@ -73,6 +73,14 @@ class Store(unittest.TestCase):
         self.assertNotIn("fcm.googleapis.com", blob)
         self.assertNotIn(AUTH, blob)
 
+    def test_devices_carry_a_one_way_hash_for_the_this_device_tag(self):
+        import hashlib
+        s = make_store()
+        s.add("alice", EP, P256DH, AUTH)
+        ep = s.devices()[0]["ep"]
+        self.assertEqual(ep, hashlib.sha256(EP.encode()).hexdigest()[:16])       # what the page script computes
+        self.assertNotIn(EP, ep)
+
     def test_file_is_private(self):
         s = make_store()
         s.add("alice", EP, P256DH, AUTH)

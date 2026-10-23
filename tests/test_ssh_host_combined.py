@@ -95,7 +95,7 @@ class Combined(Base):
     def test_ssh_card_has_grant_chips_and_a_grant_is_used_for_an_allowed_host(self):
         rid = json.loads(self.sign_to(HOST))["id"]
         _, page = self.get("/")
-        self.assertIn("Automatically approve...", page)
+        self.assertIn("<div class=timed>", page)
         self.assertIn("name=decision value='approve_grant_15'", page)
         self.assertEqual(self.approve(rid, "approve_grant_15"), 303)
         self.broker._by_id[rid].done.wait(10)

@@ -35,6 +35,7 @@ import time
 
 from . import clients as clients_mod
 from . import sshkey
+from . import ui_theme
 from .backends import BackendError
 
 MAX_RULES = 100
@@ -607,15 +608,15 @@ def policies_section(secrets_cfg, csrf, usage, now=None, state=None, client_name
                 warn = ("<br><span class=warnline>Not on the allowed hosts list: blocked by the "
                         "allowed hosts list, so this rule has no effect.</span>")
             expired = is_expired(r, now)
-            exp = (e(r["expires_at"]) + (" <b>(expired)</b>" if expired else "")) if r["expires_at"] else "never"
+            exp = (ui_theme.stamp_tag(r["expires_at"]) + (" <b>(expired)</b>" if expired else "")) if r["expires_at"] else "never"
             rows.append(
                 f"<tr><td data-label=Host>{e(r['host'] or '(no name)')}{warn}</td>"
                 f"<td data-label=Fingerprint><span class=fp title='{e(r['fp'], quote=True)}'>{e(short_fp(r['fp']))}...</span></td>"
                 f"<td data-label=Account><code>{e(r['user'])}</code></td>"
                 f"<td data-label=Client>{e(clients_mod.scope_label(r.get('client', clients_mod.ANY), client_names))}</td>"
-                f"<td data-label=Created>{e(r['by'])}<br><small class=muted>{e(r['at'])}</small></td>"
+                f"<td data-label=Created>{e(r['by'])}<br><small class=muted>{ui_theme.stamp_tag(r['at'])}</small></td>"
                 f"<td data-label=Expires>{exp}</td>"
-                f"<td data-label='Last used'>{e(_when(u['last_used']) or 'never')}"
+                f"<td data-label='Last used'>{ui_theme.time_tag(u['last_used'], 'when', fallback=_when(u['last_used'])) if _when(u['last_used']) else 'never'}"
                 f"<br><small class=muted>{int(u['uses'])} uses</small></td>"
                 "<td><form method=post action='/policies/ssh_rules/revoke' class=inline>"
                 f"<input type=hidden name=csrf value='{e(csrf, quote=True)}'>"

@@ -1120,7 +1120,7 @@ class Approval(SBase):
         self.assertIn("(unverified)", page)
         self.assertIn("&lt;U+00E4&gt;", page)                      # non-ASCII is escaped, never rendered
         self.assertNotIn("n\u00e4me", page)
-        self.assertIn("HIGH RISK", page)
+        self.assertIn("rbadge hi", page)
         self.assertIn("name=decision value=approve", page)
         self.assertIn("name=decision value=deny", page)
         self.assertIn("name=session_ttl_min", page)
@@ -1209,29 +1209,28 @@ class Observability(SBase):
         status, text, _ = self.get(f"/request/{ses['id']}")
         self.assertIn("not retained", text)
         self.assertIn("127.0.0.1", text)
-        status, page, _ = self.get("/?view=all&mode=session")
+        status, page, _ = self.get("/history?mode=session")
         self.assertIn("http session for unifi", page)
 
-    def test_clients_tab_lists_active_sessions_with_a_countdown_and_revoke(self):
+    def test_running_now_lists_active_sessions_with_a_countdown_and_revoke(self):
         sid = self.open(ttl_s=600, max_calls=9)
         self.call(sid, "GET", "/")
-        status, page, _ = self.get("/clients")
+        status, page, _ = self.get("/")
         self.assertEqual(status, 200)
-        self.assertIn("Active sessions", page)
-        self.assertIn("<b>unifi</b>", page)
+        self.assertIn("Running now", page)
+        self.assertIn("Session &middot; unifi", page)
         self.assertIn("shared key (legacy)", page)
         self.assertIn("127.0.0.1", page)
-        self.assertIn("GET, HEAD, POST, PUT", page)
-        self.assertIn("1 / 9", page)
-        self.assertRegex(page, r"<time data-gexp='\d+'>in 10 min</time>")
+        self.assertIn("1 of 9 calls", page)
+        self.assertRegex(page, r"<time data-exp='\d+'>(9:5\d|10:00) left</time>")
         self.assertIn("action='/sessions/revoke'", page)
         self.assertIn(self.broker.csrf_token("alice"), page)
-        self.assertIn("data-label=", page)                        # the mobile table layout
         self.assertNotIn(sid, page)                               # the id itself is never shown
         self.advance(300)
-        self.assertRegex(self.get("/clients")[1], r"in 5 min</time>")
+        self.assertRegex(self.get("/")[1], r"<time data-exp='\d+'>(4:5\d|5:00) left</time>")
         self.advance(400)
-        self.assertIn("No active sessions", self.get("/clients")[1])
+        self.assertNotIn("Running now", self.get("/")[1])
+        self.assertNotIn("Active sessions", self.get("/clients")[1])
 
     def test_active_sessions_page_escapes_names(self):
         a = self.new_client("alice-box")
@@ -1239,7 +1238,7 @@ class Observability(SBase):
         self.broker.clients._clients[a["id"]]["name"] = "<script>x</script>"
         for s in self.broker._sess.values():
             s.cname = "<script>x</script>"
-        page = self.get("/clients")[1]
+        page = self.get("/")[1]
         self.assertNotIn("<script>x</script>", page)
         self.assertIn("&lt;script&gt;", page)
 
@@ -1279,7 +1278,7 @@ class Leaks(SBase):
             if self.broker.details is not None:
                 every["request details"] = every.get("request details", "") + json.dumps(
                     self.broker.details.get(r["id"]) if hasattr(self.broker.details, "get") else "", default=str)
-        every["dashboard"] = self.get("/")[1] + self.get("/clients")[1] + self.get("/?view=all")[1]
+        every["dashboard"] = self.get("/")[1] + self.get("/clients")[1] + self.get("/history")[1]
         every["agent audit view"] = self.as_client(KEY, "GET", "/v1/audit?limit=500")[1]
         for where, text in every.items():
             for c in canaries:
@@ -1798,7 +1797,7 @@ class Hardening(SBase):
         self.ask()
         self.assertIn(f"127.0.0.1:{self.port}", self.get("/")[1])
         sid = self.open()
-        self.assertIn(f"127.0.0.1:{self.port}", self.get("/clients")[1])
+        self.assertIn(f"127.0.0.1:{self.port}", self.get("/")[1])      # the running session row
         self.assertEqual(self.events("session_opened")[-1]["hosts"], [self.hp()])
 
     def test_bad_host_entries_are_refused(self):
@@ -2390,7 +2389,7 @@ class Review5(SBase):
         [t.start() for t in ths]
         try:
             for _ in range(25):
-                for path in ("/", "/?fragment=1", "/?view=all", "/clients"):
+                for path in ("/", "/?fragment=1", "/history", "/clients"):
                     status, text, _ = self.get(path)
                     self.assertEqual(status, 200, path)
                 self.assertIsInstance(self.broker.open_ids(), set)
