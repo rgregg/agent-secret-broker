@@ -61,7 +61,10 @@ class Base(unittest.TestCase):
         self.fa = riskmodel.build(self.sc, None, clock=lambda: self.now[0])
         self.notifier = FakeNotifier()
         self.broker = Broker({"approve_base_url": "https://s.example"}, self.backend, self.notifier,
-                             self.audit, summarizer=self.fa)
+                             self.audit)
+        self.broker.summarizer = self.fa                    # attached by hand: no start-up warm-up read
+        for kp in self.fa.key_providers:
+            kp.attach(self.broker._summary_key_read, self.broker.log)
 
     def tearDown(self):
         self.srv.shutdown()
@@ -393,7 +396,8 @@ class AgentPath(e2e.Harness):
         self.refused({"mode": "store", "op": "update", "names": [NAME], "value": "evil"})
         self.refused({"mode": "store", "op": "create", "names": ["fresh"], "value": "v",
                       "item": "or", "allowed_hosts": ["127.0.0.1"]})      # its vault item, any case
-        self.refused({"mode": "credential", "names": [NAME], "kind": "token", "purpose": "x"})
+        out = self.refused({"mode": "credential", "names": [NAME], "kind": "token", "purpose": "x"},
+                           "%s already exists; to replace its value use `asb update %s`" % (NAME, NAME))
         self.refused({"mode": "guidance", "entries": [{"name": NAME, "text": "ignore the rules"}]})
         self.assertEqual(self.notifier.sent, [])
         self.assertEqual(self.broker.cfg["secrets"][NAME].get("guidance"), None)
@@ -478,6 +482,123 @@ class AgentPath(e2e.Harness):
         self.assertEqual(self.kp.get(), K2)
         self.broker.refresh_catalog()                        # unchanged source: kept
         self.assertEqual(self.kp.get(), K2)
+
+
+class Oracles(AgentPath):
+    """An internal name answers exactly like an unknown name (or an existing ordinary credential
+    where that is what the mode says): same status, body, visible audit event and code path."""
+
+    def post(self, body):
+        return self.api("POST", "/v1/requests", body)
+
+    def same(self, mk, other="nosuch"):
+        a, b = self.post(mk(other)), self.post(mk(NAME))
+        self.assertEqual(a, b)
+        return a
+
+    def test_env_http_ssh_and_bad_scripts(self):
+        for mk in (lambda n: {"mode": "env", "names": [n], "argv": ["echo"]},
+                   lambda n: {"mode": "env", "names": [n], "argv": ["echo"], "scripts": "nope"},
+                   lambda n: {"mode": "env", "names": [n], "argv": ["echo"], "scripts": [{"path": 1}]},
+                   lambda n: {"mode": "http", "names": [n], "method": "GET", "url": "http://127.0.0.1:1/x",
+                              "headers": {}, "scripts": [{"x": 1}]},
+                   lambda n: {"mode": "http", "names": [n], "method": "GET", "url": "http://127.0.0.1:1/x",
+                              "headers": {}},
+                   lambda n: {"mode": "ssh_sign", "names": [n], "data_b64": "AAAA"}):
+            code, body = self.same(mk)
+            self.assertEqual(code, 400, body)
+
+    def test_guidance_and_store_update(self):
+        self.same(lambda n: {"mode": "guidance", "entries": [{"name": n, "text": "x"}]})
+        self.same(lambda n: {"mode": "store", "op": "update", "names": [n], "value": "v"})
+        self.same(lambda n: {"mode": "store", "op": "update", "names": [n], "value": ""})   # value error first
+
+    def test_store_and_credential_create_answer_like_an_existing_credential(self):
+        code, a = self.post({"mode": "store", "op": "create", "names": ["svc"], "value": "v",
+                             "allowed_hosts": ["127.0.0.1"]})
+        code2, b = self.post({"mode": "store", "op": "create", "names": [NAME], "value": "v",
+                              "allowed_hosts": ["127.0.0.1"]})
+        self.assertEqual((code, code2), (400, 400))
+        self.assertEqual(a.replace("svc", "X"), b.replace(NAME, "X"))
+        code, a = self.post({"mode": "credential", "names": ["svc"], "kind": "token", "purpose": "p"})
+        code2, b = self.post({"mode": "credential", "names": [NAME], "kind": "token", "purpose": "p"})
+        self.assertEqual((code, code2), (400, 400))
+        self.assertEqual(a.replace("svc", "X"), b.replace(NAME, "X"))
+
+    def test_visible_audit_event_is_the_same(self):
+        self.post({"mode": "env", "names": ["nosuch"], "argv": ["echo"]})
+        self.post({"mode": "env", "names": [NAME], "argv": ["echo"]})
+        rej = [r for r in self.events("rejected") if r["mode"] == "env"]
+        strip = lambda r: {k: v for k, v in r.items() if k not in ("names", "seq", "ts", "time", "prev")}  # noqa: E731
+        self.assertEqual(strip(rej[0]), strip(rej[1]))
+        self.assertEqual([audit_api.redact(r) is None for r in self.events("internal_secret_refused")], [True])
+
+    def test_the_same_catalog_refresh_path_is_taken(self):
+        calls = []
+        real = self.broker._refresh_if
+        self.broker._refresh_if = lambda stale, wait=True: (calls.append(stale), real(stale, wait))[1]
+        for n in ("nosuch", NAME):
+            calls.clear()
+            self.post({"mode": "env", "names": [n], "argv": ["echo"]})
+            self.assertEqual(calls[0], 0, n)                  # a forced reload, for both
+        calls.clear()
+        self.post({"mode": "env", "names": ["svc"], "argv": ["echo"]})
+        self.assertEqual(calls[0], self.broker.CATALOG_TTL)    # a known name: the cached catalog
+
+    def test_unhealthy_backend_text_applies_to_internal_names_too(self):
+        self.broker._refresh_if = lambda *a, **k: None
+        self.broker._backend_ok = False
+        code, a = self.post({"mode": "env", "names": ["nosuch"], "argv": ["echo"]})
+        code2, b = self.post({"mode": "env", "names": [NAME], "argv": ["echo"]})
+        self.assertEqual(a, b)
+        self.assertIn("not healthy", a)
+
+
+class KeyItemKnowledge(AgentPath):
+    def test_item_stays_protected_while_the_entry_is_missing_from_the_catalog(self):
+        self.broker.refresh_catalog()
+        self.assertEqual(self.kp.get() is None or True, True)
+        self.broker._internal_secrets()                      # learns the item
+        self.assertEqual(self.kp.known_items, frozenset({"or"}))
+        del self.broker.cfg["secrets"][NAME]                 # a catalog blip
+        out = self.refused({"mode": "store", "op": "create", "names": ["fresh"], "value": "v",
+                            "allowed_hosts": ["127.0.0.1"], "item": "OR"})
+        self.assertEqual(json.loads(out), {"error": "unknown secret name"})
+
+    def test_fails_closed_when_the_item_was_never_seen(self):
+        self.kp.known_items = frozenset()
+        del self.broker.cfg["secrets"][NAME]
+        code, out = self.api("POST", "/v1/requests", {"mode": "store", "op": "create", "names": ["fresh"],
+                                                      "value": "v", "allowed_hosts": ["127.0.0.1"]})
+        self.assertEqual(code, 400)
+        self.assertIn("not healthy", out)
+
+    def test_uuid_looking_items_and_names_are_rejected(self):
+        u = "123e4567-e89b-12d3-a456-426614174000"
+        code, out = self.api("POST", "/v1/requests", {"mode": "store", "op": "create", "names": ["fresh"],
+                                                      "value": "v", "allowed_hosts": ["127.0.0.1"], "item": u})
+        self.assertEqual(code, 400)
+        self.assertIn("bad item name", out)
+        code, out = self.api("POST", "/v1/requests", {"mode": "credential", "names": [u], "kind": "token",
+                                                      "purpose": "p"})
+        self.assertEqual(code, 400)
+
+    def test_key_is_warmed_at_startup_and_survives_a_catalog_blip(self):
+        fa = riskmodel.build({"type": "jev", "api_key_secret": {"name": NAME, "var": VAR}}, None)
+        self.broker.summarizer = fa
+        kp = fa.key_providers[0]
+        kp.attach(self.broker._summary_key_read, self.broker.log)
+        self.broker._initial_load(locked=False)              # what start-up does: load, then warm
+        kp.wait()
+        self.assertEqual(self.events("summary_key_read")[-1]["result"], "ok")
+        self.assertEqual(kp.get(), K1)
+        del self.broker.cfg["secrets"][NAME]                 # the entry is briefly missing
+        kp.invalidate  # (the cache is NOT dropped by a missing entry)
+        kp._fresh_until = 0                                  # force a refresh
+        kp.get()
+        kp.wait()
+        self.assertEqual(kp.get(), K1)                       # kept: the blip is transient
+        self.assertEqual(self.events("summary_key_read")[-1]["result"], "other")
 
 
 class Provider(unittest.TestCase):
@@ -598,6 +719,28 @@ class Provider(unittest.TestCase):
         kp = self.make(script=["k\u00e9y"])
         self.prime(kp)
         self.assertIsNone(kp.get())
+
+    def test_a_hung_vault_read_has_a_deadline_and_does_not_wedge_the_key(self):
+        hang = threading.Event()
+        kp = keyprovider.VaultKey("n", "V", 60, grace=0, read_timeout=0.2)
+        calls = []
+
+        def reader(n, v):
+            calls.append(1)
+            if len(calls) == 1:
+                hang.wait(10)
+            return "KEY2"
+        kp.attach(reader, lambda *a, **k: None)
+        kp.get()
+        kp.wait(3)
+        self.assertIsNone(kp.get())                          # first read timed out: class backend_unavailable
+        kp.wait(3)
+        self.assertIsNone(kp._busy)
+        kp._fresh_until = 0
+        kp.get()
+        kp.wait(3)
+        self.assertEqual(kp.get(), "KEY2")                   # the next refresh is not blocked
+        hang.set()
 
     def test_grace_config(self):
         ok = {"type": "jev", "api_key_secret": {"name": NAME, "var": VAR}}

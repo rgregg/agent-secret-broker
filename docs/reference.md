@@ -784,26 +784,37 @@ The key is resolved lazily and cached; there is no host file.
   with the reason class only. The event is hidden from the agent audit API. The
   key is only ever sent in the `Authorization` header of calls to `base_url` /
   `summary_base_url`, never in a body, log, audit record, status or error text.
-- **Internal credential.** The credential named by `api_key_secret.name` (and
-  any catalog entry that points at the same vault item) can never be released
-  to an agent. A request that names it, in any mode (http, env, ssh_sign, store
-  create/update, credential request, guidance proposal) or a `store` / credential request whose effective vault item
-  (the explicit `item`, else the name, compared case-insensitively) is its vault item, is refused at once with the same text as an unknown
-  secret name (`unknown secret name`), so it is not an oracle. Timed grants,
-  Always approvals and `approval: allow` therefore never apply to it. It is
-  omitted from `GET /v1/secrets` (`asb list` / `asb which`). The refusal is audited as
-  the hidden `internal_secret_refused` event (`secret`, `reason:
-  internal_secret`, mode, client). The approval site still lists it, marked
-  "(internal: summary key)", and a human can still edit it there. The same refusal applies to every plan and session path: a plan manifest
-  with a rule for it (anywhere among the rules) is refused whole at submit with
-  `rules[i].secret: unknown credential`; a plan call or a session call naming it
-  gets the plan miss for an unlisted secret / `unknown session`; a session
-  whose credential it is cannot be used; opening a session for it is the plain
-  unknown-name refusal. Grants and Always approvals are never offered for it.
-  Plans, sessions, grants and Always rules are only ever created from agent
-  requests, which cannot name it, so no rule for it can come from an agent. The
-  "vault item already used" collision checks for store and credential creation
-  are case-insensitive.
+- **Internal credential.** The credential named by `api_key_secret.name` can
+  never be released to an agent, and an agent cannot tell it from a credential
+  that does not exist. For every mode it takes the code path of an unknown name:
+  the same validation order (a bad `scripts` field is reported first, as for any
+  name), a forced catalog reload (as for any unknown name), the same error text
+  (including the "backend not healthy" text), the same visible `rejected` /
+  `plan_miss` audit event. This holds for env, http, ssh_sign, guidance
+  proposals and `asb session open`. A plan manifest with a rule for it (anywhere
+  among the rules) is refused whole at submit with `rules[i].secret: unknown
+  credential`. A plan call or a session call naming it gets the ordinary miss
+  for a secret that is not in the plan / outside the session, with the same
+  refusal counting. It is omitted from `GET /v1/secrets`, and grants and Always
+  approvals are never offered for it.
+  Exceptions, where an agent can learn that the name exists (the same as for any
+  existing credential): `store` create and a credential request for the name
+  answer "already exists" (an unknown name would instead go to approval), and a
+  `store` create whose vault item is the key's item is refused with the generic
+  text. `store` update answers "unknown secret name".
+  Every refusal also writes the hidden `internal_secret_refused` event (`secret`,
+  `reason: internal_secret`, mode, client; hidden from the agent audit API). The
+  broker remembers the key's vault item, so the item stays protected (and
+  store / credential creation fails closed with the "backend not healthy" text
+  if the item was never seen) while the entry is briefly missing from the
+  catalog. Item names that look like a vault UUID are rejected. The approval site
+  lists the credential marked "(internal: summary key)" and a human can edit it.
+  Store and credential "item already used" checks are case-insensitive.
+- **Start-up and hangs.** The key is read in the background right after the
+  first catalog load. A vault read has a 20 s deadline (counted as
+  `backend_unavailable`), so a hung vault call cannot stop the key from being
+  refreshed. If the entry is missing from the catalog after having been seen,
+  the cached key is kept until its grace ends.
 - **Idle lock.** The backend contract has no read-without-touch option, so each
   vault read (one per TTL) renews a backend's idle-logout timer such as the
   local store's `idle_timeout`; with a TTL shorter than the idle timeout the

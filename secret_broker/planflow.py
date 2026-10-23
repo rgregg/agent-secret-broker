@@ -161,7 +161,9 @@ class PlansMixin:
             rej(403, "plans need a per-client credential: run `asb enroll` first", "legacy_client")
         if not self.plan_client_ok(cid):
             rej(403, "this client may not use plans", "client_policy")
-        self._refresh_if(0 if any(n not in self.cfg["secrets"] for n in _named(raw)) else self.CATALOG_TTL)
+        internal = self._internal_secrets()[0]
+        self._refresh_if(0 if any(n not in self.cfg["secrets"] or n in internal for n in _named(raw))
+                         else self.CATALOG_TTL)
         try:
             man = plans_mod.validate_manifest(raw, cfg, self.plan_max_minutes(cid))
             sigs = self._plan_check(man["rules"])
@@ -279,6 +281,11 @@ class PlansMixin:
         try:
             return self._plan_call_inner(names, spec, source, peer, client)
         except PlanRefused:
+            # an internal credential takes the ordinary miss path (_plan_live says it is gone); only
+            # the hidden audit event is added
+            hit = self._internal_hit(names)
+            if hit is not None:
+                self._log_internal_refusal(hit, "plan_call", source, peer, client)
             raise
         except Exception as e:  # noqa: BLE001 -- no exception text out: class name to the log only
             self.log("plan_internal_error", error_class=type(e).__name__,
@@ -296,10 +303,6 @@ class PlansMixin:
             # a plan call never runs in a session (plan session steps are phase 2): refused, fixed class
             self._plan_miss(client, plan_id, plans_mod.Miss("no_rule", why="request"))
         miss = lambda reason, **kw: self._plan_miss(client, plan_id, plans_mod.Miss(reason, **kw))  # noqa: E731
-        hit = self._internal_hit(names)
-        if hit is not None:         # not a rule of any plan, whatever the plan says: the same miss as an unlisted secret
-            self._log_internal_refusal(hit, "plan_call", source, peer, client)
-            miss("no_rule", why="secret")
         if not self.plans_cfg["enabled"]:
             miss("unusable", kind="unknown")
         self._refresh_if(self.CATALOG_TTL)

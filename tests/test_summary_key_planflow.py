@@ -92,6 +92,33 @@ class Plans(pb.PBase):
         self.assertEqual(code, 403, r)
         self.assertEqual(self.upstream(), [])
 
+    def test_plan_call_miss_is_identical_for_unknown_and_internal_names(self):
+        events = lambda: [r for r in self.records() if r["event"] == "plan_miss"]  # noqa: E731
+        for plan in ("pl_bogus_id", self.approve()):          # a bogus plan id, then a real plan
+            out = []
+            for n in ("nosuch", NAME):
+                before = len(events())
+                out.append(self.call(plan, n, "GET", "/v1/notes"))
+                new = events()[before:]
+                out.append([{k: v for k, v in e.items() if k not in ("seq", "ts", "time", "prev", "id")}
+                            for e in new])
+            self.assertEqual(out[0], out[2])
+            self.assertEqual(out[1], out[3])
+        # and with plans disabled
+        self.broker.plans_cfg["enabled"] = False
+        a = self.call("pl_bogus_id", "nosuch", "GET", "/v1/notes")
+        b = self.call("pl_bogus_id", NAME, "GET", "/v1/notes")
+        self.assertEqual(a, b)
+
+    def test_submit_forces_the_same_catalog_reload_for_an_internal_name(self):
+        calls = []
+        real = self.broker._refresh_if
+        self.broker._refresh_if = lambda stale, wait=True: (calls.append(stale), real(stale, wait))[1]
+        for n in ("nosuch", NAME):
+            calls.clear()
+            self.api("POST", "/v1/plans", {"manifest": self.manifest([self.rule(secret=n)]), "source": "t"})
+            self.assertEqual(calls[0], 0, n)
+
     def test_prefix_sharing_name_is_unaffected(self):
         self.manifest([self.rule(secret="ledger")])
         self.approve(self.manifest([self.read_rule(), self.rule()]))
@@ -145,15 +172,38 @@ class Sessions(ts.SBase):
     def test_a_call_naming_it_is_refused_like_an_unknown_session(self):
         sid = self.open()                                    # an ordinary session still opens
         code, r = self.call(sid, "GET", "/x", names=(NAME,))
-        self.assertEqual((code, r["error"]), (404, "unknown session"))
+        self.assertEqual(code, 403)
         code, r = self.call(sid, "GET", "/x")                # the real credential: the session works
         self.assertEqual(code, 200, r)
+
+    def test_a_valid_session_call_naming_it_is_the_ordinary_scope_miss(self):
+        sid = self.open()
+        a = self.call(sid, "GET", "/x", names=("methcred",))        # a credential outside the session
+        b = self.call(sid, "GET", "/x", names=(NAME,))
+        self.assertEqual(a, b)
+        self.assertEqual(a[0], 403)
+        self.assertEqual(self.sess(sid).calls, 0)
+
+    def test_open_refresh_and_scripts_order_match_unknown(self):
+        calls = []
+        real = self.broker._refresh_if
+        self.broker._refresh_if = lambda stale, wait=True: (calls.append(stale), real(stale, wait))[1]
+        for n in ("nosuch", NAME):
+            calls.clear()
+            self.ask(cred=n, expect=400)
+            self.assertIn(0, calls, n)
+        self.assertEqual(self.ask(cred="nosuch", expect=400, hosts=[]), self.ask(cred=NAME, expect=400, hosts=[]))
+
+    def test_unhealthy_backend_open_text(self):
+        self.broker._refresh_if = lambda *a, **k: None
+        self.broker._backend_ok = False
+        self.assertEqual(self.ask(cred="nosuch", expect=400), self.ask(cred=NAME, expect=400))
 
     def test_a_session_whose_credential_became_internal_is_refused(self):
         sid = self.open()
         self.sess(sid).cred = NAME
         code, r = self.call(sid, "GET", "/x", names=("unifi",))
-        self.assertEqual((code, r["error"]), (404, "unknown session"))
+        self.assertEqual(code, 403)
         self.assertTrue([e for e in self.records() if e["event"] == "internal_secret_refused"
                          and e["mode"] == "session_call"])
 

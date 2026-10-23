@@ -21,6 +21,7 @@ VAR_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,60}$")
 
 TTL_DEFAULT, TTL_MIN, TTL_MAX = 300, 30, 3600
 GRACE_DEFAULT, GRACE_MAX = 900, 3600
+READ_TIMEOUT = 20.0         # a vault read that takes longer counts as backend_unavailable
 FAIL_TTL = 30               # how long a failed read is remembered (no vault hammering)
 LOG_EVERY = 300             # at most one failure line per this many seconds
 
@@ -93,8 +94,11 @@ class VaultKey:
 
     TRANSIENT = ("backend_unavailable", "rate_limited", "other")
 
-    def __init__(self, name, var, ttl=TTL_DEFAULT, clock=time.monotonic, grace=GRACE_DEFAULT):
+    def __init__(self, name, var, ttl=TTL_DEFAULT, clock=time.monotonic, grace=GRACE_DEFAULT,
+                 read_timeout=READ_TIMEOUT):
         self.name, self.var, self.ttl, self.grace, self._clock = name, var, ttl, grace, clock
+        self.read_timeout = read_timeout
+        self.known_items = frozenset()          # lower-cased vault items the credential used (set by the broker)
         self._reader = self._log = None
         self._lock = threading.Lock()           # guards the fields below; never held across a read
         self._value = None
@@ -151,7 +155,7 @@ class VaultKey:
         try:
             if self._reader is None:
                 raise KeyUnavailable("not_attached")
-            raw = self._reader(self.name, self.var)
+            raw = self._bounded_read()
             if not isinstance(raw, str) or not raw.strip():
                 raise KeyUnavailable("empty")
             value = raw.strip()
@@ -181,6 +185,26 @@ class VaultKey:
         finally:
             with self._lock:
                 self._busy = None
+
+    def _bounded_read(self):
+        """Run the reader with a deadline: a hung vault call must not leave the key unrefreshable
+        forever. On expiry the abandoned call is left to finish on its own daemon thread."""
+        box = {}
+
+        def run():
+            try:
+                box["v"] = self._reader(self.name, self.var)
+            except BaseException as e:  # noqa: BLE001
+                box["e"] = e
+
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        t.join(self.read_timeout)
+        if t.is_alive():
+            raise KeyUnavailable("backend_unavailable")
+        if "e" in box:
+            raise box["e"]
+        return box.get("v")
 
     def _record(self, now, result):
         if result != "ok":
