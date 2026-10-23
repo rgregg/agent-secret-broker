@@ -698,16 +698,19 @@ class AuditTrail(Harness):
         self.decision = None
         self.create_env()
         nonce = next(iter(self.broker._by_id.values())).nonce
+        import ipaddress
+        self.broker._approval_proxies = [ipaddress.ip_network("127.0.0.1/32")]    # approval_trusted_proxies
         hdr = {"X-authentik-username": "alice", "X-Forwarded-For": "203.0.113.9, 198.51.100.1"}
         status, _ = req(self.abase + f"/a/{nonce}", headers=hdr)
         self.assertEqual(status, 200)
         v = self.events("approval_viewed")[0]
-        self.assertEqual((v["user"], v["client_ip"], v["found"]), ("alice", "203.0.113.9", True))
+        # the walk takes the rightmost untrusted hop, never the (spoofable) leftmost value
+        self.assertEqual((v["user"], v["client_ip"], v["found"]), ("alice", "198.51.100.1", True))
         data = urllib.parse.urlencode({"decision": "approve"}).encode()
         urllib.request.urlopen(urllib.request.Request(
             self.abase + f"/a/{nonce}", data=data, headers=hdr, method="POST"), timeout=10).read()
         next(iter(self.broker._by_id.values())).done.wait(10)
-        self.assertEqual(self.events("approved")[0]["approver_ip"], "203.0.113.9")
+        self.assertEqual(self.events("approved")[0]["approver_ip"], "198.51.100.1")
         self.assertNotIn(nonce, open(self.audit).read())
 
     def test_chain_continues_across_restart(self):
