@@ -353,7 +353,7 @@ while enrolling and never an argument. No key is copied by hand.
   `SECRET_BROKER_KEY` in the environment overrides the file: unset it.
 - Exit codes: 0 enrolled, 4 denied, 5 expired (the card lives 10 minutes by default), 3 refused
   or unreachable (a name already waiting, too many pending, enrollment off), 2 usage.
-- The **Clients** tab lists every client (name, claimed host, enrolled, last seen, request count,
+- The **Machines** page (Settings > Machines) lists every client (name, claimed host, enrolled, last seen, request count,
   state, effective auto-approval ceiling, its own rules) and can rename, revoke and remove them.
   Revoking takes effect on the next request (`asb` then says `this client has been revoked; run
   asb enroll`), denies the client's waiting requests and deletes its own rules.

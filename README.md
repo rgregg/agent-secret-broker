@@ -29,7 +29,7 @@ push notification or the dashboard.
 - **The agent never sees the value** in `http` mode: the broker makes the call and
   substitutes `{{VAR}}` placeholders itself.
 - **Every machine gets its own credential.** `asb enroll` makes a per-client secret locally; you
-  approve one card (matching a confirmation code), see and revoke clients on the Clients tab, and
+  approve one card (matching a confirmation code), see and revoke clients under Settings > Machines, and
   scope Always, timed and SSH rules to one client or all
   ([docs](docs/reference.md#clients-per-client-credentials-and-enrollment)).
 - **The agent can ask for a credential without ever seeing it.** `asb request-credential` puts a card
