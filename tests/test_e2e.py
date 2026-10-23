@@ -2294,6 +2294,26 @@ class Dashboard(Harness):
         v2 = re.search(r"data-version='([0-9a-f]+)'", body).group(1)
         self.assertNotEqual(v1, v2)                      # so the page swaps the card in
 
+    def test_requests_tab_count_follows_the_poll_and_clears_when_nothing_waits(self):
+        import re
+        # nothing waiting: no count in the page chrome and the polled fragment says 0
+        page = self.get("/")[1]
+        self.assertNotRegex(page, r"<span class=count>")
+        self.assertIn("data-attention='0'", self.get("/?fragment=1")[1])
+        rid = self.ask("/api/health")
+        # one waiting: the full page badge and the polled fragment agree
+        page = self.get("/")[1]
+        self.assertIn("<span class=count>1</span>", page)
+        self.assertIn("data-attention='1'", self.get("/?fragment=1")[1])
+        # the request settles elsewhere: the next poll carries 0, which is what clears the badge
+        self.decide(rid, "deny")
+        frag = self.get("/?fragment=1")[1]
+        self.assertEqual(re.search(r"data-attention='(\d+)'", frag).group(1), "0")
+        self.assertNotRegex(self.get("/")[1], r"<span class=count>")
+        # the page script applies that number to the tab on every poll, not only when the cards change
+        self.assertIn("badge(c.getAttribute('data-attention'))", page)
+        self.assertIn("function badge(n)", page)
+
     def test_notification_toggle_is_present_and_text_is_names_only(self):
         self.ask("/secret-looking-path?token=abc123")
         code, body = self.get()
