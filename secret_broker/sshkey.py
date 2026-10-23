@@ -40,7 +40,7 @@ def load_private(text):
         raise SshKeyError("the key is passphrase-protected; the broker needs an "
                           "unencrypted copy (ssh-keygen -p -N '' -f COPY)") from None
     except (ValueError, Exception) as e:  # noqa: BLE001 -- cryptography raises several types
-        raise SshKeyError(f"not an unencrypted OpenSSH private key: {str(e)[:80]}") from None
+        raise SshKeyError(f"not an unencrypted OpenSSH private key ({type(e).__name__})") from None
     if not isinstance(key, (ed25519.Ed25519PrivateKey, rsa.RSAPrivateKey, ec.EllipticCurvePrivateKey)):
         raise SshKeyError("unsupported key type (use ed25519, rsa or ecdsa)")
     if isinstance(key, rsa.RSAPrivateKey) and key.key_size < 2048:

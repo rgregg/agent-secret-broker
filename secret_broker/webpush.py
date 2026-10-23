@@ -52,9 +52,9 @@ def _send_with_pywebpush(sub, data, key_path, subject, ttl):
                 ttl=ttl, headers={"Urgency": "high"}, timeout=10)
     except WebPushException as e:
         resp = getattr(e, "response", None)
-        raise PushError(getattr(resp, "status_code", None), str(e)[:160]) from None
+        raise PushError(getattr(resp, "status_code", None), "push service refused") from None
     except OSError as e:
-        raise PushError(None, f"network error: {e}"[:160]) from None
+        raise PushError(None, "network error") from None
 
 
 class PushStore:

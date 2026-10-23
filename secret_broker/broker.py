@@ -19,7 +19,6 @@ import dataclasses
 import hashlib
 import hmac
 import html
-import http.client
 import ipaddress
 import json
 import logging
@@ -28,7 +27,6 @@ import queue
 import random
 import re
 import secrets
-import ssl
 import threading
 import time
 import urllib.error
@@ -1362,8 +1360,8 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                 req.approver = "policy:auto-create"
             try:
                 result = self._release(req)
-            except (BackendError, OSError, ValueError) as e:
-                self._finish(req, "failed", error=f"release failed: {e}", via="policy",
+            except Exception as e:  # noqa: BLE001 -- the request must always settle; a fixed label only
+                self._finish(req, "failed", error=errclass.release_text(e), via="policy",
                              auto_max=auto_max)
             else:
                 self._finish(req, "approved", result=result, via="policy", auto_max=auto_max)
@@ -1372,8 +1370,8 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             return req
         try:
             self._push(req)
-        except (NotifyError, OSError) as e:
-            self._finish(req, "failed", error=f"could not notify: {e}")
+        except (NotifyError, OSError):
+            self._finish(req, "failed", error="could not notify")
         return req
 
     def details_view(self, req):
@@ -1434,8 +1432,8 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                    entry_sha256=[e["sha"] for e in ents])
         try:
             self._push(req)
-        except (NotifyError, OSError) as e:
-            self._finish(req, "failed", error=f"could not notify: {e}")
+        except (NotifyError, OSError):
+            self._finish(req, "failed", error="could not notify")
         return req
 
     def _apply_proposal(self, req, who):
@@ -1515,8 +1513,8 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                    summary_reason=None)
         try:
             self._push(req)
-        except (NotifyError, OSError) as e:
-            self._finish(req, "failed", error=f"could not notify: {e}")
+        except (NotifyError, OSError):
+            self._finish(req, "failed", error="could not notify")
         return req
 
     def _credential_check(self, req, form):
@@ -1818,7 +1816,10 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         return host
 
     def _validate_http(self, names, spec):
-        u = urllib.parse.urlsplit(spec["url"])
+        # The agent's own text first: control characters and whitespace where they do not belong are
+        # refused with a generic sentence (never echoed), so an approval card shows what will be sent.
+        u = httpcheck.check_url_template(spec["url"])
+        httpcheck.check_headers_template(spec["headers"])
         if u.scheme not in ("http", "https") or not u.hostname:
             raise ValueError("bad url")
         allowed = None
@@ -1981,7 +1982,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                 return
             req.status = "deciding"
             req.action_hash = None
-        self._finish(req, "failed", error=f"could not notify: {err}")
+        self._finish(req, "failed", error="could not notify")
 
     # -- presence: hold phone notifications while an approval page is open ----
     # Every request is treated alike (SSH signing and high risk included): while
@@ -2072,9 +2073,9 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             {notify_mod.transport_type(t) or "?" for t in leaves}))
         try:
             notify_mod.send_to(leaves, h["n"])
-        except (NotifyError, OSError) as e:
+        except (NotifyError, OSError):
             if not req._sent_to[:-len(leaves)]:         # nothing was ever delivered
-                self._finish(req, "failed", error=f"could not notify: {e}")
+                self._finish(req, "failed", error="could not notify")
         else:
             self.audit("notified", req)
         if req.status not in ("pending", "deciding"):   # settled while sending
@@ -2188,11 +2189,15 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         return True
 
     def peer_trusted(self, peer):
-        """`approval_trusted_peers`: CIDRs the approval listener will answer.
-        The listener trusts the identity header, so it should only ever hear
-        from the SSO proxy; unset means no restriction (network isolation)."""
-        nets = self.cfg.get("approval_trusted_peers")
-        if not nets:
+        """May the approval listener believe the identity header of a request from `peer`?
+
+        The listener trusts that header, so it may only ever hear from the SSO proxy. Rules:
+          * `approval_trust_any_peer: true` (explicit, loud warning at startup): anyone, as before;
+          * loopback and every address of this host's own interfaces are NEVER trusted, whatever
+            `approval_trusted_peers` says (the broker's own outbound calls come from there);
+          * `approval_trusted_peers` set: only those CIDRs;
+          * unset: only private-range peers (not loopback, link-local or own) - a secure default."""
+        if self.cfg.get("approval_trust_any_peer") is True:
             return True
         try:
             ip = ipaddress.ip_address(peer)
@@ -2680,8 +2685,8 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                        grant_minutes=g.get("minutes") if kind == "timed" else None, grant_left_s=left)
             try:
                 result = self._release(req)
-            except (BackendError, OSError, ValueError) as e:
-                self._finish(req, "failed", error=f"release failed: {e}", via="policy",
+            except Exception as e:  # noqa: BLE001 -- the request must always settle; a fixed label only
+                self._finish(req, "failed", error=errclass.release_text(e), via="policy",
                              grant_id=g["id"], grant_left_s=left)
             else:
                 self._finish(req, "approved", result=result, via="policy",
@@ -2782,8 +2787,8 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             return
         try:
             result = self._release(req)
-        except (BackendError, OSError, ValueError) as e:
-            self._finish(req, "failed", error=f"release failed: {e}", **who)
+        except Exception as e:  # noqa: BLE001 -- the request must always settle; a fixed label only
+            self._finish(req, "failed", error=errclass.release_text(e), **who)
             return
         self._finish(req, "approved", result=result, **who)
 
@@ -2999,12 +3004,6 @@ def _placeholders(text):
         i = b + 2
 
 
-def _fill(text, env):
-    for var in _placeholders(text):
-        text = text.replace("{{" + var + "}}", env[var]).replace("{{ " + var + " }}", env[var])
-    return text
-
-
 def _mask(text, values):
     for v in sorted(values, key=len, reverse=True):
         if len(v) >= 6:
@@ -3012,18 +3011,7 @@ def _mask(text, values):
     return text
 
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    """Never follow redirects: only the originally approved URL is contacted,
-    so injected credentials cannot be forwarded to a host outside allowed_hosts.
-    The 3xx is returned to the caller as-is."""
-
-    def redirect_request(self, *args, **kwargs):
-        return None
-
-
-_opener = urllib.request.build_opener(_NoRedirect)
-
-
+        cat = None
 def _private_host(host):
     """True for addresses/names that only exist on a private network."""
     try:
@@ -3067,18 +3055,41 @@ def _opener_for(tls):
     return urllib.request.build_opener(_NoRedirect, handler)
 
 
-def _do_http(spec, env, tls=None):
+def _fill(text, env):
+    """Substitute {{NAME}} / {{ NAME }} in ONE pass: a substituted value is never scanned again."""
+    out, i = [], 0
+    while True:
+        a = text.find("{{", i)
+        b = text.find("}}", a + 2) if a >= 0 else -1
+        if a < 0 or b < 0:
+            out.append(text[i:])
+            return "".join(out)
+        raw = text[a + 2:b]
+        var = raw.strip()
+        out.append(text[i:a])
+        out.append(env[var] if raw in (var, " " + var + " ") and var in env else text[a:b + 2])
+        i = b + 2
+
+
+def _do_http(spec, env, tls=None, guard=None, entries=None):
     if spec.get("body_b64") is not None:
         data = base64.b64decode(spec["body_b64"])
     elif spec.get("body"):
         data = _fill(spec["body"], env).encode()
     else:
         data = None
-    req = urllib.request.Request(
-        _fill(spec["url"], env), data=data, method=spec["method"],
-        headers={k: _fill(v, env) for k, v in spec["headers"].items()},
-    )
-    return _exchange(req, list(env.values()), tls)
+    url = _fill(spec["url"], env)
+    headers = {k: _fill(v, env) for k, v in spec["headers"].items()}
+    # a filled value may be anything: one fixed label for every way it can break the request
+    httpcheck.check_filled(url, headers, urllib.parse.urlsplit(spec["url"]).netloc)
+    req = None
+    try:
+        req = urllib.request.Request(url, data=data, method=spec["method"], headers=headers)
+    except ValueError:
+        pass
+    if req is None:
+        raise errclass.InvalidRequest()
+    return _exchange(req, list(env.values()), tls, guard=guard, entries=entries)
 
 
 def _exchange(req, values, tls, strip_cookies=False, timeout=30):

@@ -241,7 +241,7 @@ def send_to(transports, n):
             t.send(n.for_transport(t))
             ok += 1
         except (NotifyError, OSError) as e:
-            errors.append(f"{type(getattr(t, 'wrapped', t)).__name__}: {e}")
+            errors.append(f"{type(getattr(t, 'wrapped', t)).__name__}: {type(e).__name__}")
     if not ok:
         raise NotifyError("; ".join(errors) or "no transports configured")
 
@@ -368,7 +368,7 @@ class MultiNotifier:
                 t.send(n.for_transport(t))
                 ok += 1
             except (NotifyError, OSError) as e:
-                errors.append(f"{type(getattr(t, 'wrapped', t)).__name__}: {e}")
+                errors.append(f"{type(getattr(t, 'wrapped', t)).__name__}: {type(e).__name__}")
         if not ok:
             raise NotifyError("; ".join(errors) or "no transports configured")
 

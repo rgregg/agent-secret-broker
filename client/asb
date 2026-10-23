@@ -474,6 +474,17 @@ def _safe_text(text, n=160):
     return "".join(c if 32 <= ord(c) < 127 else "?" for c in str(text))[:n]
 
 
+_LONG_TOKEN = re.compile(r"[A-Za-z0-9_+/=.~-]{20,}")
+
+
+def _srv(text, n=160):
+    """Text the BROKER sent, for a terminal or a log: printable ASCII, and any long token-like run is
+    replaced. The broker only ever sends fixed labels for a failed call (never an exception's text), so
+    this is defence in depth: an old or misbehaving broker's error must not carry a credential into an
+    agent's transcript. (The client holds no secret values and cannot mask them by value.)"""
+    return _LONG_TOKEN.sub("***", _safe_text(text, 400))[:n]
+
+
 def die(msg, code=EXIT_USAGE):
     print(f"asb: {msg}", file=sys.stderr)
     sys.exit(code)
@@ -522,9 +533,9 @@ def session_die(r):
     """Exit for a broker answer that carries a session error code; returns normally if it has none."""
     c = r.get("code") if isinstance(r, dict) else None
     if c in ("session_unknown", "session_expired"):
-        die(_safe_text(r.get("error") or "session ended"), EXIT_SESSION_ENDED)
+        die(_srv(r.get("error") or "session ended"), EXIT_SESSION_ENDED)
     if c == "session_refused":
-        die(_safe_text(r.get("error") or "session call refused"), EXIT_SESSION_REFUSED)
+        die(_srv(r.get("error") or "session call refused"), EXIT_SESSION_REFUSED)
 
 
 def obtain(payload, waiting="waiting for approval on your phone..."):
@@ -533,9 +544,9 @@ def obtain(payload, waiting="waiting for approval on your phone..."):
     code, r = call(base, key, "/v1/requests", payload)
     if code != 202:
         session_die(r)
-        die(r.get("error", f"broker returned {code}"), EXIT_BROKER)
+        die(_srv(r.get("error", f"broker returned {code}")), EXIT_BROKER)
     if r["status"] in ("denied", "expired", "failed"):
-        die(r.get("error") or r["status"], status_exit(r["status"]))
+        die(_srv(r.get("error") or r["status"]), status_exit(r["status"]))
     print(f"asb: {waiting}", file=sys.stderr)
     deadline = time.time() + r["expires_in"] + 15
     while time.time() < deadline:
@@ -543,7 +554,7 @@ def obtain(payload, waiting="waiting for approval on your phone..."):
         if r2.get("status") == "approved":
             return r2
         if r2.get("status") in ("denied", "expired", "failed", "released"):
-            die(f"request {r2['status']}" + (f": {r2['error']}" if r2.get("error") else ""),
+            die(f"request {r2['status']}" + (f": {_srv(r2['error'])}" if r2.get("error") else ""),
                 status_exit(r2["status"]))
     die("timed out waiting for approval", EXIT_EXPIRED)
 
@@ -603,7 +614,7 @@ def run_guidance(argv):
         base, key = config()
         code, r = call(base, key, f"/v1/requests/{argv[1]}?wait=0", timeout=15)
         if code != 200:
-            die(r.get("error", f"broker returned {code}"), EXIT_BROKER)
+            die(_srv(r.get("error", f"broker returned {code}")), EXIT_BROKER)
         if r.get("status") not in ("approved", "denied", "expired", "failed"):
             print("pending")          # undecided, or being applied: not an error
             return 0
@@ -619,10 +630,10 @@ def run_guidance(argv):
     base, key = config()
     code, r = call(base, key, "/v1/requests", payload)
     if code != 202:
-        die(r.get("error", f"broker returned {code}"), EXIT_BROKER)
+        die(_srv(r.get("error", f"broker returned {code}")), EXIT_BROKER)
     print(f"asb: proposal {r['id']} sent", file=sys.stderr)
     if r["status"] in ("denied", "expired", "failed"):
-        die(r.get("error") or r["status"], status_exit(r["status"]))
+        die(_srv(r.get("error") or r["status"]), status_exit(r["status"]))
     print("asb: waiting for approval on your phone... review each entry on the approval page "
           "(the human ticks the ones to apply)", file=sys.stderr)
     deadline = time.time() + r["expires_in"] + 15
@@ -711,7 +722,7 @@ def run_enroll(argv):
     if status is None:
         die(f"cannot reach the broker ({r.get('_net', 'error')})", EXIT_BROKER)
     if status != 202 or not isinstance(r.get("id"), str):
-        die("the broker refused the enrollment: " + _safe_text(r.get("error") or f"HTTP {status}"), EXIT_BROKER)
+        die("the broker refused the enrollment: " + _srv(r.get("error") or f"HTTP {status}"), EXIT_BROKER)
     if r.get("code") != code:
         die("the broker returned a different confirmation code; not continuing", EXIT_BROKER)
     print(f"asb: enrollment requested as {name!r}.", file=sys.stderr)
@@ -867,7 +878,7 @@ def run_session(argv):
                 print(f"hosts: {','.join(r['hosts'])}  methods: {','.join(r['methods'])}")
                 return 0
         session_die(r)
-        die(r.get("error", f"broker returned {code}"), EXIT_BROKER)
+        die(_srv(r.get("error", f"broker returned {code}")), EXIT_BROKER)
     if not rest:
         die(HELP["session"])
     name, rest = check_name(rest[0]), rest[1:]
@@ -1382,9 +1393,9 @@ def audit_line(ev):
 def audit_get(base, key, path):
     code, r = call(base, key, path, timeout=30)
     if code == 400:
-        die(r.get("error", "bad request"), EXIT_USAGE)
+        die(_srv(r.get("error", "bad request")), EXIT_USAGE)
     if code != 200:
-        die(r.get("error", f"broker returned {code}"), EXIT_BROKER)
+        die(_srv(r.get("error", f"broker returned {code}")), EXIT_BROKER)
     return r
 
 
@@ -2489,7 +2500,7 @@ def _plan_refusal(code, r):
     words from the broker is printed, and only as printable ASCII."""
     if not isinstance(r, dict):
         r = {}
-    err = _safe_text(r.get("error", f"broker returned {code}"))
+    err = _srv(r.get("error", f"broker returned {code}"))
     if code == 404 and r.get("error") == "plan not usable":
         kind = r.get("kind") if r.get("kind") in PLAN_KINDS else "unknown"
         hint = {"unknown": "it is unknown here, was never approved, or the broker restarted",
@@ -2521,7 +2532,7 @@ def run_plan_http(payload, plan_id):
         if r2.get("status") == "approved":
             return r2["http"]
         if r2.get("status") in ("denied", "expired", "failed", "released"):
-            die(f"request {r2['status']}" + (f": {_safe_text(r2['error'])}" if r2.get("error") else ""),
+            die(f"request {r2['status']}" + (f": {_srv(r2['error'])}" if r2.get("error") else ""),
                 status_exit(r2["status"]))
     die("timed out waiting for the call", EXIT_EXPIRED)
 
@@ -2589,7 +2600,7 @@ def run_plan(argv):
                       "after that, submit a new plan", file=sys.stderr)
                 return 0
             if st in ("denied", "expired", "failed", "released"):
-                die(f"plan {st}" + (f": {_safe_text(r2['error'])}" if r2.get("error") else ""), status_exit(st))
+                die(f"plan {st}" + (f": {_srv(r2['error'])}" if r2.get("error") else ""), status_exit(st))
         die("timed out waiting for approval", EXIT_EXPIRED)
     if sub == "list":
         if rest:
@@ -2728,7 +2739,7 @@ def main(argv):
         base, key = config()
         code, r = call(base, key, "/v1/secrets")
         if code != 200:
-            die(r.get("error", f"broker returned {code}"), EXIT_BROKER)
+            die(_srv(r.get("error", f"broker returned {code}")), EXIT_BROKER)
         if argv[1:] == ["--json"]:
             print(json.dumps(r["secrets"], indent=2))
             return 0
@@ -2746,7 +2757,7 @@ def main(argv):
         base, key = config()
         code, r = call(base, key, "/v1/status", timeout=15)
         if code != 200:
-            die(r.get("error", f"broker returned {code}"), EXIT_BROKER)
+            die(_srv(r.get("error", f"broker returned {code}")), EXIT_BROKER)
         if argv[1:] == ["--json"]:
             print(json.dumps(r, indent=2))
             return 0
@@ -2777,7 +2788,7 @@ def main(argv):
         param = "url" if "://" in argv[1] else "host"
         code, r = call(base, key, f"/v1/secrets?{param}={target}")
         if code != 200:
-            die(r.get("error", f"broker returned {code}"), EXIT_BROKER)
+            die(_srv(r.get("error", f"broker returned {code}")), EXIT_BROKER)
         for s in r["secrets"]:
             print(f"{s['name']}\t{','.join(s['vars'])}")
         if not r["secrets"]:
