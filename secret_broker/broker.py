@@ -533,10 +533,14 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin):
         if not internal:
             return
         hit = next((n for n in names if isinstance(n, str) and n in internal), None)
-        if hit is None and mode == "store" and isinstance(spec, dict):
-            it = spec.get("item")
-            if isinstance(it, str) and it.lower() in items:
-                hit = it
+        if hit is None and mode in ("store", "credential") and isinstance(spec, dict):
+            # the vault item a store / credential request would write or replace: the explicit
+            # `item`, else the name (that is the default item), whatever the case
+            first = names[0] if names and isinstance(names[0], str) else None
+            for cand in (spec.get("item") or first, spec.get("item"), first if mode == "credential" else None):
+                if isinstance(cand, str) and cand.lower() in items:
+                    hit = cand
+                    break
         if hit is not None:
             self.log("internal_secret_refused", secret=hit if hit in internal else None,
                      reason="internal_secret", mode=mode, source=source, peer=peer,
@@ -1093,6 +1097,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin):
                 self._validate_proposal(names, spec)
             elif mode == "store":
                 self._validate_store(names, spec)
+                self._deny_internal(mode, names, spec, source, peer, client)    # defaults are filled in now
             elif mode == "credential":
                 self._validate_credential(names, spec)
             else:
@@ -1418,7 +1423,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin):
                 break
         for other, sc in self.cfg["secrets"].items():
             for ref in sc["vars"].values():
-                if ref["item"] == item:
+                if str(ref["item"]).lower() == item.lower():
                     errs.append(f"vault item {item!r} is already used by {other}")
                     break
         final = {"name": name, "item": item, "field": "notes", "kind": kind, "cred_mode": mode,
@@ -1518,7 +1523,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin):
                 raise ValueError("variable must look like MY_TOKEN")
             for other, sc in secrets_cfg.items():
                 for ref in sc["vars"].values():
-                    if ref["item"] == spec["item"]:
+                    if str(ref["item"]).lower() == spec["item"].lower():
                         raise ValueError(f"vault item {spec['item']!r} is already used by {other}")
         elif op == "update":
             if name not in secrets_cfg:

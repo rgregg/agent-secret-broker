@@ -786,15 +786,16 @@ The key is resolved lazily and cached; there is no host file.
 - **Internal credential.** The credential named by `api_key_secret.name` (and
   any catalog entry that points at the same vault item) can never be released
   to an agent. A request that names it, in any mode (http, env, ssh_sign, store
-  create/update, credential request, guidance proposal) or a `store` create that
-  targets its vault item, is refused at once with the same text as an unknown
+  create/update, credential request, guidance proposal) or a `store` / credential request whose effective vault item
+  (the explicit `item`, else the name, compared case-insensitively) is its vault item, is refused at once with the same text as an unknown
   secret name (`unknown secret name`), so it is not an oracle. Timed grants,
   Always approvals and `approval: allow` therefore never apply to it. It is
   omitted from `GET /v1/secrets` (`asb list` / `asb which`). The refusal is audited as
   the hidden `internal_secret_refused` event (`secret`, `reason:
   internal_secret`, mode, client). The approval site still lists it, marked
-  "(internal: summary key)", and a human can still edit it there. (This
-  codebase has no sessions or plan manifests.)
+  "(internal: summary key)", and a human can still edit it there. The "vault item already used" collision checks for store and credential
+  creation are case-insensitive. (This codebase has no sessions or plan
+  manifests, so there is nothing further to gate.)
 - **Idle lock.** The backend contract has no read-without-touch option, so each
   vault read (one per TTL) renews a backend's idle-logout timer such as the
   local store's `idle_timeout`; with a TTL shorter than the idle timeout the

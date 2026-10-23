@@ -397,6 +397,39 @@ class AgentPath(e2e.Harness):
         self.assertEqual(self.notifier.sent, [])
         self.assertEqual(self.broker.cfg["secrets"][NAME].get("guidance"), None)
 
+    def test_effective_vault_item_is_protected(self):
+        base = {"mode": "store", "op": "create", "value": "v", "allowed_hosts": ["127.0.0.1"]}
+        # item omitted: the default item is the name, which equals the internal vault item (any case)
+        self.refused({**base, "names": ["or"]})
+        # item differing only in case
+        self.refused({**base, "names": ["fresh"], "item": "Or"})
+        self.refused({**base, "names": ["fresh"], "item": "oR"})
+        # credential request whose default item (the name) is the internal item
+        self.refused({"mode": "credential", "names": ["or"], "kind": "token", "purpose": "p"})
+        self.assertEqual(self.events("stored"), [])
+        for ev in self.events("internal_secret_refused"):
+            self.assertEqual(ev["reason"], "internal_secret")
+        self.assertEqual(len(self.events("internal_secret_refused")), 4)
+
+    def test_name_sharing_a_prefix_still_works(self):
+        code, body = self.api("POST", "/v1/requests", {"mode": "store", "op": "create", "names": ["or2"],
+                                                       "value": "v", "allowed_hosts": ["127.0.0.1"]})
+        self.assertEqual(code, 202, body)
+        code, body = self.api("POST", "/v1/requests", {"mode": "credential", "names": ["openrouter-x"],
+                                                       "kind": "token", "purpose": "p"})
+        self.assertEqual(code, 202, body)
+        self.assertEqual(self.events("internal_secret_refused"), [])
+
+    def test_item_collision_checks_ignore_case(self):
+        self.broker.summarizer = None                        # the gate off: the collision check alone
+        spec = {"op": "create", "value": "v", "allowed_hosts": ["127.0.0.1"], "item": "oR"}
+        with self.assertRaises(ValueError) as cm:
+            self.broker._validate_store(["fresh"], spec)
+        self.assertIn("already used", str(cm.exception))
+        spec = {"op": "create", "value": "v", "allowed_hosts": ["127.0.0.1"]}
+        with self.assertRaises(ValueError):
+            self.broker._validate_store(["or"], spec)         # default item "or" vs "OR"
+
     def test_standing_and_timed_approvals_do_not_apply(self):
         # the credential is approval: allow, and a timed grant exists for it: still refused
         self.broker.grants.add([NAME], 15, "any", "alice", "web", "r0", mode="env")
