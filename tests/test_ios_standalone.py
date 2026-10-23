@@ -39,8 +39,8 @@ class Pages(t.Dashboard):
             self.assertEqual(st, code, path)
             b = body.decode()
             self.assertIn("viewport-fit=cover", b, path)
-            self.assertIn("<meta name=theme-color content='#ffffff' media='(prefers-color-scheme: light)'>", b)
-            self.assertIn("<meta name=theme-color content='#161b22' media='(prefers-color-scheme: dark)'>", b)
+            self.assertIn("<meta name=theme-color content='#f3f6f1' media='(prefers-color-scheme: light)'>", b)
+            self.assertIn("<meta name=theme-color content='#0c140f' media='(prefers-color-scheme: dark)'>", b)
             self.assertIn("<meta name=apple-mobile-web-app-capable content=yes>", b)
             self.assertIn("<meta name=mobile-web-app-capable content=yes>", b)
             self.assertIn("<meta name=apple-mobile-web-app-status-bar-style content=default>", b)
@@ -67,7 +67,8 @@ class Pages(t.Dashboard):
                               "frame-ancestors 'none'; worker-src 'self'; script-src 'nonce-X'")
 
     def test_safe_area_css(self):
-        css = bmod._CSS
+        from secret_broker import ui_theme
+        css = ui_theme.TOKENS + bmod._CSS
         top = re.search(r"\.top\{([^}]*)\}", css).group(1)
         self.assertIn("background:var(--card)", top)             # opaque header surface
         self.assertIn("env(safe-area-inset-top", top)
@@ -80,10 +81,11 @@ class Pages(t.Dashboard):
         for m in re.finditer(r"env\(([a-z-]+)([^)]*)\)", css):
             self.assertEqual(m.group(2), ",0px", m.group(0))
         # theme-color matches the header surface in both schemes
-        light = re.search(r"--card:(#[0-9a-f]+)", css).group(1)
-        dark = re.search(r"prefers-color-scheme:dark\)\{:root\{[^}]*--card:(#[0-9a-f]+)", css).group(1)
-        self.assertEqual(bmod._THEME_LIGHT, "#ffffff")
-        self.assertEqual((light, dark), ("#fff", bmod._THEME_DARK))
+        light = re.search(r"--bg:(#[0-9a-f]+)", css).group(1)
+        dark = re.search(r"prefers-color-scheme:dark\)\{:root:not\(\[data-theme=light\]\)\{[^}]*--bg:(#[0-9a-f]+)",
+                         css).group(1)
+        self.assertEqual(bmod._THEME_LIGHT, "#f3f6f1")
+        self.assertEqual((light, dark), (bmod._THEME_LIGHT, bmod._THEME_DARK))
 
     def test_manifest(self):
         st, hd, body = self.hdr("/manifest.webmanifest")
@@ -104,7 +106,8 @@ class Pages(t.Dashboard):
         self.assertEqual(body[:8], b"\x89PNG\r\n\x1a\n")
         self.assertEqual(int.from_bytes(body[16:20], "big"), 180)
         self.assertEqual(int.from_bytes(body[20:24], "big"), 180)
-        self.assertLess(len(body), 8192)
+        self.assertEqual(body, open(os.path.join(os.path.dirname(bmod.__file__), "assets",
+                                                 "sb-monogram-180.png"), "rb").read())
         self.assertEqual(self.hdr("/apple-touch-icon.png", user="mallory")[0], 403)
         # the same bytes are inlined, so the home-screen icon needs no extra (SSO-gated) fetch
         import base64

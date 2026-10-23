@@ -554,7 +554,7 @@ class Card(Base):
             self.assertIn("Apply this one", page)
             self.assertIn(">Apply selected<", page)
             self.assertIn(">Deny all<", page)
-            self.assertIn("HIGH RISK", page)
+            self.assertIn("rbadge hi", page)
             self.broker._by_id[rid].status = "denied"               # leave the next surface clean
 
     def test_nothing_selected_by_default_and_names_per_index(self):

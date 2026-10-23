@@ -688,7 +688,7 @@ class SshUnaffected(Base):
         page = self.card(rid)
         self.assertIn("approve_grant_", page)                    # timed chips remain
         self.assertNotIn("value=approve_always", page)
-        self.assertRegex(page, r"<span class='chip off'[^>]*>Always</span>")
+        self.assertRegex(page, r"<span class='chip off linkish'[^>]*>Always allow this...</span>")
 
 
 if __name__ == "__main__":

@@ -332,7 +332,7 @@ class Happy(H):
         self.assertEqual(status, 200)
         for s in ("credential request", "Kind", "Purpose", "not retained", "Allowed hosts", "never recorded"):
             self.assertIn(s, frag)
-        _, hist, _ = self.get("/?view=all&mode=credential")
+        _, hist, _ = self.get("/history?mode=credential")
         self.assertIn("credential request", hist)
         # the agent's redacted audit view: requested (name, kind) and stored, not the human's entry
         code, text = self.api("GET", f"/v1/audit?request={r['id']}")

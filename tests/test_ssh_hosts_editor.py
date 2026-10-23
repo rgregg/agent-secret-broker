@@ -148,7 +148,7 @@ class Hostile(Base):
         bad = '"><img src=x onerror=alert(1)> junk'
         self.post(known_hosts=bad + "\n" + HOST.line("a"), allowed_hosts="a", confirm_weaken="1")
         body = self.page()
-        self.assertNotIn("<img", body)
+        self.assertNotIn("<img src=x", body)
         self.assertIn("&lt;img src=x", body)
 
 

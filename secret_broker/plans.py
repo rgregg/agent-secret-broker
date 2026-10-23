@@ -38,6 +38,7 @@ from collections import deque
 
 from . import clock as clock_mod
 from . import guidance as guidance_mod
+from . import ui_theme
 from . import sessions as sessions_mod     # the header, Content-Type and override rules are shared, not copied
 
 # ---------------------------------------------------------------- constants
@@ -1686,14 +1687,13 @@ def describe_html(req):
     e = html.escape
     now = clock_mod.now()
     until = now + sp["requested_s"]
-    local = time.strftime("%Y-%m-%d %H:%M", time.localtime(until))
-    utc = time.strftime("%Y-%m-%d %H:%M", time.gmtime(until))
+    utc = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(until))
     total = sum(r["max_uses"] for r in rules)
     creds = sorted({r["secret"] for r in rules})
     sites = sorted({r["host"] for r in rules})
     out = [f"<div class=pl><p><b>Plan requested</b> by {e(req.client['name'])} "
            f"<small class=muted>({e(req.client['id'])})</small></p>",
-           f"<p>Lasts at most {_hm(sp['requested_s'])}, until about {e(local)} local ({e(utc)} UTC) if you "
+           f"<p>Lasts at most {_hm(sp['requested_s'])}, until about {ui_theme.time_tag(until, 'when', fallback=utc)} if you "
            "approve now. If you approve, this client can do ONLY the following, with no further approval, "
            "until then.</p><ol>"]
     for r in rules:

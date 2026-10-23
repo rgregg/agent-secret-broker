@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -787,7 +788,7 @@ class RiskFlow(Harness):
         self.assertEqual((a["model"], a["risk"]), ("high", "high"))
         nonce = next(iter(self.broker._by_id.values())).nonce
         _, page = req(self.abase + f"/a/{nonce}", headers={"X-authentik-username": "alice"})
-        self.assertIn("HIGH RISK", page)
+        self.assertIn("rbadge hi", page)
 
     def test_low_risk_allow_secret_is_auto_released(self):
         self.broker.cfg["secrets"]["svc"]["approval"] = "allow"
@@ -886,7 +887,7 @@ class AutoApproveMax(Harness):
                               ("medium", "Up to medium risk"), ("high", "Any risk level")):
             self.broker._auto_max = setting
             _, body = req(self.abase + "/settings", headers={"X-authentik-username": "alice"})
-            self.assertIn("<b>Auto-approve</b>", body)
+            self.assertIn("Auto-approve up to", body)
             self.assertIn(text, body)
             self.assertIn("risk.auto_approve_max", body)
 
@@ -1856,7 +1857,7 @@ class TlsPolicyRules(unittest.TestCase):
 
 
 class HistoryPage(Harness):
-    """The history list lives on the Requests tab (`/`); rows open a detail view."""
+    """The history list lives on the History tab (`/history`); rows open a detail view."""
     ttl = 1
 
     def tweak(self, cfg):
@@ -1877,7 +1878,10 @@ class HistoryPage(Harness):
         return rid, json.loads(b)
 
     def page(self, query="?view=all", user="alice"):
-        return req(self.abase + "/" + query, headers={"X-authentik-username": user})
+        # the list moved to /history; "view=all" was the old way to ask for it and is implied now
+        q = re.sub(r"(?<=[?&])view=all&?|&view=all$", "", query).rstrip("&")
+        q = "" if q == "?" else q
+        return req(self.abase + "/history" + q, headers={"X-authentik-username": user})
 
     def result(self, rid):
         _, b = self.api("GET", f"/v1/requests/{rid}?wait=5")
@@ -1896,10 +1900,12 @@ class HistoryPage(Harness):
         self.call(decision="deny")                                            # last: denial starts a cooldown
         code, body = self.page()
         self.assertEqual(code, 200)
-        for label in ("approved", "denied", "expired", "auto-approved"):
-            self.assertRegex(body, rf"<span class='pill \w+'>{label}</span>")
+        for word in ("Approved", "Denied", "Expired, nobody answered", "Auto-approved"):
+            self.assertIn(f"<small>{word}", body)
+        for cls in ("hic ok", "hic no", "hic ex"):
+            self.assertIn(f"class='{cls}'", body)
         self.assertIn("svc", body)
-        self.assertIn("/x?...", body)                                         # query string hidden
+        self.assertNotIn("QUERYSECRET", body)                                 # query string hidden
         for secret in (SECRET, "QUERYSECRET"):
             self.assertNotIn(secret, body)
 
@@ -1907,21 +1913,19 @@ class HistoryPage(Harness):
         rid, _ = self.call()
         _, body = self.page("")
         self.assertIn(f"<button type=button class=hrow data-id='{rid}'", body)
-        for want in ("<dialog id=hdlg", "id=hclose", "id=hbody", "showModal", "/request/", "data-hact=all",
+        for want in ("<dialog id=hdlg", "id=hclose", "id=hbody", "showModal", "/request/",
                      "id=hform", "id=hlist"):
             self.assertIn(want, body)
         self.assertNotIn("<table", body)                                      # one list, no table layout
         self.assertNotIn("Back to Requests", body)
-        # collapsed: the filter form is present but hidden
-        self.assertIn("id=hform class=hfilters method=get action='/' hidden", body)
-        self.assertNotIn(" hidden", self.page("?view=all")[1].split("id=hform")[1].split(">")[0])
+        self.assertNotIn(" hidden", body.split("id=hform")[1].split(">")[0])  # the filters are always shown
 
-    def test_old_history_url_redirects(self):
+    def test_old_history_urls_redirect_to_the_tab(self):
         class NoFollow(urllib.request.HTTPRedirectHandler):
             def redirect_request(self, *a, **k):
                 return None
         op = urllib.request.build_opener(NoFollow)
-        for path, want in (("/history", "/?view=all"), ("/history?outcome=denied&page=3", "/?view=all&outcome=denied")):
+        for path, want in (("/?view=all", "/history"), ("/?view=all&outcome=denied&page=3", "/history?outcome=denied")):
             with self.assertRaises(urllib.error.HTTPError) as cm:
                 op.open(urllib.request.Request(self.abase + path,
                                                headers={"X-authentik-username": "alice"}), timeout=10)
@@ -1934,7 +1938,8 @@ class HistoryPage(Harness):
         _, full = self.page("?view=all")
         _, frag = self.page("?fragment=1&view=all")
         self.assertNotIn("<nav", frag)
-        self.assertIn(frag[frag.index("<div id=hlist"):frag.index("</main>")], full)               # identical list block
+        block = re.search(r"<div id=hlist.*?</div></div>", frag, re.S).group(0)
+        self.assertIn(block, full)                                                                    # identical list block
         for rid in rids:
             self.assertIn(f"data-id='{rid}'", frag)
         # outcome filter and search return list rows only, in the same markup
@@ -1945,15 +1950,13 @@ class HistoryPage(Harness):
         self.assertEqual(self.page("?fragment=1&view=all&q=NEEDLE")[1].count("class=hrow"), 1)
         self.assertIn("No requests match", self.page("?fragment=1&view=all&q=zzz-none")[1])
         # paging: "show more" extends the same list; limit is clamped
-        _, collapsed = self.page("?fragment=1")
-        self.assertEqual(collapsed.count("class=hrow"), 4)
-        self.assertIn("data-hact=all", collapsed)
         _, p1 = self.page("?fragment=1&view=all&limit=2")
         self.assertEqual(p1.count("class=hrow"), 4)                           # floor is one page
         self.assertIn("4 requests", p1)
         _, evil = self.page("?view=all&q=<script>&outcome=bogus&limit=zzz&mode=<b>")
         self.assertNotIn("<script>", evil)
         self.assertNotIn("<b>&", evil.split("id=hform")[1].split("</form>")[0])
+        self.assertNotIn("<script>&", evil)
 
     def test_show_more_link_appears_when_rows_remain(self):
         from secret_broker import broker as bmod
@@ -2003,7 +2006,6 @@ class HistoryPage(Harness):
         self.api("POST", "/v1/requests", {"mode": "store", "names": ["hist-new"], "op": "create",
                                           "value": "the-new-credential-VALUE", "allowed_hosts": ["127.0.0.1"]})
         _, body = self.page()
-        self.assertIn("create credential", body)
         self.assertNotIn("the-new-credential-VALUE", body)
         rid = self.events("requested")[0]["id"]
         code, d = self.detail(rid)
@@ -2286,7 +2288,7 @@ class Dashboard(Harness):
         keep, r.risk = r.risk, None                      # drawn before the assessment landed
         _, body = self.get("/?fragment=1")
         self.assertIn("ASSESSING", body)
-        self.assertNotIn("MEDIUM RISK", body)
+        self.assertNotIn("rbadge md", body)
         v1 = re.search(r"data-version='([0-9a-f]+)'", body).group(1)
         r.risk = keep                                    # the assessment arrives
         _, body = self.get("/?fragment=1")

@@ -293,7 +293,7 @@ class Lifecycle(PBase):
         pid = self.approve()
         self.assertEqual(self.call(pid, body=self.ok_note())[0], 202)
         st, body, hdr = self.post("/plans/revoke", {"plan": pid})
-        self.assertEqual((st, hdr["Location"]), (303, "/clients?note=planrevoked"))
+        self.assertEqual((st, hdr["Location"]), (303, "/?note=planrevoked"))
         self.assertIn("Plan revoked", self.get(hdr["Location"])[1])
         code, r = self.call(pid, body=self.ok_note())
         self.assertEqual((code, r), (404, {"error": "plan not usable", "kind": "revoked"}))
@@ -638,10 +638,11 @@ class WithSessions(PBase):
         self.assertIs(f["plans"], True)
         self.assertTrue(f["http_sessions"]["enabled"])
 
-    def test_the_clients_tab_lists_plans_above_sessions(self):
+    def test_running_now_lists_the_plan(self):
         self.approve()
-        h = self.get("/clients")[1]
-        self.assertLess(h.index("Active plans"), h.index("Active sessions"))
+        h = self.get("/")[1]
+        self.assertIn("Running now", h)
+        self.assertIn("Plan &middot;", h)
 
     def test_both_features_share_the_running_status_and_the_clock(self):
         from secret_broker import clock as clock_mod
@@ -1059,8 +1060,8 @@ class ReviewRound3(BeforeSend):
         while time.time() < end and self.plan_view(pid)["inflight"] < 1:
             time.sleep(0.02)
         self.assertIn(pid, [r["id"] for r in self.broker.active_plans()])
-        self.assertIn("Active plans", self.get("/clients")[1])
-        self.assertIn(pid[:8] if False else "build-box", self.get("/clients")[1])
+        self.assertIn("Plan &middot;", self.get("/")[1])
+        self.assertIn("build-box", self.get("/")[1])
         self.broker.cfg  # noqa: B018
         self.broker.revoke_client(self.client["id"], "alice")
         self.assertEqual([e["cause"] for e in self.events("plan_revoked") if e["plan_id"] == pid], ["client_revoked"])

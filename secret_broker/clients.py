@@ -45,6 +45,7 @@ import threading
 import time
 
 from . import risk as risk_mod
+from . import ui_theme
 
 ANY = "*"                       # a rule scope that applies to every client
 LEGACY_ID = "legacy"
@@ -886,28 +887,29 @@ def enroll_card_html(e, csrf, now, clash):
     warn = (f"<p class=warnline>The name <b>{esc(e['name'])}</b> is already used by another client; "
             "pick a different one before approving.</p>") if clash else ""
     return (
-        f"<article class='req enr' data-id='{esc(e['id'][:8])}'>"
-        f"<div class=reqhead><h2>Client enrollment: {esc(e['name'])}</h2>"
-        f"<time data-exp='{int(e['expires'])}'>expires in {left}s</time></div>"
-        "<div class='risk high'><b>NEW CLIENT</b><small>If you did not just run <code>asb enroll</code> "
-        "on a machine you control, press Deny.</small></div>"
-        "<div class=box>"
-        f"Confirmation code: <span class=code>{esc(e['code'])}</span><br>"
-        "Match it with the code printed in your terminal. If it differs, press Deny.<br>"
-        f"Source address: {esc(e['source'])}<br>"
-        f"Claims to be (unverified, typed by the client): {esc(e['claim'])}</div>"
+        f"<article class='req enr' data-id='{esc(e['id'][:8])}' data-names='New machine {esc(e['name'])}'>"
+        "<div class=glance><span class='rbadge hi'><i aria-hidden=true>&#9650;</i>HIGH</span>"
+        "<span class=gwho>New machine</span>"
+        f"<span class=left><time data-exp='{int(e['expires'])}'>{left // 60}:{left % 60:02d} left</time></span></div>"
+        f"<h2 class=sent>Client enrollment: &ldquo;{esc(e['name'])}&rdquo; wants its own broker credential.</h2>"
+        "<div class=rqmeta>Confirmation code: <span class=code>" + esc(e["code"]) + "</span> "
+        "Match it with the code printed in your terminal. If it differs, press Deny.</div>"
         f"{warn}"
         "<form method=post action='/enroll/decide' class=decide>"
         f"<input type=hidden name=id value='{esc(e['id'])}'>"
         f"<input type=hidden name=csrf value='{esc(csrf)}'>"
+        f"<div class=dxrow><details class=dx{' open' if clash else ''}><summary>Rename</summary><div class=dxbody>"
         "<label for=ename>Name (you may change it)</label>"
         f"<input id=ename type=text name=name value='{esc(e['name'])}' maxlength=32 required "
-        "spellcheck=false autocapitalize=off autocomplete=off>"
-        "<div class=decide-row><button class='btn approve' name=decision value=approve>Approve</button>"
-        "<button class='btn deny' name=decision value=deny>Deny</button></div></form>"
+        "spellcheck=false autocapitalize=off autocomplete=off></div></details></div>"
+        "<div class=decide-row><button class='btn deny' name=decision value=deny>Deny</button>"
+        "<button class='btn approve' name=decision value=approve>Approve</button></div></form>"
+        "<div class=dxrow><details class=dx><summary>Details</summary><div class=dxbody>"
+        f"<dl class=facts><dt>Source</dt><dd>{esc(e['source'])}</dd>"
+        f"<dt>Claims to be</dt><dd>{esc(e['claim'])} <small class=muted>(unverified, typed by the client)</small></dd></dl>"
         "<p class=scope><small class=muted>An approved client starts with no rules of its own: it gets "
         "only the rules set for any client, and every other request asks you. Never auto-approved; "
-        "no notification button can decide this.</small></p></article>")
+        "no notification button can decide this.</small></p></div></details></div></article>")
 
 
 def from_html(req):
@@ -930,7 +932,7 @@ def _ago(t, now):
 
 
 def clients_section(broker, csrf, now=None, flash=""):
-    """The Clients tab body."""
+    """The Machines page body (reached from Settings)."""
     esc = html.escape
     now = time.time() if now is None else now
     legacy_on = broker.clients.cfg["legacy"] == "allow"
@@ -973,7 +975,7 @@ def clients_section(broker, csrf, now=None, flash=""):
                 "and its own rules are removed. It can enroll again as a new client.</small></p>"
                 f"<button class='btn deny'>Confirm revoke</button></form></details>")
         else:
-            acts = (f"<small class=muted>revoked {esc(iso(c['revoked_at'])) if c['revoked_at'] else ''}"
+            acts = (f"<small class=muted>revoked {ui_theme.time_tag(c['revoked_at'], 'when', fallback=iso(c['revoked_at'])) if c['revoked_at'] else ''}"
                     f" by {esc(c['revoked_by'] or 'unknown')}</small>"
                     "<form method=post action='/clients/remove' class=inline>"
                     f"<input type=hidden name=csrf value='{esc(csrf)}'><input type=hidden name=id value='{esc(c['id'])}'>"
@@ -982,7 +984,7 @@ def clients_section(broker, csrf, now=None, flash=""):
             f"<tr><td data-label=Name><b>{esc(c['name'])}</b><br><span class=idn>id {esc(c['id'])}</span></td>"
             f"<td data-label=Host>{esc(c['claim'] or '-')}<br><small class=muted>unverified; enrolled from "
             f"{esc(c['enrolled_from'] or '?')}</small></td>"
-            f"<td data-label=Enrolled>{esc(iso(c['created']))}<br><small class=muted>approved by "
+            f"<td data-label=Enrolled>{ui_theme.time_tag(c['created'], 'when', fallback=iso(c['created']))}<br><small class=muted>approved by "
             f"{esc(c['approved_by'] or '?')}</small></td>"
             f"<td data-label='Last seen'>{esc(_ago(c['last_seen'], now))}"
             f"{'<br><small class=muted>' + esc(c['last_source']) + '</small>' if c['last_source'] else ''}</td>"
@@ -1009,7 +1011,7 @@ def clients_section(broker, csrf, now=None, flash=""):
                  "enrollment is in effect now but is only in memory; if the broker restarts before the "
                  "write succeeds, a revoked client would work again. The write is retried every few "
                  "seconds. Check the disk.</div>")
-    return (f"<h1>Clients</h1>{note}{hint}<div class=cl>{table}</div>"
+    return (f"<p><a href='/settings'>&lsaquo; Settings</a></p><h1>Machines</h1>{note}{hint}<div class=cl>{table}</div>"
             "<p><small class=muted>A rule made for one client never applies to another; rules for "
             "<i>any client</i> apply to all. Rules are listed per client above and in full on the Policies "
             "tab.</small></p>")

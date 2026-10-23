@@ -205,7 +205,7 @@ class Enrollment(CBase):
         # the card: name, claim marked unverified, source address, the code, Approve/Deny and a CSRF token
         status, page, _ = self.get("/")
         self.assertEqual(status, 200)
-        self.assertIn("Client enrollment: laptop", page)
+        self.assertIn("Client enrollment: &ldquo;laptop&rdquo; wants its own broker credential.", page)
         self.assertIn(body["code"], page)
         self.assertIn("bob@laptop", page)
         self.assertIn("unverified", page)
@@ -706,14 +706,14 @@ class Administration(CBase):
     def test_clients_page(self):
         a = self.new_client("alpha", claim="bob@laptop")
         page = self.get("/clients")[1]
-        for needle in ("Clients", "alpha", a["id"], "bob@laptop", "unverified", "shared key (legacy)",
+        for needle in ("Machines", "alpha", a["id"], "bob@laptop", "unverified", "shared key (legacy)",
                        "Revoke...", "Rename", "data-label=Name", "data-label='Last seen'", "data-label=Requests",
                        "data-label=State", "data-label=Ceiling", "Effective ceiling", "asb enroll"):
             self.assertIn(needle, page, needle)
         self.assertIn(self.broker.csrf_token("alice"), page)
         self.assertNotIn(a["secret"], page)
         self.assertNotIn(a["hash"], page)
-        self.assertIn("<a href='/clients' class=on>Clients", page)
+        self.assertIn("<a href='/settings' class=on>Settings", page)
         self.assertEqual(self.get("/clients", user="mallory")[0], 403)
 
 

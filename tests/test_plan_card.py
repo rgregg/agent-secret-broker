@@ -74,7 +74,7 @@ class Rendering(CardBase):
                                     else self.nonce_page(r["id"])[1]), ["600"])
 
     def test_risk_is_shown_by_code_with_reasons(self):
-        self.assertIn("MEDIUM RISK", self.html)
+        self.assertIn("rbadge md", self.html)
         self.assertIn("can change data at the target", self.html)
         req = self.card(self.r["id"])
         self.assertEqual((req.risk["level"], req.risk["model"]), ("medium", None))
@@ -183,7 +183,7 @@ class SecondConfirmation(CardBase):
             h = self.page(r["id"])
             self.assertIn("Approve anyway", h, label)
             self.assertIn("Approve anyway?", h)
-            self.assertIn("HIGH RISK", h, label)
+            self.assertIn("rbadge hi", h, label)
             self.assertEqual(self.decision_buttons(h), {"approve_confirmed", "deny"}, label)
             # the server enforces it: a plain approve (a forged form) is refused and claims nothing
             st, body, _ = self.decide(r["id"], "approve")
@@ -368,14 +368,16 @@ class Pages(CardBase):
     def test_active_plans_table_with_revoke(self):
         pid = self.approve(self.manifest(task=TASK_CANARY))
         self.call(pid, body=self.ok_note())
-        st, h, _ = self.get("/clients")
+        st, h, _ = self.get("/")
         self.assertEqual(st, 200)
-        for frag in ("Active plans", TASK_CANARY, "build-box", "ledger, svc", "1 / 10", "active",
+        run = h[h.index("Running now"):]
+        for frag in ("Plan &middot; ledger, svc", TASK_CANARY, "build-box", "1 of 10 calls",
                      "action='/plans/revoke'", f"value='{pid}'", self.broker.csrf_token("alice"), "Revoke"):
-            self.assertIn(frag, h, frag)
-        self.assertNotIn("Active plans", self.get("/policies")[1])      # plans and sessions live under Clients
+            self.assertIn(frag, run, frag)
+        self.assertNotIn("Running now", self.get("/policies")[1])       # plans and sessions run under Requests
+        self.assertNotIn("Active plans", self.get("/clients")[1])
         self.post("/plans/revoke", {"plan": pid})
-        self.assertIn("No active plans", self.get("/clients")[1])
+        self.assertNotIn("Running now", self.get("/")[1])
 
     def test_the_clients_tab_lists_the_clients_active_plans(self):
         self.approve()
@@ -405,13 +407,13 @@ class Pages(CardBase):
         self.assertIn("not retained", h)
         self.assertNotIn(TASK_CANARY, h)
         self.assertIn("plan_issued", h)
-        st, h, _ = self.get("/?view=all&mode=plan")
+        st, h, _ = self.get("/history?mode=plan")
         self.assertIn("plan", h)
 
     def test_the_list_row_for_a_plan_card(self):
         self.approve()
-        h = self.get("/?view=all")[1]
-        self.assertIn("<small>plan</small>", h)
+        h = self.get("/history")[1]
+        self.assertIn("<b>plan</b>", h)
 
     def test_a_pending_plan_shows_on_the_dashboard_and_counts_as_attention(self):
         self.submit()
