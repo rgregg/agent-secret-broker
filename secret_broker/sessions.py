@@ -74,6 +74,7 @@ REFUSAL_LOG_KEYS = 1000
 CALL_TIMEOUT_S = 30
 MASK_MIN = 4                    # captured, cookie and credential values shorter than this are not masked
 MAX_HOST_LOG = 255
+MAX_RETAINED_RESULTS = 4        # finished, uncollected session-call results kept per session (the rest are dropped)
 MAX_TOMBSTONES = 500            # ended sessions remembered (id hash -> client, reason) so the owner is told why
 TOMBSTONE_S = 86400
 SWEEP_S = 5
@@ -84,7 +85,7 @@ _HEADER_RE = re.compile(r"^[A-Za-z0-9-]{1,64}\Z")
 _COOKIE_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}\Z")
 _KEY_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}\Z")
 _TOKEN_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+\Z")
-_JSON_UNESC = re.compile(r"\\u([0-9a-fA-F]{4})")
+_JSON_UNESC = re.compile(r"\\u(?:\{([0-9a-fA-F]{1,6})\}|([0-9a-fA-F]{4}))")
 _HEX_ESC = re.compile(r"\\x([0-9a-fA-F]{2})")
 _QP_ESC = re.compile(r"=([0-9A-Fa-f]{2})")
 _ENTITY = re.compile(r"&#([xX][0-9a-fA-F]{1,6}|[0-9]{1,7});?")
@@ -311,14 +312,16 @@ class Jar:
         out.sort(key=lambda t: t[0])
         return "; ".join(f"{n}={v}" for _, n, v in out) or None
 
-    def get(self, host, name):
+    def get(self, host, name, https=True):
+        """(value, secure) of the best-matching live cookie, or (None, False). A Secure cookie is not returned
+        for an http call."""
         now = self._clock()
         best = None
         for (h, cpath, n), c in self._c.items():
-            if h == host and n == name and (c["exp"] is None or c["exp"] > now):
+            if h == host and n == name and (c["exp"] is None or c["exp"] > now) and (https or not c["secure"]):
                 if best is None or len(cpath) > len(best[0]):
-                    best = (cpath, c["value"])
-        return best[1] if best else None
+                    best = (cpath, c["value"], c["secure"])
+        return (best[1], best[2]) if best else (None, False)
 
     def values(self):
         return [c["value"] for c in self._c.values()]
@@ -372,6 +375,7 @@ class Session:
         self.purpose, self.approver = purpose, approver
         self.jar = Jar(clock)
         self.captures = {}
+        self.secure_caps = set()        # captures taken from Secure cookies: never substituted into an http url
         self.lock = threading.Lock()
         self.dead = False
         self.end_reason = None
@@ -389,6 +393,7 @@ class Session:
             self.end_reason = reason
             self.jar.clear()
             self.captures.clear()
+            self.secure_caps.clear()
 
 
 # ---------------------------------------------------------------- performing a call
@@ -466,20 +471,28 @@ def _origin(url):
 OVERRIDE_REFUSED = "a session call cannot use a method override (the text `method` is not allowed in it)"
 
 
+def _join_surrogates(t):
+    """Recombine UTF-16 surrogate pairs produced by separate \\uD83D\\uDC26 style escapes into one character."""
+    if not any("\ud800" <= ch <= "\udfff" for ch in t):
+        return t
+    return t.encode("utf-16-le", "surrogatepass").decode("utf-16-le", "replace")
+
+
 def _decode_step(t):
     """One round of every decoding an upstream might apply: percent, HTML numeric entities, \\uXXXX and \\xNN
     escapes, quoted-printable =XX, then NFKC normalisation."""
     t = urllib.parse.unquote_to_bytes(t.encode("utf-8", "replace")).decode("utf-8", "replace")
     t = _ENTITY.sub(lambda m: chr(min(int(m.group(1)[1:], 16) if m.group(1)[0] in "xX" else int(m.group(1)), 0x10FFFF)), t)
-    t = _JSON_UNESC.sub(lambda m: chr(int(m.group(1), 16)), t)
+    t = _JSON_UNESC.sub(lambda m: chr(min(int(m.group(1) or m.group(2), 16), 0x10FFFF)), t)
     t = _HEX_ESC.sub(lambda m: chr(int(m.group(1), 16)), t)
     t = _QP_ESC.sub(lambda m: chr(int(m.group(1), 16)), t)
+    t = _join_surrogates(t)
     return unicodedata.normalize("NFKC", t)
 
 
 def _text_views(data):
     """Text views of `data` to scan: a str is itself; bytes are decoded as UTF-8 (errors replaced) AND as latin-1
-    (so mojibake cannot hide text), and, when NUL bytes show it may be UTF-16 or UTF-32, as those too."""
+    (so mojibake cannot hide text), and always as UTF-16 and UTF-32 in both byte orders."""
     if not isinstance(data, bytes):
         return [data]
     views = [data.decode("utf-8", "replace"), data.decode("latin-1")]
@@ -487,9 +500,8 @@ def _text_views(data):
         views.append(data.decode("utf-8").encode("latin-1").decode("utf-8"))
     except (UnicodeError, ValueError):
         pass
-    if b"\x00" in data or data[:4] in (b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff") or data[:2] in (b"\xff\xfe", b"\xfe\xff"):
-        for enc in ("utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be"):
-            views.append(data.decode(enc, "replace"))
+    for enc in ("utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be"):      # BOM-less too: modifier letters have no NUL
+        views.append(data.decode(enc, "replace"))
     return views
 
 
@@ -626,18 +638,42 @@ def _alive(sess, clock):
         raise SessionError(*ENDED["expired"])
 
 
+def _read_bounded(resp, sess, clock, t0):
+    """Read at most READ_LIMIT bytes, giving up (TimeoutError) when the session deadline or CALL_TIMEOUT_S passes, so a
+    slow-drip upstream cannot hold a call past either. Best effort on the per-read socket timeout too."""
+    read = getattr(resp, "read1", None) or resp.read
+    chunks, n = [], 0
+    while n < READ_LIMIT:
+        left = min(CALL_TIMEOUT_S - (time.monotonic() - t0), sess.expires - clock())
+        if left <= 0:
+            raise TimeoutError("deadline")
+        try:
+            sock = resp.fp.raw._sock
+            sock.settimeout(max(0.1, left))
+        except AttributeError:
+            pass
+        chunk = read(min(65536, READ_LIMIT - n))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        n += len(chunk)
+    return b"".join(chunks)
+
+
 def run_http(sess, spec, env, tls, allowed_now, opener_for, clock, state):
-    """Perform one session call. `env` holds the credential values, spec["capture_expr"] the parsed
-    capture expressions, `clock` the session clock. Returns (out, info): out is {"status", "headers",
-    "body"} with Set-Cookie removed and every credential, cookie and captured value masked; info is
-    {"captured": [names], "missing": [names]}. Redirects are never followed: a 3xx is returned as it is
-    (Location masked) and the agent makes a new in-scope call. `state["sent"]` becomes True just before
-    the request leaves the broker (so the caller knows whether to charge the call). The session is
+    """Perform one session call. `spec` is the full call (the broker keeps no copy of the body after this),
+    `env` the credential values, spec["capture_expr"] the parsed capture expressions, `clock` the session
+    clock. Returns (out, info): out is {"status", "headers", "body"} with Set-Cookie removed and every
+    credential, cookie and captured value masked (including the ones this response deletes, rotates or
+    that the caps reject); info is {"captured": [names], "missing": [names]}. Redirects are never followed.
+    `state["sent"]` becomes True as soon as the credential has been substituted: from then on the call is
+    charged whatever happens, so no outcome that depends on a secret's content is free. The session is
     re-checked after the upstream answers: a response that arrives after a revoke, close or the deadline
     is discarded and the fixed error raised."""
     with sess.lock:
         _alive(sess, clock)
         values = {**env, **{"session." + k: v for k, v in sess.captures.items()}}
+        before = sess.jar.values() + list(sess.captures.values())
     method = spec["method"]
     try:
         if spec.get("body_b64") is not None:
@@ -651,6 +687,7 @@ def run_http(sess, spec, env, tls, allowed_now, opener_for, clock, state):
         headers = {k: fill(v, values) for k, v in spec["headers"].items()}
     except (KeyError, ValueError, UnicodeError):
         raise NotSent("a placeholder or value in this call cannot be used", "session_refused") from None
+    state["sent"] = True        # charged from here on, whatever the credential's content makes of the checks below
     # The header and method checks ran on what the AGENT wrote (scope_problem, placeholders neutral), once per call. Only
     # when the call substitutes captured values (which an upstream chose, so `me`+`thod` could join into a verb) is the
     # substituted text scanned again, with credential placeholders still neutral so no outcome depends on a secret.
@@ -668,11 +705,12 @@ def run_http(sess, spec, env, tls, allowed_now, opener_for, clock, state):
     scheme, host, port, path = _origin(url)
     if scheme not in ("http", "https") or not sess.in_scope(scheme, host, port) or host not in allowed_now:
         raise NotSent("that host or port is outside this session's scope")
-    if len(url) > MAX_URL or _ILLEGAL_HEADER_VALUE.search(url) or " " in url:
-        raise ValueError("bad url")
+    # Everything below depends on credential content: one generic error for every cause, charged like a sent call.
+    if _ILLEGAL_HEADER_VALUE.search(url) or " " in url:
+        raise ValueError("bad request")
     for k, v in headers.items():
         if not _HEADER_TOKEN.match(k) or _ILLEGAL_HEADER_VALUE.search(v) or not v.isascii():
-            raise ValueError("bad header")
+            raise ValueError("bad request")
     https = scheme == "https"
     with sess.lock:
         cookie = sess.jar.header(host, path.split("?")[0], https)
@@ -683,13 +721,13 @@ def run_http(sess, spec, env, tls, allowed_now, opener_for, clock, state):
         _alive(sess, clock)
         timeout = min(CALL_TIMEOUT_S, max(0.1, sess.expires - clock()))
     r = urllib.request.Request(url, data=data, method=method, headers=headers)
-    state["sent"] = True
+    t0 = time.monotonic()
     try:
         with opener_for(tls).open(r, timeout=timeout) as resp:
-            status, msg, body = resp.status, resp.headers, resp.read(READ_LIMIT)
+            status, msg, body = resp.status, resp.headers, _read_bounded(resp, sess, clock, t0)
     except urllib.error.HTTPError as e:
         try:
-            status, msg, body = e.code, e.headers, e.read(READ_LIMIT)
+            status, msg, body = e.code, e.headers, _read_bounded(e, sess, clock, t0)
         finally:
             e.close()
     caps, missing = {}, []
@@ -706,11 +744,22 @@ def run_http(sess, spec, env, tls, allowed_now, opener_for, clock, state):
                 except (ValueError, UnicodeDecodeError, RecursionError):
                     parsed = [None]
             found[name] = json_value(parsed[0], arg)
+    set_cookies = msg.get_all("Set-Cookie") or []
+    seen_values = [v for raw in set_cookies for v in [(Jar._parse(raw) or (None, None, None))[1]] if v]
+    seen_values += [v for v in found.values() if isinstance(v, str)]
+    secure_names = set()
     with sess.lock:
         _alive(sess, clock)                 # revoked, closed or past the deadline meanwhile: discard it all
-        sess.jar.store(host, path.split("?")[0], https, msg.get_all("Set-Cookie") or [])
+        sess.jar.store(host, path.split("?")[0], https, set_cookies)
         for name, kind, arg in exprs:
-            val = sess.jar.get(host, arg) if kind == "cookie" else found.get(name)
+            if kind == "cookie":
+                val, secure = sess.jar.get(host, arg, https)
+                if secure:
+                    secure_names.add(name)
+                if val:
+                    seen_values.append(val)
+            else:
+                val = found.get(name)
             if storable(val) and not _has_method_text(val):     # a value that would later trip the override rule is not kept
                 caps[name] = val
             else:
@@ -718,10 +767,14 @@ def run_http(sess, spec, env, tls, allowed_now, opener_for, clock, state):
         for name, val in list(caps.items()):
             if name in sess.captures or len(sess.captures) < MAX_CAPTURES:
                 sess.captures[name] = val
+                (sess.secure_caps.add if name in secure_names else sess.secure_caps.discard)(name)
             else:
                 del caps[name]
                 missing.append(name)
-        secret_values = list(env.values()) + sess.jar.values() + list(sess.captures.values())
+        # mask what was held BEFORE this response (a cookie it deletes or a token it rotates may be echoed), what it
+        # set or offered (even if a cap or rule rejected it), and what is held now
+        secret_values = (list(env.values()) + before + seen_values + sess.jar.values()
+                         + list(sess.captures.values()))
     out_headers = {}
     for k, v in msg.items():
         if k.lower() in ("set-cookie", "set-cookie2"):
@@ -732,7 +785,7 @@ def run_http(sess, spec, env, tls, allowed_now, opener_for, clock, state):
     return out, {"captured": sorted(caps), "missing": sorted(set(missing))}
 
 
-def scope_problem(s, sc, names, method, spec, capture_names=()):
+def scope_problem(s, sc, names, method, spec, capture_names=(), secure_names=()):
     """None when a call is inside the session's scope, else (reason_class, fixed message). `sc` is the
     credential's current catalog entry (None if it vanished), `capture_names` the names captured so far.
     Pure and linear in the size of the call: it reads only fields that never change after the session
@@ -753,6 +806,15 @@ def scope_problem(s, sc, names, method, spec, capture_names=()):
     why = header_problem(spec["headers"])
     if why:
         return "header", why
+    # characters and length are checked on what the agent wrote (placeholders neutral), so these refusals never depend
+    # on a secret; credential content is only checked after substitution, with one generic error, and charged
+    nurl = neutralize(spec["url"])
+    if len(nurl) > MAX_URL or _ILLEGAL_HEADER_VALUE.search(nurl) or " " in nurl:
+        return "url", "the url contains characters a session call cannot send"
+    for k, v in spec["headers"].items():
+        nv = neutralize(v)
+        if not _HEADER_TOKEN.match(k) or _ILLEGAL_HEADER_VALUE.search(nv) or not nv.isascii():
+            return "header", "a header contains characters a session call cannot send"
     body = spec.get("body")
     if spec.get("body_b64") is not None:
         import base64
@@ -763,14 +825,22 @@ def scope_problem(s, sc, names, method, spec, capture_names=()):
                            body, binary=spec.get("body_b64") is not None)
     if why:
         return "method", why
-    names_in = set(capture_names)
-    for text in [spec["url"], spec.get("body") or ""] + list(spec["headers"].values()):
-        for ph in placeholders(text):
-            if ph.startswith("session."):
-                if ph[8:] not in names_in:
-                    return "missing_value", "a {{session.NAME}} value used here has not been captured in this session"
-            elif ph not in sc["vars"]:
-                return "placeholder", "a placeholder is not provided by the session's credential"
+    names_in, secure_in = set(capture_names), set(secure_names)
+    texts = [spec["url"], spec.get("body") or ""] + list(spec["headers"].values())
+    try:
+        found = [ph for text in texts for ph in placeholders(text)]
+    except ValueError:
+        found = [None] * (MAX_PLACEHOLDERS + 1)
+    if len(found) > MAX_PLACEHOLDERS:        # per call, not per string
+        return "placeholder", f"a session call may use at most {MAX_PLACEHOLDERS} placeholders"
+    for ph in found:
+        if ph.startswith("session."):
+            if ph[8:] not in names_in:
+                return "missing_value", "a {{session.NAME}} value used here has not been captured in this session"
+            if ph[8:] in secure_in and scheme != "https":
+                return "missing_value", "a value taken from a Secure cookie can only be used in an https call"
+        elif ph not in sc["vars"]:
+            return "placeholder", "a placeholder is not provided by the session's credential"
     return None
 
 
@@ -1038,6 +1108,7 @@ class SessionsMixin:
         return sorted(rows, key=lambda r: r["left_s"])
 
     def session_counts(self, cid):
+        self.sweep_sessions()               # an overdue session must not count against the caps
         with self._sess_lock:
             return sum(s.cid == cid for s in self._sess.values()), len(self._sess)
 
@@ -1091,6 +1162,7 @@ class SessionsMixin:
             raise SessionOpenError("the credential is no longer available for http")
         if any(parse_host_entry(h)[0] not in sc["allowed_hosts"] for h in sp["hosts"]):
             raise SessionOpenError("a host is no longer allowed for this credential")
+        self.sweep_sessions()
         with self._sess_lock:
             mine = sum(s.cid == cid for s in self._sess.values())
             if mine >= self.sessions_cfg["max_per_client"] or len(self._sess) >= MAX_TOTAL:
@@ -1210,8 +1282,8 @@ class SessionsMixin:
                               client_name=client["name"], method=method[:16], host=shown)
             raise SessionError(msg, code, http)
         with s.lock:
-            have = frozenset(s.captures)
-        problem = scope_problem(s, self.cfg["secrets"].get(s.cred), names, method, spec, have)   # no lock held
+            have, secure = frozenset(s.captures), frozenset(s.secure_caps)
+        problem = scope_problem(s, self.cfg["secrets"].get(s.cred), names, method, spec, have, secure)   # no lock held
         if problem is None:
             with self._sess_lock:                       # charge the call: re-check life and cap atomically
                 s2, state = self._sess_lookup(sid, cid, self.sessions_clock())
@@ -1237,18 +1309,26 @@ class SessionsMixin:
         req.sess_state = {"sent": False}
         req.status = "running"      # never "pending": a session call is not waiting for anyone and no one can decide it
         with self._lock:
+            self._expire_locked()                       # prune old requests (and their results) on this path too
+            self._drop_old_results(s)
             self._by_id[req.id] = req       # no nonce: there is no approval link for a session call
         self.audit("requested", req)
         self._retain_details(req)
+        # the broker keeps no copy of the body or headers once the details are retained: only the call itself holds them
+        req.call_spec, req.spec = req.spec, {"method": method, "url": req.spec["url"], "headers": {}, "body": None,
+                                             "body_b64": None}
         self.audit("session_used", req, session=s.pid, host=shown or "", calls=calls_now, max_calls=max_calls,
                    left_s=max(0, int(s.expires - self.sessions_clock())))
         try:
             result = self._release(req)
         except Exception as e:  # noqa: BLE001 -- the request must always settle; never repeat the text
-            if not req.sess_state["sent"]:          # it never left the broker: do not charge it, but meter it
+            req.call_spec = None
+            if not req.sess_state["sent"]:          # it never left the broker: do not charge it, but meter and audit it
                 with self._sess_lock:
                     if not s.dead:
                         s.calls = max(0, s.calls - 1)
+                self._log_refusal(s.pid, session=s.pid, reason_class="presend", client_id=cid,
+                                  client_name=client["name"], method=method[:16], host=shown)
                 self._meter_refusal(s)
             if isinstance(e, SessionError):         # ended mid-flight, or refused before sending: the fixed text
                 self._finish(req, "failed", error=str(e), via="session")
@@ -1261,8 +1341,18 @@ class SessionsMixin:
                 err = "upstream call failed (" + coarse_class(e) + ")"
             self._finish(req, "failed", error=err, via="session")
             return req
+        req.call_spec = None
         self._finish(req, "approved", result=result, via="session")
         return req
+
+    def _drop_old_results(self, s):
+        """Keep at most MAX_RETAINED_RESULTS uncollected results per session: the oldest are discarded (their
+        request turns into a failure the owner can read) so a client that never polls cannot pin memory.
+        Call with self._lock held."""
+        mine = sorted((r for r in self._by_id.values() if r.session is s and r.result is not None),
+                      key=lambda r: r.created)
+        for r in mine[:max(0, len(mine) - MAX_RETAINED_RESULTS + 1)]:
+            r.result, r.status, r.error = None, "failed", "result discarded: it was not collected in time"
 
     def _session_http(self, req, env):
         """Execute one session call (called from _release with the credential values read)."""
@@ -1270,13 +1360,15 @@ class SessionsMixin:
         s, t0 = req.session, time.time()
         sc = self.cfg["secrets"].get(req.names[0]) or {}
         try:
-            out, info = run_http(s, req.spec, env, self._tls_policy(req.names), set(sc.get("allowed_hosts") or []),
+            out, info = run_http(s, req.call_spec, env, self._tls_policy(req.names), set(sc.get("allowed_hosts") or []),
                                  broker_mod._opener_for, lambda: self.sessions_clock(), req.sess_state)
             with s.lock:                            # last look: nothing survives a revoke, close or the deadline
                 _alive(s, self.sessions_clock)
         except SessionError:
             raise
         except Exception as e:  # noqa: BLE001 -- class only, never the exception's text
+            with s.lock:                            # revoked, closed or past the deadline: say so (exit 7), not a timeout
+                _alive(s, self.sessions_clock)
             cls = coarse_class(e)
             self.audit("http_failed", req, error=cls, session=s.pid)
             err = OSError("upstream call failed (" + cls + ")")

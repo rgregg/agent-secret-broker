@@ -149,6 +149,7 @@ class Request:
         self._sent_to = None      # leaf transports that sent it; None = all (presence hold)
         self.offered = frozenset()  # action ids offered on any token-carrying transport
         self.apply = None         # guidance proposal: the entry indexes the approver ticked
+        self.call_spec = None     # session call: the full call (bodies included) until it has been sent; then None
         self.sess_state = None    # session call: {"sent": bool}, whether the request left the broker
         self.session = None       # http session this call runs in (sessions.py); None for a normal request
         self.gclasses = {}        # guidance proposal: failed entry name -> error class (approver only)
@@ -1910,7 +1911,8 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                     self._proposal_settled(r, "expired")
                 self._resolved(r, "expired")
                 r.done.set()
-        for rid in [k for k, r in self._by_id.items() if now > r.expires + 300]:
+        for rid in [k for k, r in self._by_id.items()
+                    if r.status != "running" and now > r.expires + (30 if r.session is not None else 300)]:
             r = self._by_id.pop(rid)
             self._by_nonce.pop(r.nonce, None)
         self._gretry_sweep()
@@ -2013,6 +2015,11 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         """Token a page must echo back with a decision. Bound to the identity, so
         one user's page cannot be replayed by another session."""
         return hmac.new(self._csrf_key, ("csrf:" + user).encode(), hashlib.sha256).hexdigest()
+
+    def open_ids(self):
+        """Ids of requests still open (pending or running), taken under the lock."""
+        with self._lock:
+            return {r.id for r in self._by_id.values() if r.status in ("pending", "running")}
 
     def attention(self):
         """What is waiting for the human: open requests plus pending client enrollments."""
@@ -4382,7 +4389,7 @@ def approval_handler(broker):
             inner = ("".join(cards) if cards else
                      "<div class='card empty'>Nothing is waiting for approval.</div>")
             block = f"<div id=cards class=cards data-version='{version}'>{inner}</div>"
-            pend_ids = {r.id for r in broker._by_id.values() if r.status in ("pending", "running")}
+            pend_ids = broker.open_ids()
             a = self._hist_args(q or {})
             if fragment:
                 return _page(self, 200, block + self._hist_list(a, pend_ids), nav=False)
@@ -4502,7 +4509,7 @@ def approval_handler(broker):
             """GET /request/<id>: everything the audit log holds about one finished
             request, as server-escaped HTML. Pending requests are refused (they
             have cards); an unknown or malformed id is a plain 404."""
-            pend_ids = {r.id for r in broker._by_id.values() if r.status in ("pending", "running")}
+            pend_ids = broker.open_ids()
             row, evs = broker.history.detail(rid, pend_ids)
             if row is None or rid in pend_ids or row["outcome"] == "pending":
                 code = 404 if row is None else 409
