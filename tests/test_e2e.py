@@ -115,6 +115,10 @@ class Harness(unittest.TestCase):
         self.c, self.a = serve(self.broker, ("127.0.0.1", 0), ("127.0.0.1", 0), KEY)
         self.base = f"http://127.0.0.1:{self.c.server_address[1]}"
         self.abase = f"http://127.0.0.1:{self.a.server_address[1]}"
+        # name resolution must not depend on the machine running the tests (CI resolves `localhost` to ::1 first,
+        # and the stubs listen on 127.0.0.1 only): `localhost` is 127.0.0.1 here
+        real_resolver = self.broker.dest_guard._resolver
+        self.broker.dest_guard._resolver = lambda h, p: ["127.0.0.1"] if h.lower() == "localhost" else real_resolver(h, p)
 
     def tweak(self, cfg):
         """Subclass hook to adjust the broker config before it starts."""
