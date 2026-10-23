@@ -22,6 +22,7 @@ import html
 import http.client
 import ipaddress
 import json
+import logging
 import os
 import queue
 import random
@@ -37,6 +38,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .audit import AuditLog
 from .backends import BackendError
+from .backends.base import BackendNotFound
 from .backends import base as backend_base
 from . import audit_api
 from . import notify as notify_mod
@@ -56,6 +58,7 @@ from . import request_details as details_mod
 from . import scripts as scripts_mod
 from . import sshkey
 from . import structured
+from . import keyprovider as keyprovider_mod
 from .history import History, OUTCOMES
 
 MAX_PENDING = 3
@@ -221,6 +224,8 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin):
         self._sleep, self._mono, self._jitter = time.sleep, time.monotonic, random.uniform
         self._gretry_lock = threading.Lock()
         self._gretry = {}                   # proposal id -> text of FAILED entries, in memory only
+        for kp in getattr(summarizer, "key_providers", ()):
+            kp.attach(self._summary_key_read, self.log)     # internal vault read; see below
         self._init_clients(config)
         self._init_grants(config)
         self._init_ssh_rules()
@@ -246,6 +251,11 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin):
             except Exception as e:  # noqa: BLE001 -- start anyway; requests retry the load
                 self._backend_ok = False
                 self.log("catalog_error", error=str(e)[:200])
+            try:
+                if self._backend_ok:
+                    self._check_summary_key_catalog()
+            except Exception:  # noqa: BLE001
+                pass
             self.log("startup", policies={
                 n: {"approval": sc.get("approval", "prompt"), "auto_modes": self._auto_modes(sc)}
                 for n, sc in sorted(self.cfg["secrets"].items())})
@@ -484,6 +494,46 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin):
                      adopted=sorted(adopted))
             for n, why in ginv.items():
                 self.log("guidance_ignored", secret=n, reason=why)
+
+    def _check_summary_key_catalog(self):
+        """Startup warning (not an error) when summary.api_key_secret names a credential the
+        catalog does not hold yet. It is resolved lazily at first use. No name in the line."""
+        for kp in getattr(self.summarizer, "key_providers", ()):
+            with self._cfg_lock:
+                sc = self.cfg["secrets"].get(kp.name)
+            if sc is None or kp.var not in (sc.get("vars") or {}):
+                msg = "summary.api_key_secret is not in the catalog yet; it is resolved at first use"
+                self.log("config_warning", warning=msg)
+                logging.getLogger("secret_broker").warning(msg)
+
+    def _summary_key_read(self, name, var):
+        """INTERNAL: the value of catalog credential `name`, variable `var`, for the
+        OpenRouter-bound analyzers only (through VaultKey). Not reachable from any request: no
+        Request, no approval, no card, no notification and no `secret_read` event; the caller audits
+        the hidden `summary_key_read` event. Raises KeyUnavailable carrying a reason class only."""
+        with self._cfg_lock:
+            sc = self.cfg["secrets"].get(name)
+        if sc is None:
+            try:
+                self._refresh_if(self.CATALOG_TTL)
+            except Exception:  # noqa: BLE001
+                pass
+            with self._cfg_lock:
+                sc = self.cfg["secrets"].get(name)
+        ref = ((sc or {}).get("vars") or {}).get(var)
+        if sc is None or ref is None or sc.get("ssh"):
+            raise keyprovider_mod.KeyUnavailable("not_found")
+        try:
+            raw = self.backend.get(ref["item"], ref.get("field") or "auto")
+            return structured.get(raw, ref["key"]) if ref.get("key") else raw
+        except structured.StructuredError:
+            raise keyprovider_mod.KeyUnavailable("invalid") from None
+        except BackendNotFound:
+            raise keyprovider_mod.KeyUnavailable("not_found") from None
+        except Exception as e:  # noqa: BLE001
+            cls = backend_base.error_class(e)
+            raise keyprovider_mod.KeyUnavailable(
+                cls if cls in keyprovider_mod.REASONS else "other") from None
 
     def status(self):
         """Deploy-verification summary for GET /v1/status. Counts and type names
