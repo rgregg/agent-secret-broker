@@ -204,6 +204,33 @@ Safety measures:
   `base_url` is custom and `summary_base_url` is not set, descriptions are
   disabled (startup warning) instead of using the default endpoint.
 
+## Late descriptions and late ratings
+
+The card is drawn after at most `summary_timeout` (description) and `timeout` (rating) seconds, as
+before: a description that is not ready is replaced by the plain `auto:` line marked "model
+description pending", and a rating that is not ready counts as no verdict, so the request is
+treated as HIGH. The two model calls are NOT cancelled then. They run off the request thread (a
+shared pool, still bounded by `summary_concurrency` and `summary_max_per_minute` for descriptions)
+until `summary_hard_timeout` (default 30 s, max 120).
+
+- Description: when the reply arrives and passes `sanitize` and `consistent_with`, it replaces
+  the plain line in the pending card, the history row and the open details pop-over (the dashboard
+  poll redraws a card when its `late_seq` changes, and keeps open sections, ticked boxes and typed
+  text as it does for an arriving assessment). If the reply is rejected, or the ceiling passes, the
+  plain line becomes final and the reason class (`rejected` + rule, `timeout`, `error`, ...) is
+  recorded. Either way exactly one `description_updated` audit event is written. A reply for a
+  request that is already approved, denied or expired changes only its history row.
+- Rating: the decision is taken when the card is first drawn (including auto-approval, grants and
+  `auto_approve_max`) and is never revisited. A rating that arrives later is stored separately
+  (`late_rating`), audited as `rated_late` and shown as "rated later: LOW; it did not change how
+  the request was handled". It is never written to `req.risk`, which is the only value the gate
+  reads, so a late rating can neither auto-approve a request nor lower an approval requirement.
+- Notifications are unchanged: they carry the text the request had when it was sent (names plus
+  the plain line when no description was ready) and are never delayed. `description_updated` and
+  `rated_late` are hidden from the agent audit view.
+- Slot use: a slow call holds a description slot until it finishes, so a slow provider can make
+  later descriptions wait up to 3 s for a slot and then fall back with `rate_limited`.
+
 ## Deterministic rules
 
 - `ssh_sign` is always HIGH, whatever the model says, and is not sent to the

@@ -346,10 +346,14 @@ def _post_json(url, key, payload, timeout):
 class Describer:
     """Chat-model description writer with bounds. ``describe`` never raises."""
 
-    def __init__(self, api_key, model="openai/gpt-5-mini", timeout=8.0, max_content_chars=400,
+    def __init__(self, api_key, model="openai/gpt-5-mini", timeout=4.0, max_content_chars=400,
                  send_content=True, base_url="https://openrouter.ai/api/v1", max_per_minute=60,
-                 concurrency=4, clock=time.monotonic, read_endpoints=(), max_script_chars=1000):
+                 concurrency=4, clock=time.monotonic, read_endpoints=(), max_script_chars=1000,
+                 hard_timeout=None):
         self._key, self._model, self._timeout = keyprovider.as_provider(api_key), model, timeout
+        # `timeout` is when the card is first drawn (JevAnalyzer stops waiting); `hard_timeout`
+        # is how long the call itself may run so a late reply can still be swapped in
+        self._hard = max(float(timeout), min(float(hard_timeout), 120.0)) if hard_timeout else float(timeout)
         self._max, self._send, self._base = max_content_chars, send_content, base_url.rstrip("/")
         self._cap, self._clock = max_per_minute, clock
         self._read_eps = list(read_endpoints)
@@ -407,7 +411,7 @@ class Describer:
             if not key:
                 return None, "error", None      # no usable key: same as a provider failure
             try:
-                resp = _post_json(f"{self._base}/chat/completions", key, payload, self._timeout)
+                resp = _post_json(f"{self._base}/chat/completions", key, payload, self._hard)
                 choice = resp["choices"][0]
                 text = choice["message"]["content"]
             except TimeoutError:
@@ -447,7 +451,7 @@ class Describer:
         if out is None:
             return {"text": deterministic_summary(mode, names, spec), "source": "deterministic",
                     "reason": reason, "rule": rule}
-        return {"text": out, "source": "model", "reason": None, "rule": None}
+        return {"text": out, "source": "model", "reason": None, "rule": None, "model": self._model}
 
     def describe(self, mode, names, spec, guidance=None):
         """-> {"text", "source": "model"|"deterministic", "reason": None|class}."""

@@ -24,7 +24,7 @@ _EV_KEYS = ("reason", "reasons", "model", "risk", "error", "via", "channel", "de
             "item", "field", "key", "hosts", "grant_id", "scope", "secrets", "grant_minutes",
             "grant_left_s", "expires_at", "created_by", "max_risk", "risk_level",
             "host_bound", "host_fp", "host_type", "host_name", "claimed_dest", "forwarding", "host_lines",
-            "rule_id", "account", "rule_host", "ssh_rule_requested", "decision_source",
+            "late_level", "rule_id", "account", "rule_host", "ssh_rule_requested", "decision_source",
             # guidance proposals: names, counts, lengths and hash prefixes; never text
             "entry_names", "entry_lengths", "entry_sha256", "applied", "denied", "failed",
             "applied_names", "denied_names", "failed_names", "failed_classes", "count", "retry",
@@ -134,7 +134,7 @@ class History:
             row = self._rows[rid] = {
                 "id": rid, "ts": rec["ts"], "time": rec["time"], "names": rec.get("names") or [],
                 "mode": rec.get("mode"), "source": rec.get("source"), "outcome": "pending",
-                "via": None, "approver": None, "risk": None, "summary": None, "summary_model": None, "summary_source": None, "summary_reason": None, "summary_rule": None, "error": None,
+                "via": None, "approver": None, "risk": None, "summary": None, "summary_model": None, "summary_source": None, "summary_reason": None, "summary_rule": None, "late_rating": None, "error": None,
                 "latency_ms": None, "grant_id": None, "rule_id": None, "plan_id": None, "plan_left_s": None, "delivered": False, "escalated": False,
                 "method": rec.get("method"), "url": _short_url(rec.get("url")),
                 "op": rec.get("op"), "item": rec.get("item"), "field": rec.get("field"),
@@ -158,6 +158,12 @@ class History:
             row["summary_source"] = rec.get("summary_source")
             row["summary_reason"] = _word(rec.get("summary_reason"))
             row["summary_rule"] = _word(rec.get("summary_rule"))
+        if ev == "description_updated":
+            row["summary_source"] = rec.get("summary_source")
+            row["summary_reason"] = _word(rec.get("summary_reason"))
+            row["summary_rule"] = _word(rec.get("summary_rule"))
+        if ev == "rated_late" and rec.get("late_level") in ("low", "medium", "high"):
+            row["late_rating"] = rec["late_level"]
         if ev == "stored" and row["mode"] == "credential" and rec.get("names"):
             row["names"] = rec["names"]     # the human may have renamed it on the card
         if rec.get("risk"):

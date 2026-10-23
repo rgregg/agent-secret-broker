@@ -341,7 +341,7 @@ class Describe(unittest.TestCase):
         p = seen["payload"]
         self.assertEqual((p["temperature"], p["stream"], p["max_tokens"] <= 500), (0, False, True))
         self.assertNotIn("tools", p)
-        self.assertEqual(seen["timeout"], 8.0)
+        self.assertEqual(seen["timeout"], 4.0)
         self.assertEqual(p["model"], "openai/gpt-5-mini")
 
 

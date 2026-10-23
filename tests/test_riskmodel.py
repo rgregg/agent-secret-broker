@@ -193,6 +193,15 @@ class Config(unittest.TestCase):
         riskmodel.build({"type": "jev", "api_key_file": "/k", "base_url": "http://localhost:9/api",
                          "summary_base_url": "http://127.0.0.1:9/v1"}, self.read)
 
+    def test_hard_timeout_defaults_and_wiring(self):
+        fa = riskmodel.build({"type": "jev", "api_key_file": "/k"}, self.read)
+        d = fa.inner._describer
+        self.assertEqual((d._timeout, d._hard, fa.inner._hard), (4.0, 30.0, 30.0))
+        fa = riskmodel.build({"type": "jev", "api_key_file": "/k", "summary_timeout": 5,
+                              "summary_hard_timeout": 120, "summary_model": "google/gemini-2.5-flash-lite"}, self.read)
+        d = fa.inner._describer
+        self.assertEqual((d._timeout, d._hard, d._model), (5.0, 120.0, "google/gemini-2.5-flash-lite"))
+
     def test_validation_names_field(self):
         cases = {
             "summary.type": {"type": "gemini", "api_key_file": "/k"},
@@ -203,6 +212,9 @@ class Config(unittest.TestCase):
             "summary.summary_text": {"type": "jev", "api_key_file": "/k", "summary_text": "x"},
             "summary.summary_model": {"type": "jev", "api_key_file": "/k", "summary_model": ""},
             "summary.summary_timeout": {"type": "jev", "api_key_file": "/k", "summary_timeout": 0},
+            "summary.summary_hard_timeout": {"type": "jev", "api_key_file": "/k", "summary_hard_timeout": 121},
+            "summary.summary_hard_timeout ": {"type": "jev", "api_key_file": "/k", "summary_timeout": 10,
+                                              "summary_hard_timeout": 5},
             "summary.summary_max_per_minute": {"type": "jev", "api_key_file": "/k", "summary_max_per_minute": 0},
             "summary.summary_concurrency": {"type": "jev", "api_key_file": "/k", "summary_concurrency": "x"},
             "summary.prompt": {"model": "m", "api_key_file": "/k", "prompt": "x"},
