@@ -186,8 +186,9 @@ log, history row or page: only class names and coarse categories (`timeout`, `co
 ## Audit events
 
 `session_requested`, `session_opened` (client, hosts, methods, ttl, max calls, expiry),
-`session_used` (request id, session prefix, method host, call number), `session_refused` (reason
-class), `session_closed`, `session_expired`, `session_revoked` (who). Plus the ordinary
+`session_used` (request id, session prefix, host, call number and cap; the agent view omits the host and method), `session_refused` (reason
+class, coalesced to 5 per minute per session with a `suppressed` counter; a call refused before sending logs reason `presend` after `session_used`), `session_closed`, `session_expired`,
+`session_revoked` (who), `session_ended` (`reason: refusal_budget`). Plus the ordinary
 `requested`, `approved` (via `session`), `secret_read`, `http_executed`, `delivered` for each call,
 so each call is a history row. Values (credential, cookie, captured) are in none of them. The
 agent-visible audit view whitelists these events and fields (deny by default); the human's history
@@ -239,12 +240,30 @@ the upstream's parser, and earlier versions were evaded by JSON unicode escapes,
 and key variants. The broker therefore applies ONE rule with no parsing: a session call is refused, with a fixed message and without
 charging the call, if its URL (path, parameters, query, fragment), any header name or value, or its body contains `method`
 case-insensitively in any decoded form (raw; up to 5 rounds of percent, HTML numeric entity, `\u`, `\x` and quoted-printable decoding with
-NFKC; letters-only). Bodies are scanned as UTF-8, latin-1, UTF-16/32 and double-encoded text (and refused when not valid UTF-8, except multipart or base64 bodies, which are scanned in every view). Userinfo in the URL and multipart bodies declaring a Content-Transfer-Encoding are refused. The check runs on the template
-and again on the substituted request. The cost, stated plainly: legitimate fields such as `payment_method` are refused in session calls;
+NFKC; letters-only). Bodies are scanned as UTF-8, latin-1, UTF-16/32 and double-encoded text (and refused when not valid UTF-8, except multipart or base64 bodies, which are scanned in every view). Userinfo in the URL and multipart bodies declaring a Content-Transfer-Encoding are refused. The check runs once per call on the agent's text (credential placeholders neutral); it runs again, on the text with captured values substituted, only when the call uses `{{session.NAME}}` (credential values are never scanned, so no outcome depends on a secret). The cost, stated plainly: legitimate fields such as `payment_method` are refused in session calls;
 such a call uses plain `asb http` (one approval per call), and the later manifest (task-grant) approach is the place to allow specific ones.
 
+**Memory and concurrency.** A session call is `running`, then finished with its result held until collected. The broker keeps no copy of the body or
+headers after the request details are retained (the call itself holds them until it has been sent), prunes finished session calls 30 s after they
+settle (never a running one), keeps at most 4 uncollected results per session (older ones become a readable "discarded" failure), prunes on the
+session-call path too, and takes the request-table lock wherever it iterates it (a never-polling client cannot pin memory, and iteration cannot race a
+mutating call).
+
+**Masking set.** The values masked in a response are those held before the response (a cookie it deletes or a token it rotates may be echoed), those it sets or
+offers (even if the jar, the capture cap or the method-text rule rejects them), and those held after. Every capture taken from an https response (header, cookie or JSON) is https-only: it is substituted only into a call whose final url is https, enforced in the
+same lock-protected read that fetches the capture values (no check-use gap); `set-cookie` headers cannot be captured, and Secure cookies are never sent over http.
+
+**No free oracle on a secret.** Length and character checks on the url and headers run on the agent's template (neutral placeholders) before the call is charged.
+Once the credential is substituted the call is charged whatever happens, and every failure that depends on its content (a space, a line break, non-ASCII) gets
+one generic `invalid_request` error, so probing a credential costs calls and tells nothing beyond the generic class. A call may use at most 100 placeholders in
+total (url, headers and body together); exceeding it is a metered refusal.
+
+**Deadline during upstream trouble.** The call timeout is min(30 s, time to deadline) and the body read is bounded by the same deadline (slow-drip upstreams cannot
+stall past it); an upstream error or timeout after the deadline or a revoke is reported as `session_expired` (exit 7), not as an upstream failure. Overdue sessions
+are swept before the per-client and total caps are applied.
+
 **Free refusals.** Captured values containing `method` are not stored (a hostile upstream could otherwise poison `{{session.X}}` so later calls
-fail for free while still costing vault reads and audit lines). Every refusal (scope or pre-send) is not charged but is metered: more than 10 per session ends it (`session_ended`, `reason: refusal_budget`), and
+fail for free while still costing vault reads and audit lines). Every refusal (scope or pre-send) is not charged but is metered (a failure after the credential was substituted is charged instead, so nothing that depends on a secret is free): more than 10 per session ends it (`session_ended`, `reason: refusal_budget`), and
 `session_refused` audit lines are coalesced (5 per minute per session, then a `suppressed` counter).
 
 ## Failure modes

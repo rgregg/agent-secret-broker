@@ -2169,6 +2169,17 @@ ends its sessions at once.
   header, override, missing capture, call cap used, and a refund for a call that never left the broker) counts against a per-session budget of 10;
   the 11th ends the session (`session_ended`, `reason: refusal_budget`, exit 7). `session_refused` audit lines are coalesced: the first 5 per minute
   per session (or per client for unknown ids), then a counter that rides on the next logged line as `suppressed`.
+- **Memory.** A session call's body and headers are not kept after the request details are retained; finished results are pruned 30 s after they
+  settle, at most 4 uncollected results are kept per session (older ones turn into a "discarded" failure), and a client that never polls cannot pin memory.
+- **Masking set.** A response is masked with the values held before it (a deleted or rotated cookie or token may be echoed), those it sets or offers
+  (even if the jar, the cap or the method-text rule rejects them) and those held after. One rule for https-only values: every capture taken from an https response (header, cookie or JSON, whatever its source) is only ever
+  substituted into a call whose final url is https; this is enforced where the capture values are read, under the same lock, so a concurrent rotation cannot
+  flip the outcome (a refusal before anything is sent, not charged). `set-cookie` headers cannot be captured (use `cookie:NAME`), and a Secure cookie is never
+  sent over http.
+- **No free oracle on a secret.** Characters and length of the url and headers are checked on what the agent wrote, before the call is charged. After the
+  credential is substituted the call is charged whatever happens, with one generic `invalid_request` error for any content-dependent failure. At most 100
+  placeholders per call in total (a metered refusal). Overdue sessions are swept before the per-client and total caps apply, and an upstream error after
+  the deadline or a revoke is `session_expired` (exit 7); the body read is bounded by the deadline.
 - **Bounded work.** URL and header values up to 8192 characters, 50 headers, 100 placeholders of up to 64 characters, body up to 256 KB (a larger body is refused with a fixed message; use plain `asb http` for big uploads: every session body is scanned, so its size is bounded).
   Placeholders are scanned in linear time, and the store lock is held only for dictionary work (never for a scope check or an upstream
   call), so one hostile or slow call cannot delay another client's lookup, revoke, close or sweep.
@@ -2213,7 +2224,7 @@ page (only class names and coarse categories such as `timeout`, `connection`, `t
 when you lowered the limits), `session_used` (call number and cap, host; the call itself is also an ordinary request:
 `requested`, `approved` with `via: session`, `secret_read`, `http_executed`, `delivered`), `session_refused` (reason
 class: `max_calls`, `method`, `body`, `host`, `credential`, `placeholder`, `missing_value`, `header`, `unknown`, `expired`,
-`closed`, `revoked`), `session_closed`, `session_expired`, `session_revoked` (who). Only the first 8 characters of
+`closed`, `revoked`, `presend`), `session_closed`, `session_expired`, `session_revoked` (who), `session_ended` (`reason: refusal_budget`). Only the first 8 characters of
 the id are ever logged (and a host string at most 255 characters); no cookie, captured value or credential is in any record. The agent's own audit view
 ([above](#what-a-client-sees-of-the-audit-log)) shows its client's session events through a deny-by-default whitelist
 (no approver, no policy). The Clients tab has an **Active sessions** list: credential, client, hosts, methods, live
