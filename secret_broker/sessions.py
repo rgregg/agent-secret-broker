@@ -1279,6 +1279,10 @@ class SessionsMixin:
         active = self.clients.is_active(cid)    # a revoked client reaches nothing, even before its sessions are purged
         with self._sess_lock:
             s, state = self._sess_lookup(sid, cid, self.sessions_clock())
+        hit = self._internal_hit(list(names) + ([s.cred] if s is not None else []))
+        if hit is not None:         # never usable in a session: the answer for an unknown session
+            self._log_internal_refusal(hit, "session_call", source, peer, client)
+            s, state = None, "unknown"
         if s is None or not active:
             state = state if active else "unknown"
             msg, code, http = ENDED[state]

@@ -103,7 +103,7 @@ class PlansMixin:
 
     def _plan_live(self, name):
         sc = self.cfg["secrets"].get(name)
-        if sc is None or sc.get("ssh"):
+        if sc is None or sc.get("ssh") or name in self._internal_secrets()[0]:
             return None
         return {"hosts": frozenset(sc.get("allowed_hosts") or ()), "plans": sc.get("plans"),
                 "sig": source_sig(sc), "vars": frozenset(sc["vars"])}
@@ -112,9 +112,16 @@ class PlansMixin:
         """Check every rule against the credential catalog and the plan policy. Returns {secret:
         source signature}. Raises ManifestError (400 or 403) with a fixed sentence."""
         sigs, deny = {}, self.plans_cfg["deny_secrets"]
+        internal = self._internal_secrets()[0]
         for i, r in enumerate(rules):
             f = f"rules[{i}]"
             sc = self.cfg["secrets"].get(r["secret"])
+            if r["secret"] in internal:
+                # the broker's own key (or an alias of its vault item): the same answer as an unknown
+                # credential, for the whole manifest, and a hidden audit event
+                err = plans_mod.ManifestError(f"{f}.secret: unknown credential")
+                err.internal = r["secret"]
+                raise err
             if sc is None:
                 raise plans_mod.ManifestError(f"{f}.secret: unknown credential")
             if sc.get("ssh"):
@@ -159,6 +166,8 @@ class PlansMixin:
             man = plans_mod.validate_manifest(raw, cfg, self.plan_max_minutes(cid))
             sigs = self._plan_check(man["rules"])
         except plans_mod.ManifestError as e:
+            if getattr(e, "internal", None):
+                self._log_internal_refusal(e.internal, "plan", source, peer, client)
             rej(e.status, str(e), "invalid" if e.status == 400 else "policy")
         rules = man["rules"]
         names = sorted({r["secret"] for r in rules})
@@ -287,6 +296,10 @@ class PlansMixin:
             # a plan call never runs in a session (plan session steps are phase 2): refused, fixed class
             self._plan_miss(client, plan_id, plans_mod.Miss("no_rule", why="request"))
         miss = lambda reason, **kw: self._plan_miss(client, plan_id, plans_mod.Miss(reason, **kw))  # noqa: E731
+        hit = self._internal_hit(names)
+        if hit is not None:         # not a rule of any plan, whatever the plan says: the same miss as an unlisted secret
+            self._log_internal_refusal(hit, "plan_call", source, peer, client)
+            miss("no_rule", why="secret")
         if not self.plans_cfg["enabled"]:
             miss("unusable", kind="unknown")
         self._refresh_if(self.CATALOG_TTL)

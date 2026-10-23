@@ -794,9 +794,16 @@ The key is resolved lazily and cached; there is no host file.
   omitted from `GET /v1/secrets` (`asb list` / `asb which`). The refusal is audited as
   the hidden `internal_secret_refused` event (`secret`, `reason:
   internal_secret`, mode, client). The approval site still lists it, marked
-  "(internal: summary key)", and a human can still edit it there. The "vault item already used" collision checks for store and credential
-  creation are case-insensitive. (This codebase has no sessions or plan
-  manifests, so there is nothing further to gate.)
+  "(internal: summary key)", and a human can still edit it there. The same refusal applies to every plan and session path: a plan manifest
+  with a rule for it (anywhere among the rules) is refused whole at submit with
+  `rules[i].secret: unknown credential`; a plan call or a session call naming it
+  gets the plan miss for an unlisted secret / `unknown session`; a session
+  whose credential it is cannot be used; opening a session for it is the plain
+  unknown-name refusal. Grants and Always approvals are never offered for it.
+  Plans, sessions, grants and Always rules are only ever created from agent
+  requests, which cannot name it, so no rule for it can come from an agent. The
+  "vault item already used" collision checks for store and credential creation
+  are case-insensitive.
 - **Idle lock.** The backend contract has no read-without-touch option, so each
   vault read (one per TTL) renews a backend's idle-logout timer such as the
   local store's `idle_timeout`; with a TTL shorter than the idle timeout the

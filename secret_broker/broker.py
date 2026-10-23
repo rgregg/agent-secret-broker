@@ -543,6 +543,20 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
     def is_internal_secret(self, name):
         return name in self._internal_secrets()[0]
 
+    def _internal_hit(self, names):
+        """The first of `names` that is an internal credential (or an alias of its vault item)."""
+        internal = self._internal_secrets()[0]
+        if not internal:
+            return None
+        return next((n for n in (names if isinstance(names, (list, tuple)) else ())
+                     if isinstance(n, str) and n in internal), None)
+
+    def _log_internal_refusal(self, hit, mode, source, peer, client):
+        """The hidden audit event for a refused use of an internal credential: name and reason
+        class only. The agent is told the generic unknown-credential wording."""
+        self.log("internal_secret_refused", secret=hit, reason="internal_secret", mode=mode,
+                 source=source, peer=peer, **self._client_fields(client))
+
     def _deny_internal(self, mode, names, spec, source, peer, client):
         """Refuse a request that names the summary key (or its vault item) with the same
         wording as an unknown credential, and audit a hidden event with the reason class."""
@@ -559,9 +573,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                     hit = cand
                     break
         if hit is not None:
-            self.log("internal_secret_refused", secret=hit if hit in internal else None,
-                     reason="internal_secret", mode=mode, source=source, peer=peer,
-                     **self._client_fields(client))
+            self._log_internal_refusal(hit if hit in internal else None, mode, source, peer, client)
             raise ValueError("unknown secret name")
 
     def _check_summary_key_catalog(self):
@@ -770,6 +782,8 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         """
         if req.mode == "store":
             return False, "storing a credential always needs a fresh approval"
+        if self._internal_hit(req.names) is not None:
+            return False, "this credential is internal"
         if req.mode not in ("http", "env"):
             return False, "only web and run-with-secret requests can be always-allowed"
         if len(req.names) != 1:
@@ -2381,6 +2395,8 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         """(ok, reason): whether an approval of `req` may also create grants."""
         if not self.grants_cfg["enabled"]:
             return False, "time-boxed grants are off"
+        if self._internal_hit(req.names) is not None:
+            return False, "this credential is internal"
         if req.mode not in grants_mod.ELIGIBLE_MODES:
             return False, "storing a credential always needs a fresh approval"
         if self._script_not_visible(req.mode, req.spec):

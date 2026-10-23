@@ -376,7 +376,8 @@ class AgentPath(e2e.Harness):
 
     def test_env_http_refused_like_unknown(self):
         _, unknown = self.api("POST", "/v1/requests", {"mode": "env", "names": ["nope"], "argv": ["x"]})
-        for n in (NAME, "alias"):            # the name, and a catalog alias of the same vault item
+        for n in (NAME, "alias"):            # the name; "alias" is not a valid catalog entry now (it borrows another
+            # item's fields), so it is refused as unknown. The broker's alias rule is defence in depth
             out = self.refused({"mode": "env", "names": [n], "argv": ["echo"]})
             self.assertEqual(out, unknown)
             self.refused({"mode": "env", "names": ["svc", n], "argv": ["echo"]})
