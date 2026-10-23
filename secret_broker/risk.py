@@ -50,6 +50,7 @@ def assess(mode, names, spec, analyzer=None, guidance=None):
                 "summary_source": None, "summary_reason": None,
                 "reasons": ["an HTTP session always needs a human to approve it; always high"]}
     summary, model_risk, summary_model, src, why = None, None, None, None, None
+    rule = None
     if analyzer is not None:
         try:
             if hasattr(analyzer, "analyze"):
@@ -57,14 +58,15 @@ def assess(mode, names, spec, analyzer=None, guidance=None):
                 summary, model_risk = got.get("summary"), got.get("risk")
                 summary_model = got.get("summary_model")
                 src, why = got.get("summary_source"), got.get("summary_reason")
+                rule = got.get("summary_rule")
             else:
                 summary = analyzer.summarize(mode, names, spec)
         except Exception:  # noqa: BLE001
-            summary, model_risk, summary_model, src, why = None, None, None, None, None
+            summary, model_risk, summary_model, src, why, rule = None, None, None, None, None, None
     if model_risk not in LEVELS:
         model_risk = None
     out = {"summary": summary, "summary_model": summary_model, "summary_source": src,
-           "summary_reason": why}
+           "summary_reason": why, "summary_rule": rule}
     if mode == "store" and spec.get("op") == "create":
         # adding a credential cannot read or change an existing one, and a human
         # always approves it, so it is low whatever the model thinks

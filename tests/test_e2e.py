@@ -2115,6 +2115,28 @@ class HistoryPage(Harness):
         self.assertNotIn("<script>x", lst)
         self.assertNotIn("<img src=x", lst)
 
+    def test_plain_line_reason_is_for_the_human_only(self):
+        class Plain:
+            def analyze(self, mode, names, spec):
+                return {"summary": "auto: GET 127.0.0.1/x", "risk": "low", "summary_source": "deterministic",
+                        "summary_reason": "rejected", "summary_rule": "first_word"}
+        self.broker.summarizer = Plain()
+        rid, _ = self.call()
+        for frag in (True, False):
+            _, d = self.detail(rid, frag=frag)
+            self.assertIn("check: first_word", d)
+            self.assertIn("the AI reply failed a safety or consistency check", d)
+        # the aggregated numbers: names and counts only
+        code, body = self.api("GET", "/v1/status")
+        ds = json.loads(body)["descriptions"]
+        self.assertEqual(ds, {"model": 0, "deterministic": 1, "by_reason": {"rejected": 1},
+                              "by_rule": {"first_word": 1}})
+        # the agent's audit view never carries the reason, the rule or the assessment
+        code, body = self.api("GET", f"/v1/audit?request={rid}")
+        self.assertEqual(code, 200)
+        for leak in ("first_word", "summary_reason", "summary_rule", "assessed", "check:"):
+            self.assertNotIn(leak, body)
+
     def test_detail_unknown_malformed_and_pending(self):
         self.call()
         for bad in ("nosuchid12345678", "../../etc/passwd", "a", "x" * 200, "%2e%2e%2fsecret", "id%3Brm",
@@ -2729,7 +2751,7 @@ class StatusEndpoint(Harness):
     def test_shape_and_values(self):
         st, _ = self.status()
         self.assertEqual(set(st), {"version", "build_time", "started_at", "uptime_s", "catalog",
-                                   "backend", "notifiers", "features"})
+                                   "backend", "notifiers", "descriptions", "features"})
         self.assertEqual(set(st["catalog"]), {"count", "invalid", "adopted", "loaded_at"})
         self.assertEqual(st["catalog"]["count"], 1)
         self.assertEqual(st["catalog"]["invalid"], 1)

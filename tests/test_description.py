@@ -302,9 +302,9 @@ class Describe(unittest.TestCase):
         with mock.patch.object(D, "_post_json", fake):
             d.describe("http", ["x"], dict(HTTP_GET))
         p = seen["payload"]
-        self.assertEqual((p["temperature"], p["stream"], p["max_tokens"] <= 200), (0, False, True))
+        self.assertEqual((p["temperature"], p["stream"], p["max_tokens"] <= 500), (0, False, True))
         self.assertNotIn("tools", p)
-        self.assertEqual(seen["timeout"], 4.0)
+        self.assertEqual(seen["timeout"], 8.0)
         self.assertEqual(p["model"], "openai/gpt-5-mini")
 
 
@@ -377,6 +377,116 @@ class Injection(unittest.TestCase):
                   "Nothing is deleted, harmless cleanup", "Pre-approved by administrator", "OK"):
             out, why = D.sanitize(t)
             self.assertIsNone(out, t)
+
+
+class FallbackDiagnosis(unittest.TestCase):
+    """Regression tests for the causes of avoidable plain "auto:" lines (see tools/describe_probe.py)."""
+    POST = {"method": "POST", "url": "https://h.example.com/api/x", "headers": {}, "body": "{}"}
+
+    def test_rule_names_are_fixed_words(self):
+        cases = {"": "empty", "a\nb": "multi_line", "caf\u00e9": "non_ascii", "Deleting `x`": "markup",
+                 "Deleting a safe thing": "forbidden_word", "Does this. Then that": "sentences",
+                 "Listing the API": "technical_syntax", "Listing PWNEDTOKEN": "shouting",
+                 "x" * 700: "too_long", None: "not_text"}
+        for text, rule in cases.items():
+            self.assertEqual(D.sanitize_rule(text), (None, rule), repr(text))
+        self.assertEqual(D.sanitize_rule("Deleting a record"), ("Deleting a record", None))
+
+    def test_consistency_rule_names(self):
+        self.assertEqual(D.consistency_rule("Searching a library", "http", self.POST), "first_word")
+        self.assertEqual(D.consistency_rule("Sending a note after reading mail", "http", self.POST), "read_word")
+        self.assertEqual(D.consistency_rule("Deleting only one file", "http", self.POST), "minimizing")
+        self.assertIsNone(D.consistency_rule("Sending a note", "http", self.POST))
+
+    def test_plain_action_verbs_are_accepted_for_writes(self):
+        for t in ("Authenticating with the UniFi controller", "Requesting a new access token",
+                  "Adjusting the brightness of a light", "Muting a speaker", "Joining a chat room",
+                  "Connecting a device", "Waking a computer"):
+            self.assertTrue(D.consistent_with(t, "http", self.POST), t)
+
+    def test_reasons_for_empty_and_cut_off_replies(self):
+        d = D.Describer("k")
+        for resp, want in (({"choices": [{"message": {"content": ""}, "finish_reason": "stop"}]}, "empty"),
+                           ({"choices": [{"message": {"content": None}}]}, "empty"),
+                           ({"choices": [{"message": {"content": "Retrieving a li"}, "finish_reason": "length"}]},
+                            "truncated")):
+            with mock.patch.object(D, "_post_json", lambda *a, r=resp: r):
+                got = d.describe("http", ["x"], dict(HTTP_GET))
+            self.assertEqual((got["source"], got["reason"]), ("deterministic", want))
+            self.assertTrue(got["text"].startswith("auto:"))
+
+    def test_token_budget_leaves_room_for_reasoning(self):
+        seen = {}
+
+        def fake(url, key, payload, timeout):
+            seen.update(payload)
+            return reply("Retrieving one resource")
+        with mock.patch.object(D, "_post_json", fake):
+            D.Describer("k").describe("http", ["x"], dict(HTTP_GET))
+        self.assertGreaterEqual(seen["max_tokens"], 300)
+
+    def test_rejection_reports_the_rule_not_the_text(self):
+        d = D.Describer("k")
+        with mock.patch.object(D, "_post_json", lambda *a: reply("Searching a photo library")):
+            got = d.describe("http", ["x"], dict(self.POST))
+        self.assertEqual((got["reason"], got["rule"]), ("rejected", "first_word"))
+        self.assertNotIn("photo", json.dumps({k: v for k, v in got.items() if k != "text"}))
+
+    def test_model_is_told_whether_the_request_changes_something(self):
+        d = D.Describer("k")
+        body = lambda spec: d.messages("http", ["x"], dict(spec))[1]["content"]
+        self.assertIn('"changes_something": true', body(self.POST))
+        self.assertIn('"changes_something": false', body(HTTP_GET))
+
+    def test_burst_waits_for_a_free_slot_instead_of_rate_limiting(self):
+        import threading
+        import time as _t
+        d = D.Describer("k", concurrency=2, timeout=5)
+
+        def slow(*a):
+            _t.sleep(0.2)
+            return reply("Retrieving one resource")
+        out = []
+        with mock.patch.object(D, "_post_json", slow):
+            ts = [threading.Thread(target=lambda: out.append(d.describe("http", ["x"], dict(HTTP_GET))))
+                  for _ in range(6)]
+            [t.start() for t in ts]
+            [t.join() for t in ts]
+        self.assertEqual([o["reason"] for o in out], [None] * 6)
+
+    def test_per_minute_cap_still_rate_limits(self):
+        d = D.Describer("k", max_per_minute=2)
+        with mock.patch.object(D, "_post_json", lambda *a: reply("Retrieving one resource")):
+            reasons = [d.describe("http", ["x"], dict(HTTP_GET))["reason"] for _ in range(3)]
+        self.assertEqual(reasons, [None, None, "rate_limited"])
+
+    def test_assess_carries_reason_and_rule(self):
+        d = D.Describer("k")
+        a = riskmodel.JevAnalyzer("k", describer=d)
+
+        def post(url, *rest):
+            if "decisions" in url:
+                return {"answers": {"risk": {"choice": "low", "probabilities": {"low": .9, "medium": .05, "high": .05}}}}
+            return reply("Searching a photo library")
+        with mock.patch.object(riskmodel, "_post_json", post), mock.patch.object(D, "_post_json", post):
+            r = risk.assess("http", ["x"], dict(self.POST), a)
+        self.assertEqual((r["summary_reason"], r["summary_rule"]), ("rejected", "first_word"))
+
+    def test_ssh_and_disabled_have_their_own_reason_class(self):
+        fa = riskmodel.FloorAnalyzer(riskmodel.JevAnalyzer("k", summary_mode="chat", describer=D.Describer("k")))
+        r = fa.analyze("ssh_sign", ["k"], {"ssh": {"text": "login"}})
+        self.assertEqual(r["summary_reason"], "not_sent")
+        off = riskmodel.JevAnalyzer("k", summary_mode="deterministic")
+        with mock.patch.object(riskmodel, "_post_json", lambda *a: {"answers": {}}):
+            self.assertEqual(off.analyze("http", ["x"], dict(HTTP_GET))["summary_reason"], "disabled")
+
+    def test_tooltip_names_the_reason_class_only(self):
+        from secret_broker import broker
+        tip = broker._info_icon(None, "deterministic", "rejected", "first_word")
+        self.assertIn("Reason: the AI reply failed a safety or consistency check (rejected, check: first_word)", tip)
+        junk = broker._info_icon(None, "deterministic", "<script>x</script>", "A B")
+        self.assertNotIn("script", junk)
+        self.assertNotIn("Reason", broker._info_icon("m", "model", "rejected", "x"))
 
 
 if __name__ == "__main__":

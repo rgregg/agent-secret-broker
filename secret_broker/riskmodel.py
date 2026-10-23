@@ -408,22 +408,23 @@ class JevAnalyzer:
     def analyze(self, mode, names, spec, guidance=None):
         """The level comes from classify() alone. The description (display only)
         is produced independently and can never change it."""
-        src = reason = None
+        src = reason = rule = None
         if self._summary_mode == "chat" and self._describer is not None:
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
                 fut = ex.submit(self._describe, mode, names, spec, guidance)
                 level, cost = self.classify(mode, names, spec, guidance)
                 d = fut.result()
-            summary, src, reason = d["text"], d["source"], d["reason"]
+            summary, src, reason, rule = d["text"], d["source"], d["reason"], d.get("rule")
         else:
             level, cost = self.classify(mode, names, spec, guidance)
             if self._summary_mode == "none":
                 summary = None
             else:
                 summary, src = deterministic_summary(mode, names, spec), "deterministic"
+                reason = "disabled"       # configured off: no model was asked
         self.last_cost = cost
         return {"summary": summary, "risk": level, "cost": cost,
-                "summary_source": src, "summary_reason": reason,
+                "summary_source": src, "summary_reason": reason, "summary_rule": rule,
                 "summary_model": (getattr(self._describer, "_model", None)
                                   if src == "model" else None)}
 
@@ -509,7 +510,8 @@ class FloorAnalyzer:
     def analyze(self, mode, names, spec, guidance=None):
         if mode == "ssh_sign":
             return {"summary": deterministic_summary(mode, names, spec), "risk": "high",
-                    "cost": None, "summary_source": "deterministic", "summary_reason": None}
+                    "cost": None, "summary_source": "deterministic", "summary_reason": "not_sent",
+                    "summary_rule": None}
         res = guidance_mod.call(self.inner.analyze, mode, names, spec, guidance)
         try:
             # floor: any request (every method, known or not; a safe method only when it carries
@@ -659,10 +661,10 @@ def build(sc, read, clock=time.monotonic):
     if mode == "chat":
         from .description import Describer
         describer = Describer(
-            key, sc.get("summary_model", "openai/gpt-5-mini"), timeout=sc.get("summary_timeout", 4.0),
+            key, sc.get("summary_model", "openai/gpt-5-mini"), timeout=sc.get("summary_timeout", 8.0),
             max_content_chars=sc.get("max_content_chars", 400), send_content=sc.get("send_content", True),
             base_url=sc.get("summary_base_url", DESCRIBER_DEFAULT_BASE),
-            max_per_minute=sc.get("summary_max_per_minute", 30), concurrency=sc.get("summary_concurrency", 4),
+            max_per_minute=sc.get("summary_max_per_minute", 60), concurrency=sc.get("summary_concurrency", 4),
             read_endpoints=sc.get("summary_read_endpoints", []))
     fa = FloorAnalyzer(JevAnalyzer(
         key, sc.get("model", DEFAULT_JEV_MODEL), timeout=sc.get("timeout", 6.0),

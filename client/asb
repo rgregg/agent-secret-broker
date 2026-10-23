@@ -2771,6 +2771,11 @@ def main(argv):
               f" (loaded {c['loaded_at'] or 'never'})")
         print(f"backend:  {b['type']} {'ok' if b['ok'] else 'FAILING'}")
         print(f"notify:   {', '.join(r['notifiers']) or 'none'}")
+        ds = r.get("descriptions")
+        if ds:
+            why = ", ".join(f"{k} {v}" for k, v in (ds.get("by_reason") or {}).items())
+            print(f"summary:  {ds.get('model', 0)} by model, {ds.get('deterministic', 0)} plain auto lines"
+                  + (f" ({why})" if why else ""))
         return 0
 
     if argv[0] == "audit":

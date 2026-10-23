@@ -194,6 +194,8 @@ class Request:
         self.summary = None       # advisory, unverified
         self.summary_model = None  # model that wrote the summary (None: unknown)
         self.summary_source = None  # "model", "deterministic" or None
+        self.summary_reason = None  # why a deterministic line was used (a class), human views only
+        self.summary_rule = None    # the check that rejected the reply (a fixed word), human views only
         self.risk = None          # {"level","model","reasons"}
         self.always = None        # outcome of an "always allow" click, if any
         self.ssh_rule = None      # outcome of an "Always: this host" click: created|exists|refused|...
@@ -232,6 +234,8 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         self._cfg_lock = threading.Lock()
         self.summarizer = summarizer
         self._kp_seen = set()           # summary key credentials seen in the catalog (see _summary_key_read)
+        self._desc_lock = threading.Lock()
+        self._desc_counts, self._desc_reasons, self._desc_rules = {}, {}, {}
         self.backend = backend
         self.notifier = notifier            # property: adapts legacy transports
         self.action_policy = notify_mod.parse_action_policy(
@@ -749,6 +753,29 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             raise keyprovider_mod.KeyUnavailable(
                 cls if cls in keyprovider_mod.REASONS else "other") from None
 
+    def _description_stats(self):
+        """Since start: how many request descriptions came from the model and how many fell
+        back to the plain "auto:" line, by reason class and by rejecting check. Names and
+        counts only; never any text."""
+        with self._desc_lock:
+            return {"model": self._desc_counts.get("model", 0),
+                    "deterministic": self._desc_counts.get("deterministic", 0),
+                    "by_reason": dict(sorted(self._desc_reasons.items())),
+                    "by_rule": dict(sorted(self._desc_rules.items()))}
+
+    def _count_description(self, req):
+        """Count how each description was produced (counts of fixed class names only)."""
+        src = req.summary_source
+        if src not in ("model", "deterministic"):
+            return
+        with self._desc_lock:
+            self._desc_counts[src] = self._desc_counts.get(src, 0) + 1
+            if src == "deterministic":
+                for table, key in ((self._desc_reasons, req.summary_reason or "none"),
+                                   (self._desc_rules, req.summary_rule)):
+                    if key:
+                        table[key] = table.get(key, 0) + 1
+
     def status(self):
         """Deploy-verification summary for GET /v1/status. Counts and type names
         only: no secret names, hosts, keys or config values. Reads in-memory state
@@ -770,6 +797,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             "catalog": stats,
             "backend": {"type": btype, "ok": bool(self._backend_ok)},
             "notifiers": notifiers,
+            "descriptions": self._description_stats(),
             "features": {"ha_hook": self.ha_hook is not None, "ssh": has_ssh,
                          "webpush_actions": "webpush" in notifiers and self.push is not None,
                          "auto_approve_max": self._auto_max,
@@ -1392,8 +1420,11 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         req.summary, req.risk = a["summary"], {k: a[k] for k in ("level", "model", "reasons")}
         req.summary_model = a.get("summary_model") if a.get("summary_source") != "deterministic" else None
         req.summary_source = a.get("summary_source")
+        req.summary_reason, req.summary_rule = a.get("summary_reason"), a.get("summary_rule")
+        self._count_description(req)
         self.audit("assessed", req, model=a["model"], reasons=a["reasons"],
-                   summary_source=a.get("summary_source"), summary_reason=a.get("summary_reason"))
+                   summary_source=a.get("summary_source"), summary_reason=a.get("summary_reason"),
+                   summary_rule=a.get("summary_rule"))
         cid = req.client["id"]
         never = self.client_never_auto(cid)
         if not never and self._ssh_rule_claim(req):   # standing per-host rule: explicit policy, any risk limit
@@ -4429,11 +4460,36 @@ def _describe(req):
             "command shown is what it <em>said</em> it would run.")
 
 
-def _info_icon(model, source=None):
+_REASON_TEXT = {
+    "rejected": "the AI reply failed a safety or consistency check",
+    "timeout": "the AI model took too long",
+    "error": "the AI model call failed",
+    "rate_limited": "too many descriptions were being written at once",
+    "empty": "the AI model returned nothing (its token budget may have run out)",
+    "truncated": "the AI reply was cut off",
+    "not_sent": "SSH signing data is never sent to a model",
+    "disabled": "AI descriptions are switched off",
+}
+
+
+def _reason_note(reason, rule):
+    """Human-view note naming why a plain line was used. Fixed class and rule names only,
+    never the rejected text; callers show it on the dashboard and history, never to agents."""
+    word = re.compile(r"^[a-z_]{1,32}$")
+    if not isinstance(reason, str) or not word.match(reason):
+        return ""
+    note = f" Reason: {_REASON_TEXT.get(reason, reason)} ({reason}"
+    if isinstance(rule, str) and word.match(rule):
+        note += f", check: {rule}"
+    return note + ")."
+
+
+def _info_icon(model, source=None, reason=None, rule=None):
     """The (i) icon whose tooltip says which model wrote a description (or that
-    a plain line was built from the request details, with no model involved)."""
+    a plain line was built from the request details, with no model involved, and why)."""
     if source == "deterministic":
-        tip = html.escape("Built from the request details; no AI model was used.")
+        tip = html.escape("Built from the request details; no AI model was used."
+                          + _reason_note(reason, rule))
     else:
         tip = html.escape(f"Generated by {model or 'an AI model'} based on the request.")
     # data-tip drives the CSS tooltip (hover, focus, tap); no title attribute, or the
@@ -4450,7 +4506,7 @@ def _risk_html(req):
            + html.escape("; ".join(req.risk["reasons"]) if req.risk else "") + "</small></div>")
     if req.summary:
         out += (f"<p>{'Summary' if req.summary_source == 'deterministic' else 'AI summary'} "
-                f"{_info_icon(req.summary_model, req.summary_source)}:<br>"
+                f"{_info_icon(req.summary_model, req.summary_source, req.summary_reason, req.summary_rule)}:<br>"
                 f"<i>{html.escape(req.summary)}</i></p>")
     return out
 
@@ -4734,7 +4790,7 @@ def _detail_html(r, evs, retained=""):
     add("Source (claimed by the client, unverified)", r["source"])
     add("Peer", r["peer"])
     if r["summary"]:
-        add("Summary", f"{e(r['summary'])} {_info_icon(r.get('summary_model'), r.get('summary_source'))}", True)
+        add("Summary", f"{e(r['summary'])} {_info_icon(r.get('summary_model'), r.get('summary_source'), r.get('summary_reason'), r.get('summary_rule'))}", True)
     if r["risk"]:
         reasons = "; ".join(r["risk_reasons"] or [])
         add("Risk", f"<span class='risk {e(r['risk'])}'><b>{e(r['risk'].upper())}</b></span> "
