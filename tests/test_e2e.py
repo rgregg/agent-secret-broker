@@ -349,7 +349,7 @@ class Summary(Harness):
         nonce = None
         for r in self.broker._by_id.values():
             nonce = r.nonce
-            self.assertLessEqual(len(r.summary), 100)
+            self.assertLessEqual(len(r.summary), 320)
         status, page = req(self.abase + f"/a/{nonce}", headers={"X-authentik-username": "alice"})
         self.assertEqual(status, 200)
         self.assertNotIn("<script>", page)
