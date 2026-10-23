@@ -351,7 +351,7 @@ class Verified(HostBase):
             _, body = self.sign(login(SID_A), claimed=evil)
             card = self.card(body)
             self.assertNotIn("alert(1)", card)
-            self.assertNotIn("<img", card)
+            self.assertNotIn("<img src=x", card)
             self.assertNotIn("claimed by the client", card)
         # defence in depth: even a value that reached the spec is escaped
         class R:

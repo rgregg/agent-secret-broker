@@ -43,7 +43,7 @@ class Rendering(CardBase):
     def test_every_rule_is_rendered_from_the_validated_structure(self):
         h = self.html
         for frag in ("Plan requested</b> by build-box", self.client["id"], "Lasts at most 8 hours",
-                     "UTC)", "with no further approval", "READ-ONLY", "CAN CHANGE DATA",
+                     " UTC</time> if you approve now", "with no further approval", "READ-ONLY", "CAN CHANGE DATA",
                      f"GET http://127.0.0.1:{self.port}/v1/accounts, up to 50 times.",
                      f"POST http://127.0.0.1:{self.port}/v1/notes, up to 5 times.",
                      "Body: none (an empty body only).",
