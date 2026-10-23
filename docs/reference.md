@@ -1918,8 +1918,10 @@ ends its sessions at once.
 - **Memory.** A session call's body and headers are not kept after the request details are retained; finished results are pruned 30 s after they
   settle, at most 4 uncollected results are kept per session (older ones turn into a "discarded" failure), and a client that never polls cannot pin memory.
 - **Masking set.** A response is masked with the values held before it (a deleted or rotated cookie or token may be echoed), those it sets or offers
-  (even if the jar, the cap or the method-text rule rejects them) and those held after. A Secure cookie is never captured for an http call, and a capture
-  from a Secure cookie can only be used in an https call.
+  (even if the jar, the cap or the method-text rule rejects them) and those held after. One rule for https-only values: every capture taken from an https response (header, cookie or JSON, whatever its source) is only ever
+  substituted into a call whose final url is https; this is enforced where the capture values are read, under the same lock, so a concurrent rotation cannot
+  flip the outcome (a refusal before anything is sent, not charged). `set-cookie` headers cannot be captured (use `cookie:NAME`), and a Secure cookie is never
+  sent over http.
 - **No free oracle on a secret.** Characters and length of the url and headers are checked on what the agent wrote, before the call is charged. After the
   credential is substituted the call is charged whatever happens, with one generic `invalid_request` error for any content-dependent failure. At most 100
   placeholders per call in total (a metered refusal). Overdue sessions are swept before the per-client and total caps apply, and an upstream error after

@@ -250,8 +250,8 @@ session-call path too, and takes the request-table lock wherever it iterates it 
 mutating call).
 
 **Masking set.** The values masked in a response are those held before the response (a cookie it deletes or a token it rotates may be echoed), those it sets or
-offers (even if the jar, the capture cap or the method-text rule rejects them), and those held after. Secure cookies are never captured for an http call, and a
-capture taken from a Secure cookie can only be substituted into an https call.
+offers (even if the jar, the capture cap or the method-text rule rejects them), and those held after. Every capture taken from an https response (header, cookie or JSON) is https-only: it is substituted only into a call whose final url is https, enforced in the
+same lock-protected read that fetches the capture values (no check-use gap); `set-cookie` headers cannot be captured, and Secure cookies are never sent over http.
 
 **No free oracle on a secret.** Length and character checks on the url and headers run on the agent's template (neutral placeholders) before the call is charged.
 Once the credential is substituted the call is charged whatever happens, and every failure that depends on its content (a space, a line break, non-ASCII) gets

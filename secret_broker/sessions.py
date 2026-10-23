@@ -195,6 +195,8 @@ def parse_capture(text):
     if not NAME_RE.match(name):
         raise ValueError("bad capture name: a letter, then letters, digits or _ (up to 32)")
     if kind == "header" and _HEADER_RE.match(arg):
+        if arg.lower() in ("set-cookie", "set-cookie2"):
+            raise ValueError("bad capture expression: use cookie:NAME to capture a cookie")
         return name, "header", arg.lower()
     if kind == "cookie" and _COOKIE_NAME_RE.match(arg):
         return name, "cookie", arg
@@ -375,7 +377,7 @@ class Session:
         self.purpose, self.approver = purpose, approver
         self.jar = Jar(clock)
         self.captures = {}
-        self.secure_caps = set()        # captures taken from Secure cookies: never substituted into an http url
+        self.https_only = set()         # captures taken from an https response: only ever substituted into an https call
         self.lock = threading.Lock()
         self.dead = False
         self.end_reason = None
@@ -393,7 +395,7 @@ class Session:
             self.end_reason = reason
             self.jar.clear()
             self.captures.clear()
-            self.secure_caps.clear()
+            self.https_only.clear()
 
 
 # ---------------------------------------------------------------- performing a call
@@ -673,6 +675,7 @@ def run_http(sess, spec, env, tls, allowed_now, opener_for, clock, state):
     with sess.lock:
         _alive(sess, clock)
         values = {**env, **{"session." + k: v for k, v in sess.captures.items()}}
+        https_only = frozenset(sess.https_only)     # read under the same lock as the values: no check-use gap
         before = sess.jar.values() + list(sess.captures.values())
     method = spec["method"]
     try:
@@ -687,6 +690,11 @@ def run_http(sess, spec, env, tls, allowed_now, opener_for, clock, state):
         headers = {k: fill(v, values) for k, v in spec["headers"].items()}
     except (KeyError, ValueError, UnicodeError):
         raise NotSent("a placeholder or value in this call cannot be used", "session_refused") from None
+    # ONE rule: a capture taken from an https response is only ever substituted into an https call (its final url)
+    if not url.lower().startswith("https://") and any(
+            ph.startswith("session.") and ph[8:] in https_only
+            for t in [spec["url"], spec.get("body") or ""] + list(spec["headers"].values()) for ph in placeholders(t)):
+        raise NotSent("a placeholder or value in this call cannot be used", "session_refused")
     state["sent"] = True        # charged from here on, whatever the credential's content makes of the checks below
     # The header and method checks ran on what the AGENT wrote (scope_problem, placeholders neutral), once per call. Only
     # when the call substitutes captured values (which an upstream chose, so `me`+`thod` could join into a verb) is the
@@ -747,15 +755,12 @@ def run_http(sess, spec, env, tls, allowed_now, opener_for, clock, state):
     set_cookies = msg.get_all("Set-Cookie") or []
     seen_values = [v for raw in set_cookies for v in [(Jar._parse(raw) or (None, None, None))[1]] if v]
     seen_values += [v for v in found.values() if isinstance(v, str)]
-    secure_names = set()
     with sess.lock:
         _alive(sess, clock)                 # revoked, closed or past the deadline meanwhile: discard it all
         sess.jar.store(host, path.split("?")[0], https, set_cookies)
         for name, kind, arg in exprs:
             if kind == "cookie":
-                val, secure = sess.jar.get(host, arg, https)
-                if secure:
-                    secure_names.add(name)
+                val, _ = sess.jar.get(host, arg, https)
                 if val:
                     seen_values.append(val)
             else:
@@ -767,7 +772,7 @@ def run_http(sess, spec, env, tls, allowed_now, opener_for, clock, state):
         for name, val in list(caps.items()):
             if name in sess.captures or len(sess.captures) < MAX_CAPTURES:
                 sess.captures[name] = val
-                (sess.secure_caps.add if name in secure_names else sess.secure_caps.discard)(name)
+                (sess.https_only.add if https else sess.https_only.discard)(name)
             else:
                 del caps[name]
                 missing.append(name)
@@ -785,7 +790,7 @@ def run_http(sess, spec, env, tls, allowed_now, opener_for, clock, state):
     return out, {"captured": sorted(caps), "missing": sorted(set(missing))}
 
 
-def scope_problem(s, sc, names, method, spec, capture_names=(), secure_names=()):
+def scope_problem(s, sc, names, method, spec, capture_names=()):
     """None when a call is inside the session's scope, else (reason_class, fixed message). `sc` is the
     credential's current catalog entry (None if it vanished), `capture_names` the names captured so far.
     Pure and linear in the size of the call: it reads only fields that never change after the session
@@ -825,7 +830,7 @@ def scope_problem(s, sc, names, method, spec, capture_names=(), secure_names=())
                            body, binary=spec.get("body_b64") is not None)
     if why:
         return "method", why
-    names_in, secure_in = set(capture_names), set(secure_names)
+    names_in = set(capture_names)
     texts = [spec["url"], spec.get("body") or ""] + list(spec["headers"].values())
     try:
         found = [ph for text in texts for ph in placeholders(text)]
@@ -837,8 +842,6 @@ def scope_problem(s, sc, names, method, spec, capture_names=(), secure_names=())
         if ph.startswith("session."):
             if ph[8:] not in names_in:
                 return "missing_value", "a {{session.NAME}} value used here has not been captured in this session"
-            if ph[8:] in secure_in and scheme != "https":
-                return "missing_value", "a value taken from a Secure cookie can only be used in an https call"
         elif ph not in sc["vars"]:
             return "placeholder", "a placeholder is not provided by the session's credential"
     return None
@@ -1282,8 +1285,8 @@ class SessionsMixin:
                               client_name=client["name"], method=method[:16], host=shown)
             raise SessionError(msg, code, http)
         with s.lock:
-            have, secure = frozenset(s.captures), frozenset(s.secure_caps)
-        problem = scope_problem(s, self.cfg["secrets"].get(s.cred), names, method, spec, have, secure)   # no lock held
+            have = frozenset(s.captures)
+        problem = scope_problem(s, self.cfg["secrets"].get(s.cred), names, method, spec, have)   # no lock held
         if problem is None:
             with self._sess_lock:                       # charge the call: re-check life and cap atomically
                 s2, state = self._sess_lookup(sid, cid, self.sessions_clock())

@@ -2501,25 +2501,140 @@ class Review5(SBase):
         self.assertEqual((code, r["code"]), (403, "session_refused"))
         self.assertEqual(s.free_refusals, 2)
 
-    # -- Secure cookies --------------------------------------------------------------------
-    def test_secure_cookies_are_not_captured_for_http_and_captures_of_them_stay_https_only(self):
+    # -- https-only captures ------------------------------------------------------------
+    def test_header_captures_of_set_cookie_are_refused(self):
+        for src in ("set-cookie", "Set-Cookie", "SET-COOKIE2"):
+            with self.assertRaises(ValueError):
+                S.parse_capture("A=header:" + src)
+        sid = self.open()
+        code, r = self.call(sid, "GET", "/", capture=["A=header:Set-Cookie"])
+        self.assertEqual(code, 400)
+        self.assertEqual(S.parse_capture("A=cookie:TOKEN")[1], "cookie")
+
+    def fake_session(self, hosts=("h.example",)):
+        import email.message
+
+        class Resp:
+            def __init__(inner, status, headers, body):
+                inner.status, inner.body = status, body
+                inner.headers = email.message.Message()
+                for k, v in headers:
+                    inner.headers.add_header(k, v)
+
+            def __enter__(inner):
+                return inner
+
+            def __exit__(inner, *a):
+                return False
+
+            def read1(inner, n):
+                out, inner.body = inner.body[:n], inner.body[n:]
+                return out
+
+        class Opener:
+            def __init__(inner):
+                inner.sent, inner.script = [], []
+
+            def open(inner, req, timeout=None):
+                inner.sent.append((req.full_url, dict(req.header_items())))
+                return inner.script.pop(0) if inner.script else Resp(200, [], b"{}")
+        op = Opener()
+        sess = S.Session("a" * 32, "aaaaaaaa", {"id": "legacy", "name": "x"}, "unifi", list(hosts), ["GET", "POST"], 600,
+                         100, 0.0, "p", "a", lambda: 0.0)
+        return sess, op, Resp
+
+    def run_fake(self, sess, op, method, url, headers=None, capture=None):
+        spec = {"method": method, "url": url, "headers": headers or {}, "body": None, "body_b64": None,
+                "capture_expr": [S.parse_capture(c) for c in (capture or [])]}
+        state = {"sent": False}
+        try:
+            out, info = S.run_http(sess, spec, {"UNIFI_PASSWORD": "pw-secret-1"}, None, {"h.example"}, lambda tls: op,
+                                   lambda: 0.0, state)
+        except S.SessionError as e:
+            return None, state, e
+        return (out, info), state, None
+
+    def test_every_capture_from_an_https_response_is_https_only(self):
+        sess, op, Resp = self.fake_session()
+        secure_val = "SECURE-COOKIE-VALUE-123"
+        op.script = [Resp(200, [("Set-Cookie", f"SC={secure_val}; Secure; Path=/"), ("X-Token", "hdr-token-value-1")],
+                          json.dumps({"tok": secure_val}).encode())]
+        res, state, err = self.run_fake(sess, op, "GET", "https://h.example/login",
+                                        capture=["H=header:X-Token", "C=cookie:SC", "J=json:$.tok"])
+        self.assertIsNone(err)
+        self.assertEqual(sorted(res[1]["captured"]), ["C", "H", "J"])
+        self.assertEqual(sess.https_only, {"C", "H", "J"})
+        for name in ("H", "C", "J"):                                # replay over http: refused, nothing sent, not charged
+            n = len(op.sent)
+            res, state, err = self.run_fake(sess, op, "GET", "http://h.example/x", {"X-API-Key": "{{session.%s}}" % name})
+            self.assertIsNotNone(err, name)
+            self.assertIsInstance(err, S.NotSent)
+            self.assertFalse(state["sent"])
+            self.assertEqual(len(op.sent), n)
+        res, state, err = self.run_fake(sess, op, "GET", "https://h.example/x", {"X-API-Key": "{{session.J}}"})
+        self.assertIsNone(err)                                      # the same value over https is fine
+        self.assertEqual(op.sent[-1][1]["X-api-key"], secure_val)
+        # a placeholder inside the url or the body counts too
+        for url, body in (("http://h.example/{{session.J}}", None),):
+            res, state, err = self.run_fake(sess, op, "GET", url)
+            self.assertIsInstance(err, S.NotSent)
+
+    def test_a_capture_from_an_http_response_may_be_used_over_http(self):
+        sess, op, Resp = self.fake_session()
+        op.script = [Resp(200, [("X-Token", "plain-token-12")], b"{}")]
+        res, state, err = self.run_fake(sess, op, "GET", "http://h.example/a", capture=["H=header:X-Token"])
+        self.assertEqual(sess.https_only, set())
+        res, state, err = self.run_fake(sess, op, "GET", "http://h.example/b", {"X-API-Key": "{{session.H}}"})
+        self.assertIsNone(err)
+        # a later https capture of the same name flips it to https-only; a later http one flips it back
+        op.script = [Resp(200, [("X-Token", "https-token-34")], b"{}")]
+        self.run_fake(sess, op, "GET", "https://h.example/a", capture=["H=header:X-Token"])
+        self.assertEqual(sess.https_only, {"H"})
+        op.script = [Resp(200, [("X-Token", "plain-again-56")], b"{}")]
+        self.run_fake(sess, op, "GET", "http://h.example/a", capture=["H=header:X-Token"], headers={})
+        self.assertEqual(sess.https_only, set())
+
+    def test_rotation_between_the_scope_check_and_the_send_cannot_flip_the_outcome(self):
+        sess, op, Resp = self.fake_session()
+        sess.captures["N"] = "plain-value-1"
+        spec = {"url": "http://h.example/", "headers": {"X-API-Key": "{{session.N}}"}}
+        sc = self.broker.cfg["secrets"]["unifi"]
+        self.assertIsNone(S.scope_problem(sess, {"vars": {}, "allowed_hosts": ["h.example"]}, ["unifi"], "GET", spec, {"N"}))
+        # ... and now the capture is rotated to a value taken over https, before the send
+        with sess.lock:
+            sess.captures["N"] = "https-value-2"
+            sess.https_only.add("N")
+        res, state, err = self.run_fake(sess, op, "GET", "http://h.example/", {"X-API-Key": "{{session.N}}"})
+        self.assertIsInstance(err, S.NotSent)
+        self.assertEqual(op.sent, [])
+        # under contention the decision and the value always agree: a https-only value never leaves over http
+        stop = threading.Event()
+
+        def rotate():
+            flag = False
+            while not stop.is_set():
+                flag = not flag
+                with sess.lock:
+                    sess.captures["N"] = "HTTPS-SECRET-VALUE" if flag else "plain-value-3"
+                    (sess.https_only.add if flag else sess.https_only.discard)("N")
+        t = threading.Thread(target=rotate, daemon=True)
+        t.start()
+        try:
+            for _ in range(400):
+                self.run_fake(sess, op, "GET", "http://h.example/", {"X-API-Key": "{{session.N}}"})
+        finally:
+            stop.set()
+            t.join(5)
+        self.assertTrue(op.sent)
+        for url, hdr in op.sent:
+            self.assertTrue(url.startswith("http://"))
+            self.assertNotEqual(hdr.get("X-api-key"), "HTTPS-SECRET-VALUE")
+
+    def test_jar_does_not_hand_out_a_secure_cookie_for_http(self):
         j = S.Jar(lambda: 0, wall=lambda: 0)
         j.store("h.example", "/", True, ["SC=secret-secure-value; Secure; Path=/", "PC=plain-value; Path=/"])
         self.assertEqual(j.get("h.example", "SC", True), ("secret-secure-value", True))
         self.assertEqual(j.get("h.example", "SC", False), (None, False))
-        self.assertEqual(j.get("h.example", "PC", False), ("plain-value", False))
-        sid = self.open()
-        s = self.sess(sid)
-        s.captures["C"] = "secure-capture-value"
-        s.secure_caps.add("C")
-        code, r = self.call(sid, "GET", "/echo", headers={"X-API-Key": "{{session.C}}"})
-        self.assertEqual((code, r["code"]), (403, "session_refused"))      # an http call: refused
-        self.assertEqual(self.st["seen"], [])
-        self.assertIsNone(S.scope_problem(s, self.broker.cfg["secrets"]["unifi"], ["unifi"], "GET",
-                                          {"url": f"https://127.0.0.1:{self.port}/", "headers": {"X-API-Key": "{{session.C}}"}},
-                                          {"C"}, {"C"}))
-        self.assertIsNotNone(S.scope_problem(s, self.broker.cfg["secrets"]["unifi"], ["unifi"], "GET",
-                                             {"url": self.url("/"), "headers": {"X-API-Key": "{{session.C}}"}}, {"C"}, {"C"}))
 
     # -- deadline during upstream trouble ---------------------------------------------------
     def test_an_upstream_error_after_the_deadline_or_revoke_is_session_expired(self):
