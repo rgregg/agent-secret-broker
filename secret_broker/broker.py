@@ -22,6 +22,7 @@ import html
 import http.client
 import ipaddress
 import json
+import logging
 import os
 import queue
 import random
@@ -37,6 +38,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .audit import AuditLog
 from .backends import BackendError
+from .backends.base import BackendNotFound
 from .backends import base as backend_base
 from . import audit_api
 from . import notify as notify_mod
@@ -60,6 +62,7 @@ from . import request_details as details_mod
 from . import scripts as scripts_mod
 from . import sshkey
 from . import structured
+from . import keyprovider as keyprovider_mod
 from .history import History, OUTCOMES
 
 MAX_PENDING = 3
@@ -81,6 +84,7 @@ _DANGEROUS_VAR_RE = re.compile(
     r"KUBECONFIG|.*_PROXY|SHELLOPTS|BASHOPTS|ZDOTDIR|SUDO_ASKPASS|BROWSER|LESS.*|SECRET_BROKER_.*)$")
 _FIELD_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_ .-]{0,59}$")
 _ITEM_RE = re.compile(r"^[^\x00-\x1f]{1,100}$")
+_UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")   # a vault id, not a name
 APPROVAL_VALUES = ("prompt", "allow")
 
 
@@ -203,6 +207,10 @@ class Request:
         self.done = threading.Event()
 
 
+class _InternalRefused(ValueError):
+    """An internal refusal already audited (hidden event); the text is the generic one."""
+
+
 class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.SessionsMixin,
              planflow.PlansMixin):
     def __init__(self, config, backend, notifier, audit=None, summarizer=None,
@@ -218,6 +226,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         self._refreshing = threading.Lock()
         self._cfg_lock = threading.Lock()
         self.summarizer = summarizer
+        self._kp_seen = set()           # summary key credentials seen in the catalog (see _summary_key_read)
         self.backend = backend
         self.notifier = notifier            # property: adapts legacy transports
         self.action_policy = notify_mod.parse_action_policy(
@@ -273,6 +282,8 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         self._sleep, self._mono, self._jitter = time.sleep, time.monotonic, random.uniform
         self._gretry_lock = threading.Lock()
         self._gretry = {}                   # proposal id -> text of FAILED entries, in memory only
+        for kp in getattr(summarizer, "key_providers", ()):
+            kp.attach(self._summary_key_read, self.log)     # internal vault read; see below
         self._init_clients(config)
         self._init_sessions(config)
         self._init_grants(config)
@@ -304,6 +315,13 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             except Exception as e:  # noqa: BLE001 -- start anyway; requests retry the load
                 self._backend_ok = False
                 self.log("catalog_error", error=str(e)[:200])
+            try:
+                if self._backend_ok:
+                    self._check_summary_key_catalog()
+                for kp in getattr(self.summarizer, "key_providers", ()):
+                    kp.get()                    # warm the key (a background read) so the first request has it
+            except Exception:  # noqa: BLE001
+                pass
             self.log("startup", policies={
                 n: {"approval": sc.get("approval", "prompt"), "auto_modes": self._auto_modes(sc)}
                 for n, sc in sorted(self.cfg["secrets"].items())})
@@ -536,6 +554,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             self._backend_ok = True
             self._catalog_stats = {"count": len(out), "invalid": len(bad), "adopted": len(adopted),
                                    "loaded_at": _iso(self._catalog_at)}
+        self._sync_summary_key(out)
         ginv = {n: e["guidance_invalid"] for n, e in sorted(out.items()) if e.get("guidance_invalid")}
         sig = json.dumps([sorted(out), bad, ginv], sort_keys=True)
         if sig != self._catalog_sig:
@@ -544,6 +563,137 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                      adopted=sorted(adopted))
             for n, why in ginv.items():
                 self.log("guidance_ignored", secret=n, reason=why)
+
+    def _internal_secrets(self):
+        """(names, vault items lowercased) of the credentials the broker uses for its own
+        summary key, plus any catalog entry that points at the same vault item (an alias would
+        be a way round the name). Agents can never request, list or change any of them."""
+        names = {kp.name for kp in getattr(self.summarizer, "key_providers", ())}
+        if not names:
+            return frozenset(), frozenset()
+        with self._cfg_lock:
+            secrets_ = dict(self.cfg["secrets"])
+        items = {str(r.get("item")).lower() for n in names for r in (secrets_.get(n, {}).get("vars") or {}).values()}
+        for kp in getattr(self.summarizer, "key_providers", ()):
+            # remember where the key lives: while the entry is briefly missing from the catalog the
+            # vault item stays protected
+            if secrets_.get(kp.name):
+                kp.known_items = frozenset(i for i in items)
+            items |= set(getattr(kp, "known_items", ()))
+        names |= {n for n, sc in secrets_.items()
+                  if any(str(r.get("item")).lower() in items for r in (sc.get("vars") or {}).values())}
+        return frozenset(names), frozenset(items)
+
+    def _sync_summary_key(self, catalog):
+        """The catalog was reloaded: if the key credential's source (item, field, key) changed,
+        drop the cached key so the next use re-reads it."""
+        for kp in getattr(self.summarizer, "key_providers", ()):
+            try:
+                ref = ((catalog.get(kp.name) or {}).get("vars") or {}).get(kp.var)
+                sig = json.dumps(ref, sort_keys=True, default=str) if ref is not None else None
+                if getattr(kp, "_src_sig", sig) != sig:
+                    kp.invalidate()
+                kp._src_sig = sig
+            except Exception:  # noqa: BLE001
+                pass
+
+    def internal_snapshot(self):
+        """The internal credential names as of NOW. Take it after the catalog was refreshed and use
+        that one value for every decision in a request; never reuse an earlier one."""
+        return self._internal_secrets()[0]
+
+    def is_internal_secret(self, name):
+        return name in self._internal_secrets()[0]
+
+    def _internal_hit(self, names):
+        """The first of `names` that is an internal credential (or an alias of its vault item)."""
+        internal = self._internal_secrets()[0]
+        if not internal:
+            return None
+        return next((n for n in (names if isinstance(names, (list, tuple)) else ())
+                     if isinstance(n, str) and n in internal), None)
+
+    def _items_unknown(self):
+        """True when a summary key credential is configured but its vault item was never seen, so a
+        store or credential request cannot be checked against it: those fail closed."""
+        kps = getattr(self.summarizer, "key_providers", ())
+        if not kps:
+            return False
+        self._internal_secrets()
+        return any(not getattr(kp, "known_items", ()) for kp in kps)
+
+    def _log_internal_refusal(self, hit, mode, source, peer, client):
+        """The hidden audit event for a refused use of an internal credential: name and reason
+        class only. The agent is told the generic unknown-credential wording."""
+        self.log("internal_secret_refused", secret=hit, reason="internal_secret", mode=mode,
+                 source=source, peer=peer, **self._client_fields(client))
+
+    def _deny_internal(self, mode, names, spec, source, peer, client):
+        """Store / credential requests: refuse one whose effective vault item (the explicit `item`,
+        else the name) is the summary key's vault item. Names are not checked here: an internal name
+        is simply "already exists" / "unknown" like any other credential would be (see the
+        validators). With the key's item not yet known the request fails closed."""
+        internal, items = self._internal_secrets()
+        if not getattr(self.summarizer, "key_providers", ()):
+            return
+        if self._items_unknown():
+            raise ValueError("unknown secret name, but the credential backend is not healthy "
+                             "(the catalog may be empty or stale): ask the operator to check "
+                             "`asb status` and the store key")
+        hit = None
+        first = names[0] if names and isinstance(names[0], str) else None
+        for cand in (spec.get("item") if isinstance(spec, dict) else None, first):
+            if isinstance(cand, str) and cand.lower() in items:
+                hit = cand
+                break
+        if hit is not None:
+            self._log_internal_refusal(None, mode, source, peer, client)
+            raise _InternalRefused("unknown secret name")
+
+    def _check_summary_key_catalog(self):
+        """Startup warning (not an error) when summary.api_key_secret names a credential the
+        catalog does not hold yet. It is resolved lazily at first use. No name in the line."""
+        for kp in getattr(self.summarizer, "key_providers", ()):
+            with self._cfg_lock:
+                sc = self.cfg["secrets"].get(kp.name)
+            if sc is None or kp.var not in (sc.get("vars") or {}):
+                msg = "summary.api_key_secret is not in the catalog yet; it is resolved at first use"
+                self.log("config_warning", warning=msg)
+                logging.getLogger("secret_broker").warning(msg)
+
+    def _summary_key_read(self, name, var):
+        """INTERNAL: the value of catalog credential `name`, variable `var`, for the
+        OpenRouter-bound analyzers only (through VaultKey). Not reachable from any request: no
+        Request, no approval, no card, no notification and no `secret_read` event; the caller audits
+        the hidden `summary_key_read` event. Raises KeyUnavailable carrying a reason class only."""
+        with self._cfg_lock:
+            sc = self.cfg["secrets"].get(name)
+        if sc is None:
+            try:
+                self._refresh_if(self.CATALOG_TTL)
+            except Exception:  # noqa: BLE001
+                pass
+            with self._cfg_lock:
+                sc = self.cfg["secrets"].get(name)
+        ref = ((sc or {}).get("vars") or {}).get(var)
+        if sc is None and name in self._kp_seen:
+            # present before, missing now: a catalog blip, not a removal. Transient: the cached key
+            # is kept until its grace ends
+            raise keyprovider_mod.KeyUnavailable("other")
+        if sc is None or ref is None or sc.get("ssh"):
+            raise keyprovider_mod.KeyUnavailable("not_found")
+        self._kp_seen.add(name)
+        try:
+            raw = self.backend.get(ref["item"], ref.get("field") or "auto")
+            return structured.get(raw, ref["key"]) if ref.get("key") else raw
+        except structured.StructuredError:
+            raise keyprovider_mod.KeyUnavailable("invalid") from None
+        except BackendNotFound:
+            raise keyprovider_mod.KeyUnavailable("not_found") from None
+        except Exception as e:  # noqa: BLE001
+            cls = backend_base.error_class(e)
+            raise keyprovider_mod.KeyUnavailable(
+                cls if cls in keyprovider_mod.REASONS else "other") from None
 
     def status(self):
         """Deploy-verification summary for GET /v1/status. Counts and type names
@@ -711,6 +861,8 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         """
         if req.mode == "store":
             return False, "storing a credential always needs a fresh approval"
+        if self._internal_hit(req.names) is not None:
+            return False, "this credential is internal"
         if req.mode not in ("http", "env"):
             return False, "only web and run-with-secret requests can be always-allowed"
         if len(req.names) != 1:
@@ -1041,7 +1193,10 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             threading.Thread(target=self._refresh_if, args=(self.CATALOG_BG_TTL, False),
                              daemon=True).start()
         out = []
+        internal = self._internal_secrets()[0]
         for name, sc in sorted(self.cfg["secrets"].items()):
+            if name in internal:
+                continue                    # the broker's own summary key is never offered
             hosts = sc.get("allowed_hosts") or []
             if host is None or host in hosts:
                 # Deliberately no approval policy or sensitivity here: whether a
@@ -1061,10 +1216,14 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         if mode == "http" and isinstance(spec, dict) and spec.get("session") is not None:
             return self._session_call(names, spec, source, peer, client)
         try:
+            # Pre-refresh membership test: it only decides HOW to refresh (a name that is unknown or
+            # internal forces a reload, so both cost the same). It is never used for a decision.
+            pre = self._internal_secrets()[0]
             self._refresh_if(0 if (mode not in ("store", "credential")
-                                   and any(n not in self.cfg["secrets"] for n in names))
+                                   and any(n not in self.cfg["secrets"] or n in pre for n in names))
                              else self.CATALOG_TTL)
             secrets_cfg = self.cfg["secrets"]
+            internal = self.internal_snapshot()     # ONE snapshot, taken after the refresh, for every check below
             if mode == "env":
                 spec["scripts"] = scripts_mod.validate(spec.get("scripts"))
                 spec["cwd"] = scripts_mod.validate_cwd(spec.get("cwd"))
@@ -1074,14 +1233,16 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                 self._validate_proposal(names, spec)
             elif mode == "store":
                 self._validate_store(names, spec)
+                self._deny_internal(mode, names, spec, source, peer, client)    # defaults are filled in now
             elif mode == "credential":
                 self._validate_credential(names, spec)
+                self._deny_internal(mode, names, spec, source, peer, client)
             elif mode == "session":
-                if not names or any(n not in secrets_cfg for n in names):
+                if not names or any(n not in secrets_cfg or n in internal for n in names):
                     self._refresh_if(0)
                 self._validate_session(names, spec, client)
             else:
-                if not names or any(n not in secrets_cfg for n in names):
+                if not names or any(n not in secrets_cfg or n in internal for n in names):
                     if not self._backend_ok:
                         # the catalog could not be (re)loaded: do not blame the agent's spelling
                         raise ValueError("unknown secret name, but the credential backend is not "
@@ -1105,6 +1266,11 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                      **self._client_fields(client), **e.fields)
             raise
         except (ValueError, PermissionError) as e:
+            hit = None if isinstance(e, _InternalRefused) else self._internal_hit(
+                proposals_mod.names_of(spec.get("entries")) if mode == "guidance" and isinstance(spec, dict)
+                else names)
+            if hit is not None:
+                self._log_internal_refusal(hit, mode, source, peer, client)
             self.log("rejected", reason=str(e), names=names, mode=mode, source=source, peer=peer,
                      **self._client_fields(client),
                      url=spec.get("url") if isinstance(spec, dict) and mode == "http" else None)
@@ -1243,7 +1409,9 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         validated entry names."""
         if not self.proposals_cfg["enabled"]:
             raise PermissionError("guidance proposals are disabled")
-        ents = proposals_mod.validate_entries(spec.get("entries"), self.cfg["secrets"])
+        internal = self._internal_secrets()[0]
+        known = {n: v for n, v in self.cfg["secrets"].items() if n not in internal}
+        ents = proposals_mod.validate_entries(spec.get("entries"), known)
         spec.clear()
         spec["entries"] = [
             {"name": e["name"], "text": e["text"], "length": len(e["text"]),
@@ -1311,6 +1479,8 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             raise ValueError("a credential request never carries a value: the human enters it on the "
                              "approval page")
         name = names[0]
+        if _UUID_RE.match(name):
+            raise ValueError("secret name must be 1-41 chars of a-z 0-9 _ - ")
         if name in self.cfg["secrets"]:
             raise ValueError(f"{name} already exists; to replace its value use `asb update {name}`")
         kind = spec.get("kind")
@@ -1357,7 +1527,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         errs, sp = [], req.spec
         one = lambda k: form.get(k) if isinstance(form.get(k), str) else ""  # noqa: E731
         name = one("name").strip()
-        if not _NAME_RE.match(name):
+        if not _NAME_RE.match(name) or _UUID_RE.match(name):
             errs.append("name must be 1-41 chars of a-z 0-9 _ -")
         elif name in self.cfg["secrets"]:
             errs.append(f"{name} already exists; choose another name (to replace a value use `asb update`)")
@@ -1414,7 +1584,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                 break
         for other, sc in self.cfg["secrets"].items():
             for ref in sc["vars"].values():
-                if ref["item"] == item:
+                if str(ref["item"]).lower() == item.lower():
                     errs.append(f"vault item {item!r} is already used by {other}")
                     break
         final = {"name": name, "item": item, "field": "notes", "kind": kind, "cred_mode": mode,
@@ -1508,16 +1678,19 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             if not _FIELD_RE.match(spec["field"]) or spec["field"] in \
                     backend_base.RESERVED_FIELDS:
                 raise ValueError("bad field name")
-            if not _ITEM_RE.match(spec["item"]):
+            if not _ITEM_RE.match(spec["item"]) or _UUID_RE.match(spec["item"]):
                 raise ValueError("bad item name")
             if not _VAR_RE.match(spec["var"]):
                 raise ValueError("variable must look like MY_TOKEN")
+            internal_now = self._internal_secrets()[0]
             for other, sc in secrets_cfg.items():
+                if other in internal_now:
+                    continue            # refused by _deny_internal with the generic text
                 for ref in sc["vars"].values():
-                    if ref["item"] == spec["item"]:
+                    if str(ref["item"]).lower() == spec["item"].lower():
                         raise ValueError(f"vault item {spec['item']!r} is already used by {other}")
         elif op == "update":
-            if name not in secrets_cfg:
+            if name not in secrets_cfg or name in self._internal_secrets()[0]:
                 if not self._backend_ok:
                     raise ValueError("unknown secret name, but the credential backend is not "
                                      "healthy (the catalog may be empty or stale): ask the "
@@ -2317,6 +2490,8 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         """(ok, reason): whether an approval of `req` may also create grants."""
         if not self.grants_cfg["enabled"]:
             return False, "time-boxed grants are off"
+        if self._internal_hit(req.names) is not None:
+            return False, "this credential is internal"
         if req.mode not in grants_mod.ELIGIBLE_MODES:
             return False, "storing a credential always needs a fresh approval"
         if self._script_not_visible(req.mode, req.spec):
@@ -2344,11 +2519,13 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                          "minutes": g["minutes"]})
         with self._cfg_lock:
             secrets_now = sorted(self.cfg["secrets"].items())
+        internal = self._internal_secrets()[0]
+        internal_tag = lambda n: " (internal: summary key)" if n in internal else ""  # noqa: E731
         for name, sc in secrets_now:
             for e in sc.get("standing") or []:
                 off = e["mode"] not in self._effective_auto_modes(sc, e.get("client") if e.get("client", clients_mod.ANY) != clients_mod.ANY
                                                                    else None)
-                rows.append({"kind": "always", "id": e["id"], "secrets": [name], "mode": e["mode"],
+                rows.append({"kind": "always", "id": e["id"], "secrets": [name + internal_tag(name)], "mode": e["mode"],
                              "client": e.get("client", clients_mod.ANY), "scope": e["scope"], "covers": standing_mod.covers_label(e["mode"], e["scope"])
                              + (" (not active: mode not enabled)" if off else ""),
                              "expires_at": None, "left_s": None, "created_by": e["created_by"],
@@ -2359,7 +2536,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             ch = sc.get("approval_changed") or {}
             at = ch.get("at") or ""
             modes = ", ".join(_MODE_LABEL.get(m, m) for m in self._auto_modes(sc)) or "none"
-            rows.append({"kind": "legacy", "id": "", "name": name, "secrets": [name], "mode": None,
+            rows.append({"kind": "legacy", "id": "", "name": name, "secrets": [name + internal_tag(name)], "mode": None,
                          "client": clients_mod.ANY, "scope": "any", "covers": f"whole credential, any method, any covered mode ({modes})",
                          "expires_at": None, "left_s": None, "created_by": ch.get("by") or "",
                          "created_at": at.replace("T", " ").replace("Z", " UTC")})

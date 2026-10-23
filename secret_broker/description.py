@@ -25,6 +25,7 @@ import urllib.parse
 import urllib.request
 
 from . import guidance as guidance_mod
+from . import keyprovider
 from . import scripts as scripts_mod
 from .riskmodel import deterministic_summary, request_fields
 
@@ -296,7 +297,7 @@ class Describer:
     def __init__(self, api_key, model="openai/gpt-5-mini", timeout=4.0, max_content_chars=400,
                  send_content=True, base_url="https://openrouter.ai/api/v1", max_per_minute=30,
                  concurrency=4, clock=time.monotonic, read_endpoints=(), max_script_chars=1000):
-        self._key, self._model, self._timeout = api_key, model, timeout
+        self._key, self._model, self._timeout = keyprovider.as_provider(api_key), model, timeout
         self._max, self._send, self._base = max_content_chars, send_content, base_url.rstrip("/")
         self._cap, self._clock = max_per_minute, clock
         self._read_eps = list(read_endpoints)
@@ -342,8 +343,11 @@ class Describer:
             payload = {"model": self._model, "messages": self.messages(mode, names, spec, guidance),
                        "max_tokens": 150, "temperature": 0, "stream": False,
                        "reasoning": {"effort": "minimal"}}
+            key = self._key.get()
+            if not key:
+                return None, "error", None      # no usable key: same as a provider failure
             try:
-                resp = _post_json(f"{self._base}/chat/completions", self._key, payload, self._timeout)
+                resp = _post_json(f"{self._base}/chat/completions", key, payload, self._timeout)
                 text = resp["choices"][0]["message"]["content"]
             except TimeoutError:
                 return None, "timeout", None

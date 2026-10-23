@@ -483,7 +483,8 @@ class Validation(H):
         self.assertIn("svc already exists", body)
         self.assertEqual(self.pending_ids(), [r["id"]])
         self.assertEqual(self.vault_value("svc", "token"), "existing-svc-value")
-        self.assertEqual(self.events("credential_refused")[0]["problems"], 1)
+        # the name is taken AND its default vault item "svc" is the existing "Svc" (case-insensitive)
+        self.assertEqual(self.events("credential_refused")[0]["problems"], 2)
 
     def test_name_taken_while_the_request_waits(self):
         r = self.ask()

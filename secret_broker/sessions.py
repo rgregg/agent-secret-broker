@@ -1124,7 +1124,7 @@ class SessionsMixin:
         if len(names) != 1 or not isinstance(names[0], str):
             raise ValueError("a session uses exactly one credential")
         sc = self.cfg["secrets"].get(names[0])
-        if sc is None:
+        if sc is None or self._internal_hit(names):
             if not self._backend_ok:
                 raise ValueError("unknown secret name, but the credential backend is not healthy "
                                  "(ask the operator to check `asb status`)")
@@ -1279,6 +1279,9 @@ class SessionsMixin:
         active = self.clients.is_active(cid)    # a revoked client reaches nothing, even before its sessions are purged
         with self._sess_lock:
             s, state = self._sess_lookup(sid, cid, self.sessions_clock())
+        hit = self._internal_hit(list(names) + ([s.cred] if s is not None else []))
+        if hit is not None:         # audited (hidden); the answer below is the ordinary scope miss
+            self._log_internal_refusal(hit, "session_call", source, peer, client)
         if s is None or not active:
             state = state if active else "unknown"
             msg, code, http = ENDED[state]
@@ -1287,7 +1290,8 @@ class SessionsMixin:
             raise SessionError(msg, code, http)
         with s.lock:
             have = frozenset(s.captures)
-        problem = scope_problem(s, self.cfg["secrets"].get(s.cred), names, method, spec, have)   # no lock held
+        sc_now = None if self._internal_hit([s.cred]) else self.cfg["secrets"].get(s.cred)
+        problem = scope_problem(s, sc_now, names, method, spec, have)   # no lock held
         if problem is None:
             with self._sess_lock:                       # charge the call: re-check life and cap atomically
                 s2, state = self._sess_lookup(sid, cid, self.sessions_clock())

@@ -103,7 +103,7 @@ class PlansMixin:
 
     def _plan_live(self, name):
         sc = self.cfg["secrets"].get(name)
-        if sc is None or sc.get("ssh"):
+        if sc is None or sc.get("ssh") or name in self._internal_secrets()[0]:
             return None
         return {"hosts": frozenset(sc.get("allowed_hosts") or ()), "plans": sc.get("plans"),
                 "sig": source_sig(sc), "vars": frozenset(sc["vars"])}
@@ -112,9 +112,16 @@ class PlansMixin:
         """Check every rule against the credential catalog and the plan policy. Returns {secret:
         source signature}. Raises ManifestError (400 or 403) with a fixed sentence."""
         sigs, deny = {}, self.plans_cfg["deny_secrets"]
+        internal = self.internal_snapshot()     # after the refresh in submit_plan
         for i, r in enumerate(rules):
             f = f"rules[{i}]"
             sc = self.cfg["secrets"].get(r["secret"])
+            if r["secret"] in internal:
+                # the broker's own key (or an alias of its vault item): the same answer as an unknown
+                # credential, for the whole manifest, and a hidden audit event
+                err = plans_mod.ManifestError(f"{f}.secret: unknown credential")
+                err.internal = r["secret"]
+                raise err
             if sc is None:
                 raise plans_mod.ManifestError(f"{f}.secret: unknown credential")
             if sc.get("ssh"):
@@ -154,11 +161,15 @@ class PlansMixin:
             rej(403, "plans need a per-client credential: run `asb enroll` first", "legacy_client")
         if not self.plan_client_ok(cid):
             rej(403, "this client may not use plans", "client_policy")
-        self._refresh_if(0 if any(n not in self.cfg["secrets"] for n in _named(raw)) else self.CATALOG_TTL)
+        pre = self.internal_snapshot()      # pre-refresh: only decides how to refresh, never a decision
+        self._refresh_if(0 if any(n not in self.cfg["secrets"] or n in pre for n in _named(raw))
+                         else self.CATALOG_TTL)
         try:
             man = plans_mod.validate_manifest(raw, cfg, self.plan_max_minutes(cid))
             sigs = self._plan_check(man["rules"])
         except plans_mod.ManifestError as e:
+            if getattr(e, "internal", None):
+                self._log_internal_refusal(e.internal, "plan", source, peer, client)
             rej(e.status, str(e), "invalid" if e.status == 400 else "policy")
         rules = man["rules"]
         names = sorted({r["secret"] for r in rules})
@@ -270,6 +281,11 @@ class PlansMixin:
         try:
             return self._plan_call_inner(names, spec, source, peer, client)
         except PlanRefused:
+            # an internal credential takes the ordinary miss path (_plan_live says it is gone); only
+            # the hidden audit event is added
+            hit = self._internal_hit(names)
+            if hit is not None:
+                self._log_internal_refusal(hit, "plan_call", source, peer, client)
             raise
         except Exception as e:  # noqa: BLE001 -- no exception text out: class name to the log only
             self.log("plan_internal_error", error_class=type(e).__name__,

@@ -39,7 +39,10 @@ sensitivity of the service.
 
 ## Providers
 
-`summary.type` selects the provider (see reference.md for all keys):
+`summary.type` selects the provider (see reference.md for all keys). The OpenRouter key
+comes from a file (`api_key_file`) or from the broker's own vault (`api_key_secret`, cached
+`api_key_ttl_s`, rotated by editing the item). With no usable key every call degrades
+like a provider failure: the `auto:` description and a HIGH rating:
 
 - `openrouter` (default): a chat model returns a summary and a level.
 - `jev`: `typesafe/jev-1.14` through OpenRouter's Decisions API

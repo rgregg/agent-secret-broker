@@ -724,6 +724,7 @@ block). They are labelled unverified and never replace the raw request.
 ### Classifier config (`summary` block)
 
     "summary": {"api_key_file": "/run/secrets/openrouter_key", "model": "openai/gpt-5-mini"}
+    "summary": {"type": "jev", "api_key_secret": {"name": "openrouter-secret-broker", "var": "OPENROUTER_KEY"}}
 
 With no `type` this is the original chat-completions classifier, unchanged.
 Set `type` to pick another:
@@ -731,7 +732,10 @@ Set `type` to pick another:
 | key | applies to | default | meaning |
 |---|---|---|---|
 | `type` | both | `openrouter` | `openrouter` (chat model) or `jev` (decision model) |
-| `api_key_file` | both | required | file holding the OpenRouter key |
+| `api_key_file` | both | one of the two | file holding the OpenRouter key, read once at startup |
+| `api_key_secret` | both | one of the two | `{"name": "<credential>", "var": "<VARIABLE>"}`: read the key from the broker's own vault instead of a host file. `name` is a catalog credential, `var` one of its variable names. Exactly one of `api_key_file` / `api_key_secret` must be set |
+| `api_key_ttl_s` | both | 300 | with `api_key_secret` only: seconds a vault read is cached (30-3600). Editing the vault item takes effect after at most this long (plus one request), with no restart |
+| `api_key_grace_s` | both | 900 | with `api_key_secret` only (0-3600): how long the last good key keeps being used after the TTL while a refresh runs or the vault is down; 0 turns that off |
 | `model` | both | required for `openrouter`; `typesafe/jev-1.14` for `jev` | OpenRouter model id |
 | `timeout` | both | 4 (`openrouter`), 6 (`jev`) | seconds; a timeout is a HIGH verdict |
 | `max_content_chars` | both | 300 / 400 | body or command characters sent |
@@ -748,6 +752,73 @@ Set `type` to pick another:
 | `summary_base_url` | `jev` | `https://openrouter.ai/api/v1` | chat endpoint root for descriptions. Required when `base_url` is custom (otherwise descriptions are disabled with a startup warning, so request details and the key are never sent to the default endpoint) |
 | `summary_read_endpoints` | `jev` | `[]` | list of `{"host": "name[:port]", "path": "/exact/path"}` for POST endpoints that are pure reads (exact host, case-insensitive, and exact path; request must have no query string, userinfo or method-override header); their descriptions may use read verbs. Other writes get the technical `auto:` line unless the AI phrase starts with a write verb |
 | `base_url` | both | OpenRouter | override the decision/chat endpoint root (https; http only for localhost) |
+
+#### Key from the vault (`api_key_secret`)
+
+The key is resolved lazily and cached; there is no host file.
+
+- **Never waits on the vault.** Within `api_key_ttl_s` of a good read the cached
+  key is used. After that exactly one background read refreshes it while every
+  request keeps using the old key (stale-while-revalidate, for at most
+  `api_key_grace_s`). With no key yet (first use after a start, or after the
+  catalog entry for it changed) requests get no key until the background read
+  finishes: they get the `auto:` summary and the HIGH fail-safe rating, exactly
+  as on a provider failure. Nothing raises into the request path.
+- **Failures.** A transient failure (`backend_unavailable`, `rate_limited`,
+  `other`) keeps the last good key for the grace period and retries every 30
+  seconds. `not_found` (no such credential or variable), `empty` and `invalid`
+  (whitespace, control characters or non-ASCII) drop the key at once. With no
+  key the analyzers fail closed as above. The TTL is counted from when the read
+  finished.
+- **Rotation.** Edit the vault item; the new key is used within
+  `api_key_ttl_s` plus one request. If the catalog reload sees the credential's
+  source (item, field or key) change, the cached key is dropped immediately.
+  There is no signal or admin endpoint to force a refresh; restart the broker or
+  wait for the TTL.
+- **Startup.** A credential that is not in the catalog at startup is a WARNING
+  (the catalog may still be loading), not an error.
+- **Audit.** Each vault read (at most one per TTL) writes one hidden
+  `summary_key_read` event with only `secret` (the credential name) and
+  `result` (`ok`, `not_found`, `backend_unavailable`, `rate_limited`, `empty`,
+  `invalid`, `other`). Failures also write one WARNING log line per 5 minutes
+  with the reason class only. The event is hidden from the agent audit API. The
+  key is only ever sent in the `Authorization` header of calls to `base_url` /
+  `summary_base_url`, never in a body, log, audit record, status or error text.
+- **Internal credential.** The credential named by `api_key_secret.name` can
+  never be released to an agent, and an agent cannot tell it from a credential
+  that does not exist. For every mode it takes the code path of an unknown name:
+  the same validation order (a bad `scripts` field is reported first, as for any
+  name), a forced catalog reload (as for any unknown name), the same error text
+  (including the "backend not healthy" text), the same visible `rejected` /
+  `plan_miss` audit event. This holds for env, http, ssh_sign, guidance
+  proposals and `asb session open`. A plan manifest with a rule for it (anywhere
+  among the rules) is refused whole at submit with `rules[i].secret: unknown
+  credential`. A plan call or a session call naming it gets the ordinary miss
+  for a secret that is not in the plan / outside the session, with the same
+  refusal counting. It is omitted from `GET /v1/secrets`, and grants and Always
+  approvals are never offered for it.
+  Exceptions, where an agent can learn that the name exists (the same as for any
+  existing credential): `store` create and a credential request for the name
+  answer "already exists" (an unknown name would instead go to approval), and a
+  `store` create whose vault item is the key's item is refused with the generic
+  text. `store` update answers "unknown secret name".
+  Every refusal also writes the hidden `internal_secret_refused` event (`secret`,
+  `reason: internal_secret`, mode, client; hidden from the agent audit API). The
+  broker remembers the key's vault item, so the item stays protected (and
+  store / credential creation fails closed with the "backend not healthy" text
+  if the item was never seen) while the entry is briefly missing from the
+  catalog. Item names that look like a vault UUID are rejected. The approval site
+  lists the credential marked "(internal: summary key)" and a human can edit it.
+  Store and credential "item already used" checks are case-insensitive.
+- **Start-up and hangs.** The key is read in the background right after the
+  first catalog load. A vault read has a 20 s deadline (counted as
+  `backend_unavailable`), so a hung vault call cannot stop the key from being
+  refreshed. If the entry is missing from the catalog after having been seen,
+  the cached key is kept until its grace ends.
+- **Idle lock.** The backend contract has no read-without-touch option, so each
+  vault read (one per TTL) renews a backend's idle-logout timer such as the
+  local store's `idle_timeout`; with a TTL shorter than the idle timeout the
+  store never idles out.
 
 Config with an explicit `type` rejects unknown keys at startup, naming the field
 (`summary.<key>`); a block without `type` keeps ignoring extra keys as before.

@@ -96,7 +96,11 @@ and fails open when the analysis model is down; see the reference),
 `approval: allow` secret auto-approves; `["http"]` keeps run-with-secret
 (`NAME -- command`) prompting),
 `summary` (a one-line AI summary of each request via OpenRouter, marked
-unverified), `ttl_seconds` (how long a request waits, default 300),
+unverified; prefer `"api_key_secret": {"name": "<credential>", "var": "<VARIABLE>"}`, which
+reads the OpenRouter key from the broker's own vault, over `api_key_file`, which needs the key
+copied to a host file. Add the key as an ordinary credential (the broker then refuses to hand it to any agent and hides it from `asb list`),
+and rotate it by editing the vault item: the broker picks it up within `api_key_ttl_s`,
+default 5 minutes, with no restart; see the reference), `ttl_seconds` (how long a request waits, default 300),
 `audit_log`, `timed_grants` ("Automatically approve... 5/15/30 min" chips on the approval
 card; on by default, tune or turn off with `{"enabled": false}`, see the
 reference), `request_details` (headers and body shown on the approval card, kept 7 days for

@@ -26,11 +26,13 @@ import json
 import logging
 import math
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 
 from . import guidance as guidance_mod
+from . import keyprovider
 from . import scripts as scripts_mod
 from . import summarize
 
@@ -353,7 +355,7 @@ class JevAnalyzer:
     def __init__(self, api_key, model=DEFAULT_JEV_MODEL, timeout=6.0, base_url=DEFAULT_JEV_BASE,
                  max_content_chars=400, send_content=True, high_threshold=0.5, low_threshold=0.5,
                  summary_mode="chat", describer=None, max_script_chars=DEFAULT_MAX_SCRIPT_CHARS):
-        self._key, self._model, self._timeout = api_key, model, timeout
+        self._key, self._model, self._timeout = keyprovider.as_provider(api_key), model, timeout
         self._base = base_url.rstrip("/")
         self._max, self._send = max_content_chars, send_content
         self._hi, self._lo = high_threshold, low_threshold
@@ -383,8 +385,11 @@ class JevAnalyzer:
 
     def classify(self, mode, names, spec, guidance=None):
         """Return (level|None, cost|None). Never raises."""
+        key = self._key.get()
+        if not key:
+            return None, None           # no usable key: same as a provider failure
         try:
-            resp = _post_json(f"{self._base}/alpha/decisions", self._key,
+            resp = _post_json(f"{self._base}/alpha/decisions", key,
                               self.payload(mode, names, spec, guidance), self._timeout)
         except Exception:  # noqa: BLE001  (HTTP error, timeout, bad JSON, ...)
             return None, None
@@ -459,8 +464,12 @@ class ChatAnalyzer(summarize.OpenRouterSummarizer):
     def analyze(self, mode, names, spec, guidance=None):
         payload = {"model": self._model, "messages": self._messages(mode, names, spec, guidance),
                    "max_tokens": 200, "temperature": 0, "reasoning": {"effort": "minimal"}}
+        key = self._key.get()
+        if not key:
+            self.last_cost = None
+            return None
         try:
-            resp = _post_json(f"{self._base}/chat/completions", self._key, payload, self._timeout)
+            resp = _post_json(f"{self._base}/chat/completions", key, payload, self._timeout)
             text = resp["choices"][0]["message"]["content"]
         except Exception:  # noqa: BLE001
             self.last_cost = None
@@ -487,6 +496,7 @@ MUTATING = ("POST", "PUT", "PATCH", "DELETE")
 
 class FloorAnalyzer:
     config_warnings = ()
+    key_providers = ()      # VaultKey objects the broker attaches its vault reader to
 
     """Wraps an analyzer; ssh_sign requests are always HIGH, with no model call
     (so no signing data goes to a third party)."""
@@ -524,9 +534,9 @@ class FloorAnalyzer:
 
 TYPES = ("openrouter", "jev")
 _KEYS = {
-    "openrouter": {"type", "api_key_file", "model", "timeout", "max_content_chars", "send_content",
+    "openrouter": {"type", "api_key_file", "api_key_secret", "api_key_ttl_s", "api_key_grace_s", "model", "timeout", "max_content_chars", "send_content",
                    "prompt", "base_url"},
-    "jev": {"type", "api_key_file", "model", "timeout", "max_content_chars", "send_content",
+    "jev": {"type", "api_key_file", "api_key_secret", "api_key_ttl_s", "api_key_grace_s", "model", "timeout", "max_content_chars", "send_content",
             "max_script_chars", "base_url", "high_threshold", "low_threshold", "summary_text", "summary_model",
             "summary_timeout", "summary_max_per_minute", "summary_concurrency", "summary_base_url", "summary_read_endpoints"},
 }
@@ -550,8 +560,19 @@ def validate_config(sc):
     for k in sc if "type" in sc else ():     # legacy blocks (no type) keep ignoring extras
         if k not in _KEYS[typ]:
             raise ValueError(f"summary.{k} is not a known setting for type {typ!r}")
-    if not isinstance(sc.get("api_key_file"), str) or not sc["api_key_file"]:
-        raise ValueError("summary.api_key_file is required (path to a file holding the OpenRouter key)")
+    if ("api_key_file" in sc) == ("api_key_secret" in sc):
+        raise ValueError("summary needs exactly one of summary.api_key_file (a file holding the OpenRouter "
+                         "key) or summary.api_key_secret (a vault credential)")
+    if "api_key_file" in sc:
+        if not isinstance(sc["api_key_file"], str) or not sc["api_key_file"]:
+            raise ValueError("summary.api_key_file must be a path to a file holding the OpenRouter key")
+        for k in ("api_key_ttl_s", "api_key_grace_s"):
+            if k in sc:
+                raise ValueError(f"summary.{k} applies only with api_key_secret")
+    else:
+        keyprovider.parse_secret(sc["api_key_secret"])
+        keyprovider.parse_ttl(sc)
+        keyprovider.parse_grace(sc)
     if typ == "openrouter" and not (isinstance(sc.get("model"), str) and sc["model"]):
         raise ValueError("summary.model is required for type 'openrouter'")
     if "model" in sc and not (isinstance(sc["model"], str) and sc["model"]):
@@ -601,11 +622,17 @@ def validate_config(sc):
     return typ
 
 
-def build(sc, read):
+def build(sc, read, clock=time.monotonic):
     """Build the analyzer for a validated `summary` block. `read(path)` returns
     the key file's text."""
     typ = validate_config(sc)
-    key = read(sc["api_key_file"])
+    if "api_key_secret" in sc:
+        name, var = keyprovider.parse_secret(sc["api_key_secret"])
+        key = keyprovider.VaultKey(name, var, keyprovider.parse_ttl(sc), clock=clock,
+                                 grace=keyprovider.parse_grace(sc))
+        providers = (key,)
+    else:
+        key, providers = keyprovider.ConstKey(read(sc["api_key_file"])), ()
     base = sc.get("base_url")
     if typ == "openrouter":
         kw = dict(timeout=sc.get("timeout", 4.0), max_content_chars=sc.get("max_content_chars", 300),
@@ -613,8 +640,11 @@ def build(sc, read):
         if base:
             kw["base_url"] = base
         if sc.get("prompt", "legacy") == "legacy":
-            return FloorAnalyzer(summarize.OpenRouterSummarizer(key, sc["model"], **kw))
-        return FloorAnalyzer(ChatAnalyzer(key, sc["model"], prompt="rubric", **kw))
+            fa = FloorAnalyzer(summarize.OpenRouterSummarizer(key, sc["model"], **kw))
+        else:
+            fa = FloorAnalyzer(ChatAnalyzer(key, sc["model"], prompt="rubric", **kw))
+        fa.key_providers = providers
+        return fa
     describer, mode, warnings = None, sc.get("summary_text", "chat"), []
     custom = bool(base) and base.rstrip("/") != DEFAULT_JEV_BASE
     if mode == "chat" and custom and not sc.get("summary_base_url"):
@@ -640,4 +670,5 @@ def build(sc, read):
         summary_mode=mode, describer=describer,
         max_script_chars=sc.get("max_script_chars", DEFAULT_MAX_SCRIPT_CHARS)))
     fa.config_warnings = warnings
+    fa.key_providers = providers
     return fa
