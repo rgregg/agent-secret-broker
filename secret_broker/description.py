@@ -362,6 +362,7 @@ class Describer:
         self._wait = min(3.0, float(timeout))     # how long a burst waits for a free slot
         self._stamps, self._lock = collections.deque(), threading.Lock()
         self.last_cost = None
+        self.last_usage = None            # {prompt_tokens, completion_tokens} of the last call, for evals
 
     def messages(self, mode, names, spec, guidance=None):
         tok = secrets.token_hex(8)
@@ -424,6 +425,11 @@ class Describer:
                 cost = float(resp["usage"]["cost"])
             except (KeyError, TypeError, ValueError):
                 cost = None
+            try:
+                u = resp["usage"]
+                self.last_usage = {k: int(u[k]) for k in ("prompt_tokens", "completion_tokens") if k in u}
+            except (KeyError, TypeError, ValueError):
+                self.last_usage = None
             try:
                 finish = choice.get("finish_reason")
             except AttributeError:
