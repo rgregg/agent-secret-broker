@@ -81,7 +81,7 @@ monospace stack for code, ids and calls. Spacing: 4 px steps; card radius 16 px;
 - **Tabs**: underlined, count badge on Requests.
 - **Request card**: glance row (risk chip, credential and machine, time left), the description in
   large type, a one-line requested time plus risk reason, the one-tap rows, the `Always allow this...`
-  link, then disclosure chips (Details, Why <LEVEL>, what a timed approval covers).
+  link, then disclosure chips (Covers, Details, Why <LEVEL>, Request details).
 - **Risk chip**: icon, word, colour: `&#9679; LOW` green, `&#9670; MEDIUM` amber, `&#9650; HIGH` red.
   `white-space: nowrap; flex: none`. Pills and chips never wrap or shrink.
 - **Buttons**: Deny (pale red fill, red border and text; deep red fill, muted red border, salmon text in
@@ -120,6 +120,23 @@ Stage 2 (not in this change): Secrets tab (list, editor, new type, value types),
 - Settings shows only what exists. The global auto-approve limit and the notification-presence rule are
   set in the broker config, so they are shown, not toggled. Description-model statistics are not in
   this base, so the Descriptions section is not shown.
+
+## Deviations from the mockups (stage 1)
+
+- Fonts: the system stack; Inter and JetBrains Mono are not loaded (the CSP forbids external fonts).
+- The history detail card opens in the existing bottom-sheet dialog instead of expanding inside the list.
+- A request card also shows the raw call as one truncated monospace line for http, env, ssh and store requests
+  (the mockup shows it only in the detail view). Plans, sessions, proposals and credential forms keep their
+  whole review on the card, because that review is the decision.
+- `Whom a standing approval applies to` (this client / any client) is inside the Always confirm. The timed
+  buttons and the SSH host rule apply to the requesting client only, which was the default before.
+- The wording of what a timed approval covers is kept, behind a `Covers` chip.
+- Settings: the push and notification controls stay buttons (turning them off needs flows that do not exist);
+  `Skip the push while this page is open` and the auto-approve limit are shown, not toggled, because they are set
+  in the broker config; `Clear the notification once I decide` and the Descriptions section are not in this
+  base and are not shown; Machines shows a summary and a Manage link to the Machines page.
+- Day headings in History are made by the page script in the viewer's timezone (no headings without scripts).
+- The signed-in user is shown under About, not in the header.
 
 ## Accessibility
 

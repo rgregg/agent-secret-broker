@@ -43,7 +43,6 @@ from . import notify as notify_mod
 from . import presence as presence_mod
 from .notify import NotifyError
 from . import grants as grants_mod
-from . import icon as icon_mod
 from . import ui_theme
 from . import standing as standing_mod
 from . import guidance as guidance_mod
