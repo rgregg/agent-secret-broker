@@ -207,13 +207,31 @@ class GraphQL(unittest.TestCase):
     def test_mutation_and_subscription_anywhere_is_a_write(self):
         for d in ("mutation M { x }", "subscription S { x }", "query { a(s: \"mutation\") }",
                   "query { a } # mutation here", "fragment F on Mutation { x } query { ...F }",
-                  "query { a(s: \"\"\"subscription\"\"\") }", "query Q { mutationField }", "MUTATION { x }"):
+                  "query { a(s: \"\"\"subscription\"\"\") }", "query Q { mutationField }"):
             self.assertEqual(P.classify_graphql(d)[0], "write", d)
 
-    def test_unparsable_is_a_write(self):
+    def test_invalid_documents_are_neither_read_nor_write(self):
+        for d in ("MUTATION { x }", "query {", "}", "", "fragment F on T { a }", "fragment F on Mutation { a }",
+                  'query { a(s: """a"""") }', 'query { a(s: """unterminated) }', "type T { a: Int }"):
+            self.assertEqual(P.classify_graphql(d), ("invalid", 0), d)
+        self.assertEqual(P.classify_graphql('query { a(s: """x""""") }')[0], "read")      # an empty string follows
+
+    def test_invalid_documents_are_refused_even_when_mutations_are_allowed(self):
+        opt = P.parse_config({"allow_graphql_mutation": True})
+        for d in ("query {", "fragment F on T { a }", "MUTATION { x }", 'query { a(s: """a"""") }', "}"):
+            with self.assertRaises(P.ManifestError, msg=d) as cm:
+                P.validate_manifest({"v": 1, "task": "t", "rules": [rule(body={"graphql": {"document": d}})]}, opt)
+            self.assertIn("not a parsable GraphQL document", str(cm.exception))
+        P.validate_manifest({"v": 1, "task": "t", "rules": [rule(body={"graphql": {"document": "mutation M { x }"}})]}, opt)
+        # a multi-operation document still needs its operation name with mutations allowed
+        with self.assertRaises(P.ManifestError):
+            P.validate_manifest({"v": 1, "task": "t", "rules": [rule(body={"graphql": {
+                "document": "mutation A { a } query B { b }"}})]}, opt)
+
+    def test_unparsable_is_invalid(self):
         for d in ("query {", "query { a ", "}", "query { a(s: \"unterminated) }", "query { a } }", "", "   ",
                   "type Foo { a: Int }", "query { \u00e9 }", "query { a(", "query { a($) )"):
-            self.assertEqual(P.classify_graphql(d)[0], "write", d)
+            self.assertEqual(P.classify_graphql(d)[0], "invalid", d)
 
     def test_operation_counting_ignores_fragments_strings_and_comments(self):
         self.assertEqual(P.classify_graphql('query A { a(s: "query B { b }") } # query C { c }')[1], 1)
@@ -365,7 +383,7 @@ class ManifestValidation(unittest.TestCase):
         self.assertEqual(norm(rule(body=g(variables_keys=["b", "a", "a"])))["body"]["graphql"]["variables_keys"], ["a", "b"])
         self.bad(self.man(rules=[rule(body={"graphql": {"document": "mutation M { x }"}})]), "mutation")
         self.bad(self.man(rules=[rule(body={"graphql": {"document": "query { a }  # mutation"}})]), "mutation")
-        self.bad(self.man(rules=[rule(body={"graphql": {"document": "query {"}})]), "unparsable")
+        self.bad(self.man(rules=[rule(body={"graphql": {"document": "query {"}})]), "not a parsable GraphQL document")
         two = "query A { a } query B { b }"
         self.bad(self.man(rules=[rule(body={"graphql": {"document": two}})]), "operation_name: is required")
         self.assertEqual(norm(rule(body={"graphql": {"document": two, "operation_name": "A"}}))["body"]["graphql"]
@@ -678,9 +696,9 @@ class MatcherHeaders(unittest.TestCase):
         self.assertEqual(self.v(hdrs(TE="trailers")), "headers")
 
     def test_a_configured_header_list_is_honoured_but_never_a_framing_header(self):
-        cfg = P.parse_config({"allowed_request_headers": ["Accept", "Content-Type", "X-Csrf-Token"]})
-        self.assertIsNone(self.v(hdrs(**{"X-Csrf-Token": "1"}), cfg=cfg) if False else
-                          verdict(self.R, frozen(headers=hdrs(**{"X-Csrf-Token": "1"}), body=NOTE), cfg))
+        cfg = P.parse_config({"allowed_request_headers": ["Accept", "Content-Type", "X-Requested-With"]})
+        self.assertIsNone(self.v(hdrs(**{"X-Requested-With": "1"}), cfg=cfg) if False else
+                          verdict(self.R, frozen(headers=hdrs(**{"X-Requested-With": "1"}), body=NOTE), cfg))
         self.assertEqual(verdict(self.R, frozen(headers=hdrs(**{"User-Agent": "x"}), body=NOTE), cfg), "headers")
 
     # -- placeholders -------------------------------------------------------------
@@ -1482,10 +1500,13 @@ class Store(unittest.TestCase):
         miss = self.use(pid)
         self.assertEqual((miss.reason, miss.http), ("uses_exhausted", 403))
         self.assertEqual(self.store.status_for(CLIENT["id"], pid)["state"], "active")      # one rule still has a use
-        self.use(pid, path="/v1/b").release()
+        m = self.use(pid, path="/v1/b")
+        self.assertEqual(self.store.status_for(CLIENT["id"], pid)["state"], "active")      # its last call is in flight
+        self.assertEqual(self.use(pid).reason, "uses_exhausted")
+        m.release()
         self.assertEqual(self.store.status_for(CLIENT["id"], pid)["state"], "exhausted")
         miss = self.use(pid)
-        self.assertEqual((miss.reason, miss.kind), ("unusable", "exhausted"))
+        self.assertEqual((miss.reason, miss.http, miss.kind), ("uses_exhausted", 403, None))   # one answer, exit 8
         self.assertEqual([e[1]["cause"] for e in self.events if e[0] == "plan_closed"], ["exhausted"])
 
     def test_a_failed_upstream_call_still_counts(self):
@@ -1660,6 +1681,9 @@ class Store(unittest.TestCase):
         self.assertEqual({r.reason for r in res if isinstance(r, P.Miss)} - {"unusable"}, {"uses_exhausted"} - set()
                          if False else {r.reason for r in res if isinstance(r, P.Miss)} - {"unusable"})
         self.assertEqual(self.store.status_for(CLIENT["id"], pid)["uses"], 7)
+        self.assertEqual(self.store.status_for(CLIENT["id"], pid)["state"], "active")      # calls still in flight
+        for w in wins:
+            w.release()
         self.assertEqual(self.store.status_for(CLIENT["id"], pid)["state"], "exhausted")
 
     def test_racing_callers_never_exceed_the_inflight_limit(self):
@@ -1772,6 +1796,7 @@ class ReviewFixes(Store):
         m = self.use(pid)
         self.assertEqual(self.store.status_for(CLIENT["id"], pid)["uses"], 1)
         m.refund()
+        m.refund()                                             # idempotent
         m.release()
         v = self.store.status_for(CLIENT["id"], pid)
         self.assertEqual((v["uses"], v["inflight"], len(self.store._plans[pid].recent)), (0, 0, 0))
@@ -1780,21 +1805,54 @@ class ReviewFixes(Store):
         self.t.m += 20                                         # the monotonic clock says it is over
         self.assertIsNone(self.store.time_left(pid))
         self.assertIsNone(self.store.time_left("0" * 32))
-        self.store.refund("0" * 32, 0)                         # unknown plan: nothing happens
+        self.store.refund("0" * 32, 0, P._Ticket(1.0))         # unknown plan: nothing happens
 
-    def test_an_exhausted_plan_with_its_last_call_in_flight_can_be_revoked_or_closed(self):
-        for how in ("revoke", "close"):
-            pid = self.active(client=OTHER if how == "close" else CLIENT, rules=[rule(max_uses=1)], task="t" + how)
+    def test_a_plan_on_its_last_use_stays_active_revocable_and_counted_until_the_call_finishes(self):
+        for how in ("revoke", "close", "revoke_client"):
             c = OTHER if how == "close" else CLIENT
+            pid = self.active(client=c, rules=[rule(max_uses=1)], task="t" + how)
             m = self.use(pid, client=c)
-            self.assertEqual(self.store.status_for(c["id"], pid)["state"], "exhausted")
-            self.assertFalse(self.store.alive(pid) is False)
-            ok = self.store.revoke(pid, "alice") if how == "revoke" else self.store.close(c["id"], pid)
-            self.assertTrue(ok, how)
+            self.assertEqual(self.store.status_for(c["id"], pid)["state"], "active")
+            self.assertEqual([r["id"] for r in self.store.rows(("active",)) if r["client_id"] == c["id"]], [pid])
+            if how == "revoke_client":
+                self.assertEqual(self.store.revoke_client(c["id"]), [pid])
+                self.assertIn("plan_revoked", [e[0] for e in self.events])
+            else:
+                ok = self.store.revoke(pid, "alice") if how == "revoke" else self.store.close(c["id"], pid)
+                self.assertTrue(ok, how)
             self.assertFalse(self.store.alive(pid))
-            self.assertIsNone(self.store.time_left(pid))
             m.release()
-            self.assertFalse(self.store.revoke(pid, "alice") if how == "revoke" else self.store.close(c["id"], pid) is True)
+            self.assertNotEqual(self.store.status_for(c["id"], pid)["state"], "exhausted")      # revoked/closed won
+
+    def test_the_active_cap_counts_a_plan_whose_last_call_is_in_flight(self):
+        self.cfg["max_active_per_client"] = 1
+        pid = self.active(rules=[rule(max_uses=1)])
+        m = self.use(pid)
+        self.assertEqual(self.store.submit(CLIENT, self.manifest(task="n"), "r", 3600), (None, "too_many"))
+        m.release()                                            # exhausted now: the slot is free
+        self.assertIsNone(self.store.submit(CLIENT, self.manifest(task="n"), "r", 3600)[1])
+
+    def test_a_refund_removes_its_own_timestamp_not_the_newest(self):
+        self.cfg.update(max_inflight=8, rate_per_min=600)
+        pid = self.active(rules=[rule(max_uses=50)])
+        a = self.use(pid)
+        self.t.advance(5)
+        b = self.use(pid)
+        self.t.advance(5)
+        c = self.use(pid)
+        a.refund()
+        self.assertEqual(list(self.store._plans[pid].recent), [b.ticket.stamp, c.ticket.stamp])
+        for m in (a, b, c):
+            m.release()
+        self.assertEqual(self.store.status_for(CLIENT["id"], pid)["uses"], 2)
+
+    def test_a_refund_before_release_leaves_the_plan_active(self):
+        pid = self.active(rules=[rule(max_uses=1)])
+        m = self.use(pid)
+        m.refund()
+        m.release()
+        self.assertEqual(self.store.status_for(CLIENT["id"], pid)["state"], "active")
+        self.assertIsInstance(self.use(pid), P.Match)
 
     def test_an_exhausted_plan_with_nothing_in_flight_stays_terminal(self):
         pid = self.active(rules=[rule(max_uses=1)])
@@ -1842,6 +1900,63 @@ class ReviewFixes(Store):
         self.assertEqual(v("method".encode("utf-32-le")), "override")
         self.assertEqual(v("method".encode("utf-8").decode("latin-1").encode("utf-8")), "override")   # double encoded
         self.assertEqual(v(b"\xff\xfe\xfd"), "override")                               # not UTF-8: cannot be checked
+
+
+
+class PlaceholderHeaders(unittest.TestCase):
+    R = norm(rule())
+
+    def v(self, headers, cfg=CFG):
+        return verdict(self.R, frozen(headers={"Content-Type": "application/json", **headers}, body=NOTE), cfg)
+
+    def test_placeholders_only_in_the_explicit_auth_set(self):
+        for name in ("Authorization", "X-Api-Key", "X-Csrf-Token", "X-Updated-Csrf-Token", "X-Requested-With"):
+            self.assertIsNone(self.v({name: "{{LEDGER_TOKEN}}"}), name)
+        for name in ("Accept-Language", "If-Modified-Since", "Accept", "User-Agent", "If-None-Match"):
+            self.assertEqual(self.v({name: "{{LEDGER_TOKEN}}"}), "headers", name)
+
+    def test_configuring_a_credential_header_does_not_break_its_placeholder(self):
+        cfg = P.parse_config({"allowed_request_headers": ["Accept", "Content-Type", "Authorization", "X-Api-Key"]})
+        self.assertIsNone(self.v({"Authorization": "Bearer {{LEDGER_TOKEN}}"}, cfg))
+        self.assertIsNone(self.v({"X-Api-Key": "{{LEDGER_TOKEN}}"}, cfg))
+
+    def test_a_credential_header_never_carries_a_literal(self):
+        cfg = P.parse_config({"allowed_request_headers": ["Accept", "Content-Type", "Authorization", "X-Api-Key",
+                                                         "X-Requested-With"]})
+        for h in ({"Authorization": "Bearer abc"}, {"X-Api-Key": "literal"}, {"Authorization": "x"}):
+            self.assertEqual(self.v(h, cfg), "headers", h)
+        self.assertIsNone(self.v({"X-Requested-With": "XMLHttpRequest"}, cfg))       # not a credential header
+        self.assertEqual(self.v({"Authorization": "Bearer abc"}), "headers")           # not allowed by default either
+
+    def test_filled_headers_stay_in_the_auth_set(self):
+        f = frozen(headers={"Content-Type": "application/json", "Accept-Language": "{{LEDGER_TOKEN}}"}, body=NOTE)
+        with self.assertRaises(P.NoMatch):
+            P.substitute(f, {"LEDGER_TOKEN": "s"}, self.R, CFG, OWN)
+
+
+class CardLabels(unittest.TestCase):
+    def label(self, **kw):
+        cfg = P.parse_config({"allow_any_body": True, "allow_graphql_mutation": True, "allow_root_prefix": True})
+        return "\n".join(P.rule_lines(norm(rule(**kw), cfg)))
+
+    def test_a_high_write_rule_keeps_its_can_change_data_badge(self):
+        h = self.label(path_prefix="/notes")
+        self.assertIn("HIGH (CAN CHANGE DATA): reach everything under the broad path /notes", h)
+        h = self.label(method="DELETE", body={"none": True})
+        self.assertIn("HIGH (CAN CHANGE DATA): delete data (DELETE)", h)
+        h = self.label(body={"any": True}, path_prefix="/v1/x")
+        self.assertIn("HIGH (CAN CHANGE DATA): send any content", h)
+
+    def test_a_high_read_rule_keeps_its_read_only_badge(self):
+        h = self.label(method="GET", body=None, path_prefix="/v1")
+        self.assertIn("HIGH (READ-ONLY): reach everything under the broad path /v1", h)
+        h = self.label(path_prefix="/graphql", body={"graphql": {"document": DOC}})
+        self.assertIn("HIGH (READ-ONLY (pure GraphQL query)):", h)
+
+    def test_medium_and_low_labels_are_unchanged(self):
+        self.assertIn("CAN CHANGE DATA", self.label(path_prefix="/v1/notes"))
+        self.assertNotIn("HIGH", self.label(path_prefix="/v1/notes"))
+        self.assertIn("READ-ONLY", self.label(method="GET", body=None, path_prefix="/v1/notes"))
 
 
 

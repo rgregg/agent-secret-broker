@@ -63,7 +63,7 @@ writes a manifest of the calls it will make:
                               "variables_keys": []}}},
         {"secret": "ledger", "method": "POST", "host": "ledger.example.com",
          "path_prefix": "/v1/notes", "max_uses": 5,
-         "body": {"json": {"keys": ["text"], "pin": {"kind": "reconcile"}}}}
+         "body": {"json": {"keys": ["text", "kind"], "pin": {"kind": "reconcile"}}}}
       ]
     }
 
@@ -261,8 +261,11 @@ between match and send). Placeholders in v1:
   header values treated as opaque.
 - After substitution, any remaining `{{` anywhere in the request is a non-match.
 
-**B. Host and URL.** Parse the URL once, with one parser (`urllib.parse.urlsplit`), and use only that
-parse for matching and for sending. Non-match if: userinfo is present; a fragment is present; the
+**B. Host and URL.** Parse the URL once, with one strict parser of our own (`plans._parse_url`: plain printable
+ASCII only, no userinfo, fragment, whitespace or control characters), and use only that parse for matching.
+Because the sender (`urllib.request`) has its own parser, the request object it will actually send is compared
+with the matched one just before sending (`assert_sent_is_matched`: URL text, request target, method, body, headers,
+byte length), so a parser differential cannot send something other than what was matched. Non-match if: userinfo is present; a fragment is present; the
 host has a trailing dot, any non-ASCII character or any uppercase character (checked **before**
 comparing, no silent lowercasing); the host is an IP literal unless the rule's host is the same
 literal. The host equals the rule host exactly; an explicit port equals the rule's (default port
@@ -419,8 +422,8 @@ body, document text, `task` or `description` (only lengths and a hash prefix), n
 | `plan_issued` | `plan_id`, `rules` (count), `names`, `granted_s`, `expires_at`, approver, channel, peer, `manifest_hash`, `rules_hash` |
 | `plan_closed` | `plan_id`, `cause` (`agent`, `deadline`, `exhausted`), `uses` |
 | `plan_revoked` | `plan_id`, `by`, `left_s`, `peer`, `client_ip`, `cause` (`human`, `client_revoked`) |
-| `plan_used` | `plan_id`, `rule` (index), `request` (id), `uses_left` (rule, plan), `left_s` |
-| `plan_miss` | `plan_id`, `reason` class, `host_class` only; **coalesced** (below) |
+| `plan_used` | `id` (the call's request id), `plan_id`, `rule` (index), `uses_left_rule`, `uses_left_plan`, `left_s`; written only once the call is cleared to go out (after the pre-send liveness check) |
+| `plan_miss` | `plan_id` (the owner's only), `reason` class, `why` (the matcher item that failed); **coalesced** (below) |
 
 Submit, deny and pending-expiry are recorded through the ordinary request events (`requested`,
 `denied`, `expired`, `rejected`) for the `plan` mode request, so no extra event types are needed in
@@ -522,7 +525,7 @@ result is only `{"plan": id, "expires_at", "granted_s"}`.
       "enabled": true, "default_minutes": 30, "max_minutes": 480, "pending_ttl_s": 900,
       "max_rules": 20, "max_uses_per_rule": 500, "max_total_uses": 2000,
       "rate_per_min": 30, "max_inflight": 4, "max_body_bytes": 16384,
-      "max_pending": 2, "max_active_per_client": 2,
+      "max_pending": 4, "max_pending_per_client": 1, "max_active_per_client": 2, "submits_per_hour": 6,
       "allow_any_body": false, "allow_root_prefix": false, "allow_graphql_mutation": false,
       "allow_legacy": false,
       "allowed_request_headers": ["Accept", "Content-Type", "Content-Length", "If-None-Match", "User-Agent"],
@@ -544,10 +547,10 @@ Unknown, expired, closed and **wrong-client** plans are **always 404** with the 
 | Manifest invalid or over a cap | 400 | fixed message naming field and class | 3 |
 | Disabled, legacy client, never-auto client, `plans: false`/`deny_secrets` | 403 | fixed | 3 |
 | Submit over `max_pending` or `max_active_per_client` | **429** | `{"error": "too many plans"}` | 3 |
-| Plan call outside the plan (`no_rule`, `uses_exhausted`, `session_ended`, `wrong_policy`) | 403 | `{"error": "outside plan", "reason": class}` | **8** |
+| Plan call outside the plan (`no_rule`, `uses_exhausted` (a rule or the whole plan used up), `session_ended`, `wrong_policy`) | 403 | `{"error": "outside plan", "reason": class}` | **8** |
 | `rate_limited` | **429** | `{"error": "outside plan", "reason": "rate_limited", "retry_after_s": N}` | **9** |
 | `inflight_limit` | **429** | `{"error": "outside plan", "reason": "inflight_limit", "retry_after_s": 1}` | **9** |
-| Plan not usable (unknown, foreign, ended, closed, revoked, exhausted, lost to restart) | 404 | `{"error": "plan not usable", "kind": "ended"\|"exhausted"\|"closed"\|"revoked"\|"unknown"}` | **7** |
+| Plan not usable (unknown, foreign, ended, closed, revoked, lost to restart; or stopped mid-call) | 404 | `{"error": "plan not usable", "kind": "ended"\|"closed"\|"revoked"\|"unknown"}` | **7** |
 | Denied by the human | | | 4 |
 | Expired while pending | | | 5 |
 | Upstream status 400 or more | | | 22 (unchanged) |
@@ -727,3 +730,17 @@ Everything above holds except the following, each decided while building it.
     last call in flight can be revoked or closed, `any` bodies are scanned as bytes (every text view), non-ASCII
     digits are refused in form fields, a revoked client leaves no denial cooldown, and `plans.max_pending` defaults to
     4 and must be at least `2 * max_pending_per_client + 1`.
+17. **Review round 3.** (a) A plan becomes `exhausted` (terminal) only when every rule is used up AND nothing is
+    in flight; until then it stays `active`: listed on the Clients tab, revocable, closed with its client, counted
+    against `max_active_per_client`. An exhausted plan answers like an exhausted rule: 403 `uses_exhausted`, exit 8
+    (exit 7 is only for ended, closed, revoked and unknown). (b) A call stopped before sending or whose response is
+    discarded because the plan or client ended answers 404 `plan not usable` (exit 7), a filled request that no
+    longer matches answers 403 (exit 8); neither logs `http_failed`. A pre-send stop refunds its use and removes its
+    own rate-window timestamp, and `plan_used` is audited only after the liveness check. (c) GraphQL: an unparsable
+    document, or one with no operation, is `invalid` and refused unconditionally (also with
+    `allow_graphql_mutation`); a block string ending in a quote is unparsable per the spec and so invalid. (d) The
+    card label keeps both facts: `HIGH (CAN CHANGE DATA): ...`. (e) Only the credential headers (`Authorization`,
+    `X-Api-Key`, `X-Csrf-Token`, `X-Updated-Csrf-Token`, `X-Requested-With`) may carry a placeholder, whatever
+    `allowed_request_headers` says; the first four must carry one (never a literal). (f) A plan's pending deadline is
+    its card's expiry (one clock), the sweeper expires unanswered cards, and deciding an expired card is a clean
+    "stale".

@@ -1867,7 +1867,7 @@ the approved scope, and 9 retry later (plans). A plan with session steps is phas
         "max_uses": 50, "body": {"graphql": {"document": "query Accounts { accounts { id balance } }",
                                               "variables_keys": []}}},
        {"secret": "ledger", "method": "POST", "host": "ledger.example.com", "path_prefix": "/v1/notes",
-        "max_uses": 5, "body": {"json": {"keys": ["text"], "pin": {"kind": "reconcile"}}}}]}
+        "max_uses": 5, "body": {"json": {"keys": ["text", "kind"], "pin": {"kind": "reconcile"}}}}]}
 
 Rule keys: `secret`, `method` (uppercase), `host` (lowercase ASCII, one of the credential's
 `allowed_hosts`), `path_prefix`, `max_uses`; optional `port` (default 443, or 80 for `http`), `scheme`
@@ -1916,8 +1916,9 @@ the filled header values treated as opaque).
   `Content-Type`, `User-Agent`, `If-None-Match`, `If-Modified-Since`, `Authorization`, `X-Csrf-Token`,
   `X-Updated-Csrf-Token`, `X-Requested-With`, `X-Api-Key`; plus `Content-Length`, checked to equal the body):
   `plans.allowed_request_headers` (default `Accept`, `Content-Type`, `Content-Length`, `If-None-Match`,
-  `User-Agent`) chooses among them, and a header carrying a placeholder must be one of the credential headers
-  of that list. A placeholder value must be exactly `(Bearer |Basic |Token )?{{NAME}}` with `NAME` a variable of
+  `User-Agent`) chooses among them, and only `Authorization`, `X-Api-Key`, `X-Csrf-Token`,
+  `X-Updated-Csrf-Token` and `X-Requested-With` may carry a placeholder (whatever the configuration lists); the
+  first four must carry one, never a literal. A placeholder value must be exactly `(Bearer |Basic |Token )?{{NAME}}` with `NAME` a variable of
   the rule's own credential. `Content-Type`, when present, is one of the five session types
   (`application/json`, `application/x-www-form-urlencoded`, `text/plain`, `application/graphql`,
   `multipart/form-data` with a boundary) with at most `charset=utf-8`; a json or GraphQL rule needs
@@ -1971,12 +1972,15 @@ schema matching, windows, sessions, renewal.
 - **Memory only.** A restart drops every plan (fail closed): calls get exit 7 `kind: unknown` and the job must
   submit again, which needs you.
 - **Before and after sending.** Immediately before the request is sent (after the vault read and header
-  substitution, which can take seconds) the plan's liveness is checked again: client active, plan active (or
-  exhausted with this call in flight) and inside its deadline on both clocks; if not, nothing is sent, the use is
+  substitution, which can take seconds) the plan's liveness is checked again: client active, plan active and
+  inside its deadline on both clocks; if not, nothing is sent, the use is
   given back and the call fails with the fixed text "release failed: plan or client ended". The upstream timeout is
   `min(30 s, time left to the plan deadline)`. After the upstream answers the same check runs and a response for an
-  ended plan or revoked client is discarded. A plan whose last use is in flight (state `exhausted`) can still be
-  revoked or closed. A deadline noticed by any operation (even a submit) is audited as `plan_closed`.
+  ended plan or revoked client is discarded (answer 404 `plan not usable`, exit 7; the use of a call stopped before
+  sending is given back, `plan_used` is audited only for a call cleared to go out, and no `http_failed` is logged for
+  a call that never left). A plan becomes `exhausted` (terminal) only when every rule is used up and nothing is in
+  flight, so a plan on its last use stays listed, revocable and counted against `max_active_per_client` until its call
+  finishes; an exhausted plan answers 403 `uses_exhausted` (exit 8), like an exhausted rule. A deadline noticed by any operation (even a submit) is audited as `plan_closed`.
 - **Revoke.** Clients tab, **Active plans** table (above Active sessions), Revoke (SSO, CSRF, same-origin). It takes effect before the
   next call; a call already released finishes. Terminal plans stay visible to their owner and History for an
   hour.
@@ -2058,7 +2062,7 @@ Per client: `"clients": {"c-1a2b3c4d": {"plans": {"enabled": true, "max_minutes"
 ### Errors and exit codes
 
 Unknown, expired, closed and wrong-client plans are always `404 {"error": "plan not usable", "kind": ...}`;
-only the owner's retained record gets a specific `kind` (`ended`, `exhausted`, `closed`, `revoked`), else
+only the owner's retained record gets a specific `kind` (`ended`, `closed`, `revoked`), else
 `unknown`.
 
 | Situation | HTTP | `asb` exit |
@@ -2066,9 +2070,9 @@ only the owner's retained record gets a specific `kind` (`ended`, `exhausted`, `
 | Manifest invalid or over a cap | 400 | 3 |
 | Disabled, legacy client, never-auto client, `plans: false` or `deny_secrets` | 403 | 3 |
 | Too many pending or active plans, or the same task denied recently | 429 | 3 |
-| Call outside the plan (`no_rule` with `why`, `uses_exhausted`, `wrong_policy`) | 403 `{"error": "outside plan", "reason": ...}` | 8 |
+| Call outside the plan (`no_rule` with `why`, `uses_exhausted` for a rule or the whole plan, `wrong_policy`) | 403 `{"error": "outside plan", "reason": ...}` | 8 |
 | `rate_limited`, `inflight_limit` | 429 with `retry_after_s` | 9 |
-| Plan not usable (`ended`, `exhausted`, `closed`, `revoked`, `unknown`) | 404 | 7 |
+| Plan not usable (`ended`, `closed`, `revoked`, `unknown`; also a call stopped mid-flight) | 404 | 7 |
 | Denied / expired while pending | | 4 / 5 |
 | Upstream status 400 or more | | 22 |
 

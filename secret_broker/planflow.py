@@ -8,6 +8,7 @@ client_never_auto, _client_fields, CATALOG_TTL, backend (through _read_env).
 No exception text ever leaves this module: refusals are fixed sentences plus a coarse class.
 """
 import json
+import math
 import re
 import socket
 import ssl
@@ -52,7 +53,8 @@ def error_class(exc):
 _RELEASE_TEXT = {"timeout": "release failed: timeout", "tls": "release failed: tls",
                  "dns": "release failed: name resolution", "connection": "release failed: connection",
                  "vault": "release failed: vault", "other": "release failed: other",
-                 "ended": "release failed: plan or client ended"}
+                 "ended": "release failed: plan or client ended",
+                 "nomatch": "release failed: the request no longer matches the plan"}
 
 
 class PlanEnded(Exception):
@@ -79,6 +81,8 @@ class PlansMixin:
             time.sleep(SWEEP_S)
             try:
                 self.plans.sweep()
+                with self._lock:
+                    self._expire_locked()       # cards nobody answered stop being pending
             except Exception:  # noqa: BLE001 -- never let the sweeper die
                 pass
 
@@ -178,7 +182,7 @@ class PlansMixin:
             if err is None:
                 req = Request("plan", names, spec, source, cfg["pending_ttl_s"], peer, client)
                 req.plan_id = plan.id
-                self.plans.set_request(plan.id, req.id)
+                self.plans.set_request(plan.id, req.id, req.expires)
                 self._by_id[req.id] = req
                 self._by_nonce[req.nonce] = req
         if err is not None:
@@ -204,6 +208,8 @@ class PlansMixin:
         is "approve", "approve_confirmed" or "deny". Returns (http status, req)."""
         if decision not in ("approve", "approve_confirmed", "deny"):
             return 400, None
+        with self._lock:
+            self._expire_locked()               # a card past its time is expired, not approvable
         approve = decision != "deny"
         return self.decide_via("link" if nonce else "dashboard", None if nonce else rid,
                                "approve" if approve else "deny", user, nonce=nonce, peer=peer,
@@ -308,12 +314,19 @@ class PlansMixin:
                 self._by_id[req.id] = req
             self.audit("requested", req)
             self._retain_details(req)
-            self.log("plan_used", id=req.id, plan_id=m.plan_id, rule=m.rule_index,
-                     uses_left_rule=m.uses_left_rule, uses_left_plan=m.uses_left_plan, left_s=m.left_s,
-                     **self._client_fields(client))
             extra = {"via": "policy", "decision_source": "plan", "plan_id": m.plan_id, "plan_left_s": m.left_s}
             try:
                 result = self._plan_release(req, m)
+            except PlanEnded:
+                # stopped before sending, or its response discarded afterwards: the plan or client ended
+                self._finish(req, "failed", error=_RELEASE_TEXT["ended"], **extra)
+                st = (self.plans.get_view(m.plan_id) or {}).get("state")
+                self._plan_miss(client, plan_id, plans_mod.Miss(
+                    "unusable", kind=st if st in ("revoked", "closed", "ended") else "ended", plan_id=m.plan_id))
+            except plans_mod.NoMatch as e:
+                # the filled request no longer matches its rule (a credential value broke it): nothing was sent
+                self._finish(req, "failed", error=_RELEASE_TEXT["nomatch"], **extra)
+                self._plan_miss(client, plan_id, plans_mod.Miss("no_rule", why=e.why, plan_id=m.plan_id))
             except Exception as e:  # noqa: BLE001 -- the request must always settle; class only
                 cat = error_class(e)
                 self.audit("http_failed", req, error=cat)
@@ -342,9 +355,12 @@ class PlansMixin:
         if left is None or not self.clients.is_active(req.client["id"]):
             m.refund()
             raise PlanEnded()
+        self.log("plan_used", id=req.id, plan_id=m.plan_id, rule=m.rule_index,
+                 uses_left_rule=m.uses_left_rule, uses_left_plan=m.uses_left_plan, left_s=m.left_s,
+                 **self._client_fields(req.client))           # audited only once the call is cleared to go out
         t0 = time.time()
         out = _exchange_frozen(done, list(env.values()), self._tls_policy(req.names),
-                               timeout=max(1, min(30, int(left))))
+                               timeout=max(1, min(30, math.ceil(left))))
         self.audit("http_executed", req, upstream_status=out["status"], response_bytes=len(out["body"]),
                    duration_ms=int((time.time() - t0) * 1000))
         # Re-check after the upstream answered (the sessions rule): a revoked client, or a plan that was

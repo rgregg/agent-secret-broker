@@ -134,7 +134,7 @@ class Request:
         self.spec = spec
         self.source = source      # client-claimed
         self.peer = peer          # actual socket peer
-        self.created = time.time()
+        self.created = clock_mod.now()
         self.expires = self.created + ttl
         self.status = "pending"   # pending|approved|denied|expired|failed|released
         self.error = None

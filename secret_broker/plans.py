@@ -89,6 +89,11 @@ _FORBIDDEN_PREFIXES = ("x-forwarded-", "x-envoy-", "x-original-")
 
 # Header names a plan may ever allow: the shared session allowlist, plus Content-Length (checked to equal the body).
 HEADER_NAMES = frozenset(sessions_mod.ALLOWED_HEADERS) | {"content-length"}
+# The only headers that may carry a credential placeholder, whatever `allowed_request_headers` says. The first
+# four exist to carry a credential or token, so their value must BE a placeholder (never a literal).
+PLACEHOLDER_HEADERS = frozenset(("authorization", "x-api-key", "x-csrf-token", "x-updated-csrf-token",
+                                 "x-requested-with"))
+PLACEHOLDER_ONLY = PLACEHOLDER_HEADERS - {"x-requested-with"}
 
 DEFAULTS = {
     "enabled": True, "default_minutes": 30, "max_minutes": 480, "pending_ttl_s": 900,
@@ -349,15 +354,15 @@ def _gql_tokens(doc):
 
 
 def classify_graphql(doc):
-    """(kind, operations): kind is "read" for a document that is a pure query, else "write". A
-    document is a write when the text contains `mutation` or `subscription` ANYWHERE (strings and
-    comments too, on purpose) or cannot be parsed. `operations` is the number of operation
-    definitions (0 when unparsable)."""
-    if _GQL_WRITE_RE.search(doc):
-        return "write", _count_ops(doc) or 0
+    """(kind, operations): kind is "invalid" for a document that cannot be parsed or has no operation (never
+    accepted, whatever the configuration), "write" when the text contains `mutation` or `subscription`
+    ANYWHERE (strings and comments too, on purpose), else "read" (a pure query). `operations` is the number
+    of operation definitions (0 for an invalid document)."""
     ops = _count_ops(doc)
     if ops is None or ops == 0:
-        return "write", 0
+        return "invalid", 0
+    if _GQL_WRITE_RE.search(doc):
+        return "write", ops
     return "read", ops
 
 
@@ -645,6 +650,8 @@ def _norm_body(raw, method, f, cfg, graphql_write_ok):
             or not all(isinstance(k, str) and _text_key(k) for k in vk)):
         _bad(f"{f}.graphql.variables_keys", f"must be a list of up to {MAX_KEYS} variable names")
     kind_, ops = classify_graphql(doc)
+    if kind_ == "invalid":
+        _bad(f"{f}.graphql.document", "is not a parsable GraphQL document with at least one operation")
     if kind_ == "write" and not (cfg["allow_graphql_mutation"] and graphql_write_ok):
         _bad(f"{f}.graphql.document", "a GraphQL mutation, subscription or unparsable document is not "
                                       "allowed on this broker")
@@ -874,7 +881,7 @@ def _norm_headers(frozen, cfg, own_vars, opaque, post=False):
             raise NoMatch("headers")
         out[low] = value
         if low in opaque:
-            if low in allowed or _forbidden_header(low) or low not in sessions_mod.ALLOWED_HEADERS:
+            if _forbidden_header(low) or low not in PLACEHOLDER_HEADERS:
                 raise NoMatch("headers")
             continue
         if "{{" in name or "}}" in name:
@@ -885,9 +892,11 @@ def _norm_headers(frozen, cfg, own_vars, opaque, post=False):
             m = _ph(value)
             if not m or m[1] not in own_vars:
                 raise NoMatch("placeholder")
-            if low in allowed or _forbidden_header(low) or low not in sessions_mod.ALLOWED_HEADERS:
+            if _forbidden_header(low) or low not in PLACEHOLDER_HEADERS:
                 raise NoMatch("headers")
             continue
+        if low in PLACEHOLDER_ONLY:
+            raise NoMatch("headers")                # a credential header carries a placeholder, never a literal
         if low not in allowed or _forbidden_header(low) or low not in HEADER_NAMES:
             raise NoMatch("headers")
         if low == "content-type" and not sessions_mod._content_type_ok(value):
@@ -1092,7 +1101,7 @@ class Match:
 
     def refund(self):
         """Give the reserved use back: the call was stopped before anything was sent."""
-        self.store.refund(self.plan_id, self.rule_index)
+        self.store.refund(self.plan_id, self.rule_index, self.ticket)
 
 
 class Miss:
@@ -1117,10 +1126,11 @@ class Miss:
 
 
 class _Ticket:
-    __slots__ = ("thread", "done")
+    __slots__ = ("thread", "done", "stamp", "refunded")
 
-    def __init__(self):
+    def __init__(self, stamp=None):
         self.thread, self.done = threading.current_thread(), False
+        self.stamp, self.refunded = stamp, False        # the rate-window timestamp this reservation recorded
 
 
 class PlanStore:
@@ -1158,6 +1168,8 @@ class PlanStore:
         elif p.state == "active" and self._expired_locked(p):
             p.state, p.ended_at = "ended", self.now()
             ev.append(("plan_closed", p, {"cause": "deadline", "uses": p.uses_total}))
+        elif p.state == "active":
+            self._maybe_exhaust_locked(p, ev)
 
     def _emit(self, ev):
         for name, p, extra in ev:
@@ -1222,11 +1234,14 @@ class PlanStore:
         for k in [k for k, q in self._submits.items() if not q or now - q[-1] >= SUBMIT_WINDOW_S]:
             del self._submits[k]
 
-    def set_request(self, pid, request_id):
+    def set_request(self, pid, request_id, expires=None):
+        """Link the plan to its card; the plan's pending deadline is the card's own expiry (one clock)."""
         with self._lock:
             p = self._plans.get(pid)
             if p is not None:
                 p.request_id = request_id
+                if expires is not None:
+                    p.pending_until = expires
 
     def settle(self, pid, state, cooldown=True):
         """The card ended without an approval: state "denied" or "expired" (or "failed" -> expired). A denial
@@ -1284,7 +1299,7 @@ class PlanStore:
             if p is None:
                 return False
             self._tick_locked(p, ev)
-            ok = p.state in ("active", "exhausted") and not self._expired_locked(p)
+            ok = p.state == "active" and not self._expired_locked(p)
         self._emit(ev)
         return ok
 
@@ -1297,20 +1312,26 @@ class PlanStore:
             if p is None:
                 return None
             self._tick_locked(p, ev)
-            left = self._left_locked(p) if p.state in ("active", "exhausted") and not self._expired_locked(p) else None
+            left = None
+            if p.state == "active" and not self._expired_locked(p):
+                left = min(p.expires_at - self.now(), p.granted_s - (self.mono() - p.approved_mono))
         self._emit(ev)
-        return left if left else None
+        return left if left and left > 0 else None
 
-    def refund(self, pid, rule_index):
-        """A reserved use that never left the broker is given back (counters and the rate window only)."""
+    def refund(self, pid, rule_index, ticket):
+        """A reserved use that never left the broker is given back: the counters, and THIS reservation's own
+        rate-window timestamp (not the newest one). Idempotent. Call before releasing the ticket."""
         with self._lock:
             p = self._plans.get(pid)
-            if p is None or p.uses_by_rule[rule_index] <= 0:
+            if p is None or ticket.refunded or p.uses_by_rule[rule_index] <= 0:
                 return
+            ticket.refunded = True
             p.uses_by_rule[rule_index] -= 1
             p.uses_total = max(0, p.uses_total - 1)
-            if p.recent:
-                p.recent.pop()
+            try:
+                p.recent.remove(ticket.stamp)
+            except ValueError:
+                pass                                    # already aged out of the window
 
     def needs_confirm(self, pid):
         with self._lock:
@@ -1335,6 +1356,8 @@ class PlanStore:
             if p is None or not hmac.compare_digest(p.client_id.encode(), client_id.encode()):
                 return Miss("unusable", kind="unknown")
             self._tick_locked(p, ev)
+            if p.state == "exhausted":
+                return Miss("uses_exhausted", plan_id=p.id)      # same answer as an exhausted rule: 403, exit 8
             if p.state != "active":
                 kind = {"ended": "ended", "exhausted": "exhausted", "closed": "closed",
                         "revoked": "revoked"}.get(p.state, "unknown")
@@ -1385,16 +1408,15 @@ class PlanStore:
             p.uses_total += 1
             p.recent.append(mono)
             p.inflight += 1
-            t = _Ticket()
+            t = _Ticket(mono)
             p.tickets.add(t)
             left_rule = p.rules[idx]["max_uses"] - p.uses_by_rule[idx]
             left_plan = sum(r["max_uses"] for r in p.rules) - p.uses_total
-            if all(p.uses_by_rule[i] >= r["max_uses"] for i, r in enumerate(p.rules)):
-                p.state, p.ended_at = "exhausted", self.now()
-                ev.append(("plan_closed", p, {"cause": "exhausted", "uses": p.uses_total}))
+            # (the plan turns "exhausted" only once nothing is in flight: see _maybe_exhaust_locked)
             return Match(self, p, idx, p.rules[idx], t, left_rule, left_plan, self._left_locked(p))
 
     def _release_ticket(self, pid, ticket):
+        ev = []
         with self._lock:
             if ticket.done:
                 return
@@ -1403,6 +1425,16 @@ class PlanStore:
             if p is not None:
                 p.tickets.discard(ticket)
                 p.inflight = max(0, p.inflight - 1)
+                self._maybe_exhaust_locked(p, ev)
+        self._emit(ev)
+
+    def _maybe_exhaust_locked(self, p, ev):
+        """An active plan whose every rule is used up and whose calls have all finished becomes exhausted
+        (terminal). Until then it stays active: visible and revocable, counted against the active cap."""
+        if (p.state == "active" and p.inflight == 0
+                and all(p.uses_by_rule[i] >= r["max_uses"] for i, r in enumerate(p.rules))):
+            p.state, p.ended_at = "exhausted", self.now()
+            ev.append(("plan_closed", p, {"cause": "exhausted", "uses": p.uses_total}))
 
     # -- miss bookkeeping (coalesced audit) -----------------------------------------
     def note_miss(self, key):
@@ -1468,7 +1500,7 @@ class PlanStore:
             if p is None or not hmac.compare_digest(p.client_id.encode(), client_id.encode()):
                 return None
             self._tick_locked(p, ev)
-            if p.state != "active" and not (p.state == "exhausted" and p.inflight > 0):
+            if p.state != "active":
                 done = None
             else:
                 p.state, p.ended_at = "closed", self.now()
@@ -1485,7 +1517,7 @@ class PlanStore:
             if p is None:
                 return False
             self._tick_locked(p, ev)
-            ok = p.state == "active" or (p.state == "exhausted" and p.inflight > 0)
+            ok = p.state == "active"
             if ok:
                 left = self._left_locked(p)
                 p.state, p.ended_at = "revoked", self.now()
@@ -1526,6 +1558,7 @@ class PlanStore:
                         t.done = True
                         p.tickets.discard(t)
                         p.inflight = max(0, p.inflight - 1)
+                self._maybe_exhaust_locked(p, ev)
             self._drop_old_locked(now)
         self._emit(ev)
         return n
@@ -1607,7 +1640,7 @@ def rule_lines(rule):
     label = ("READ-ONLY" + (" (pure GraphQL query)" if rule["method"] == "POST" else "")) if not writes else (
         "CAN CHANGE DATA")
     if rule_flags(rule) and tier == "high":
-        label = "HIGH: " + "; ".join(rule_flags(rule))
+        label = f"HIGH ({label}): " + "; ".join(rule_flags(rule))
     port = "" if rule["port"] == (443 if rule["scheme"] == "https" else 80) else f":{rule['port']}"
     where = f"{rule['scheme']}://{rule['host']}{port}{rule['path_prefix']}"
     n = rule["max_uses"]

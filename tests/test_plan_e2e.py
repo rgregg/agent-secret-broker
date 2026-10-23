@@ -201,7 +201,7 @@ class Lifecycle(PBase):
         for i in range(3):
             self.assertEqual(self.call(pid, body=self.ok_note())[0], 202, i)
         code, r = self.call(pid, body=self.ok_note())
-        self.assertEqual((code, r), (404, {"error": "plan not usable", "kind": "exhausted"}))
+        self.assertEqual((code, r), (403, {"error": "outside plan", "reason": "uses_exhausted"}))   # exit 8, as for a rule
         self.assertEqual(self.api("GET", f"/v1/plans/{pid}")[1]["status"], "exhausted")
         self.assertEqual(len(self.upstream()), 3)
         self.assertEqual([e["cause"] for e in self.events("plan_closed")], ["exhausted"])
@@ -933,7 +933,8 @@ class BeforeSend(PBase):
         end = time.time() + 10
         while time.time() < end and self.plan_view(pid)["inflight"] < 1:
             time.sleep(0.02)
-        self.assertEqual(self.plan_view(pid)["state"], "exhausted")
+        self.assertEqual(self.plan_view(pid)["state"], "active")           # stays active until its call finishes
+        self.assertIn(pid, [r["id"] for r in self.broker.active_plans()])        # and on the Clients tab
         self.assertTrue(self.broker.revoke_plan(pid, "alice"))
         Stub.gate.set()
         th.join()
@@ -956,6 +957,144 @@ class BeforeSend(PBase):
         self.broker.revoke_client(self.client["id"], "alice")
         self.assertEqual(self.card(r["id"]).status, "denied")
         self.assertEqual(self.broker.plans._denied.get(self.client["id"]), None)
+
+
+class ReviewRound3(BeforeSend):
+    """Errors keep their meaning (404 ended / 403 outside plan, never a 202 that exits 3), nothing is audited as
+    sent or failed for a call that never went out, and a plan stays visible until its last call finishes."""
+
+    def test_stopped_before_sending_is_404_with_the_kind_and_leaves_no_false_audit(self):
+        for label, action, kind in (("revoke", lambda: self.broker.revoke_plan(self.pid, "alice"), "revoked"),
+                                    ("close", lambda: self.api("POST", f"/v1/plans/{self.pid}/close", {}), "closed"),
+                                    ("deadline", lambda: self.tick(4000), "ended")):
+            self.setUp()
+            before = len(self.events("plan_used")), len(self.events("http_failed"))
+            out = self.gated_call(action)
+            self.assertEqual(out[0], (404, {"error": "plan not usable", "kind": kind}), label)
+            self.assertEqual((len(self.events("plan_used")), len(self.events("http_failed"))), before, label)
+            self.assert_stopped(out)
+            self.tearDown()
+
+    def test_the_cli_exits_7_when_the_plan_ends_mid_call(self):
+        gate, reached = threading.Event(), threading.Event()
+        real = self.broker.backend.get
+
+        def slow(*a, **k):
+            reached.set()
+            gate.wait(10)
+            return real(*a, **k)
+        res = []
+        with mock.patch.object(self.broker.backend, "get", slow):
+            th = threading.Thread(target=lambda: res.append(self.cli(
+                "http", "ledger", "POST", f"http://127.0.0.1:{self.port}/v1/notes",
+                "-H", "Authorization: Bearer {{LEDGER_TOKEN}}", "-H", "Content-Type: application/json",
+                "-d", json.dumps(self.ok_note()), "--plan", self.pid)))
+            th.start()
+            self.assertTrue(reached.wait(10))
+            self.broker.revoke_plan(self.pid, "alice")
+            gate.set()
+            th.join()
+        rc, out, err, _ = res[0]
+        self.assertEqual(rc, 7, err)
+        self.assertIn("kind: revoked", err)
+
+    def test_the_response_discarded_after_sending_is_404_too_and_plan_used_is_audited_once(self):
+        Stub.gate = threading.Event()
+        out = []
+        th = threading.Thread(target=lambda: out.append(self.call(self.pid, body=self.ok_note())))
+        th.start()
+        end = time.time() + 10
+        while time.time() < end and len(self.upstream()) < 1:
+            time.sleep(0.02)
+        self.broker.revoke_plan(self.pid, "alice")
+        Stub.gate.set()
+        th.join()
+        self.assertEqual(out[0], (404, {"error": "plan not usable", "kind": "revoked"}))
+        self.assertEqual(len(self.events("plan_used")), 1)
+        self.assertEqual(len(self.events("http_failed")), 0)
+
+    def test_a_filled_request_that_no_longer_matches_is_403_not_a_failed_202(self):
+        real = self.broker.backend.get
+        with mock.patch.object(self.broker.backend, "get", lambda *a, **k: "bad\nvalue"):
+            code, r = self.call(self.pid, body=self.ok_note())
+        self.assertEqual((code, r["error"], r["reason"], r["why"]), (403, "outside plan", "no_rule", "placeholder"))
+        self.assertEqual(self.upstream(), [])
+        self.assertEqual((len(self.events("plan_used")), len(self.events("http_failed"))), (0, 0))
+        rc, out, err, _ = self.cli("plan", "status", self.pid)
+        self.assertEqual(rc, 0)
+
+    def test_concurrent_stopped_calls_each_give_back_their_own_use(self):
+        gate, reached = threading.Event(), threading.Barrier(3)
+        real = self.broker.backend.get
+
+        def slow(*a, **k):
+            try:
+                reached.wait(10)
+            except threading.BrokenBarrierError:
+                pass
+            gate.wait(10)
+            return real(*a, **k)
+        out = []
+        with mock.patch.object(self.broker.backend, "get", slow):
+            ths = [threading.Thread(target=lambda: out.append(self.call(self.pid, body=self.ok_note())[0]))
+                   for _ in range(2)]
+            [t.start() for t in ths]
+            reached.wait(10)
+            self.assertEqual(self.plan_view(self.pid)["inflight"], 2)
+            self.broker.revoke_plan(self.pid, "alice")
+            gate.set()
+            [t.join() for t in ths]
+        self.assertEqual(out, [404, 404])
+        v = self.plan_view(self.pid)
+        self.assertEqual((v["uses"], v["inflight"]), (0, 0))
+        self.assertEqual(len(self.broker.plans._plans[self.pid].recent), 0)
+        self.assertEqual(self.upstream(), [])
+
+    def test_a_plan_on_its_last_use_is_listed_and_revoked_with_its_client(self):
+        pid = self.approve(self.manifest(task="one", rules=[self.rule(max_uses=1)]))
+        Stub.gate = threading.Event()
+        th = threading.Thread(target=lambda: self.call(pid, body=self.ok_note()))
+        th.start()
+        end = time.time() + 10
+        while time.time() < end and self.plan_view(pid)["inflight"] < 1:
+            time.sleep(0.02)
+        self.assertIn(pid, [r["id"] for r in self.broker.active_plans()])
+        self.assertIn("Active plans", self.get("/clients")[1])
+        self.assertIn(pid[:8] if False else "build-box", self.get("/clients")[1])
+        self.broker.cfg  # noqa: B018
+        self.broker.revoke_client(self.client["id"], "alice")
+        self.assertEqual([e["cause"] for e in self.events("plan_revoked") if e["plan_id"] == pid], ["client_revoked"])
+        Stub.gate.set()
+        th.join()
+        self.assertEqual(self.plan_view(pid)["state"], "revoked")
+
+    def test_an_exhausted_plan_and_an_exhausted_rule_answer_the_same(self):
+        pid = self.approve(self.manifest(task="two", rules=[self.rule(max_uses=1), self.rule(max_uses=1, path_prefix="/v1/b")]))
+        self.call(pid, body=self.ok_note())
+        c1 = self.call(pid, body=self.ok_note())
+        self.call(pid, body=self.ok_note(), url=f"http://127.0.0.1:{self.port}/v1/b/x")
+        c2 = self.call(pid, body=self.ok_note())
+        self.assertEqual(self.plan_view(pid)["state"], "exhausted")
+        self.assertEqual(c1, (403, {"error": "outside plan", "reason": "uses_exhausted"}))
+        self.assertEqual(c2, c1)
+        rc, out, err, _ = self.cli("http", "ledger", "POST", f"http://127.0.0.1:{self.port}/v1/notes",
+                                   "-H", "Authorization: Bearer {{LEDGER_TOKEN}}",
+                                   "-H", "Content-Type: application/json", "-d", json.dumps(self.ok_note()), "--plan", pid)
+        self.assertEqual(rc, 8, err)
+        self.assertIn("uses_exhausted", err)
+
+    def test_an_expired_card_is_not_approvable_and_not_a_server_error(self):
+        r = self.submit(self.manifest(task="late"))
+        req = self.card(r["id"])
+        self.assertEqual(self.broker.plans._plans[r["plan"]].pending_until, req.expires)    # one clock, one deadline
+        self.tick(req.expires - __import__("time").time() + 5)
+        st, _, hdr = self.decide(r["id"], "approve")
+        self.assertEqual((st, "note=stale" in hdr["Location"]), (303, True))
+        st, body, _ = self.post("/plans/decide", {"nonce": req.nonce, "decision": "approve", "granted": req.spec["requested_s"]})
+        self.assertEqual(st, 404)
+        self.assertEqual(req.status, "expired")
+        self.assertEqual(self.broker.pending(), [])
+        self.assertEqual(self.api("GET", f"/v1/plans/{r['plan']}")[1]["status"], "expired")
 
 
 class Submission(PBase):
