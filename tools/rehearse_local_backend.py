@@ -58,6 +58,8 @@ SECRETS = {
     "credtoken": "FAKE-credreq-token-4d9a17c3",
     "creduser": "FAKE-credreq-user-a07e52b9",
     "credpw": "FAKE-credreq-pw-6e2c80d1",
+    "sesscookie": "FAKE-session-cookie-3e7b19d4",
+    "sesscsrf": "FAKE-session-csrf-a52c8f70",
 }
 
 
@@ -96,6 +98,9 @@ class Upstream(BaseHTTPRequestHandler):
         raw = json.dumps({"echo": rec}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
+        if self.path.startswith("/sess/login"):         # a login that sets a cookie and returns a CSRF header
+            self.send_header("Set-Cookie", "SESS=" + SECRETS["sesscookie"] + "; HttpOnly; Path=/")
+            self.send_header("X-CSRF-Token", SECRETS["sesscsrf"])
         self.send_header("Content-Length", str(len(raw)))
         self.end_headers()
         self.wfile.write(raw)
@@ -756,6 +761,201 @@ def scenario_C(rh):
              len(Aux.telegram) > 3 and not any(v in t for t in Aux.telegram for v in S.values()), f"{len(Aux.telegram)} messages")
     credreq_scenario(rh, g)
     clients_scenario(rh, g)
+    plans_scenario(rh, g)
+    sessions_scenario(rh, g)
+
+
+def plans_scenario(rh, g):
+    """Plan mode (task-scoped grants) on the main throwaway broker: a fresh per-client credential submits a
+    manifest, the human approves the card on the real approval site, matching calls run through the real
+    `asb http --plan` with no card and no notification, off-manifest calls are refused (exit 3), the use
+    limit holds, close ends the plan (exit 7). A restart dropping every plan is covered by the unit tests."""
+    b = rh.main
+    home = rh.home / "planhome"         # outside the scanned data and log directories
+    home.mkdir(exist_ok=True)
+    quiet = {"HOME": str(home), "SECRET_BROKER_KEY": ""}
+
+    def enroll_card():
+        _, _, page = b.ap.get("/")
+        m = re.search(r"Client enrollment: ([a-z0-9._-]+)</h2>.*?action='/enroll/decide' class=decide>"
+                      r"<input type=hidden name=id value='([^']+)'", page, re.S)
+        return m.groups() if m else None
+    p = rh.asb_popen(b, "enroll", "--name", "plan-box", "--url", b.url, extra_env=quiet)
+    p.stdin.close()
+    p.stdin = None
+    card, end = None, time.time() + 25
+    while time.time() < end and card is None and p.poll() is None:
+        card = enroll_card()
+        time.sleep(0.2)
+    if card:
+        b.ap.post("/enroll/decide", {"id": card[1], "decision": "approve", "name": card[0]})
+    out, err = p.communicate(timeout=60)
+    rh.outputs.append(("asb enroll", out + err))
+    cfgf = home / ".config" / "secret-broker" / "client.json"
+    key = json.loads(cfgf.read_text()).get("key", "") if cfgf.exists() else ""
+    rh.check(g, "plans: a fresh per-client credential enrolled for the plan scenario", p.returncode == 0 and bool(key), f"rc={p.returncode}")
+    if not key:
+        return
+    SECRETS["plankey"] = key
+    env2 = {"HOME": str(home), "SECRET_BROKER_KEY": key}
+    port = rh.up_port
+    task = "rehearsal nightly sync"
+    manifest = {"v": 1, "task": task, "description": "plan scenario", "ttl_seconds": 1800, "rules": [
+        {"secret": "stub", "method": "GET", "host": "127.0.0.1", "port": port, "scheme": "http",
+         "path_prefix": "/plan/read", "max_uses": 2},
+        {"secret": "stub", "method": "POST", "host": "127.0.0.1", "port": port, "scheme": "http",
+         "path_prefix": "/plan/write", "max_uses": 2,
+         "body": {"json": {"keys": ["x", "kind"], "pin": {"kind": "nightly"}}}}]}
+    mf = rh.srcdir / "plan_manifest.json"
+    mf.write_text(json.dumps(manifest))
+    # 1. submit: the legacy shared key may not, the client can; the human approves the card
+    rc, o, e = rh.asb(b, "plan", "submit", str(mf), "--no-wait")
+    rh.check(g, "plans: the shared legacy key cannot submit a plan (exit 3, per-client credential needed)",
+             rc == 3 and "per-client" in e, f"rc={rc} {e.strip()[:80]}")
+    seen = set(b.ap.cards())
+    n_tg = len(Aux.telegram)
+    sp = rh.asb_popen(b, "plan", "submit", str(mf), extra_env=env2)
+    sp.stdin.close()
+    sp.stdin = None
+    rid = b.ap.wait_card(seen, timeout=25, proc=sp)
+    _, _, page = b.ap.get("/")
+    rh.check(g, "plans: the card renders the rules, the worst case and the agent's words in a marked box",
+             rid is not None and "Plan requested" in page and "CAN CHANGE DATA" in page and "Worst case:" in page
+             and "not verified, not used for any decision" in page and f"GET http://127.0.0.1:{port}/plan/read" in page, "")
+    code, loc, body = b.ap.post("/plans/decide", {"id": rid, "decision": "approve", "granted": "1800"}) if rid else (0, "", "")
+    out, err = sp.communicate(timeout=60)
+    rh.outputs.append(("asb plan submit", out + err))
+    pid = out.strip()
+    rh.check(g, "plans: approval on the approval site prints the plan id", sp.returncode == 0 and re.fullmatch(r"[0-9a-f]{32}", pid) is not None
+             and code == 303, f"rc={sp.returncode} {err.strip()[-80:]}")
+    time.sleep(1.0)
+    msgs = Aux.telegram[n_tg:]
+    rh.check(g, "plans: the notification names the client and credentials only, with no task text and no buttons",
+             any("Plan requested: plan-box, 2 rules: stub" in m for m in msgs) and not any(task in m for m in msgs), f"{len(msgs)} messages")
+    if not re.fullmatch(r"[0-9a-f]{32}", pid):
+        return
+    # 2. matching calls: no card, the secret reaches the upstream, never the agent
+    seen = set(b.ap.cards())
+    n_up = len(Upstream.hits)
+    hdr = ["-H", "Authorization: Bearer {{STUB_TOKEN}}"]
+    rc, o, e = rh.asb(b, "http", "stub", "GET", up_url(rh, "/plan/read"), *hdr, "--plan", pid, extra_env=env2, timeout=30)
+    h = last_hit(rh)
+    rh.check(g, "plans: a matching call runs with no card; the upstream got the secret, the agent output is masked",
+             rc == 0 and set(b.ap.cards()) == seen and h and h["headers"].get("Authorization") == "Bearer " + SECRETS["http"]
+             and SECRETS["http"] not in o + e, f"rc={rc} {e.strip()[:80]}")
+    rc, o, e = rh.asb(b, "http", "stub", "POST", up_url(rh, "/plan/write/1"), *hdr, "-H", "Content-Type: application/json",
+                      "-d", '{"x": "anything", "kind": "nightly"}', "--plan", pid, extra_env=env2, timeout=30)
+    rh.check(g, "plans: a matching POST with a pinned field runs", rc == 0 and last_hit(rh)["method"] == "POST", f"rc={rc} {e.strip()[:80]}")
+    # 3. off-manifest: refused with a reason, no card, nothing sent
+    n_up = len(Upstream.hits)
+    for label, args in (("another path", ["GET", up_url(rh, "/plan/other")] + hdr),
+                        ("a smuggled query override", ["GET", up_url(rh, "/plan/read?_method=DELETE")] + hdr),
+                        ("a different pinned value", ["POST", up_url(rh, "/plan/write"), "-H", "Content-Type: application/json",
+                                                       "-d", '{"x": 1, "kind": "other"}'] + hdr),
+                        ("an encoded dot segment", ["GET", up_url(rh, "/plan/read/%2e%2e/secret")] + hdr)):
+        rc, o, e = rh.asb(b, "http", "stub", *args, "--plan", pid, extra_env=env2, timeout=30)
+        rh.check(g, f"plans: off-manifest ({label}) is refused, exit 8, no prompt",
+                 rc == 8 and "outside the plan" in e and set(b.ap.cards()) == seen, f"rc={rc} {e.strip()[:80]}")
+    rh.check(g, "plans: no refused call reached the upstream", len(Upstream.hits) == n_up, "")
+    # 4. the same call without --plan still asks the human (left undecided)
+    rc, o, e, rid2 = rh.asb_decided(b, ["http", "stub", "GET", up_url(rh, "/plan/noplan")] + hdr, decision=None, timeout=60,
+                                    extra_env=env2)
+    rh.check(g, "plans: the same call without --plan still prompts (a normal card appears)", rid2 is not None and rc == 5, f"rc={rc}")
+    # 5. uses
+    rc, o, e = rh.asb(b, "http", "stub", "GET", up_url(rh, "/plan/read"), *hdr, "--plan", pid, extra_env=env2, timeout=30)
+    rc2, o2, e2 = rh.asb(b, "http", "stub", "GET", up_url(rh, "/plan/read"), *hdr, "--plan", pid, extra_env=env2, timeout=30)
+    rh.check(g, "plans: max_uses holds (the third read is refused, uses_exhausted)",
+             rc == 0 and rc2 == 8 and "uses_exhausted" in e2, f"rc={rc} rc2={rc2} {e2.strip()[:80]}")
+    rc, o, e = rh.asb(b, "plan", "status", pid, extra_env=env2)
+    rh.check(g, "plans: asb plan status shows the uses", rc == 0 and "state:   active" in o and "uses:    3 / 4" in o, o.strip()[:120])
+    # 6. close
+    rc, o, e = rh.asb(b, "plan", "close", pid, extra_env=env2)
+    rc2, o2, e2 = rh.asb(b, "http", "stub", "POST", up_url(rh, "/plan/write"), *hdr, "-H", "Content-Type: application/json",
+                         "-d", '{"x": 1, "kind": "nightly"}', "--plan", pid, extra_env=env2, timeout=30)
+    rh.check(g, "plans: close ends the plan (exit 7, kind closed)", rc == 0 and rc2 == 7 and "kind: closed" in e2, f"rc={rc} rc2={rc2}")
+    recs = {r["event"] for r in b.records()}
+    rh.check(g, "plans: audit has plan_issued, plan_used, plan_miss, plan_closed and no task text or secret",
+             {"plan_issued", "plan_used", "plan_miss", "plan_closed"} <= recs and task not in open(b.audit).read()
+             and SECRETS["http"] not in open(b.audit).read() and key not in open(b.audit).read(), "")
+    rc, o, e = rh.asb(b, "audit", "--event", "plan_issued,plan_used,plan_miss", "--json", extra_env=env2)
+    rh.check(g, "plans: the agent audit view shows plan events without the approver", rc == 0 and "plan_used" in o and "alice" not in o, "")
+
+
+def sessions_scenario(rh, g):
+    """HTTP sessions on the main throwaway broker with the real asb: open (the card shows credential,
+    hosts, methods, time and cap; the human shortens the cap), log in with a captured CSRF value, calls
+    that need the cookie and the CSRF value, refusals (host, method, cap), close, revoke, and no cookie or
+    CSRF value anywhere the agent or the logs can see."""
+    b = rh.main
+    S = SECRETS
+    seen = set(b.ap.cards())
+    p = rh.asb_popen(b, "session", "open", "stub", "--for", "rehearse a login flow", "--host", f"127.0.0.1:{rh.up_port}",
+                     "--methods", "GET,POST", "--ttl", "10m", "--max-calls", "6")
+    p.stdin.close()
+    p.stdin = None
+    rid = b.ap.wait_card(seen, timeout=25, proc=p)
+    page = b.ap.get("/")[2] if rid else ""
+    rh.check(g, "sessions: the card shows credential, hosts, methods, time limit and call cap, with no Always chips",
+             rid and all(x in page for x in ("HTTP session", "stub", "127.0.0.1", "GET, POST", "10 min", "6 calls",
+                                             "name=session_ttl_min", "HIGH RISK"))
+             and "approve_always" not in page and "approve_grant_" not in page, "")
+    if rid:
+        b.ap.decide(rid, "approve", {"session_max_calls": "5"})
+    out, err = p.communicate(timeout=60)
+    rh.outputs.append(("asb session open", out + err))
+    sid = out.strip()
+    rh.check(g, "sessions: open exits 0 and prints only the session id; the approver shortened the cap to 5",
+             p.returncode == 0 and re.fullmatch(r"[A-Za-z0-9_-]{32}", sid) and "up to 5 calls" in err, f"rc={p.returncode}")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{32}", sid or ""):
+        return
+    n0 = len(b.records())
+    rc, o, e = rh.asb(b, "http", "stub", "POST", up_url(rh, "/sess/login"), "--session", sid, "-H",
+                      "Authorization: Bearer {{STUB_TOKEN}}", "--capture", "CSRF=header:X-CSRF-Token")
+    rh.check(g, "sessions: login runs with no prompt, captures the CSRF header, and the agent sees no cookie, CSRF or token",
+             rc == 0 and "captured CSRF" in e and not b.ap.cards() and S["sesscookie"] not in o + e
+             and S["sesscsrf"] not in o + e and S["http"] not in o + e, f"rc={rc} {e.strip()[:80]}")
+    rc, o, e = rh.asb(b, "http", "stub", "POST", up_url(rh, "/sess/write"), "--session", sid, "-H",
+                      "X-CSRF-Token: {{session.CSRF}}", "-d", "{}")
+    h = last_hit(rh)
+    hl = {k.lower(): v for k, v in (h or {}).get("headers", {}).items()}
+    rh.check(g, "sessions: the next call carries the jar's cookie and the captured CSRF value upstream, masked in the reply",
+             rc == 0 and h and hl.get("cookie") == "SESS=" + S["sesscookie"]
+             and hl.get("x-csrf-token") == S["sesscsrf"] and S["sesscookie"] not in o + e
+             and S["sesscsrf"] not in o + e, f"rc={rc}")
+    rc, o, e = rh.asb(b, "http", "stub", "DELETE", up_url(rh, "/sess/x"), "--session", sid)
+    rh.check(g, "sessions: a method outside the session is refused (exit 8), not prompted", rc == 8 and not b.ap.cards(), f"rc={rc}")
+    rc, o, e = rh.asb(b, "http", "stub", "GET", "http://localhost:%d/sess/x" % rh.up_port, "--session", sid)
+    rh.check(g, "sessions: a host outside the session is refused (exit 8)", rc == 8, f"rc={rc} {e.strip()[:80]}")
+    rc, o, e = rh.asb(b, "session", "status", sid)
+    rh.check(g, "sessions: status shows the calls left", rc == 0 and "calls left: 3 of 5" in o, o.strip()[:80])
+    for _ in range(3):
+        rh.asb(b, "http", "stub", "GET", up_url(rh, "/sess/more"), "--session", sid)
+    rc, o, e = rh.asb(b, "http", "stub", "GET", up_url(rh, "/sess/more"), "--session", sid)
+    rh.check(g, "sessions: the call cap is enforced (exit 8)", rc == 8, f"rc={rc}")
+    ev = {r["event"] for r in b.records()[n0:]}
+    rh.check(g, "sessions: audit has session_used and session_refused, and no cookie or CSRF value",
+             {"session_used", "session_refused"} <= ev and S["sesscookie"] not in open(b.audit).read()
+             and S["sesscsrf"] not in open(b.audit).read(), "")
+    # a second session: closed by the agent, then another revoked by the human on the Clients tab
+    def open_one():
+        return rh.asb_decided(b, ["session", "open", "stub", "--for", "second", "--host", f"127.0.0.1:{rh.up_port}", "--ttl", "5m"])
+    rc, o, e, rid2 = open_one()
+    sid2 = o.strip()
+    rc2, o2, e2 = rh.asb(b, "session", "close", sid2)
+    rc3, o3, e3 = rh.asb(b, "http", "stub", "GET", up_url(rh, "/sess/x"), "--session", sid2)
+    rh.check(g, "sessions: the agent closes its session (exit 0) and later calls exit 7", rc == 0 and rc2 == 0 and rc3 == 7, f"{rc},{rc2},{rc3}")
+    rc, o, e, rid3 = open_one()
+    sid3 = o.strip()
+    page = b.ap.get("/clients")[2]
+    rh.check(g, "sessions: the Clients tab lists the active session with its time left and a Revoke button",
+             "Active sessions" in page and "data-gexp=" in page and "/sessions/revoke" in page and sid3 not in page, "")
+    m = re.search(r"name=pid value='([^']+)'", page)
+    if m:
+        b.ap.post("/sessions/revoke", {"pid": m.group(1)})
+    rc, o, e = rh.asb(b, "http", "stub", "GET", up_url(rh, "/sess/x"), "--session", sid3)
+    rh.check(g, "sessions: a revoked session stops at once (exit 7)", rc == 7 and "revoked" in e, f"rc={rc}")
+    rc, o, e = rh.asb(b, "http", "stub", "GET", up_url(rh, "/sess/x"), "--session", sid, extra_env={"SECRET_BROKER_KEY": "wrong-key"})
+    rh.check(g, "sessions: a call with another key never reaches the session (auth fails)", rc == 3, f"rc={rc}")
 
 
 def clients_scenario(rh, g):

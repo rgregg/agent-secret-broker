@@ -32,7 +32,14 @@ _EV_KEYS = ("reason", "reasons", "model", "risk", "error", "via", "channel", "de
             "cred_kind", "cred_mode", "purpose_length", "purpose_sha256", "edited", "requested_name",
             "var_names", "no_hosts",
             # per-client credentials: whose request it was and whom a rule created from it applies to
-            "client_id", "client_name", "rule_client")
+            "client_id", "client_name", "rule_client",
+            # plans: ids, counts, lengths and hash prefixes; never the task, description or any rule text
+            "plan_id", "plan_rules", "plan_tier", "plan_left_s", "manifest_hash", "rules_hash", "requested_s",
+            "task_length", "task_sha256", "description_length", "description_sha256", "granted_s", "rules",
+            "names", "rule", "uses_left_rule", "uses_left_plan", "left_s", "cause", "suppressed",
+            # http sessions: public prefix, manifest and counters; never an id, cookie or value
+            "session", "methods", "ttl_s", "max_calls", "calls", "left_s", "reason_class", "lifetime_s",
+            "unused", "shortened", "revoked_by", "suppressed")
 _MAX_EVENTS = 60            # per request
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 
@@ -120,7 +127,7 @@ class History:
                 "id": rid, "ts": rec["ts"], "time": rec["time"], "names": rec.get("names") or [],
                 "mode": rec.get("mode"), "source": rec.get("source"), "outcome": "pending",
                 "via": None, "approver": None, "risk": None, "summary": None, "summary_model": None, "summary_source": None, "error": None,
-                "latency_ms": None, "grant_id": None, "rule_id": None, "delivered": False, "escalated": False,
+                "latency_ms": None, "grant_id": None, "rule_id": None, "plan_id": None, "plan_left_s": None, "delivered": False, "escalated": False,
                 "method": rec.get("method"), "url": _short_url(rec.get("url")),
                 "op": rec.get("op"), "item": rec.get("item"), "field": rec.get("field"),
                 "key": rec.get("key"), "hosts": rec.get("hosts"), "final_seq": -1,
@@ -162,6 +169,8 @@ class History:
             row["latency_ms"] = rec.get("latency_ms")
             row["grant_id"] = rec.get("grant_id")
             row["rule_id"] = rec.get("rule_id")
+            row["plan_id"] = rec.get("plan_id")
+            row["plan_left_s"] = rec.get("plan_left_s")
             if ev == "approved" and row["via"] == "policy":
                 row["outcome"] = "auto-approved"
 

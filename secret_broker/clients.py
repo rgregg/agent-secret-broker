@@ -155,9 +155,9 @@ def parse_config(cfg):
             raise ValueError(f"{at}: the key must be a client id such as c-1a2b3c4d, or legacy")
         if not isinstance(spec, dict):
             raise ValueError(f"{at} must be an object")
-        extra = sorted(set(spec) - {"risk"})
+        extra = sorted(set(spec) - {"risk", "plans"})
         if extra:
-            raise ValueError(f"{at}.{extra[0]} is not a known option (risk)")
+            raise ValueError(f"{at}.{extra[0]} is not a known option (risk, plans)")
         rk = spec.get("risk")
         if rk is not None and not isinstance(rk, dict):
             raise ValueError(f"{at}.risk must be an object")
@@ -172,6 +172,9 @@ def parse_config(cfg):
             ov["auto_approve_max"] = rk["auto_approve_max"]
         if "auto_modes" in rk:
             ov["auto_modes"] = risk_mod.parse_auto_modes({"auto_modes": rk["auto_modes"]}, f"{at}.risk")
+        if spec.get("plans") is not None:
+            from . import plans as plans_mod        # late: plans.py imports nothing from here
+            ov["plans"] = plans_mod.parse_client_override(spec["plans"], f"{at}.plans")
         overrides[cid] = ov
     return {"legacy": legacy, "enrollment": enr, "overrides": overrides}
 
@@ -786,9 +789,11 @@ class ClientsMixin:
             return status
         denied = self._deny_client_pending(cid)
         gone = self._purge_client_rules(cid)
+        plans_gone = self._revoke_client_plans(cid, actor, peer, client_ip)
+        ended = self.revoke_client_sessions(cid, actor)
         self.log("client_revoked", client_id=cid, client_name=rec["name"], revoked_by=actor, user=actor,
-                 peer=peer, client_ip=client_ip, denied_pending=denied, rules_removed=gone["removed"],
-                 rules_failed=gone["failed"], saved=status == "revoked")
+                 peer=peer, client_ip=client_ip, denied_pending=denied, sessions_ended=ended, rules_removed=gone["removed"],
+                 rules_failed=gone["failed"], plans_revoked=plans_gone, saved=status == "revoked")
         return status
 
     def remove_client(self, cid, actor, peer=None, client_ip=None):
@@ -847,6 +852,10 @@ class ClientsMixin:
             for r in sc.get("ssh_rules") or []:
                 if r.get("client", ANY) == cid:
                     rows.append(("ssh host rule", name, f"{r['user']} on {r['host'] or r['fp'][:19]}"))
+        for v in self.active_plans():
+            if v["client_id"] == cid:
+                rows.append(("plan", ", ".join(v["names"]),
+                             f"{v['uses']}/{v['uses_max']} calls used, {max(0, v['left_s']) // 60} min left"))
         return rows
 
 
