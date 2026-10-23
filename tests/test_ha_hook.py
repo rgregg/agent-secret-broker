@@ -5,8 +5,10 @@ import os
 import sys
 import tempfile
 import threading
+import types
 import time
 import unittest
+from unittest import mock
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -56,10 +58,15 @@ class TickerActions(unittest.TestCase):
         self.srv = ThreadingHTTPServer(("127.0.0.1", 0), FakeHA)
         threading.Thread(target=self.srv.serve_forever, daemon=True).start()
         self.url = f"http://127.0.0.1:{self.srv.server_address[1]}"
-        self._sleep, time.sleep = time.sleep, lambda s: None
+        # Patch only notify's reference to the time module. Replacing time.sleep globally makes every leaked
+        # background sweeper thread (`while True: time.sleep(n); sweep()`) busy-spin and starve this test on CI.
+        shim = types.SimpleNamespace(**{k: getattr(time, k) for k in dir(time) if not k.startswith("__")})
+        shim.sleep = lambda s: None
+        self._time_patch = mock.patch.object(notify, "time", shim)
+        self._time_patch.start()
 
     def tearDown(self):
-        time.sleep = self._sleep
+        self._time_patch.stop()
         self.srv.shutdown()
         self.srv.server_close()
 

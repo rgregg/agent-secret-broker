@@ -786,8 +786,9 @@ class ClientsMixin:
             return status
         denied = self._deny_client_pending(cid)
         gone = self._purge_client_rules(cid)
+        ended = self.revoke_client_sessions(cid, actor)
         self.log("client_revoked", client_id=cid, client_name=rec["name"], revoked_by=actor, user=actor,
-                 peer=peer, client_ip=client_ip, denied_pending=denied, rules_removed=gone["removed"],
+                 peer=peer, client_ip=client_ip, denied_pending=denied, sessions_ended=ended, rules_removed=gone["removed"],
                  rules_failed=gone["failed"], saved=status == "revoked")
         return status
 

@@ -44,6 +44,11 @@ def assess(mode, names, spec, analyzer=None, guidance=None):
         return {"level": "high", "model": None, "summary": None, "summary_model": None,
                 "summary_source": None, "summary_reason": None,
                 "reasons": ["credential requests always need a human to supply the value; always high"]}
+    if mode == "session":
+        # an http session: high by code, no model sees the request (the purpose is untrusted agent text)
+        return {"level": "high", "model": None, "summary": None, "summary_model": None,
+                "summary_source": None, "summary_reason": None,
+                "reasons": ["an HTTP session always needs a human to approve it; always high"]}
     summary, model_risk, summary_model, src, why = None, None, None, None, None
     if analyzer is not None:
         try:

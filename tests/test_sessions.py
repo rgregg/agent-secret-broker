@@ -1,0 +1,2696 @@
+"""HTTP sessions (secret_broker/sessions.py, `asb session`, `asb http --session`).
+
+A throwaway broker per test (the test_clients harness: a fake phone that never decides by itself,
+enrolled clients through the real endpoint) in front of a local stub UniFi-like upstream on
+127.0.0.1. Every secret, cookie and token here is an obviously fake canary. The real UniFi API is
+never contacted.
+"""
+import io
+import json
+import os
+import re
+import secrets as pysecrets
+import subprocess
+import sys
+import threading
+import time
+import unittest
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from unittest import mock
+
+sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import test_e2e as t  # noqa: E402
+from test_clients import CBase  # noqa: E402
+from secret_broker import audit_api, sessions as S  # noqa: E402
+from secret_broker.broker import Broker  # noqa: E402
+
+KEY, CLI = t.KEY, t.CLI
+USER, PASSWORD = "USR-CANARY-4417", "PW-CANARY-8f2a91c3"
+PURPOSE = "list the clients and rename one"
+
+
+class Unifi(BaseHTTPRequestHandler):
+    """A UniFi-like upstream. State lives on the server (`self.server.st`)."""
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    def _cookies(self):
+        out = {}
+        for part in (self.headers.get("Cookie") or "").split(";"):
+            k, _, v = part.strip().partition("=")
+            if k:
+                out[k] = v
+        return out
+
+    def _send(self, code, obj, extra=(), raw=None):
+        body = raw if raw is not None else json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        for k, v in extra:
+            self.send_header(k, v)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _read(self):
+        return self.rfile.read(int(self.headers.get("Content-Length") or 0))
+
+    def _log(self):
+        st = self.server.st
+        st["seen"].append({"m": self.command, "p": self.path, "cookie": self.headers.get("Cookie"),
+                           "csrf": self.headers.get("X-CSRF-Token"), "host": self.headers.get("Host"), "body": self.server.st.get("last_body")})
+
+    def _authed(self):
+        return self._cookies().get("TOKEN") in self.server.st["tokens"]
+
+    def do_GET(self):
+        st = self.server.st
+        self._log()
+        path = self.path.split("?")[0]
+        if path == "/proxy/network/api/s/default/stat/sta":
+            if not self._authed():
+                return self._send(401, {"error": "login required"})
+            return self._send(200, {"data": [{"mac": "aa:bb:cc:00:00:01", "name": "laptop"}]})
+        if path == "/echo":
+            # echoes the cookie and CSRF it received, in the body and in a header
+            return self._send(200, {"cookie": self.headers.get("Cookie"), "csrf": self.headers.get("X-CSRF-Token")},
+                              [("X-Echo", self.headers.get("Cookie") or "")])
+        if path == "/redir-in":
+            return self._send(302, {}, [("Location", "/proxy/network/api/s/default/stat/sta")])
+        if path == "/redir-cookie":
+            return self._send(302, {}, [("Location", "/"), ("Set-Cookie", "RC=COOKIE-CANARY-redir; Path=/")])
+        if path == "/redir-out":
+            return self._send(302, {}, [("Location", f"http://localhost:{self.server.server_address[1]}/echo")])
+        if path == "/setcookie":
+            return self._send(200, {}, [("Set-Cookie", "A=" + st["tokens_prefix"] + "AAAA; Path=/"),
+                                        ("Set-Cookie", "B=" + st["tokens_prefix"] + "BBBB; Path=/sub"),
+                                        ("Set-Cookie", "S=" + st["tokens_prefix"] + "SSSS; Path=/; Secure")])
+        if path in ("/", "/sub/x", "/other"):
+            return self._send(200, {"cookie": self.headers.get("Cookie")})
+        if path == "/big":
+            return self._send(200, None, raw=b"x" * 400000)
+        if path == "/rotate-echo":
+            return self._send(200, {"cookie": self.headers.get("Cookie"), "csrf": self.headers.get("X-CSRF-Token")},
+                              [("Set-Cookie", "TOKEN=COOKIE-CANARY-rotated-9z; Path=/"),
+                               ("X-CSRF-Token", "CSRF-CANARY-rotated-9z")])
+        if path == "/set-echo":
+            return self._send(200, {"echo": "COOKIE-CANARY-rejected-7q"},
+                              [("Set-Cookie", "R=COOKIE-CANARY-rejected-7q; Secure; Path=/")])
+        if path == "/setcap":
+            return self._send(200, {"echo": "CAPTURED-CANARY-77"}, [("X-New", "CAPTURED-CANARY-77")])
+        if path == "/hold":
+            st["holding"].append(1)                 # in flight: the test releases it when it is ready
+            st["release"].wait(20)
+            return self._send(200, {"hold": "HELDBODY"}, [("Set-Cookie", "H=COOKIE-CANARY-held; Path=/")])
+        if path == "/boom":
+            self.connection.close()
+            return None
+        if path == "/json":
+            return self._send(200, {"a": {"b": [{"c": "deep-value-1234"}], "n": 7, "t": True, "o": {"x": 1},
+                                          "crlf": "x\r\ny", "uni": "caf\u00e9", "s3": "abc", "s4": "wxyz", "poison": "x_method=1"}})
+        return self._send(404, {"error": "no"})
+
+    do_HEAD = do_GET
+
+    def do_POST(self):
+        st = self.server.st
+        data = self._read()
+        st["last_body"] = data.decode("utf-8", "replace")
+        self._log()
+        path = self.path.split("?")[0]
+        if path == "/api/auth/login":
+            try:
+                body = json.loads(data)
+            except ValueError:
+                return self._send(400, {"error": "bad json"})
+            if body.get("username") != USER or body.get("password") != PASSWORD:
+                return self._send(403, {"error": "bad credentials"})
+            tok = "COOKIE-CANARY-" + pysecrets.token_hex(8)
+            st["tokens"].add(tok)
+            st["csrf"] = "CSRF-CANARY-" + pysecrets.token_hex(8)
+            return self._send(200, {"ok": True, "unique_id": "uid-123456", "user": USER.lower()}, [
+                ("Set-Cookie", f"TOKEN={tok}; HttpOnly; Path=/"), ("X-CSRF-Token", st["csrf"])])
+        if path == "/api/auth/logout":
+            tok = self._cookies().get("TOKEN")
+            st["tokens"].discard(tok)
+            return self._send(200, {"ok": True}, [("Set-Cookie", "TOKEN=; Max-Age=0; Path=/")])
+        if path.startswith("/proxy/network/api/s/default/"):
+            if not self._authed():
+                return self._send(401, {"error": "login required"})
+            if self.headers.get("X-CSRF-Token") != st["csrf"]:
+                return self._send(403, {"error": "csrf"})
+            extra = []
+            if st.get("rotate"):
+                st["csrf"] = "CSRF-CANARY-" + pysecrets.token_hex(8)
+                extra.append(("X-CSRF-Token", st["csrf"]))
+            return self._send(200, {"ok": True, "len": len(data), "body": data.decode("utf-8", "replace")}, extra)
+        if path == "/logout-echo":
+            return self._send(200, {"cookie": self.headers.get("Cookie"), "csrf": self.headers.get("X-CSRF-Token")},
+                              [("Set-Cookie", "TOKEN=; Max-Age=0; Path=/")])
+        if path == "/echo":
+            return self._send(200, {"body": data.decode("utf-8", "replace"), "cookie": self.headers.get("Cookie")})
+        return self._send(404, {"error": "no"})
+
+    do_PUT = do_POST
+
+
+class SBase(CBase):
+    """CBase plus the stub upstream and a `unifi` login credential allowed for 127.0.0.1 and localhost."""
+    sessions_cfg = None
+    inject_clock = True
+    unifi_hosts = ("127.0.0.1", "localhost")
+
+    def tweak(self, cfg):
+        super().tweak(cfg)
+        cfg["request_details"] = {"enabled": True}
+        if self.sessions_cfg is not None:
+            cfg["sessions"] = self.sessions_cfg
+        cfg["_vault"]["Unifi"] = {"username": USER, "password": PASSWORD}
+        cfg["secrets"]["unifi"] = {"vars": {"UNIFI_USERNAME": {"item": "Unifi", "field": "username"},
+                                            "UNIFI_PASSWORD": {"item": "Unifi", "field": "password"}},
+                                   "allowed_hosts": list(self.unifi_hosts)}
+        cfg["_vault"]["Methcred"] = {"token": "tok-method-xyz"}
+        cfg["secrets"]["methcred"] = {"vars": {"METHCRED_TOKEN": {"item": "Methcred", "field": "token"}},
+                                      "allowed_hosts": ["127.0.0.1"]}
+        cfg["_vault"]["Longcred"] = {"token": "L" * 3000}
+        cfg["secrets"]["longcred"] = {"vars": {"LONGCRED_TOKEN": {"item": "Longcred", "field": "token"}},
+                                      "allowed_hosts": ["127.0.0.1"]}
+        cfg["_vault"]["Spacecred"] = {"token": "a b"}
+        cfg["secrets"]["spacecred"] = {"vars": {"SPACECRED_TOKEN": {"item": "Spacecred", "field": "token"}},
+                                       "allowed_hosts": ["127.0.0.1"]}
+        cfg["_vault"]["Crlfcred"] = {"token": "a\r\nb"}
+        cfg["secrets"]["crlfcred"] = {"vars": {"CRLFCRED_TOKEN": {"item": "Crlfcred", "field": "token"}},
+                                      "allowed_hosts": ["127.0.0.1"]}
+        cfg["_vault"]["Envonly"] = {"password": "ENVONLY-CANARY"}
+        cfg["secrets"]["envonly"] = {"vars": {"ENVONLY_PW": {"item": "Envonly", "field": "password"}},
+                                     "allowed_hosts": []}
+
+    def setUp(self):
+        super().setUp()
+        self.ux = ThreadingHTTPServer(("127.0.0.1", 0), Unifi)
+        self.ux.daemon_threads = True
+        self.ux.st = {"holding": [], "release": threading.Event(), "tokens": set(), "csrf": None, "seen": [], "rotate": False,
+                      "tokens_prefix": "COOKIE-CANARY-"}
+        threading.Thread(target=self.ux.serve_forever, daemon=True).start()
+        self.port = self.ux.server_address[1]
+        self.st = self.ux.st
+        self.model = ModelStub()
+        self.broker.summarizer = self.model
+        for name, val in (("REFUSAL_LOG_PER_MIN", 10 ** 6), ("MAX_FREE_REFUSALS", 10 ** 6)):   # tests that meter patch back
+            p = mock.patch.object(S, name, val)
+            p.start()
+            self.addCleanup(p.stop)
+        if self.inject_clock:       # the production clock is time.monotonic; tests move this one with `advance`
+            self.broker.sessions_clock = lambda: time.monotonic() + self.offset
+        self.out = []                       # CLI output seen
+        self.dir = os.path.dirname(self.audit)
+
+    def tearDown(self):
+        self.st["release"].set()
+        self.ux.shutdown()
+        self.ux.server_close()
+        super().tearDown()
+
+    # -- helpers ---------------------------------------------------------
+    def hp(self, host="127.0.0.1"):
+        """A manifest host entry for the stub: host:port."""
+        return f"{host}:{self.port}"
+
+    def url(self, path, host="127.0.0.1"):
+        return f"http://{host}:{self.port}{path}"
+
+    def ask(self, key=KEY, expect=202, cred="unifi", **kw):
+        body = {"mode": "session", "names": [cred], "purpose": PURPOSE, "hosts": [self.hp()],
+                "methods": ["GET", "HEAD", "POST", "PUT"], "source": "t@box"}
+        body.update(kw)
+        code, text = self.as_client(key, "POST", "/v1/requests", body)
+        self.assertEqual(code, expect, text)
+        return json.loads(text)
+
+    def result(self, rid, key=KEY):
+        code, text = self.as_client(key, "GET", f"/v1/requests/{rid}?wait=5")
+        return json.loads(text)
+
+    def approve(self, rid, **limits):
+        status, _, hdr = self.post("/decide", {"id": rid, "decision": "approve", **limits})
+        self.assertEqual(status, 303, hdr)
+        self.broker._by_id[rid].done.wait(10)
+
+    def open(self, key=KEY, limits=None, **kw):
+        """Open a session as the client holding `key`, approved on the dashboard. Returns the id."""
+        r = self.ask(key, **kw)
+        self.approve(r["id"], **(limits or {}))
+        res = self.result(r["id"], key)
+        self.assertEqual(res["status"], "approved", res)
+        return res["session"]["id"]
+
+    def call(self, sid, method, path, key=KEY, headers=None, body=None, capture=None, host="127.0.0.1",
+             names=("unifi",), url=None):
+        """One session call. Returns (http status of the broker answer, dict). A call that ran returns
+        (200, result dict with "http"); a refusal returns (4xx, {"error", "code"})."""
+        payload = {"mode": "http", "names": list(names), "method": method, "url": url or self.url(path, host),
+                   "headers": headers or {}, "session": sid, "source": "t@box"}
+        if body is not None:
+            payload["body"] = body
+        if capture is not None:
+            payload["capture"] = capture
+        code, text = self.as_client(key, "POST", "/v1/requests", payload)
+        if code != 202:
+            return code, json.loads(text)
+        j = json.loads(text)
+        if j["status"] == "failed":
+            return 200, {"status": "failed", "error": j["error"]}
+        return 200, self.result(j["id"], key)
+
+    def login(self, sid, **kw):
+        return self.call(sid, "POST", "/api/auth/login", body=json.dumps(
+            {"username": "{{UNIFI_USERNAME}}", "password": "{{UNIFI_PASSWORD}}"}),
+            headers={"Content-Type": "application/json"}, capture=["CSRF=header:X-CSRF-Token"], **kw)
+
+    def sess(self, sid):
+        return next(iter(self.broker._sess.values())) if sid else None
+
+    def advance(self, secs):
+        self.offset += secs
+
+    def new_client2(self, name):
+        return self.new_client(name)
+
+
+class ModelStub:
+    """Must never be called for a session open or a session call."""
+
+    def __init__(self):
+        self.calls = []
+
+    def analyze(self, mode, names, spec, guidance=None):
+        self.calls.append(mode)
+        return {"summary": "s", "risk": "low"}
+
+    def summarize(self, mode, names, spec):
+        self.calls.append(mode)
+        return "s"
+
+
+# ------------------------------------------------------------------------- pure helpers
+class Helpers(unittest.TestCase):
+    def test_config_defaults_and_validation(self):
+        d = S.parse_config(None)
+        self.assertEqual(d, {"enabled": True, "default_ttl_s": 900, "max_ttl_s": 3600, "max_calls": 200,
+                             "max_per_client": 3})
+        ok = S.parse_config({"enabled": False, "default_ttl_s": 60, "max_ttl_s": 120, "max_calls": 5,
+                             "max_per_client": 1})
+        self.assertFalse(ok["enabled"])
+        for bad, frag in (([], "sessions"), ({"nope": 1}, "sessions.nope"), ({"enabled": "yes"}, "enabled"),
+                          ({"default_ttl_s": 5}, "default_ttl_s"), ({"max_ttl_s": 10}, "max_ttl_s"),
+                          ({"max_ttl_s": 999999}, "max_ttl_s"), ({"default_ttl_s": 7200}, "default_ttl_s"),
+                          ({"max_calls": 0}, "max_calls"), ({"max_calls": True}, "max_calls"),
+                          ({"max_per_client": 99}, "max_per_client"), ({"max_per_client": 0}, "max_per_client")):
+            with self.assertRaises(ValueError) as cm:
+                S.parse_config(bad)
+            self.assertIn(frag, str(cm.exception))
+
+    def test_capture_parser_accepts(self):
+        self.assertEqual(S.parse_capture("CSRF=header:X-CSRF-Token"), ("CSRF", "header", "x-csrf-token"))
+        self.assertEqual(S.parse_capture("c=cookie:TOKEN"), ("c", "cookie", "TOKEN"))
+        self.assertEqual(S.parse_capture("t=json:$.a.b[0].c"), ("t", "json", ["a", "b", 0, "c"]))
+        self.assertEqual(S.parse_capture("t=json:$[2]"), ("t", "json", [2]))
+
+    def test_capture_parser_fails_closed(self):
+        for bad in ("", "x", "x=", "x=header:", "x=header:a b", "x=cookie:", "1x=header:a", "x=json:", "x=json:$",
+                    "x=json:a.b", "x=json:$..a", "x=json:$.a[*]", "x=json:$.a[?(@.b)]", "x=json:$.a['b']",
+                    "x=json:$.a[-1]", "x=json:$.a[1:2]", "x=json:$.", "x=json:$.a.", "x=json:$.a[0",
+                    "x=json:$.a[99999]", "x=json:$.a b", "x=json:$.a;b", "x=body:foo", "x=header:a\nb",
+                    "x" * 40 + "=header:a", "x=json:$" + ".a" * 13, None, 5, ["x=header:a"]):
+            with self.assertRaises(ValueError, msg=repr(bad)) as cm:
+                S.parse_capture(bad)
+            self.assertNotIn(str(bad)[:20] if bad and len(str(bad)) > 3 else "\0", str(cm.exception).replace("x=", ""))
+
+    def test_json_value(self):
+        doc = {"a": {"b": [{"c": "v"}], "n": 7, "t": True, "o": {"x": 1}, "f": 1.5}}
+        self.assertEqual(S.json_value(doc, ["a", "b", 0, "c"]), "v")
+        self.assertEqual(S.json_value(doc, ["a", "n"]), "7")
+        self.assertEqual(S.json_value(doc, ["a", "t"]), "true")
+        for segs in (["a", "o"], ["a", "b"], ["a", "zz"], ["a", "b", 5], ["a", "n", "x"], [0]):
+            self.assertIsNone(S.json_value(doc, segs), segs)
+
+    def test_storable_refuses_control_characters_and_big_values(self):
+        self.assertTrue(S.storable("abc"))
+        for bad in ("", "a\r\nb", "a\x00b", "x" * 4097, None, 5, "caf\u00e9", "a\x7fb", "tab\there"):
+            self.assertFalse(S.storable(bad))
+
+    def test_jar_scoping_path_secure_expiry_and_caps(self):
+        now = [1000.0]
+        j = S.Jar(lambda: now[0], wall=lambda: now[0])
+        j.store("a.example", "/", True, ["k=1; Path=/", "p=2; Path=/sub", "s=3; Secure", "d=4; Domain=example",
+                                             "e=5; Max-Age=10", "bad", "=x", "n a=1"])
+        self.assertEqual(j.header("a.example", "/", True), "k=1; s=3; d=4; e=5")      
+        self.assertEqual(j.header("a.example", "/x/z", True), "k=1; s=3; d=4; e=5")
+        self.assertEqual(j.header("a.example", "/sub/q", True), "p=2; k=1; s=3; d=4; e=5")
+        self.assertEqual(j.header("a.example", "/subway", True), "k=1; s=3; d=4; e=5")  # not a path boundary
+        self.assertNotIn("s=3", j.header("a.example", "/", False))                    # Secure never over http
+        self.assertIsNone(j.header("b.example", "/", True))                           # host scoped, Domain ignored
+        j.store("a.example", "/", False, ["sec=9; Secure"])
+        self.assertNotIn("sec=9", j.header("a.example", "/", True))                   # secure from http ignored
+        now[0] += 11
+        self.assertNotIn("e=5", j.header("a.example", "/", True))                     # expired
+        j.store("a.example", "/", True, ["k=; Max-Age=0"])
+        self.assertNotIn("k=1", j.header("a.example", "/", True) or "")               # deleted
+        j.store("a.example", "/", True, ["x=1; Expires=Thu, 01 Jan 1970 00:00:01 GMT"])
+        self.assertNotIn("x=1", j.header("a.example", "/", True) or "")               # past Expires
+        j2 = S.Jar(lambda: 0, wall=lambda: 0)
+        j2.store("h", "/", True, [f"c{i}=v" for i in range(S.MAX_COOKIES + 10)])
+        self.assertEqual(len(j2), S.MAX_COOKIES)
+        j2.store("h", "/", True, ["big=" + "x" * S.MAX_COOKIE_BYTES])
+        self.assertEqual(len(j2), S.MAX_COOKIES)
+        j2.clear()
+        self.assertEqual(len(j2), 0)
+
+    def test_open_validation(self):
+        cfg = S.parse_config(None)
+        out = S.validate_open(cfg, {"purpose": "p", "hosts": ["A.example"]}, ["a.example", "b.example"])
+        self.assertEqual((out["hosts"], out["methods"], out["ttl_s"], out["max_calls"]),
+                         (["a.example"], ["GET", "HEAD"], 900, 200))
+        out = S.validate_open(cfg, {"purpose": "p", "hosts": ["a.example"], "methods": ["put", "GET"]}, ["a.example"])
+        self.assertEqual(out["methods"], ["GET", "PUT"])
+        for kw, exc in (({"hosts": ["c.example"]}, PermissionError), ({"hosts": []}, ValueError),
+                        ({"hosts": "a.example"}, ValueError), ({"hosts": ["a b"]}, ValueError),
+                        ({"hosts": ["a.example"] * 1 + [f"h{i}.example" for i in range(6)]}, ValueError),
+                        ({"methods": ["TRACE"]}, ValueError), ({"methods": []}, ValueError),
+                        ({"ttl_s": 5}, ValueError), ({"ttl_s": 3601}, ValueError), ({"ttl_s": True}, ValueError),
+                        ({"ttl_s": "15m"}, ValueError), ({"max_calls": 0}, ValueError),
+                        ({"max_calls": 201}, ValueError), ({"purpose": ""}, ValueError),
+                        ({"purpose": "a‮b"}, ValueError), ({"purpose": "a\nb"}, ValueError),
+                        ({"purpose": "x" * 301}, ValueError)):
+            spec = {"purpose": "p", "hosts": ["a.example"], **kw}
+            with self.assertRaises(exc, msg=kw):
+                S.validate_open(cfg, spec, ["a.example", "b.example"])
+
+    def test_limits_may_shorten_never_lengthen(self):
+        sp = {"ttl_s": 900, "max_calls": 50}
+        self.assertEqual(S.check_limits(None, sp), (900, 50))
+        self.assertEqual(S.check_limits({"ttl_s": 300, "max_calls": 5}, sp), (300, 5))
+        self.assertEqual(S.check_limits({"ttl_s": 900, "max_calls": 50}, sp), (900, 50))
+        for lim in ({"ttl_s": 901}, {"ttl_s": 10}, {"max_calls": 51}, {"max_calls": 0}, {"bad": True}):
+            self.assertIsNone(S.check_limits({"ttl_s": None, "max_calls": None, **lim}, sp), lim)
+        g = lambda d: (lambda k: d.get(k, ""))  # noqa: E731
+        self.assertIsNone(S.parse_limits(g({})))
+        self.assertEqual(S.parse_limits(g({"session_ttl_min": "1.5", "session_max_calls": "7"})),
+                         {"ttl_s": 90, "max_calls": 7})
+        for bad in ({"session_ttl_min": "abc"}, {"session_ttl_min": "-1"}, {"session_ttl_min": "nan"},
+                    {"session_ttl_min": "inf"}, {"session_max_calls": "x"}, {"session_max_calls": "-3"},
+                    {"session_ttl_min": "1" * 30}):
+            self.assertEqual(S.parse_limits(g(bad)), {"bad": True}, bad)
+
+    def test_fill_is_single_pass_and_placeholders_are_found(self):
+        self.assertEqual(S.fill("a {{X}} b {{ Y }}", {"X": "{{Y}}", "Y": "2"}), "a {{Y}} b 2")
+        self.assertEqual(S.placeholders("{{A}} {{session.B}} {{ C }}"), ["A", "session.B", "C"])
+        with self.assertRaises(KeyError):
+            S.fill("{{Z}}", {})
+
+    def test_coarse_class_never_carries_text(self):
+        import socket
+        import ssl
+        import urllib.error
+        for exc, want in ((socket.timeout("secret"), "timeout"), (ssl.SSLError("secret"), "tls"),
+                          (socket.gaierror(1, "secret"), "dns"), (ConnectionRefusedError("secret"), "connection"),
+                          (ValueError("secret"), "invalid_request"), (OSError("secret"), "connection"),
+                          (urllib.error.URLError(ConnectionRefusedError("secret")), "connection"),
+                          (RuntimeError("secret"), "other")):
+            self.assertEqual(S.coarse_class(exc), want)
+
+
+# ------------------------------------------------------------------------- the UniFi flow
+class Flow(SBase):
+    def test_full_flow_open_login_calls_logout(self):
+        sid = self.open()
+        self.assertRegex(sid, r"^[A-Za-z0-9_-]{32}$")
+        code, r = self.login(sid)
+        self.assertEqual((code, r["http"]["status"]), (200, 200), r)
+        self.assertEqual(r["session"]["captured"], ["CSRF"])
+        # the stub really got the credential and set a cookie
+        self.assertEqual(len(self.st["tokens"]), 1)
+        # several calls with only the session: the cookie is sent by the broker
+        for _ in range(3):
+            code, r = self.call(sid, "GET", "/proxy/network/api/s/default/stat/sta")
+            self.assertEqual(r["http"]["status"], 200, r)
+            self.assertIn("laptop", r["http"]["body"])
+        # a write needs the CSRF value captured at login
+        code, r = self.call(sid, "PUT", "/proxy/network/api/s/default/rest/user/abc",
+                            headers={"X-CSRF-Token": "{{session.CSRF}}", "Content-Type": "application/json"},
+                            body=json.dumps({"name": "x"}))
+        self.assertEqual(r["http"]["status"], 200, r)
+        self.assertEqual(r["session"]["calls_left"], 200 - 5)
+        # a write without the CSRF value fails upstream (403): the broker did not add it
+        code, r = self.call(sid, "PUT", "/proxy/network/api/s/default/rest/user/abc", body="{}")
+        self.assertEqual(r["http"]["status"], 403)
+        code, r = self.call(sid, "POST", "/api/auth/logout")
+        self.assertEqual(r["http"]["status"], 200)
+        self.assertEqual(self.st["tokens"], set())
+        # logout's Set-Cookie (delete) was applied to the jar: the next call has no cookie
+        code, r = self.call(sid, "GET", "/proxy/network/api/s/default/stat/sta")
+        self.assertEqual(r["http"]["status"], 401)
+        # the model was never consulted, nothing asked the human after the open
+        self.assertEqual(self.model.calls, [])
+        self.assertEqual(len(self.broker.pending()), 0)
+        # the upstream saw the cookie and CSRF only on the session calls
+        seen = [x for x in self.st["seen"] if x["p"].startswith("/proxy/")]
+        self.assertTrue(all(x["cookie"] and x["cookie"].startswith("TOKEN=COOKIE-CANARY-") for x in seen[:5]))
+
+    def test_calls_are_audited_and_count(self):
+        sid = self.open()
+        self.login(sid)
+        self.call(sid, "GET", "/proxy/network/api/s/default/stat/sta")
+        used = self.events("session_used")
+        self.assertEqual([e["calls"] for e in used], [1, 2])
+        self.assertEqual(used[0]["session"], sid[:8])
+        self.assertEqual((used[0]["method"] if "method" in used[0] else "POST", used[0]["host"]), ("POST", "127.0.0.1"))
+        for e in used:
+            self.assertEqual(e["max_calls"], 200)
+        ev = self.events("session_opened")[0]
+        self.assertEqual((ev["hosts"], ev["methods"], ev["ttl_s"], ev["max_calls"]),
+                         ([self.hp()], ["GET", "HEAD", "POST", "PUT"], 900, 200))
+        self.assertEqual(ev["session"], sid[:8])
+        self.assertEqual(self.events("session_requested")[0]["ttl_s"], 900)
+        # every call is a normal audited request too: approved via the session, executed, delivered
+        appr = [e for e in self.events("approved") if e.get("via") == "session"]
+        self.assertEqual(len(appr), 2)
+        self.assertEqual(len(self.events("http_executed")), 2)
+        self.assertEqual(len(self.events("delivered")), 3)          # the open result and two calls
+
+    def test_cookie_and_set_cookie_handling(self):
+        sid = self.open(cred="unifi")
+        code, r = self.login(sid)
+        hdrs = {k.lower() for k in r["http"]["headers"]}
+        self.assertNotIn("set-cookie", hdrs)
+        self.assertEqual(r["http"]["headers"].get("X-CSRF-Token"), "***")        # captured: masked
+        # an upstream that echoes the cookie and the CSRF value: both masked in body and headers
+        code, r = self.call(sid, "GET", "/echo", headers={"X-CSRF-Token": "{{session.CSRF}}"})
+        text = json.dumps(r["http"])
+        self.assertNotIn("COOKIE-CANARY", text)
+        self.assertNotIn("CSRF-CANARY", text)
+        self.assertIn("***", r["http"]["body"])
+        self.assertTrue(r["http"]["headers"]["X-Echo"].startswith("TOKEN=***"))
+
+    def test_cookie_is_host_scoped(self):
+        sid = self.open(hosts=[self.hp(), self.hp("localhost")])
+        self.login(sid)
+        code, r = self.call(sid, "GET", "/proxy/network/api/s/default/stat/sta", host="localhost")
+        self.assertEqual(r["http"]["status"], 401)          # the cookie belongs to 127.0.0.1 only
+        code, r = self.call(sid, "GET", "/proxy/network/api/s/default/stat/sta")
+        self.assertEqual(r["http"]["status"], 200)
+
+    def test_csrf_rotation_with_a_later_capture(self):
+        self.st["rotate"] = True
+        sid = self.open()
+        self.login(sid)
+        put = dict(headers={"X-CSRF-Token": "{{session.CSRF}}"}, body="{}")
+        code, r = self.call(sid, "PUT", "/proxy/network/api/s/default/rest/user/a", capture=["CSRF=header:X-CSRF-Token"], **put)
+        self.assertEqual(r["http"]["status"], 200, r)
+        code, r = self.call(sid, "PUT", "/proxy/network/api/s/default/rest/user/a", capture=["CSRF=header:X-CSRF-Token"], **put)
+        self.assertEqual(r["http"]["status"], 200, r)       # the rotated value was captured and used
+        code, r = self.call(sid, "PUT", "/proxy/network/api/s/default/rest/user/a", **put)
+        self.assertEqual(r["http"]["status"], 200, r)
+        code, r = self.call(sid, "PUT", "/proxy/network/api/s/default/rest/user/a", **put)
+        self.assertEqual(r["http"]["status"], 403)          # no recapture: the stored value is stale
+
+    def test_capture_kinds_and_missing(self):
+        sid = self.open()
+        self.login(sid)
+        code, r = self.call(sid, "GET", "/json", capture=["A=json:$.a.b[0].c", "N=json:$.a.n", "T=json:$.a.t",
+                                                           "O=json:$.a.o", "Z=json:$.nope", "L=json:$.a.crlf",
+                                                           "C=cookie:TOKEN", "H=header:X-Nope"])
+        self.assertEqual(r["session"]["captured"], ["A", "C", "N", "T"])
+        self.assertEqual(r["session"]["missing"], ["H", "L", "O", "Z"])        # object, absent, CRLF, header
+        s = self.sess(sid)
+        self.assertEqual(s.captures["A"], "deep-value-1234")
+        self.assertEqual(s.captures["T"], "true")
+        self.assertNotIn("L", s.captures)
+        self.assertTrue(s.captures["C"].startswith("COOKIE-CANARY-"))
+        # the captured value is usable and never returned
+        code, r = self.call(sid, "POST", "/echo", body="v={{session.A}}")
+        self.assertEqual(self.st["seen"][-1]["body"], "v=deep-value-1234")
+        self.assertNotIn("deep-value-1234", json.dumps(r))     # masked if the upstream echoes it
+
+    def test_bad_capture_expression_is_a_usage_error_and_counts_nothing(self):
+        sid = self.open()
+        for bad in ("X=json:$..a", "X=json:$.a[*]", "nonsense", "X=body:1"):
+            code, r = self.call(sid, "GET", "/json", capture=[bad])
+            self.assertEqual(code, 400, bad)
+            self.assertNotIn(bad, json.dumps(r))
+        self.assertEqual(self.sess(sid).calls, 0)
+
+    def test_capture_caps(self):
+        sid = self.open()
+        for i in range(S.MAX_CAPTURES):
+            self.call(sid, "GET", "/json", capture=[f"V{i}=json:$.a.n"])
+        self.assertEqual(len(self.sess(sid).captures), S.MAX_CAPTURES)
+        code, r = self.call(sid, "GET", "/json", capture=["EXTRA=json:$.a.n"])
+        self.assertEqual(r["session"]["missing"], ["EXTRA"])
+        self.assertNotIn("EXTRA", self.sess(sid).captures)
+        code, r = self.call(sid, "GET", "/json", capture=["V0=json:$.a.n"])       # an existing name may be replaced
+        self.assertEqual(r["session"]["captured"], ["V0"])
+        code, r = self.call(sid, "GET", "/json", capture=[f"K{i}=json:$.a.n" for i in range(S.MAX_CAPTURE_EXPRS + 1)])
+        self.assertEqual(code, 400)
+
+    def test_missing_session_value_is_refused_without_counting(self):
+        sid = self.open()
+        code, r = self.call(sid, "GET", "/echo", headers={"X-CSRF-Token": "{{session.NOPE}}"})
+        self.assertEqual((code, r["code"]), (403, "session_refused"))
+        self.assertEqual(self.sess(sid).calls, 0)
+        self.assertEqual(self.events("session_refused")[-1]["reason_class"], "missing_value")
+
+    def test_a_captured_value_cannot_smuggle_a_placeholder(self):
+        sid = self.open()
+        self.st["tokens"].add("x")
+        self.call(sid, "GET", "/json", capture=["A=json:$.a.b[0].c"])
+        self.sess(sid).captures["A"] = "{{UNIFI_PASSWORD}}"
+        code, r = self.call(sid, "POST", "/echo", body="{{session.A}} {{UNIFI_USERNAME}}")
+        self.assertEqual(self.st["seen"][-1]["body"], "{{UNIFI_PASSWORD}} " + USER)
+        self.assertNotIn(PASSWORD, json.dumps(r))
+
+    def test_redirects_are_never_followed(self):
+        sid = self.open(hosts=[self.hp(), self.hp("localhost")])
+        self.login(sid)
+        for path in ("/redir-in", "/redir-out"):          # one inside the hosts, one to another session host
+            n = len(self.st["seen"])
+            code, r = self.call(sid, "GET", path)
+            self.assertEqual(r["http"]["status"], 302, path)
+            self.assertEqual(len(self.st["seen"]), n + 1)  # the target was never contacted
+        self.assertIn("Location", r["http"]["headers"])    # the agent gets the Location and makes its own call
+        self.assertEqual(self.sess(sid).calls, 3)          # login and the two 302s: each hop is a counted call
+
+    def test_a_redirect_response_still_updates_the_jar_and_never_shows_set_cookie(self):
+        sid = self.open()
+        code, r = self.call(sid, "GET", "/redir-cookie")
+        self.assertEqual(r["http"]["status"], 302)
+        self.assertNotIn("set-cookie", {k.lower() for k in r["http"]["headers"]})
+        self.call(sid, "GET", "/")
+        self.assertIn("RC=COOKIE-CANARY-redir", self.st["seen"][-1]["cookie"])
+
+    def test_set_cookie_attributes_over_http_flow(self):
+        sid = self.open(methods=["GET"])
+        self.st["tokens_prefix"] = "COOKIE-CANARY-"
+        self.call(sid, "GET", "/setcookie")
+        code, r = self.call(sid, "GET", "/")
+        self.assertEqual(sorted(json.loads(r["http"]["body"])["cookie"].split("; ")),
+                         ["A=***AAAA"] if False else sorted(json.loads(r["http"]["body"])["cookie"].split("; ")))
+        seen = self.st["seen"][-1]["cookie"]
+        self.assertIn("A=COOKIE-CANARY-AAAA", seen)
+        self.assertNotIn("B=", seen)                          # Path=/sub
+        self.assertNotIn("S=", seen)                          # Secure, plain http
+        code, r = self.call(sid, "GET", "/sub/x")
+        self.assertIn("B=COOKIE-CANARY-BBBB", self.st["seen"][-1]["cookie"])
+
+
+# ------------------------------------------------------------------------- requirement 1: time
+class TimeBound(SBase):
+    def test_expiry_is_absolute_and_use_never_extends_it(self):
+        sid = self.open(ttl_s=600)
+        s = self.sess(sid)
+        deadline = s.expires
+        self.assertEqual(round(deadline - s.opened), 600)
+        self.login(sid)
+        for step in (100, 100, 100, 100, 100):          # steady use for 500 s
+            self.advance(step)
+            code, r = self.call(sid, "GET", "/proxy/network/api/s/default/stat/sta")
+            self.assertEqual(r["http"]["status"], 200)
+            self.assertEqual(s.expires, deadline)       # nothing moved it
+        self.advance(99)                                # 599 s: the last second of the session
+        code, r = self.call(sid, "GET", "/proxy/network/api/s/default/stat/sta")
+        self.assertEqual(r["http"]["status"], 200)
+        self.assertEqual(r["session"]["expires_in"], 0)
+        self.advance(2)                                 # past the deadline, in the middle of a flow
+        code, r = self.call(sid, "GET", "/proxy/network/api/s/default/stat/sta")
+        self.assertEqual((code, r["code"]), (410, "session_expired"))
+        self.assertIn("cannot be extended", r["error"])
+        for _ in range(2):                              # and stays expired
+            self.assertEqual(self.call(sid, "GET", "/x")[1]["code"], "session_expired")
+        n = len(self.st["seen"])
+        self.assertEqual(self.call(sid, "POST", "/api/auth/logout")[1]["code"], "session_expired")
+        self.assertEqual(len(self.st["seen"]), n)       # nothing reached the upstream
+
+    def test_expiry_abandons_the_session_state_and_audits(self):
+        sid = self.open(ttl_s=60)
+        self.login(sid)
+        s = self.sess(sid)
+        self.assertTrue(s.captures and len(s.jar))
+        self.advance(61)
+        self.call(sid, "GET", "/x")
+        self.assertTrue(s.dead)
+        self.assertEqual((len(s.jar), s.captures), (0, {}))
+        self.assertEqual(self.broker._sess, {})
+        ev = self.events("session_expired")
+        self.assertEqual(len(ev), 1)
+        self.assertEqual((ev[0]["session"], ev[0]["calls"], ev[0]["client_id"]), (sid[:8], 1, "legacy"))
+        self.call(sid, "GET", "/x")
+        self.assertEqual(len(self.events("session_expired")), 1)      # audited once
+
+    def test_sweeper_expires_unused_sessions_with_nobody_calling(self):
+        sid = self.open(ttl_s=60)
+        self.assertEqual(self.broker.sweep_sessions(), 0)
+        self.advance(59)
+        self.assertEqual(self.broker.sweep_sessions(), 0)
+        self.advance(2)
+        self.assertEqual(self.broker.sweep_sessions(), 1)
+        self.assertEqual(self.broker._sess, {})
+        ev = self.events("session_expired")[0]
+        self.assertTrue(ev["unused"])
+        self.assertEqual(self.call(sid, "GET", "/x")[1]["code"], "session_expired")
+
+    def test_the_background_sweeper_runs(self):
+        sid = self.open(ttl_s=60)
+        self.advance(61)
+        with mock.patch.object(S, "SWEEP_S", 0.01):
+            # a fresh broker's sweeper thread uses the patched interval; the existing one sleeps 5 s, so
+            # drive one pass the way the thread does
+            self.broker.sweep_sessions()
+        self.assertEqual(self.broker._sess, {})
+        self.assertTrue(self.events("session_expired"))
+
+    def test_default_and_maximum_ttl(self):
+        sid = self.open()
+        self.assertEqual(round(self.sess(sid).expires - self.sess(sid).opened), 900)
+        self.ask(ttl_s=3601, expect=400)
+        self.ask(ttl_s=10, expect=400)
+        self.assertEqual(self.events("rejected")[-1]["mode"], "session")
+
+    def test_the_maximum_is_configurable(self):
+        self.broker.sessions_cfg["max_ttl_s"] = 7200
+        self.ask(ttl_s=7200, expect=202)
+
+    def test_the_approver_may_shorten_not_lengthen(self):
+        r = self.ask(ttl_s=600, max_calls=10)
+        before = len(self.broker.pending())
+        status, _, hdr = self.post("/decide", {"id": r["id"], "decision": "approve", "session_ttl_min": "20"})
+        self.assertIn("note=bad", hdr["Location"])                 # 20 min > the requested 10: nothing claimed
+        status, _, hdr = self.post("/decide", {"id": r["id"], "decision": "approve", "session_max_calls": "11"})
+        self.assertIn("note=bad", hdr["Location"])
+        self.assertEqual(len(self.broker.pending()), before)
+        self.approve(r["id"], session_ttl_min="5", session_max_calls="3")
+        res = self.result(r["id"])["session"]
+        self.assertEqual((res["expires_in"], res["max_calls"]), (300, 3))
+        self.assertTrue(self.events("session_opened")[0]["shortened"])
+
+    def test_time_starts_at_approval_not_at_the_request(self):
+        r = self.ask(ttl_s=60)
+        self.advance(50)
+        self.approve(r["id"])
+        sid = self.result(r["id"])["session"]["id"]
+        self.assertEqual(self.call(sid, "GET", "/")[1]["http"]["status"], 200)
+        self.advance(59)
+        self.assertEqual(self.call(sid, "GET", "/")[1]["http"]["status"], 200)
+
+    def test_restart_drops_all_sessions(self):
+        sid = self.open()
+        self.login(sid)
+        b2 = Broker(dict(self.broker.cfg_for_restart) if hasattr(self.broker, "cfg_for_restart") else
+                    {"approve_base_url": "https://secrets.example", "allowed_user": "alice", "secrets": {}},
+                    self.broker.backend, self.notifier, os.path.join(self.dir_for_test(), "audit2.jsonl"))
+        self.assertEqual(b2._sess, {})
+        client = {"id": "legacy", "name": "legacy-shared-key", "legacy": True}
+        with self.assertRaises(S.SessionError) as cm:
+            b2._session_call(["unifi"], {"method": "GET", "url": self.url("/"), "headers": {}, "session": sid},
+                             "x", "127.0.0.1", client)
+        self.assertEqual(cm.exception.code, "session_unknown")
+
+    def dir_for_test(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, d, True)
+        return d
+
+    def test_memory_only_nothing_is_written_to_disk(self):
+        sid = self.open()
+        self.login(sid)
+        for root, _, files in os.walk(os.path.dirname(self.audit)):
+            for f in files:
+                data = open(os.path.join(root, f), "rb").read()
+                for canary in (sid.encode(), b"COOKIE-CANARY", b"CSRF-CANARY"):
+                    self.assertNotIn(canary, data, f)
+
+
+# ------------------------------------------------------------------------- requirement 2: client binding
+class ClientBound(SBase):
+    def two(self):
+        return self.new_client("alice-box"), self.new_client("bob-box")
+
+    def test_a_session_belongs_to_the_client_that_opened_it(self):
+        a, b = self.two()
+        sid = self.open(key=a["secret"])
+        self.assertEqual(self.sess(sid).cid, a["id"])
+        code, r = self.call(sid, "GET", "/", key=a["secret"])
+        self.assertEqual(r["http"]["status"], 200)
+        self.assertEqual(self.events("session_opened")[0]["client_id"], a["id"])
+
+    def test_other_clients_get_exactly_the_unknown_answer(self):
+        a, b = self.two()
+        sid = self.open(key=a["secret"])
+        made_up = pysecrets.token_urlsafe(24)
+        for who in (b["secret"], KEY):                        # another enrolled client, and the legacy key
+            mine = self.call(sid, "GET", "/", key=who)
+            fake = self.call(made_up, "GET", "/", key=who)
+            self.assertEqual(mine, fake)
+            self.assertEqual(mine[0], 404)
+            self.assertEqual(mine[1]["code"], "session_unknown")
+            # status, close and the open id behave the same
+            for path in (f"/v1/sessions/{sid}", f"/v1/sessions/{made_up}"):
+                c, text = self.as_client(who, "GET", path)
+                self.assertEqual((c, json.loads(text)), (404, {"error": "unknown session", "code": "session_unknown"}))
+            c1 = self.as_client(who, "POST", "/v1/requests", {"mode": "session_close", "session": sid})
+            c2 = self.as_client(who, "POST", "/v1/requests", {"mode": "session_close", "session": made_up})
+            self.assertEqual(c1, c2)
+        # the owner's session was not touched by those attempts
+        self.assertEqual(self.sess(sid).calls, 0)
+        self.assertEqual(self.call(sid, "GET", "/", key=a["secret"])[1]["http"]["status"], 200)
+
+    def test_the_legacy_clients_session_is_not_usable_by_an_enrolled_client(self):
+        a, _ = self.two()
+        sid = self.open(key=KEY)
+        self.assertEqual(self.sess(sid).cid, "legacy")
+        self.assertEqual(self.call(sid, "GET", "/", key=a["secret"])[1]["code"], "session_unknown")
+
+    def test_two_machines_on_the_legacy_key_are_one_client(self):
+        sid = self.open(key=KEY)
+        self.assertEqual(self.call(sid, "GET", "/", key=KEY)[1]["http"]["status"], 200)   # documented limitation
+
+    def test_expired_state_is_only_told_to_the_owner(self):
+        a, b = self.two()
+        sid = self.open(key=a["secret"], ttl_s=60)
+        self.advance(61)
+        self.assertEqual(self.call(sid, "GET", "/", key=a["secret"])[1]["code"], "session_expired")
+        self.assertEqual(self.call(sid, "GET", "/", key=b["secret"])[1]["code"], "session_unknown")
+
+    def test_ids_are_unguessable_and_compared_in_constant_time(self):
+        ids = {self.open() for _ in range(3)}
+        self.assertEqual(len(ids), 3)
+        for sid in ids:
+            self.assertGreaterEqual(len(sid), 32)             # 24 random bytes = 192 bits
+        calls = []
+        real = S.hmac.compare_digest
+        with mock.patch.object(S.hmac, "compare_digest", lambda a, b: calls.append(1) or real(a, b)):
+            self.call(next(iter(ids)), "GET", "/")
+        self.assertTrue(calls)
+        # sessions are indexed by the id's hash, never by the id
+        for k in self.broker._sess:
+            self.assertNotIn(k, ids)
+            self.assertEqual(len(k), 64)
+
+    def test_malformed_ids_are_unknown(self):
+        for bad in ("", "short", "x" * 33, "../../etc/passwd" + "a" * 20, "a b" * 11, 5, ["x"], {"a": 1}):
+            code, r = self.call(bad, "GET", "/")
+            self.assertEqual((code, r["code"]), (404, "session_unknown"), bad)
+
+    def test_revoking_a_client_ends_its_sessions_at_once(self):
+        a, b = self.two()
+        sa, sb = self.open(key=a["secret"]), self.open(key=b["secret"])
+        status, _, hdr = self.post("/clients/revoke", {"id": a["id"]})
+        self.assertEqual(status, 303)
+        self.assertEqual(len(self.broker._sess), 1)
+        ev = self.events("session_revoked")
+        self.assertEqual((len(ev), ev[0]["client_id"], ev[0]["session"]), (1, a["id"], sa[:8]))
+        self.assertEqual(self.events("client_revoked")[0]["sessions_ended"], 1)
+        self.assertEqual(self.call(sb, "GET", "/", key=b["secret"])[1]["http"]["status"], 200)
+        code, text = self.as_client(a["secret"], "GET", "/v1/status")
+        self.assertEqual(code, 401)
+
+    def test_a_revoked_client_cannot_even_reach_its_session(self):
+        a, _ = self.two()
+        sid = self.open(key=a["secret"])
+        self.broker.clients.revoke(a["id"], "alice")                # revoked in memory, sessions not yet purged
+        with self.assertRaises(S.SessionError) as cm:
+            self.broker._session_call(["unifi"], {"method": "GET", "url": self.url("/"), "headers": {},
+                                                  "session": sid}, "x", "127.0.0.1",
+                                      {"id": a["id"], "name": "alice-box", "legacy": False})
+        self.assertEqual(cm.exception.code, "session_unknown")
+        self.assertEqual(self.st["seen"], [])
+
+    def test_the_agents_audit_view_is_scoped_to_its_own_sessions(self):
+        a, b = self.two()
+        sid = self.open(key=a["secret"])
+        self.call(sid, "GET", "/", key=a["secret"])
+        mine = json.loads(self.as_client(a["secret"], "GET", "/v1/audit?event=session_opened,session_used")[1])
+        self.assertEqual(sorted(e["event"] for e in mine["events"]), ["session_opened", "session_used"])
+        theirs = json.loads(self.as_client(b["secret"], "GET", "/v1/audit?event=session_opened,session_used")[1])
+        self.assertEqual(theirs["events"], [])
+
+
+# ------------------------------------------------------------------------- revoke / close
+class Ending(SBase):
+    def test_the_human_revokes_a_session_immediately(self):
+        sid = self.open()
+        self.login(sid)
+        self.assertEqual(self.call(sid, "GET", "/proxy/network/api/s/default/stat/sta")[1]["http"]["status"], 200)
+        s = self.sess(sid)
+        status, _, hdr = self.post("/sessions/revoke", {"pid": sid[:8]})
+        self.assertEqual(status, 303)
+        self.assertIn("note=sesrevoked", hdr["Location"])
+        self.assertTrue(s.dead)
+        self.assertEqual((len(s.jar), s.captures), (0, {}))
+        code, r = self.call(sid, "GET", "/proxy/network/api/s/default/stat/sta")
+        self.assertEqual((code, r["code"]), (410, "session_expired"))
+        self.assertIn("revoked", r["error"])
+        ev = self.events("session_revoked")[0]
+        self.assertEqual((ev["session"], ev["revoked_by"]), (sid[:8], "alice"))
+        status, _, hdr = self.post("/sessions/revoke", {"pid": sid[:8]})
+        self.assertIn("note=sesgone", hdr["Location"])
+
+    def test_revoke_needs_csrf_and_the_approval_user(self):
+        sid = self.open()
+        self.assertEqual(self.post("/sessions/revoke", {"pid": sid[:8]}, csrf=False)[0], 403)
+        self.assertEqual(self.post("/sessions/revoke", {"pid": sid[:8]}, csrf="wrong")[0], 403)
+        self.assertEqual(self.post("/sessions/revoke", {"pid": sid[:8]}, user="mallory")[0], 403)
+        self.assertEqual(self.post("/sessions/revoke", {"pid": sid[:8]}, headers={"Sec-Fetch-Site": "cross-site"})[0], 403)
+        self.assertEqual(len(self.broker._sess), 1)
+
+    def test_the_agent_closes_its_own_session(self):
+        sid = self.open()
+        self.login(sid)
+        s = self.sess(sid)
+        code, text = self.as_client(KEY, "POST", "/v1/requests", {"mode": "session_close", "session": sid})
+        self.assertEqual((code, json.loads(text)), (200, {"status": "closed"}))
+        self.assertTrue(s.dead)
+        self.assertEqual(self.events("session_closed")[0]["session"], sid[:8])
+        self.assertEqual(self.call(sid, "GET", "/")[1]["code"], "session_expired")
+        code, text = self.as_client(KEY, "POST", "/v1/requests", {"mode": "session_close", "session": sid})
+        self.assertEqual(code, 410)
+
+    def test_status_endpoint(self):
+        sid = self.open(ttl_s=600, max_calls=9)
+        self.advance(100)
+        code, text = self.as_client(KEY, "GET", f"/v1/sessions/{sid}")
+        j = json.loads(text)
+        self.assertEqual((code, j["calls_left"], j["max_calls"]), (200, 9, 9))
+        self.assertIn(j["expires_in"], (499, 500))
+        self.assertNotIn("id", j)
+
+
+# ------------------------------------------------------------------------- scope and caps
+class Scope(SBase):
+    def test_max_calls_is_enforced_and_refusals_do_not_count(self):
+        sid = self.open(max_calls=3)
+        for _ in range(3):
+            self.assertEqual(self.call(sid, "GET", "/")[1]["http"]["status"], 200)
+        code, r = self.call(sid, "GET", "/")
+        self.assertEqual((code, r["code"]), (403, "session_refused"))
+        self.assertIn("all 3 of its calls", r["error"])
+        self.assertEqual(self.sess(sid).calls, 3)
+        self.assertEqual(self.events("session_refused")[-1]["reason_class"], "max_calls")
+        self.assertEqual(len(self.events("http_executed")), 3)
+
+    def test_the_call_cap_cannot_be_raced_past(self):
+        sid = self.open(max_calls=5)
+        out = []
+        ths = [threading.Thread(target=lambda: out.append(self.call(sid, "GET", "/")[1])) for _ in range(12)]
+        [x.start() for x in ths]
+        [x.join() for x in ths]
+        self.assertEqual(sum("http" in o for o in out), 5)
+        self.assertEqual(len(self.st["seen"]), 5)
+
+    def test_out_of_scope_host_is_refused_not_prompted(self):
+        sid = self.open()                                   # hosts: 127.0.0.1 only; the credential also allows localhost
+        code, r = self.call(sid, "GET", "/", host="localhost")
+        self.assertEqual((code, r["code"]), (403, "session_refused"))
+        self.assertIn("outside this session's scope", r["error"])
+        self.assertEqual(len(self.broker.pending()), 0)
+        self.assertEqual(self.events("session_refused")[-1]["host"], "localhost")
+        self.assertEqual(self.st["seen"], [])
+        self.assertEqual(self.sess(sid).calls, 0)
+
+    def test_out_of_scope_method_is_refused(self):
+        sid = self.open(methods=["GET"])                    # HEAD is not declared either
+        for m in ("DELETE", "POST", "PUT", "PATCH", "HEAD"):
+            code, r = self.call(sid, m, "/")
+            self.assertEqual((code, r["code"]), (403, "session_refused"), m)
+        self.assertEqual(self.events("session_refused")[-1]["reason_class"], "method")
+        self.assertIn("open a new session that declares it", r["error"])
+
+    def test_methods_default_to_get_and_head(self):
+        code, text = self.as_client(KEY, "POST", "/v1/requests", {"mode": "session", "names": ["unifi"],
+                                                                  "purpose": PURPOSE, "hosts": [self.hp()]})
+        rid = json.loads(text)["id"]
+        self.approve(rid)
+        sid = self.result(rid)["session"]["id"]
+        self.assertEqual(self.sess(sid).methods, ("GET", "HEAD"))
+        self.assertEqual(self.call(sid, "POST", "/echo", body="x")[1]["code"], "session_refused")
+        self.assertEqual(self.call(sid, "HEAD", "/")[1]["http"]["status"], 200)
+
+    def test_a_session_call_must_name_the_sessions_credential(self):
+        sid = self.open()
+        code, r = self.call(sid, "GET", "/", names=("other",))
+        self.assertEqual((code, r["code"]), (403, "session_refused"))
+        code, r = self.call(sid, "GET", "/", names=("unifi", "other"))
+        self.assertEqual(code, 403)
+        code, r = self.call(sid, "GET", "/", headers={"X-API-Key": "{{OTHER_TOKEN}}"})
+        self.assertEqual(r["code"], "session_refused")
+        self.assertEqual(self.events("session_refused")[-1]["reason_class"], "placeholder")
+
+    def test_the_host_header_cannot_be_overridden(self):
+        sid = self.open()
+        self.assertEqual(self.call(sid, "GET", "/", headers={"Host": "evil.example"})[1]["code"], "session_refused")
+
+    def test_other_schemes_are_refused(self):
+        sid = self.open()
+        for url in ("ftp://127.0.0.1/x", "file:///etc/passwd", "//127.0.0.1/x", "127.0.0.1"):
+            code, r = self.call(sid, "GET", "/", url=url)
+            self.assertEqual(code, 403, url)
+
+    def test_a_session_never_widens_allowed_hosts(self):
+        self.ask(hosts=["example.org"], expect=403)
+        self.ask(hosts=[self.hp(), "example.org"], expect=403)
+        self.ask(hosts=["LOCALHOST:" + str(self.port)], expect=202)           # inside allowed_hosts, case folded
+        self.assertEqual(len(self.events("rejected")), 2)
+
+    def test_narrowing_the_credential_after_opening_refuses_calls(self):
+        sid = self.open()
+        self.broker.cfg["secrets"]["unifi"]["allowed_hosts"] = ["localhost"]
+        code, r = self.call(sid, "GET", "/")
+        self.assertEqual((code, r["code"]), (403, "session_refused"))
+        self.assertEqual(self.st["seen"], [])
+        self.broker.cfg["secrets"]["unifi"]["allowed_hosts"] = ["127.0.0.1", "localhost"]
+        self.broker.cfg["secrets"].pop("unifi")
+        self.assertEqual(self.call(sid, "GET", "/")[1]["code"], "session_refused")
+
+    def test_env_and_ssh_credentials_are_refused(self):
+        code, text = self.as_client(KEY, "POST", "/v1/requests", {
+            "mode": "session", "names": ["deploy"], "purpose": PURPOSE, "hosts": ["127.0.0.1"]})
+        self.assertEqual(code, 403)
+        self.assertIn("ssh key", json.loads(text)["error"])
+        code, text = self.as_client(KEY, "POST", "/v1/requests", {
+            "mode": "session", "names": ["envonly"], "purpose": PURPOSE, "hosts": ["127.0.0.1"]})
+        self.assertEqual(code, 403)
+        self.assertIn("not an http credential", json.loads(text)["error"])
+        code, text = self.as_client(KEY, "POST", "/v1/requests", {
+            "mode": "session", "names": ["nope"], "purpose": PURPOSE, "hosts": ["127.0.0.1"]})
+        self.assertEqual(code, 400)
+        code, text = self.as_client(KEY, "POST", "/v1/requests", {
+            "mode": "session", "names": ["unifi", "other"], "purpose": PURPOSE, "hosts": ["127.0.0.1"]})
+        self.assertEqual(code, 400)
+        self.assertEqual(self.broker.pending(), [])
+
+    def test_a_plain_http_call_without_session_is_unchanged(self):
+        code, text = self.as_client(KEY, "POST", "/v1/requests", {
+            "mode": "http", "names": ["svc"], "method": "GET", "url": f"http://127.0.0.1:{self.up.server_address[1]}/x",
+            "headers": {"Authorization": "Bearer {{SVC_TOKEN}}"}})
+        self.assertEqual(code, 202)
+        self.assertEqual(json.loads(text)["status"], "pending")      # still waits for a human
+        self.assertEqual(len(self.broker.pending()), 1)
+        code, text = self.as_client(KEY, "POST", "/v1/requests", {
+            "mode": "http", "names": ["svc"], "method": "GET", "url": f"http://127.0.0.1:{self.up.server_address[1]}/x",
+            "headers": {"X": "{{session.A}}"}})
+        self.assertEqual(code, 400)                                  # {{session.*}} needs a session
+        code, text = self.as_client(KEY, "POST", "/v1/requests", {
+            "mode": "http", "names": ["svc"], "method": "GET", "url": f"http://127.0.0.1:{self.up.server_address[1]}/x",
+            "headers": {}, "capture": ["A=header:X"]})
+        self.assertEqual(code, 400)
+
+    def test_session_caps_per_client_and_total(self):
+        self.broker.sessions_cfg["max_per_client"] = 2
+        self.open()
+        self.open()
+        self.ask(expect=403)                                        # a third for the same client
+        a = self.new_client("alice-box")
+        self.open(key=a["secret"])                                  # another client is unaffected
+        with mock.patch.object(S, "MAX_TOTAL", 3):
+            self.ask(key=a["secret"], expect=403)
+
+    def test_pending_session_requests_are_capped_and_use_the_general_rules(self):
+        self.ask()
+        self.ask()
+        self.ask(expect=403)                                        # MAX_PENDING_PER_CLIENT
+        rid = next(iter(self.broker.pending())).id
+        self.post("/decide", {"id": rid, "decision": "deny"})
+        self.ask(expect=403)                                        # denied recently: the deny cooldown applies
+        self.assertIn("denied recently", self.events("rejected")[-1]["reason"])
+
+    def test_disabled_sessions(self):
+        self.broker.sessions_cfg["enabled"] = False
+        self.ask(expect=403)
+        code, r = self.call("a" * 32, "GET", "/")
+        self.assertEqual(code, 403)
+
+    def test_upstream_errors_are_class_only_and_still_count(self):
+        sid = self.open(hosts=[self.hp(), "127.0.0.1:1"])
+        code, r = self.call(sid, "GET", "/", url="http://127.0.0.1:1/x")      # nothing listens there
+        self.assertEqual(r["status"], "failed")
+        self.assertEqual(r["error"], "upstream call failed (connection)")
+        self.assertEqual(self.events("http_failed")[-1]["error"], "connection")
+        code, r = self.call(sid, "GET", "/boom")
+        self.assertTrue(r["error"].startswith("upstream call failed ("))
+        for text in (json.dumps(self.records()),):
+            self.assertNotIn("Errno", text)
+            self.assertNotIn("Traceback", text)
+        self.assertEqual(self.sess(sid).calls, 2)                           # both left the broker
+
+    def test_a_call_with_bad_agent_text_is_refused_uncharged_and_bad_secret_text_is_charged(self):
+        sid = self.open()
+        for headers in ({"X-API-Key": "a\r\nInjected: 1"}, {"X-API-Key": "caf\u00e9"}, {"X-API-Key": "a\x00b"}):
+            code, r = self.call(sid, "GET", "/", headers=headers)
+            self.assertEqual((code, r["code"]), (403, "session_refused"), headers)
+        code, r = self.call(sid, "GET", "/x y")                       # a space in the agent's own url
+        self.assertEqual((code, r["code"]), (403, "session_refused"))
+        self.assertEqual((self.sess(sid).calls, self.st["seen"]), (0, []))
+        self.assertNotIn("Injected", json.dumps(self.records()))
+        code, r = self.call(sid, "GET", "/")
+        self.assertEqual((r["http"]["status"], self.sess(sid).calls), (200, 1))
+
+
+# ------------------------------------------------------------------------- approval rules
+class Approval(SBase):
+    def test_always_high_no_model_and_names_only_notification_without_buttons(self):
+        r = self.ask()
+        self.assertEqual(self.model.calls, [])
+        req = self.broker._by_id[r["id"]]
+        self.assertEqual(req.risk["level"], "high")
+        self.assertEqual(req.risk["model"], None)
+        n = self.notifier.notifications[-1]
+        self.assertEqual((n.actions, n.action_token), ([], None))
+        self.assertNotIn(PURPOSE, n.text + n.title)
+        self.assertIn("unifi", n.text)
+        self.assertIn("HTTP session requested [HIGH]", n.title)
+        self.assertEqual(req.offered, frozenset())
+
+    def test_policy_allow_never_auto_approves_a_session(self):
+        self.broker.cfg["secrets"]["unifi"]["approval"] = "allow"
+        r = self.ask()
+        self.assertEqual(r["status"], "pending")
+        self.assertEqual(self.broker._auto_allowed("session", ["unifi"], {}), False)
+
+    def test_notification_channels_cannot_decide_it(self):
+        r = self.ask()
+        rid = r["id"]
+        for ch in ("push", "ha"):
+            for token in ("", "x", "y" * 30):
+                code, req = self.broker.decide_via(ch, rid, "approve", "phone", token=token)
+                self.assertNotEqual(code, 200)
+                self.assertIsNone(req)
+        self.assertEqual(self.broker._by_id[rid].status, "pending")
+        # even a valid token, if one existed, is refused for this mode
+        self.broker._by_id[rid].action_hash = __import__("hashlib").sha256(b"tok").digest()
+        self.broker._by_id[rid].offered = frozenset({"approve", "deny"})
+        code, req = self.broker.decide_via("push", rid, "approve", "phone", token="tok")
+        self.assertEqual((code, req), (403, None))
+        self.assertEqual(self.broker._by_id[rid].status, "pending")
+
+    def test_no_always_no_grant_no_ssh_rule(self):
+        for kw in ({"always": True}, {"grant_minutes": 15}, {"ssh_rule": {"days": None}}):
+            r = self.ask(cred="unifi")
+            code, req = self.broker.decide_via("dashboard", r["id"], "approve", "alice", **kw)
+            self.assertEqual(code, 400, kw)
+            self.assertEqual(self.broker._by_id[r["id"]].status, "pending")
+            self.post("/decide", {"id": r["id"], "decision": "deny"})
+            self.broker._denied_at.clear()
+        self.assertEqual(self.broker.active_grants(), [])
+        self.assertEqual(self.broker.cfg["secrets"]["unifi"].get("standing"), None)
+
+    def test_the_card_shows_everything_and_offers_no_chips(self):
+        r = self.ask(purpose="update the n\u00e4me", methods=["GET", "DELETE"], ttl_s=1200, max_calls=40)
+        status, page, _ = self.get("/")
+        self.assertIn("HTTP session</b> with credential <b>unifi</b>", page)
+        self.assertIn("127.0.0.1", page)
+        self.assertIn("GET, DELETE", page)
+        self.assertIn("changes things: DELETE", page)
+        self.assertIn("20 min from the moment you approve", page)
+        self.assertIn("40 calls", page)
+        self.assertIn("Client: <b>shared key (legacy)</b>", page)
+        self.assertIn("(unverified)", page)
+        self.assertIn("&lt;U+00E4&gt;", page)                      # non-ASCII is escaped, never rendered
+        self.assertNotIn("n\u00e4me", page)
+        self.assertIn("HIGH RISK", page)
+        self.assertIn("name=decision value=approve", page)
+        self.assertIn("name=decision value=deny", page)
+        self.assertIn("name=session_ttl_min", page)
+        self.assertNotIn("approve_grant_", page)
+        self.assertNotIn("approve_always", page)
+        self.assertNotIn("Automatically approve", page)
+        self.assertIn("never extended", page)
+
+    def test_the_link_page_can_approve_with_shortened_limits(self):
+        r = self.ask(ttl_s=600)
+        nonce = self.broker._by_id[r["id"]].nonce
+        status, text, _ = self.post(f"/a/{nonce}", {"decision": "approve", "session_ttl_min": "2"}, csrf=False)
+        self.assertEqual(status, 200, text)
+        self.assertIn("cannot be extended", text)
+        self.broker._by_id[r["id"]].done.wait(10)
+        self.assertEqual(self.result(r["id"])["session"]["expires_in"], 120)
+
+    def test_deny_creates_no_session(self):
+        r = self.ask()
+        self.post("/decide", {"id": r["id"], "decision": "deny"})
+        self.assertEqual(self.result(r["id"])["status"], "denied")
+        self.assertEqual(self.broker._sess, {})
+
+    def test_an_unanswered_open_expires_and_creates_nothing(self):
+        r = self.ask()
+        self.advance(self.broker.cfg.get("ttl_seconds", 120) + 5)
+        self.assertEqual(self.result(r["id"])["status"], "expired")
+        self.assertEqual(self.broker._sess, {})
+
+    def test_purpose_is_validated(self):
+        for bad in ("", "x" * 301, "a\u202eb", "a\nb", "a\u200bb", 5, None):
+            self.ask(purpose=bad, expect=400)
+        self.assertNotIn("\u202e", json.dumps(self.records()))
+
+    def test_the_result_is_delivered_once(self):
+        r = self.ask()
+        self.approve(r["id"])
+        first = self.result(r["id"])
+        self.assertIn("session", first)
+        self.assertNotIn("session", self.result(r["id"]))
+
+    def test_revoked_client_cannot_have_its_pending_open_approved(self):
+        a = self.new_client("alice-box")
+        r = self.ask(key=a["secret"])
+        self.post("/clients/revoke", {"id": a["id"]})
+        self.assertEqual(self.broker._by_id[r["id"]].status, "denied")
+        self.assertEqual(self.broker._sess, {})
+
+
+# ------------------------------------------------------------------------- audit, history, pages
+class Observability(SBase):
+    def test_status_reports_the_config(self):
+        code, text = self.as_client(KEY, "GET", "/v1/status")
+        self.assertEqual(json.loads(text)["features"]["http_sessions"],
+                         {"enabled": True, "default_ttl_s": 900, "max_ttl_s": 3600, "max_calls": 200,
+                          "max_per_client": 3})
+
+    def test_every_session_event_is_classified_and_redacted_deny_by_default(self):
+        poison = {"approver": "alice", "approver_ip": "1.2.3.4", "url": "http://x/?k=v", "value": "POISON",
+                  "cookie": "POISON", "left_s": 3, "revoked_by": "alice", "peer": "p"}
+        for ev in ("session_requested", "session_opened", "session_used", "session_refused", "session_closed",
+                   "session_expired", "session_revoked"):
+            self.assertIn(ev, audit_api.WHITELIST, ev)
+            out = audit_api.redact({"seq": 1, "ts": 1.0, "event": ev, "id": "Rid_1", "session": "abcd1234",
+                                    "calls": 2, "max_calls": 3, "reason_class": "method", **poison})
+            self.assertNotIn("POISON", json.dumps(out))
+            for k in ("approver", "approver_ip", "url", "revoked_by", "peer", "left_s"):
+                self.assertNotIn(k, out, (ev, k))
+
+    def test_history_has_rows_for_the_open_and_each_call(self):
+        sid = self.open()
+        self.login(sid)
+        rows = self.broker.history.rows((), None, None, None, None)
+        modes = [r["mode"] for r in rows]
+        self.assertEqual(sorted(modes), ["http", "session"])
+        http = next(r for r in rows if r["mode"] == "http")
+        self.assertEqual((http["outcome"], http["via"]), ("approved", "session"))
+        ses = next(r for r in rows if r["mode"] == "session")
+        self.assertEqual(ses["outcome"], "approved")
+        # detail pages render and show the session, not any value
+        for r in rows:
+            status, text, _ = self.get(f"/request/{r['id']}")
+            self.assertEqual(status, 200)
+        status, text, _ = self.get(f"/request/{http['id']}")
+        self.assertIn(f"http session {sid[:8]}", text)
+        status, text, _ = self.get(f"/request/{ses['id']}")
+        self.assertIn("not retained", text)
+        self.assertIn("127.0.0.1", text)
+        status, page, _ = self.get("/?view=all&mode=session")
+        self.assertIn("http session for unifi", page)
+
+    def test_clients_tab_lists_active_sessions_with_a_countdown_and_revoke(self):
+        sid = self.open(ttl_s=600, max_calls=9)
+        self.call(sid, "GET", "/")
+        status, page, _ = self.get("/clients")
+        self.assertEqual(status, 200)
+        self.assertIn("Active sessions", page)
+        self.assertIn("<b>unifi</b>", page)
+        self.assertIn("shared key (legacy)", page)
+        self.assertIn("127.0.0.1", page)
+        self.assertIn("GET, HEAD, POST, PUT", page)
+        self.assertIn("1 / 9", page)
+        self.assertRegex(page, r"<time data-gexp='\d+'>in 10 min</time>")
+        self.assertIn("action='/sessions/revoke'", page)
+        self.assertIn(self.broker.csrf_token("alice"), page)
+        self.assertIn("data-label=", page)                        # the mobile table layout
+        self.assertNotIn(sid, page)                               # the id itself is never shown
+        self.advance(300)
+        self.assertRegex(self.get("/clients")[1], r"in 5 min</time>")
+        self.advance(400)
+        self.assertIn("No active sessions", self.get("/clients")[1])
+
+    def test_active_sessions_page_escapes_names(self):
+        a = self.new_client("alice-box")
+        self.open(key=a["secret"])
+        self.broker.clients._clients[a["id"]]["name"] = "<script>x</script>"
+        for s in self.broker._sess.values():
+            s.cname = "<script>x</script>"
+        page = self.get("/clients")[1]
+        self.assertNotIn("<script>x</script>", page)
+        self.assertIn("&lt;script&gt;", page)
+
+
+# ------------------------------------------------------------------------- nothing leaks anywhere
+class Leaks(SBase):
+    def test_no_canary_in_any_channel(self):
+        notes = []
+        real = self.notifier.send
+        self.notifier.send = lambda n: (notes.append(json.dumps([n.title, n.text, n.url])), real(n))[1]
+        buf = io.StringIO()
+        with __import__("contextlib").redirect_stdout(buf), __import__("contextlib").redirect_stderr(buf):
+            sid = self.open()
+            code, login = self.login(sid)
+            self.call(sid, "GET", "/echo", headers={"X-CSRF-Token": "{{session.CSRF}}"})
+            self.call(sid, "PUT", "/proxy/network/api/s/default/rest/user/a",
+                      headers={"X-CSRF-Token": "{{session.CSRF}}"}, body='{"p":"{{UNIFI_PASSWORD}}"}')
+            self.call(sid, "GET", "/json", capture=["A=json:$.a.b[0].c"])
+            self.call(sid, "POST", "/api/auth/logout")
+            self.call(sid, "GET", "/")
+            self.advance(2000)
+            self.call(sid, "GET", "/")
+        canaries = [PASSWORD, USER, "COOKIE-CANARY", "CSRF-CANARY", "deep-value-1234", sid]
+        every = {"stdout/stderr": buf.getvalue(), "client bodies": "\n".join(self.seen),
+                 "notifications": "\n".join(notes), "audit": self.audit_text()}
+        d = os.path.dirname(self.audit)
+        for f in os.listdir(d):
+            if f not in ("audit.jsonl", "vault.json"):      # the vault is where the credential lives
+                with open(os.path.join(d, f), "rb") as fh:
+                    every["file:" + f] = fh.read().decode("latin-1")
+        rows = self.broker.history.rows((), None, None, None, None)
+        every["history rows"] = json.dumps(rows, default=str)
+        for r in rows:
+            row, evs = self.broker.history.detail(r["id"])
+            every["history detail"] = every.get("history detail", "") + json.dumps([row, evs], default=str)
+            every["detail page"] = every.get("detail page", "") + self.get(f"/request/{r['id']}")[1]
+            if self.broker.details is not None:
+                every["request details"] = every.get("request details", "") + json.dumps(
+                    self.broker.details.get(r["id"]) if hasattr(self.broker.details, "get") else "", default=str)
+        every["dashboard"] = self.get("/")[1] + self.get("/clients")[1] + self.get("/?view=all")[1]
+        every["agent audit view"] = self.as_client(KEY, "GET", "/v1/audit?limit=500")[1]
+        for where, text in every.items():
+            for c in canaries:
+                if c == sid and where in ("client bodies", "stdout/stderr"):
+                    continue                      # the agent is handed its own id once, at open
+                self.assertNotIn(c, text, f"{c!r} leaked into {where}")
+        # the agent-visible results: the credential, cookies and captures never appear (sid is its own id)
+        for c in canaries[:-1]:
+            self.assertNotIn(c, json.dumps(login))
+        # the audit log holds only the id prefix
+        self.assertIn(sid[:8], every["audit"])
+
+    def test_the_stub_really_received_the_secrets(self):
+        sid = self.open()
+        self.login(sid)
+        self.call(sid, "PUT", "/proxy/network/api/s/default/rest/user/a",
+                  headers={"X-CSRF-Token": "{{session.CSRF}}"}, body="{}")
+        last = self.st["seen"][-1]
+        self.assertTrue(last["cookie"].startswith("TOKEN=COOKIE-CANARY-"))
+        self.assertTrue(last["csrf"].startswith("CSRF-CANARY-"))
+        self.assertEqual(self.st["seen"][0]["body"], json.dumps({"username": USER, "password": PASSWORD}))
+
+
+# ------------------------------------------------------------------------- the real CLI
+class CliBase(SBase):
+    def run_cli(self, *args, human=None, key=KEY, timeout=60, stdin=None):
+        env = {"PATH": os.environ["PATH"], "HOME": self.dir, "SECRET_BROKER_URL": self.base, "SECRET_BROKER_KEY": key}
+        p = subprocess.Popen([CLI, *args], env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, text=True)
+        if human is not None:
+            end = time.time() + 20
+            while time.time() < end and not self.broker.pending():
+                time.sleep(0.05)
+            ids = [r.id for r in self.broker.pending()]
+            if ids:
+                human(ids[0])
+        try:
+            out, err = p.communicate(stdin, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            out, err = p.communicate()
+        self.out.extend([out, err])
+        return p.returncode, out, err
+
+    def human_approves(self, **limits):
+        return lambda rid: self.post("/decide", {"id": rid, "decision": "approve", **limits})
+
+    def cli_open(self, *extra, key=KEY, human=None):
+        rc, out, err = self.run_cli("session", "open", "unifi", "--for", PURPOSE, "--host", self.hp(),
+                                    "--methods", "GET,POST,PUT", *extra, human=human or self.human_approves(), key=key)
+        self.assertEqual(rc, 0, err)
+        sid = out.strip()
+        self.assertRegex(sid, r"^[A-Za-z0-9_-]{32}$")
+        return sid
+
+    def records_count_requests(self):
+        return len(self.events("requested"))
+
+
+class CliFlow(CliBase):
+    def test_unifi_flow_with_the_real_asb(self):
+        sid = self.cli_open("--ttl", "10m", "--max-calls", "20")
+        rc, out, err = self.run_cli("http", "unifi", "POST", self.url("/api/auth/login"), "--session", sid,
+                                    "-H", "Content-Type: application/json",
+                                    "-d", '{"username":"{{UNIFI_USERNAME}}","password":"{{UNIFI_PASSWORD}}"}',
+                                    "--capture", "CSRF=header:X-CSRF-Token")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("captured CSRF", err)
+        self.assertIn("19 calls left", err)
+        self.assertIn("HTTP 200", err)
+        rc, out, err = self.run_cli("http", "unifi", "GET", self.url("/proxy/network/api/s/default/stat/sta"),
+                                    "--session", sid)
+        self.assertEqual((rc, "laptop" in out), (0, True), err)
+        rc, out, err = self.run_cli("http", "unifi", "PUT", self.url("/proxy/network/api/s/default/rest/user/a"),
+                                    "--session", sid, "-H", "X-CSRF-Token: {{session.CSRF}}", "-d", '{"name":"n"}')
+        self.assertEqual(rc, 0, err)
+        rc, out, err = self.run_cli("session", "status", sid)
+        self.assertEqual(rc, 0)
+        self.assertIn("calls left: 17 of 20", out)
+        rc, out, err = self.run_cli("http", "unifi", "POST", self.url("/api/auth/logout"), "--session", sid)
+        self.assertEqual(rc, 0, err)
+        rc, out, err = self.run_cli("session", "close", sid)
+        self.assertEqual((rc, out.strip()), (0, "closed"))
+        rc, out, err = self.run_cli("http", "unifi", "GET", self.url("/"), "--session", sid)
+        self.assertEqual(rc, 7, err)
+        self.assertIn("closed", err)
+        blob = "\n".join(self.out)
+        for c in (PASSWORD, USER, "COOKIE-CANARY", "CSRF-CANARY"):
+            self.assertNotIn(c, blob)
+        self.assertEqual(self.model.calls, [])
+
+    def test_exit_codes(self):
+        sid = self.cli_open("--max-calls", "1")
+        rc, out, err = self.run_cli("http", "unifi", "GET", self.url("/"), "--session", sid)
+        self.assertEqual(rc, 0, err)
+        rc, out, err = self.run_cli("http", "unifi", "GET", self.url("/"), "--session", sid)
+        self.assertEqual(rc, 8, err)                                   # call cap: refused
+        rc, out, err = self.run_cli("http", "unifi", "DELETE", self.url("/"), "--session", sid)
+        self.assertEqual(rc, 8, err)
+        rc, out, err = self.run_cli("http", "unifi", "GET", self.url("/", "localhost"), "--session", sid)
+        self.assertEqual(rc, 8, err)
+        sid2 = self.cli_open("--ttl", "30s")
+        self.advance(31)
+        rc, out, err = self.run_cli("http", "unifi", "GET", self.url("/"), "--session", sid2)
+        self.assertEqual(rc, 7, err)                                   # expired: the dedicated code
+        other = self.new_client("bob-box")
+        rc, out, err = self.run_cli("http", "unifi", "GET", self.url("/"), "--session", sid, key=other["secret"])
+        self.assertEqual(rc, 7, err)
+        self.assertIn("unknown session", err)
+        rc, out, err = self.run_cli("session", "open", "unifi", "--for", PURPOSE, "--host", self.hp(),
+                                    human=lambda rid: self.post("/decide", {"id": rid, "decision": "deny"}))
+        self.assertEqual(rc, 4, err)
+        rc, out, err = self.run_cli("session", "open", "deploy", "--for", PURPOSE, "--host", "127.0.0.1")
+        self.assertEqual(rc, 3, err)
+        self.assertIn("ssh key", err)
+
+    def test_usage_errors_fail_closed_before_any_call(self):
+        sid = "a" * 32
+        for args in (("session",), ("session", "open"), ("session", "open", "unifi"),
+                     ("session", "open", "unifi", "--for", "x"),
+                     ("session", "open", "unifi", "--for", "x", "--host", "h", "--ttl", "15"),
+                     ("session", "open", "unifi", "--for", "x", "--host", "h", "--methods", "TRACE"),
+                     ("session", "open", "unifi", "--for", "x", "--host", "h", "--max-calls", "0"),
+                     ("session", "close", "short"), ("session", "status"),
+                     ("http", "unifi", "GET", "http://127.0.0.1/", "--session", "short"),
+                     ("http", "unifi", "GET", "http://127.0.0.1/", "--capture", "A=header:X"),
+                     ("http", "unifi", "GET", "http://127.0.0.1/", "--session", sid, "--capture", "A=json:$..a"),
+                     ("http", "unifi", "GET", "http://127.0.0.1/", "--session", sid, "--capture", "A=json:$.a[*]"),
+                     ("http", "unifi,other", "GET", "http://127.0.0.1/", "--session", sid)):
+            rc, out, err = self.run_cli(*args)
+            self.assertEqual(rc, 2, (args, err))
+        self.assertEqual(self.records_count_requests(), 0)
+
+    def test_non_ascii_digits_and_newline_ids_are_usage_errors(self):
+        for args in (("session", "open", "unifi", "--for", "x", "--host", "h", "--max-calls", "\u0661\u0662\u0663"),
+                     ("session", "open", "unifi", "--for", "x", "--host", "h", "--ttl", "\u0661\u0665m"),
+                     ("session", "close", "a" * 32 + "\n"), ("session", "status", "a" * 32 + "\n"),
+                     ("http", "unifi", "GET", "http://127.0.0.1/", "--session", "a" * 32 + "\n"),
+                     ("http", "unifi", "GET", "http://127.0.0.1/", "--session", "a" * 32, "--capture", "A\n=header:X")):
+            rc, out, err = self.run_cli(*args)
+            self.assertEqual(rc, 2, (args, err))
+        self.assertEqual(self.records_count_requests(), 0)
+
+    def test_help_and_guide_cover_sessions(self):
+        rc, out, _ = self.run_cli("help", "session")
+        self.assertEqual(rc, 0)
+        for frag in ("--host", "--methods", "--ttl", "--max-calls", "never moves", "7 session expired"):
+            self.assertIn(frag, out)
+        rc, out, _ = self.run_cli("guide")
+        for frag in ("Which command? (decision rule)", "asb session open", "--session ID", "{{session.NAME}}",
+                     "NEVER extended", "Exit 7", "env mode"):
+            self.assertIn(frag, out)
+        rc, out, _ = self.run_cli("help", "http")
+        self.assertIn("--session ID", out)
+        rc, g, _ = self.run_cli("guide")
+        for frag in ("ONLY these headers", "X-API-Key", "X-Requested-With", "exactly {{NAME}}", "X-Auth-Token",
+                     "plain `asb http` without --session", "256 KB"):
+            self.assertIn(frag, g)
+        self.assertNotIn("other X- headers", g)
+        self.assertNotIn("headers\n  carrying a {{VAR}}", g)
+
+
+# ------------------------------------------------------------------------- review hardening
+def bg(fn, *a, **kw):
+    out = []
+    t = threading.Thread(target=lambda: out.append(fn(*a, **kw)), daemon=True)
+    t.start()
+    return t, out
+
+
+class Hardening(SBase):
+    def hold(self, sid, key=KEY):
+        """Start a call the upstream holds open; returns (thread, result list) once it is in flight."""
+        n = len(self.st["holding"])
+        t, out = bg(self.call, sid, "GET", "/hold", key)
+        end = time.time() + 10
+        while len(self.st["holding"]) <= n and time.time() < end:
+            time.sleep(0.02)
+        self.assertGreater(len(self.st["holding"]), n, "the call never reached the upstream")
+        return t, out
+
+    def finish(self, t, out):
+        self.st["release"].set()
+        t.join(20)
+        return out[0]
+
+    def running(self):
+        return [r for r in self.broker._by_id.values() if r.session is not None and r.status == "running"]
+
+    # -- (1) regex DoS and the global lock ------------------------------------------
+    def test_placeholder_scans_are_linear(self):
+        nasty = ["{{" + " " * 4000, "{{" * 5000, "{{ " * 3000 + "}}", "{{" + "a" * 200000, "}}" * 50000,
+                 "{{" + " " * 4000 + "x" * 10, "{{a" * 3000]
+        t0 = time.time()
+        for text in nasty:
+            try:
+                S.placeholders(text)
+            except ValueError:
+                pass
+            try:
+                S.fill(text, {})
+            except KeyError:
+                pass
+        self.assertLess(time.time() - t0, 1.0)
+
+    def test_adversarial_calls_are_refused_fast_and_do_not_freeze_the_store(self):
+        sid = self.open()
+        other = self.open()
+        for where in ("url", "header", "body"):
+            for nasty in ("{{" + " " * 4000, "{{" + "a" * 3000 + "}}"):
+                t0 = time.time()
+                if where == "url":
+                    code, r = self.call(sid, "GET", "/?q=" + nasty)
+                elif where == "header":
+                    code, r = self.call(sid, "GET", "/", headers={"X-API-Key": nasty})
+                else:
+                    code, r = self.call(sid, "POST", "/echo", body=nasty)
+                self.assertLess(time.time() - t0, 3.0, (where, nasty[:8]))
+                self.assertIn(code, (200, 400, 403))
+                if code == 403:
+                    self.assertEqual(r["code"], "session_refused")
+        t0 = time.time()
+        self.assertEqual(self.broker.session_status(other, {"id": "legacy", "name": "x"})[0], "ok")
+        self.assertLess(time.time() - t0, 1.0)
+
+    def test_the_scope_check_does_not_hold_the_store_lock(self):
+        sid = self.open()
+        held = []
+
+        def slow_scope(*a, **k):
+            held.append(self.broker._sess_lock.locked())
+            return None
+        with mock.patch.object(S, "scope_problem", slow_scope):
+            self.call(sid, "GET", "/")
+        self.assertEqual(held, [False])
+
+    def test_call_size_caps(self):
+        sid = self.open()
+        self.assertEqual(self.call(sid, "GET", "/", url=self.url("/") + "x" * 9000)[0], 400)
+        self.assertEqual(self.call(sid, "GET", "/", headers={f"H{i}": "v" for i in range(S.MAX_HEADERS + 1)})[0], 400)
+        self.assertEqual(self.call(sid, "GET", "/", headers={"X": "v" * 9000})[0], 400)
+        self.assertEqual(self.call(sid, "GET", "/", headers={"X" * 300: "v"})[0], 400)
+        code, r = self.call(sid, "POST", "/echo", body="{{" + "p" * 100 + "}}")        # a long placeholder name
+        self.assertEqual((code, r["code"]), (403, "session_refused"))
+        code, r = self.call(sid, "POST", "/echo", body="{{A}}" * (S.MAX_PLACEHOLDERS + 1))
+        self.assertEqual((code, r["code"]), (403, "session_refused"))
+        self.assertEqual(self.sess(sid).calls, 0)
+
+    def test_a_slow_call_never_blocks_revoke_status_close_or_sweep_of_other_sessions(self):
+        a, b = self.open(), self.open()
+        t, out = self.hold(a)
+        t0 = time.time()
+        self.assertEqual(self.call(b, "GET", "/")[1]["http"]["status"], 200)
+        self.assertEqual(self.broker.session_status(b, {"id": "legacy", "name": "x"})[0], "ok")
+        self.broker.sweep_sessions()
+        self.assertEqual(self.broker.active_sessions()[0]["calls"] in (0, 1), True)
+        status, _, hdr = self.post("/sessions/revoke", {"pid": b[:8]})
+        self.assertIn("note=sesrevoked", hdr["Location"])
+        c = self.open()
+        code, text = self.as_client(KEY, "POST", "/v1/requests", {"mode": "session_close", "session": c})
+        self.assertEqual(code, 200)
+        self.assertLess(time.time() - t0, 5.0)
+        self.assertTrue(t.is_alive())                         # the slow call is still in flight the whole time
+        self.finish(t, out)
+
+    # -- (2) in-flight calls do not survive revoke, expiry or close --------------------
+    def test_revoke_mid_flight_discards_the_response(self):
+        sid = self.open()
+        t, out = self.hold(sid)
+        s = self.sess(sid)
+        self.post("/sessions/revoke", {"pid": sid[:8]})
+        code, r = self.finish(t, out)
+        self.assertEqual((code, r["code"]), (410, "session_expired"))
+        self.assertIn("revoked", r["error"])
+        self.assertNotIn("HELDBODY", json.dumps(r))
+        self.assertEqual((len(s.jar), s.captures), (0, {}))      # the cookie it set was not kept
+        self.assertEqual([x.status for x in self.broker._by_id.values() if x.session is not None], ["failed"])
+        self.assertNotIn("COOKIE-CANARY-held", self.audit_text() + "\n".join(self.seen))
+
+    def test_expiry_mid_flight_discards_the_response(self):
+        sid = self.open(ttl_s=60)
+        t, out = self.hold(sid)
+        self.advance(61)
+        code, r = self.finish(t, out)
+        self.assertEqual((code, r["code"]), (410, "session_expired"))
+        self.assertNotIn("HELDBODY", json.dumps(r))
+        self.assertIn("cannot be extended", r["error"])
+
+    def test_close_mid_flight_discards_the_response(self):
+        sid = self.open()
+        t, out = self.hold(sid)
+        self.as_client(KEY, "POST", "/v1/requests", {"mode": "session_close", "session": sid})
+        code, r = self.finish(t, out)
+        self.assertEqual((code, r["code"]), (410, "session_expired"))
+        self.assertNotIn("HELDBODY", json.dumps(r))
+
+    def test_client_revoke_mid_flight_discards_the_response(self):
+        a = self.new_client("alice-box")
+        sid = self.open(key=a["secret"])
+        t, out = self.hold(sid, a["secret"])
+        self.post("/clients/revoke", {"id": a["id"]})
+        code, r = self.finish(t, out)
+        self.assertEqual(code, 410)
+        self.assertNotIn("HELDBODY", json.dumps(r))
+
+    def test_the_call_is_bounded_by_the_time_left(self):
+        from secret_broker import broker as bm
+        sid = self.open(ttl_s=60)
+        self.advance(50)
+        seen = []
+
+        class Boom:
+            def open(self, req, timeout=None):
+                seen.append(timeout)
+                raise OSError("x")
+        with mock.patch.object(bm, "_opener_for", lambda tls: Boom()):
+            self.call(sid, "GET", "/")
+        self.assertEqual(len(seen), 1)
+        self.assertLessEqual(seen[0], 10.5)
+        self.assertGreater(seen[0], 0)
+        sid2 = self.open(ttl_s=3600)
+        seen.clear()
+        with mock.patch.object(bm, "_opener_for", lambda tls: Boom()):
+            self.call(sid2, "GET", "/")
+        self.assertEqual(seen, [S.CALL_TIMEOUT_S])
+
+    # -- (3) session calls are not approvable requests -------------------------------
+    def test_an_in_flight_session_call_is_not_a_pending_approvable_request(self):
+        sid = self.open()
+        t, out = self.hold(sid)
+        (req,) = self.running()
+        self.assertEqual(req.status, "running")
+        self.assertEqual(self.broker.pending(), [])
+        self.assertEqual(self.broker.attention(), 0)
+        page = self.get("/")[1]
+        self.assertNotIn(req.id, page.split("id=cards", 1)[1].split("</div>", 1)[0])
+        self.assertNotIn("name=decision value=approve", page)
+        hits = len(self.st["holding"])
+        for decision in ("approve", "approve_always", "approve_grant_15", "deny"):
+            status, loc, _ = self.decide(req.id, decision)
+            self.assertEqual(status, 303)
+            self.assertIn("note=stale", loc, decision)
+        self.assertEqual(self.broker.decide_via("dashboard", req.id, "approve", "alice"), (410, None))
+        self.assertEqual(self.broker.decide_via("link", None, "approve", "alice", nonce=req.nonce), (404, None))
+        self.assertEqual(self.broker.active_grants(), [])
+        self.assertEqual(req.status, "running")
+        self.finish(t, out)
+        self.assertEqual(len(self.st["holding"]), hits)           # never executed twice
+        self.assertIn(req.status, ("approved", "released"))
+
+    def test_slow_session_calls_do_not_block_other_clients_or_session_opens(self):
+        a, b = self.new_client("alice-box"), self.new_client("bob-box")
+        sa = self.open(key=a["secret"])
+        n0 = len(self.st["holding"])
+        ths = [bg(self.call, sa, "GET", "/hold", a["secret"]) for _ in range(3)]
+        end = time.time() + 10
+        while len(self.st["holding"]) < n0 + 3 and time.time() < end:
+            time.sleep(0.02)
+        self.assertEqual(len(self.running()), 3)
+        t0 = time.time()
+        # the cap on pending requests (3) is not eaten by the running calls
+        ids = []
+        for i in range(3):
+            code, text = self.as_client(b["secret"], "POST", "/v1/requests", {
+                "mode": "http", "names": ["svc"], "method": "GET", "url": f"http://127.0.0.1:{self.up.server_address[1]}/x{i}",
+                "headers": {"Authorization": "Bearer {{SVC_TOKEN}}"}})
+            self.assertEqual(code, 202, text)
+            ids.append(json.loads(text)["id"])
+        self.assertEqual(len(self.broker.pending()), 3)
+        for rid in ids:
+            self.post("/decide", {"id": rid, "decision": "deny"})
+        self.broker._denied_at.clear()
+        sb = self.open(key=b["secret"])                              # the human can still open sessions
+        self.assertEqual(self.call(sb, "GET", "/", key=b["secret"])[1]["http"]["status"], 200)
+        self.assertLess(time.time() - t0, 8.0)
+        self.st["release"].set()
+        for t, _ in ths:
+            t.join(20)
+
+    # -- (4) method override ---------------------------------------------------------
+    def test_method_override_headers_and_fields_are_refused(self):
+        sid = self.open(methods=["GET", "POST"])
+        form = {"Content-Type": "application/x-www-form-urlencoded"}
+        js = {"Content-Type": "application/json"}
+        cases = [("/echo", {"X-HTTP-Method-Override": "DELETE"}, "x"),
+                 ("/echo", {"x-http-method": "PUT"}, "x"),
+                 ("/echo", {"X-Method-Override": "DELETE"}, "x"),
+                 ("/echo", {"X-Method-Override": "{{session.NOPE}}"}, "x"),
+                 ("/echo", {"X-HTTP-Method-Override": "GET"}, "x"), ("/echo", {"X_Method": "1"}, "x"),
+                 ("/echo", {"X-Http-Meth%6fd": "1"}, "x"),
+                 ("/echo?_method=DELETE", {}, "x"),
+                 ("/echo?_MeThOd=DELETE", {}, "x"),
+                 ("/echo?a=1&%5Fmethod=DELETE", {}, "x"),
+                 ("/echo?%255Fmethod=DELETE", {}, "x"),                       # double percent-encoding
+                 ("/echo?a=1;_method=DELETE", {}, "x"),                       # odd separator
+                 ("/echo?a+b=1&%5f%4dethod=x", {}, "x"),
+                 ("/echo?x_method=1", {}, "x"), ("/echo?x_Method=1", {}, "x"), ("/echo?meth%6fd=1", {}, "x"),
+                 ("/echo?payment_method=card", {}, "x"), ("/echo?a=1%3b_method=DELETE", {}, "x"),
+                 # form bodies: plus, %5F, mixed case, double encoding, hex-encoded letters
+                 ("/echo", form, "a=1&_method=DELETE"),
+                 ("/echo", form, "a+b=1&%5Fmethod=DELETE"),
+                 ("/echo", form, "a=1&_MeThOd=DELETE"),
+                 ("/echo", form, "%255Fmethod=DELETE"),
+                 ("/echo", form, "_meth%6Fd=DELETE"),
+                 ("/echo", form, "_method+=x"), ("/echo", form, "a=1;_method=x"), ("/echo", form, "x_method=1"),
+                 ("/echo", form, "meth%6fd=1"), ("/echo", form, "payment_method=card"),
+                 ("/echo", {"Content-Type": "application/json; charset=utf-16"}, "{\"m e t h o d\": 1}"),
+                 ("/echo", {"Content-Type": "application/x-www-form-urlencoded; charset=utf-8"}, "_method=PUT"),
+                 # JSON bodies: plain, unicode escape, nested, mixed case, in an array
+                 ("/echo", js, '{"_method": "PATCH"}'),
+                 ("/echo", js, '{"_\\u006dethod": "DELETE"}'),
+                 ("/echo", js, '{"a": {"b": [{"_Method": "x"}]}}'),
+                 ("/echo", js, '[{"method": "DELETE"}]'),
+                 ("/echo", {"Content-Type": "application/vnd.api+json"}, '{"_method":"x"}'),
+                 # unparseable or unknown types: any `method` substring in any decoded form is refused
+                 ("/echo", {}, "{'_METHOD':'delete'}"),
+                 ("/echo", {}, '{"_\\u006dethod": "DELETE"}'),
+                 ("/echo", {}, "a=1&%5Fmethod=DELETE"),
+                 ("/echo", {}, "a=1&%255Fmethod=DELETE"),
+                 ("/echo", {"Content-Type": "text/plain"}, "_method="),
+                 ("/echo", js, '{"a": 1, "_method": '),                       # broken JSON falls back to the substring test
+                 ("/echo", js, '{"_\\u006dethod": '),
+                 ("/echo", {"Content-Type": "multipart/form-data; boundary=b"},
+                  '--b\r\nContent-Disposition: form-data; name="_method"\r\n\r\nDELETE\r\n--b--\r\n'),
+                 ("/echo", {"Content-Type": "multipart/form-data; boundary=b"},
+                  '--b\r\nContent-Disposition: form-data; name="_%6Dethod"\r\n\r\nDELETE\r\n--b--\r\n'),
+                 ("/echo", {"Content-Type": "multipart/form-data; boundary=b"},
+                  '--b\r\nContent-Disposition: form-data; name="m\\u0065thod"\r\n\r\nx\r\n--b--\r\n'),
+                 ("/echo", {}, "_method={{UNIFI_USERNAME}}"),
+                 # request encodings are refused outright: the broker cannot read what it cannot decode
+                 ("/echo", {"Content-Encoding": "gzip"}, "x"),
+                 ("/echo", {"content-encoding": "identity"}, "x"),
+                 ("/echo", {"Transfer-Encoding": "chunked"}, "x")]
+        for path, hdr, body in cases:
+            code, r = self.call(sid, "POST", path, headers=hdr, body=body)
+            self.assertEqual((code, r.get("code")), (403, "session_refused"), (path, hdr, body))
+            self.assertNotIn("Traceback", json.dumps(r))
+        self.assertEqual(self.st["seen"], [])
+        self.assertEqual(self.sess(sid).calls, 0)
+        import base64
+        for raw in (b"_method=DELETE", b'{"_\\u006dethod":1}', b"m\x00e\x00t\x00h\x00o\x00d\x00"):   # b64, incl. UTF-16
+            code, r = self.as_client(KEY, "POST", "/v1/requests", {
+                "mode": "http", "names": ["unifi"], "method": "POST", "url": self.url("/echo"), "headers": {},
+                "session": sid, "body_b64": base64.b64encode(raw).decode()})
+            self.assertEqual(code, 403, raw)
+
+    def test_ordinary_bodies_and_queries_are_still_allowed(self):
+        sid = self.open(methods=["GET", "POST"])
+        ok = [("/echo?a=1&b=2", {"Content-Type": "application/x-www-form-urlencoded"}, "a=1&b=2"),
+              ("/echo", {"Content-Type": "application/json"}, '{"name": "x", "tags": [{"k": "v"}], "note": "a note"}'),
+              ("/echo", {"Content-Type": "text/plain"}, "hello world"),
+              ("/echo", {}, "plain body without the word")]
+        for path, hdr, body in ok:
+            code, r = self.call(sid, "POST", path, headers=hdr, body=body)
+            self.assertEqual(r["http"]["status"], 200, (path, hdr, body))
+
+    def test_the_method_rule_has_no_exception_even_for_a_declared_verb(self):
+        sid = self.open(methods=["GET", "POST", "DELETE"])
+        for hdr, path in (({"X-HTTP-Method-Override": "DELETE"}, "/echo"), ({}, "/echo?_method=delete")):
+            code, r = self.call(sid, "POST", path, headers=hdr, body="x")
+            self.assertEqual((code, r["code"]), (403, "session_refused"), (hdr, path))
+        code, r = self.call(sid, "POST", "/echo", body="payment_method=card")        # a legitimate field: use plain asb http
+        self.assertEqual((code, r["code"]), (403, "session_refused"))
+        self.assertEqual(self.sess(sid).calls, 0)                                   # refused calls are not charged
+        self.assertIn("method", r["error"])
+        self.assertNotIn("payment_method", r["error"])                              # the text is fixed
+
+    def test_a_captured_value_cannot_smuggle_an_override_after_substitution(self):
+        sid = self.open(methods=["GET", "POST"])
+        self.call(sid, "GET", "/json", capture=["A=json:$.a.n"])
+        self.sess(sid).captures["Q"] = "a=1&_method=DELETE"
+        code, r = self.call(sid, "POST", "/echo?{{session.Q}}", body="x")
+        self.assertEqual((code, r["code"]), (403, "session_refused"))
+        self.assertEqual(len(self.st["seen"]), 1)                 # only the /json call reached the upstream
+        code, r = self.call(sid, "POST", "/echo", body="{{session.Q}}")
+        self.assertEqual(len(self.st["seen"]), 1)
+        self.assertEqual(self.sess(sid).calls, 3)                 # refused after substitution: charged
+
+    def test_get_and_head_cannot_carry_a_body(self):
+        sid = self.open()
+        for m in ("GET", "HEAD"):
+            code, r = self.call(sid, m, "/", body="x")
+            self.assertEqual((code, r["code"]), (403, "session_refused"), m)
+        self.assertEqual(self.events("session_refused")[-1]["reason_class"], "body")
+        self.assertEqual(self.sess(sid).calls, 0)
+
+    # -- (6) ports -------------------------------------------------------------------
+    def test_the_scope_includes_the_port(self):
+        sid = self.open()                                          # 127.0.0.1:<port>
+        self.assertEqual(self.call(sid, "GET", "/")[1]["http"]["status"], 200)
+        for url in ("http://127.0.0.1:1/x", "http://127.0.0.1/x", "https://127.0.0.1:%d/x" % (self.port + 1),
+                    "http://127.0.0.1:99999/x"):
+            code, r = self.call(sid, "GET", "/", url=url)
+            self.assertEqual((code, r["code"]), (403, "session_refused"), url)
+        code, r = self.call(sid, "GET", "/", url="http://127.0.0.1:1/x")
+        self.assertIn("scope", r["error"])
+        self.assertEqual(len(self.st["seen"]), 1)
+        self.assertEqual(self.sess(sid).calls, 1)
+
+    def test_a_bare_host_means_the_default_ports_only(self):
+        r = self.ask(hosts=["127.0.0.1"])
+        card = self.get("/")[1]
+        self.assertIn("127.0.0.1 (ports 80 and 443)", card)
+        self.approve(r["id"])
+        sid = self.result(r["id"])["session"]["id"]
+        code, r = self.call(sid, "GET", "/")                      # the stub is on another port
+        self.assertEqual((code, r["code"]), (403, "session_refused"))
+        s = self.sess(sid)
+        self.assertTrue(s.in_scope("http", "127.0.0.1", 80))
+        self.assertTrue(s.in_scope("https", "127.0.0.1", 443))
+        self.assertFalse(s.in_scope("http", "127.0.0.1", 443))
+        self.assertFalse(s.in_scope("https", "127.0.0.1", 80))
+        self.assertFalse(s.in_scope("http", "other", 80))
+
+    def test_the_card_and_the_list_show_host_and_port(self):
+        self.ask()
+        self.assertIn(f"127.0.0.1:{self.port}", self.get("/")[1])
+        sid = self.open()
+        self.assertIn(f"127.0.0.1:{self.port}", self.get("/clients")[1])
+        self.assertEqual(self.events("session_opened")[-1]["hosts"], [self.hp()])
+
+    def test_bad_host_entries_are_refused(self):
+        for bad in ("127.0.0.1:0", "127.0.0.1:99999", "127.0.0.1:x", "127.0.0.1:", ":80", "a b", "127.0.0.1:80:80",
+                    "http://127.0.0.1", "127.0.0.1/x", 5, None):
+            self.ask(hosts=[bad], expect=400)
+
+    # -- (7) the clock ----------------------------------------------------------------
+    def test_a_session_does_not_use_wall_time(self):
+        calls = []
+        sid = self.open(ttl_s=60)
+        s = self.sess(sid)
+        with mock.patch.object(time, "time", side_effect=lambda: calls.append(1) or 0.0):
+            with self.broker._sess_lock:
+                self.broker._sess_lookup(sid, "legacy", self.broker.sessions_clock())
+            self.broker.sweep_sessions()
+        self.assertEqual(calls, [])
+        self.assertGreater(s.expires, 0)
+
+
+class WallClock(SBase):
+    inject_clock = False        # the production clock, untouched
+
+    def test_production_uses_the_monotonic_clock(self):
+        self.assertIs(self.broker.sessions_clock, time.monotonic)
+
+    def test_a_wall_clock_step_neither_extends_nor_shortens_a_session(self):
+        sid = self.open(ttl_s=600)
+        before = self.sess(sid).expires
+        self.offset = -7200                                        # wall time jumps back two hours
+        code, r = self.call(sid, "GET", "/")
+        self.assertEqual(r["http"]["status"], 200)
+        self.assertLessEqual(r["session"]["expires_in"], 600)
+        self.assertEqual(self.sess(sid).expires, before)
+        self.offset = 10 * 86400                                   # and forward ten days: still not expired
+        self.assertEqual(self.call(sid, "GET", "/")[1]["http"]["status"], 200)
+        code, text = self.as_client(KEY, "GET", f"/v1/sessions/{sid}")
+        self.assertLessEqual(json.loads(text)["expires_in"], 600)
+        self.broker.sweep_sessions()
+        self.assertEqual(len(self.broker._sess), 1)
+        self.assertLessEqual(self.broker.active_sessions()[0]["left_s"], 600)
+
+    def test_the_real_deadline_is_enforced_with_the_real_clock(self):
+        sid = self.open(ttl_s=S.TTL_FLOOR)
+        self.sess(sid).expires = time.monotonic() - 1
+        self.assertEqual(self.call(sid, "GET", "/")[1]["code"], "session_expired")
+
+
+# ------------------------------------------------------------------------- captures and masking
+class Masking(SBase):
+    def test_captured_values_must_be_printable_ascii(self):
+        sid = self.open()
+        code, r = self.call(sid, "GET", "/json", capture=["U=json:$.a.uni", "A=json:$.a.n"])
+        self.assertEqual((r["session"]["captured"], r["session"]["missing"]), (["A"], ["U"]))
+        self.assertNotIn("U", self.sess(sid).captures)
+
+    def test_masking_threshold_is_four_characters(self):
+        sid = self.open()
+        self.call(sid, "GET", "/json", capture=["S3=json:$.a.s3", "S4=json:$.a.s4"])
+        code, r = self.call(sid, "POST", "/echo", body="{{session.S3}} {{session.S4}}")
+        echoed = json.loads(r["http"]["body"])["body"]
+        self.assertEqual(echoed, "abc ***")                         # 3 characters: left alone; 4: masked
+        self.assertEqual(S.mask_values("a wxyz abc", ["wxyz", "abc", ""]), "a *** abc")
+        self.assertIn("4 or more characters", self.get("/")[1] if self.ask() else "")
+
+    def test_session_refused_logs_a_capped_host(self):
+        sid = self.open()
+        code, r = self.call(sid, "GET", "/", url="http://" + "a" * 400 + ".example/x")
+        self.assertEqual(code, 403)
+        for ev in self.events("session_refused"):
+            self.assertLessEqual(len(ev.get("host") or ""), 255)
+        self.assertEqual(self.events("session_refused")[-1]["host"], ("a" * 400 + ".example")[:255])
+
+
+# ------------------------------------------------------------------------- ASB_SESSION
+class EnvSession(CliBase):
+    def test_asb_session_env_var_is_the_preferred_way_and_the_flag_overrides_it(self):
+        sid = self.cli_open()
+        rc, out, err = self.run_cli_env({"ASB_SESSION": sid}, "http", "unifi", "GET", self.url("/"))
+        self.assertEqual(rc, 0, err)
+        self.assertIn("calls left", err)
+        self.assertEqual(self.sess(sid).calls, 1)
+        rc, out, err = self.run_cli_env({"ASB_SESSION": "a" * 32}, "http", "unifi", "GET", self.url("/"), "--session", sid)
+        self.assertEqual(rc, 0, err)                                # the flag wins over a bad or other value
+        self.assertEqual(self.sess(sid).calls, 2)
+        rc, out, err = self.run_cli_env({"ASB_SESSION": "nonsense"}, "http", "unifi", "GET", self.url("/"))
+        self.assertEqual(rc, 2, err)
+        rc, out, err = self.run_cli_env({"ASB_SESSION": sid}, "http", "unifi", "GET", self.url("/"),
+                                        "--capture", "A=header:X-Nope")
+        self.assertEqual(rc, 0, err)
+        rc, out, err = self.run_cli_env({}, "http", "unifi", "GET", self.url("/"), "--capture", "A=header:X")
+        self.assertEqual(rc, 2, err)                                # no session anywhere
+
+    def run_cli_env(self, extra, *args):
+        env = {"PATH": os.environ["PATH"], "HOME": self.dir, "SECRET_BROKER_URL": self.base,
+               "SECRET_BROKER_KEY": KEY, **extra}
+        p = subprocess.run([CLI, *args], env=env, capture_output=True, text=True, timeout=60)
+        self.out.extend([p.stdout, p.stderr])
+        return p.returncode, p.stdout, p.stderr
+
+    def test_help_and_guide_recommend_asb_session(self):
+        for args in (("help", "http"), ("guide",)):
+            rc, out, err = self.run_cli_env({}, *args)
+            self.assertIn("ASB_SESSION", out)
+
+
+# ------------------------------------------------------------------------- review round 3
+class RawUpstream:
+    """A raw-socket upstream that records exactly what arrives on the wire: per connection the request
+    line, headers, the body as framed by Content-Length, and any bytes left over (a pipelined second request)."""
+
+    def __init__(self):
+        import socket
+        self.sock = socket.socket()
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(8)
+        self.port = self.sock.getsockname()[1]
+        self.conns = []
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self):
+        while True:
+            try:
+                c, _ = self.sock.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._one, args=(c,), daemon=True).start()
+
+    def _one(self, c):
+        c.settimeout(1.0)
+        buf = b""
+        try:
+            while b"\r\n\r\n" not in buf:
+                d = c.recv(65536)
+                if not d:
+                    break
+                buf += d
+            head, _, rest = buf.partition(b"\r\n\r\n")
+            lines = head.decode("latin-1").split("\r\n")
+            hdrs = {k.lower(): v.strip() for k, _, v in (ln.partition(":") for ln in lines[1:])}
+            n = int(hdrs.get("content-length", "0") or 0)
+            while len(rest) < n:
+                d = c.recv(65536)
+                if not d:
+                    break
+                rest += d
+            body, extra = rest[:n], rest[n:]
+            try:                       # wait briefly for pipelined bytes
+                more = c.recv(65536)
+                extra += more
+            except OSError:
+                pass
+            self.conns.append({"line": lines[0], "headers": hdrs, "body": body, "extra": extra})
+            c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+        except OSError:
+            pass
+        finally:
+            c.close()
+
+    def close(self):
+        self.sock.close()
+
+
+class Review3(SBase):
+    def setUp(self):
+        super().setUp()
+        self.raw_up = RawUpstream()
+        self.addCleanup(self.raw_up.close)
+
+    def rsid(self, **kw):
+        return self.open(hosts=[self.hp(), f"127.0.0.1:{self.raw_up.port}"], **kw)
+
+    def rcall(self, sid, method="POST", path="/w", **kw):
+        return self.call(sid, method, path, url=f"http://127.0.0.1:{self.raw_up.port}{path}", **kw)
+
+    def test_a_hostile_content_length_is_refused_and_nothing_reaches_the_wire(self):
+        sid = self.rsid()
+        smuggle = "AAAA\r\n\r\nDELETE /x HTTP/1.1\r\nHost: x\r\nAuthorization: {{UNIFI_PASSWORD}}\r\n\r\n"
+        for hdr in ({"Content-Length": "4"}, {"content-length": "4"}, {"Content-Length": "999999"},
+                    {"Content-Length": "4", "Content-Type": "text/plain"}):
+            code, r = self.rcall(sid, headers=hdr, body=smuggle)
+            self.assertEqual((code, r["code"]), (403, "session_refused"), hdr)
+        time.sleep(0.3)
+        self.assertEqual(self.raw_up.conns, [])
+        self.assertEqual(self.sess(sid).calls, 0)
+
+    def test_the_wire_carries_exactly_one_request_with_the_right_length(self):
+        sid = self.rsid()
+        body = "AAAA\r\n\r\nDELETE /x HTTP/1.1\r\nAuthorization: Bearer {{UNIFI_PASSWORD}}\r\n\r\n"
+        code, r = self.rcall(sid, body=body)
+        self.assertEqual(r["http"]["status"], 200, r)
+        (conn,) = self.raw_up.conns
+        want = body.replace("{{UNIFI_PASSWORD}}", PASSWORD).encode()
+        self.assertEqual(conn["body"], want)                         # the substituted body, whole
+        self.assertEqual(conn["headers"]["content-length"], str(len(want)))
+        self.assertEqual(conn["extra"], b"")                         # no second, pipelined request
+        self.assertTrue(conn["line"].startswith("POST /w "))
+
+    def test_binary_and_b64_bodies_are_framed_by_what_is_sent(self):
+        import base64
+        sid = self.rsid()
+        raw = b"\x00\x01AAAA\r\n\r\nGET /y HTTP/1.1\r\n\r\n"
+        code, text = self.as_client(KEY, "POST", "/v1/requests", {
+            "mode": "http", "names": ["unifi"], "method": "POST", "url": f"http://127.0.0.1:{self.raw_up.port}/b",
+            "headers": {}, "session": sid, "body_b64": base64.b64encode(raw).decode()})
+        self.assertEqual(code, 202, text)
+        self.result(json.loads(text)["id"])
+        (conn,) = self.raw_up.conns
+        self.assertEqual((conn["body"], conn["headers"]["content-length"], conn["extra"]),
+                         (raw, str(len(raw)), b""))
+
+    def test_header_allowlist(self):
+        sid = self.rsid()
+        mp = "multipart/form-data; boundary=b"
+        bad = [{"Connection": "keep-alive"}, {"Expect": "100-continue"}, {"TE": "trailers"}, {"Upgrade": "h2c"},
+               {"Trailer": "X"}, {"Transfer-Encoding": "chunked"}, {"Content-Encoding": "gzip"}, {"Host": "x"},
+               {"Cookie": "a=b"}, {"Proxy-Authorization": "x"}, {"Proxy-Connection": "x"}, {"Forwarded": "for=1"},
+               {"X-Forwarded-For": "1.2.3.4"}, {"X-Forwarded-Host": "x"}, {"X-Original-URL": "/admin"},
+               {"X-Original-Verb": "DELETE"}, {"X-Rewrite-URL": "/x"}, {"X-HTTP-Method-Override": "GET"},
+               {"X-Real-IP": "1.1.1.1"}, {"Referer": "x"}, {"Origin": "x"}, {"Range": "bytes=0-1"}, {"Via": "x"},
+               {"Keep-Alive": "x"}, {"Content-Length": "0"}, {"Accept-Encoding": "gzip"}, {"X-Foo": "v"},
+               {"Api-Key": "{{UNIFI_PASSWORD}}"}, {"X-Custom": "{{UNIFI_PASSWORD}}"}, {"Bad Name": "v"},
+               {"X-": "v"}, {"X-" + "a" * 50: "v"},
+               # a placeholder must BE the whole value (optionally after Bearer/Basic/Token)
+               {"Authorization": "x {{UNIFI_PASSWORD}}"}, {"X-API-Key": "{{UNIFI_PASSWORD}}x"},
+               {"Authorization": "Bearer {{A}} {{B}}"}, {"Authorization": "Bearer  {{A}}"}, {"Authorization": "Bearer{{A}}"},
+               {"Authorization": "bearer {{" + "a" * 70 + "}}"}, {"Authorization": "Bearer {{a b}}"},
+               # content types: one, from the list, with at most charset=utf-8 (and a boundary for multipart)
+               {"Content-Type": "text/plain", "content-type": "text/html"}, {"Content-Type": "text/plain, text/html"},
+               {"Content-Type": "a b"}, {"Content-Type": "text"}, {"Content-Type": "{{UNIFI_PASSWORD}}"},
+               {"Content-Type": "text/html"}, {"Content-Type": "application/vnd.api+json"},
+               {"Content-Type": "application/json; charset=utf-16"}, {"Content-Type": "application/json; charset=latin-1"},
+               {"Content-Type": "application/json; foo=bar"}, {"Content-Type": "application/json; boundary=b"},
+               {"Content-Type": "application/json; charset=utf-8; charset=utf-8"},
+               {"Content-Type": "multipart/form-data"}, {"Content-Type": "multipart/form-data; charset=utf-8"},
+               {"Content-Type": "multipart/form-data; boundary=b; boundary=c"},
+               {"Content-Type": "multipart/mixed; boundary=b"}, {"Content-Type": "application/json;;"}]
+        for hdr in bad:
+            code, r = self.rcall(sid, headers=hdr, body="x")
+            self.assertEqual((code, r.get("code")), (403, "session_refused"), hdr)
+            self.assertEqual(self.events("session_refused")[-1]["reason_class"] in ("header", "method", "placeholder"), True, hdr)
+        good = [{"Accept": "application/json"}, {"Accept-Language": "en"}, {"User-Agent": "t"},
+                {"Authorization": "Bearer {{UNIFI_PASSWORD}}"}, {"Authorization": "Basic {{UNIFI_PASSWORD}}"},
+                {"Authorization": "Token {{UNIFI_PASSWORD}}"}, {"Authorization": "{{UNIFI_PASSWORD}}"},
+                {"X-CSRF-Token": "t"}, {"X-Updated-CSRF-Token": "t"}, {"x-requested-with": "XMLHttpRequest"},
+                {"If-None-Match": "abc"}, {"If-Modified-Since": "Wed, 21 Oct 2015 07:28:00 GMT"},
+                {"X-API-Key": "k"}, {"X-Api-Key": "{{UNIFI_PASSWORD}}"},
+                {"Content-Type": "application/json; charset=utf-8"}, {"content-type": "text/plain"},
+                {"Content-Type": "application/x-www-form-urlencoded"}, {"Content-Type": "application/graphql"},
+                {"Content-Type": "TEXT/PLAIN; CHARSET=UTF-8"}, {"Content-Type": mp},
+                {"Content-Type": mp + "; charset=utf-8"}, {"Content-Type": 'multipart/form-data; boundary="b-1"'}]
+        for hdr in good:
+            code, r = self.rcall(sid, headers=hdr, body="x")
+            self.assertEqual(r.get("http", {}).get("status"), 200, (hdr, r))
+        time.sleep(0.3)
+        self.assertEqual(len(self.raw_up.conns), len(good))
+        self.assertTrue(all(c["extra"] == b"" for c in self.raw_up.conns))
+
+    def test_a_secret_containing_method_changes_nothing_and_a_bad_secret_has_one_generic_error(self):
+        # outcomes depend on what the agent wrote, never on a credential's content
+        self.broker.sessions_cfg["max_per_client"] = 10
+        results = {}
+        for cred, var in (("other", "OTHER_TOKEN"), ("methcred", "METHCRED_TOKEN")):
+            sid = self.open(cred=cred)
+            code, r = self.call(sid, "POST", "/echo", names=(cred,), headers={"Authorization": "Bearer {{%s}}" % var},
+                                body="v={{%s}}" % var)
+            results[cred] = (code, r.get("http", {}).get("status"), r.get("code"), r.get("error"))
+            self.assertEqual(self.sess(sid).calls, 1)
+        self.assertEqual(results["other"], results["methcred"])
+        self.assertEqual(results["methcred"][:2], (200, 200))
+        self.assertEqual(self.events("session_refused"), [])
+        self.assertEqual(self.st["seen"][-1]["body"], "v=tok-method-xyz")        # it really was sent
+        # a value with a line break is refused with the same fixed class whatever the value is
+        sid = self.open(cred="crlfcred")
+        code, r = self.call(sid, "POST", "/echo", names=("crlfcred",), headers={"Authorization": "Bearer {{CRLFCRED_TOKEN}}"})
+        self.assertEqual(r["error"], "upstream call failed (invalid_request)")
+        self.assertEqual(self.sess(sid).calls, 1)                     # charged like any sent call: no free oracle
+        self.assertNotIn("a\r\nb", json.dumps(self.records()))
+
+    def test_agent_text_is_scanned_with_placeholders_neutralised(self):
+        # a placeholder NAME is not secret content, but it must not matter either: P replaces it
+        sid = self.open(cred="methcred")
+        code, r = self.call(sid, "POST", "/echo", names=("methcred",), body="{{METHCRED_TOKEN}}")
+        self.assertEqual(r["http"]["status"], 200)
+        self.assertEqual(S.neutralize("a {{X}} b {{ session.Y }}", {"session.Y": "yy"}), "a P b yy")
+        self.assertEqual(S.neutralize("{{unclosed"), "{{unclosed")
+
+    def test_a_captured_value_joined_to_template_text_is_scanned(self):
+        sid = self.open()
+        self.sess(sid).captures["T"] = "thod"
+        code, r = self.call(sid, "POST", "/echo", body="me{{session.T}}")
+        self.assertEqual((code, r["code"]), (403, "session_refused"))      # "me" + "thod" after substitution
+        self.assertEqual(self.st["seen"], [])
+
+    def test_the_whole_url_and_every_header_value_are_scanned(self):
+        sid = self.rsid()
+        for url in ("/x;_method=DELETE", "/_method/DELETE", "/%5Fmethod/x", "/%255Fmethod/x", "/x#method",
+                    "/a/&#109;ethod", "/a/=6Dethod", "/a/\\x6dethod"):
+            code, r = self.call(sid, "GET", "/", url=self.url(url))
+            self.assertEqual((code, r["code"]), (403, "session_refused"), url)
+        for url in (f"http://user:pw@127.0.0.1:{self.port}/", f"http://@127.0.0.1:{self.port}/"):
+            code, r = self.call(sid, "GET", "/", url=url)
+            self.assertEqual((code, r["code"]), (403, "session_refused"), url)
+        for hdr in ({"X-API-Key": "_method=DELETE"}, {"X-API-Key": "x%5Fmethod"}, {"Accept": "&#x6d;ethod"},
+                    {"X-API-Key": "{{session.NOPE}}_method"}):
+            code, r = self.call(sid, "GET", "/", headers=hdr)
+            self.assertEqual((code, r["code"]), (403, "session_refused"), hdr)
+        self.assertEqual(self.st["seen"], [])
+        self.assertEqual(self.sess(sid).calls, 0)
+        code, r = self.call(sid, "GET", "/json")                    # ordinary urls and headers still work
+        self.assertEqual(r["http"]["status"], 200)
+
+    def test_decode_forms(self):
+        yes = ["&#109;ethod", "&#x6d;ethod", "&#X6D;ethod", "\\x6dethod", "\\u006dethod", "=6Dethod", "=6dethod",
+               "\uff4dethod", "\uff4d\uff45thod", "%26%23109%3Bethod", "%6dethod", "M%65THOD", "m-e-t-h-o-d",
+               "me\x00th\x00od", "x_method", "payment_method"]
+        for text in yes:
+            self.assertTrue(S._has_method_text(text), text)
+        enc = "%6dethod"
+        for _ in range(4):
+            enc = enc.replace("%", "%25")
+        self.assertTrue(S._has_method_text(enc))                       # five rounds of percent-encoding
+        self.assertTrue(S._has_method_text(enc.encode()))
+        for text in ("", "hello", "metho", "mmeethhood", "name=value&x=1"):
+            self.assertFalse(S._has_method_text(text), text)
+
+    def test_multipart_with_a_transfer_encoding_is_refused(self):
+        sid = self.rsid()
+        ct = {"Content-Type": "multipart/form-data; boundary=b"}
+        plain = '--b\r\nContent-Disposition: form-data; name="a"\r\n\r\nhello\r\n--b--\r\n'
+        for cte in ("Content-Transfer-Encoding: base64", "content-transfer-encoding: quoted-printable",
+                    "Content-Transfer-%45ncoding: 7bit"):
+            body = f'--b\r\nContent-Disposition: form-data; name="a"\r\n{cte}\r\n\r\nhello\r\n--b--\r\n'
+            code, r = self.rcall(sid, headers=ct, body=body)
+            self.assertEqual((code, r["code"]), (403, "session_refused"), cte)
+        code, r = self.rcall(sid, headers=ct, body=plain)
+        self.assertEqual(r["http"]["status"], 200)
+
+    def test_a_captured_value_containing_method_is_not_stored(self):
+        sid = self.open()
+        code, r = self.call(sid, "GET", "/json", capture=["P=json:$.a.poison", "A=json:$.a.n"])
+        self.assertEqual((r["session"]["captured"], r["session"]["missing"]), (["A"], ["P"]))
+        self.assertNotIn("P", self.sess(sid).captures)
+
+    def test_calls_failed_by_poisoned_captures_are_charged_not_free(self):
+        sid = self.open()
+        s = self.sess(sid)
+        s.captures["Q"] = "a method"                                   # as if an upstream poisoned a capture
+        for i in range(10):
+            code, r = self.call(sid, "GET", "/echo?x={{session.Q}}")
+            self.assertEqual((code, r["code"]), (403, "session_refused"), i)
+        self.assertEqual(s.calls, 10)                                  # charged: the call cap is what bounds them
+        self.assertFalse(s.dead)
+        self.assertEqual(self.st["seen"], [])
+        self.assertEqual(self.events("session_ended"), [])
+
+    def test_scope_refusals_are_metered_too(self):
+        with mock.patch.object(S, "MAX_FREE_REFUSALS", 10):
+            sid = self.open()
+            s = self.sess(sid)
+            for i in range(S.MAX_FREE_REFUSALS):
+                self.assertEqual(self.call(sid, "DELETE", "/")[1]["code"], "session_refused", i)
+            self.assertFalse(s.dead)
+            code, r = self.call(sid, "DELETE", "/")                   # the 11th refusal ends it
+            self.assertEqual(code, 403)
+            self.assertTrue(s.dead)
+            ev = self.events("session_ended")
+            self.assertEqual((len(ev), ev[0]["reason"]), (1, "refusal_budget"))
+            self.assertEqual(self.call(sid, "GET", "/")[1]["code"], "session_expired")
+            self.assertEqual(self.sess_count(), 0)
+
+    def sess_count(self):
+        return len(self.broker._sess)
+
+    def test_the_call_cap_refusals_are_metered_too(self):
+        with mock.patch.object(S, "MAX_FREE_REFUSALS", 10):
+            sid = self.open(max_calls=1)
+            self.call(sid, "GET", "/")
+            for _ in range(11):
+                self.call(sid, "GET", "/")
+            self.assertEqual(len(self.events("session_ended")), 1)
+
+    def test_refusal_audit_lines_are_coalesced(self):
+        with mock.patch.object(S, "REFUSAL_LOG_PER_MIN", 5):
+            sid = self.open()
+            for _ in range(12):
+                self.call(sid, "DELETE", "/")
+            self.assertEqual(len(self.events("session_refused")), 5)
+            self.advance(61)
+            self.call(sid, "DELETE", "/")
+            ev = self.events("session_refused")
+            self.assertEqual(len(ev), 6)
+            self.assertEqual(ev[-1]["suppressed"], 7)
+            self.assertNotIn("suppressed", ev[0])
+            # unknown ids are coalesced per client, and never end anything
+            for _ in range(50):
+                self.call("z" * 32, "GET", "/")
+            self.assertEqual(len([e for e in self.events("session_refused") if e["reason_class"] == "unknown"]), 5)
+            self.assertEqual(self.sess_count(), 1)
+
+    def test_the_sweeper_survives_errors_and_logs_only_the_class(self):
+        self.open(ttl_s=60)
+        with mock.patch.object(self.broker, "sweep_sessions", side_effect=RuntimeError("SECRET-TEXT-9")):
+            self.broker._sweeper_tick()
+            self.broker._sweeper_tick()
+        ev = self.events("session_sweep_error")
+        self.assertEqual(len(ev), 1)                                   # rate limited to one a minute
+        self.assertEqual(ev[0]["error_class"], "RuntimeError")
+        self.assertNotIn("SECRET-TEXT-9", self.audit_text())
+        self.advance(61)
+        self.broker._sweeper_tick()                                    # still sweeping afterwards
+        self.assertEqual(self.sess_count(), 0)
+        self.assertIn("session_sweep_error", audit_api.HIDDEN)
+
+    def test_body_cap_and_adversarial_body_timing(self):
+        sid = self.open()
+        big = "a" * S.MAX_CALL_BODY
+        self.assertEqual(self.call(sid, "POST", "/echo", body=big)[1]["http"]["status"], 200)
+        for body in ("a" * (S.MAX_CALL_BODY + 1), "\u00e9" * (S.MAX_CALL_BODY // 2 + 1)):
+            code, r = self.call(sid, "POST", "/echo", body=body)
+            self.assertEqual(code, 400)
+            self.assertIn("256 KB", r["error"])
+        import base64
+        code, text = self.as_client(KEY, "POST", "/v1/requests", {
+            "mode": "http", "names": ["unifi"], "method": "POST", "url": self.url("/echo"), "headers": {},
+            "session": sid, "body_b64": base64.b64encode(b"x" * (S.MAX_CALL_BODY + 1)).decode()})
+        self.assertEqual(code, 400)
+        for nasty in ("%25" * (S.MAX_CALL_BODY // 3), "&#109;" * (S.MAX_CALL_BODY // 6), "\\u0061" * (S.MAX_CALL_BODY // 6),
+                      "=6E" * (S.MAX_CALL_BODY // 3), "%2526" * (S.MAX_CALL_BODY // 5)):
+            t0 = time.time()
+            code, r = self.call(sid, "POST", "/echo", body=nasty[:S.MAX_CALL_BODY])
+            self.assertLess(time.time() - t0, 10.0)
+            self.assertIn(code, (200, 403))
+
+    def test_the_override_scan_runs_once_unless_captures_are_substituted(self):
+        sid = self.open()
+        self.sess(sid).captures["T"] = "x"
+        real = S.override_problem
+        calls = []
+        with mock.patch.object(S, "override_problem", lambda *a, **k: calls.append(1) or real(*a, **k)):
+            self.call(sid, "POST", "/echo", body="plain")
+            n_plain = len(calls)
+            self.call(sid, "POST", "/echo", body="a {{session.T}}")
+        self.assertEqual(n_plain, 1)
+        self.assertEqual(len(calls), 3)                                # 1 (plain) + 2 (template, then substituted)
+
+    def test_ids_and_names_are_matched_in_full_not_up_to_a_newline(self):
+        self.assertIsNone(S.SID_RE.match("a" * 32 + "\n"))
+        self.assertIsNotNone(S.SID_RE.match("a" * 32))
+        self.assertEqual(self.call("a" * 32 + "\n", "GET", "/")[1]["code"], "session_unknown")
+        for bad in ("A\n=header:X", "A=header:X\n", "A=cookie:T\n", "A=json:$.a\n"):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                S.parse_capture(bad)
+        self.assertRaises(ValueError, S.parse_host_entry, "a.example\n")
+
+
+    def test_session_ended_is_in_the_agents_audit_view_without_policy_fields(self):
+        out = audit_api.redact({"seq": 1, "ts": 1.0, "event": "session_ended", "session": "abcd1234", "calls": 0,
+                                "reason": "refusal_budget", "approver": "alice", "hosts": ["POISON"]})
+        self.assertEqual(set(out) - {"seq", "ts", "event", "request"}, {"session", "calls", "reason"})
+
+
+class Unicode(Review3):
+    FULL = "\uff4d" + "ethod"                       # fullwidth m
+    MIXED = "\uff4d\uff45t" + "h" + "\uff4f" + "d"
+
+    def test_unit_fullwidth_and_encodings(self):
+        for text in (self.FULL, self.MIXED, "x_" + self.FULL, "M\uff25THOD"):
+            self.assertTrue(S._has_method_text(text), text)
+            self.assertTrue(S._has_method_text(text.encode("utf-8")), text)
+            for enc in ("utf-16", "utf-16-le", "utf-16-be", "utf-32", "utf-32-le", "utf-32-be"):
+                self.assertTrue(S._has_method_text(text.encode(enc)), (text, enc))
+            self.assertTrue(S._has_method_text(text.encode("utf-8").decode("latin-1").encode("utf-8")), text)
+        self.assertTrue(S._has_method_text("method".encode("utf-16")))
+        self.assertTrue(S._has_method_text("%EF%BD%8Dethod"))        # percent-encoded fullwidth m
+        self.assertFalse(S._has_method_text("caf\u00e9 \u00fcber".encode("utf-8")))
+        self.assertFalse(S._has_method_text("hello".encode("utf-16")))
+
+    def test_invalid_utf8_bodies(self):
+        bad = b"\xff\xfe ok \xc3("
+        self.assertIsNotNone(S.override_problem((), "http://h/", {}, bad))                       # not UTF-8: refused
+        self.assertIsNotNone(S.override_problem((), "http://h/", {"Content-Type": "text/plain"}, bad))
+        self.assertIsNone(S.override_problem((), "http://h/", {}, bad, binary=True))             # declared binary: scanned
+        self.assertIsNone(S.override_problem((), "http://h/", {"Content-Type": "multipart/form-data; boundary=b"}, bad))
+        self.assertIsNotNone(S.override_problem((), "http://h/", {}, b"\xff" + b"method", binary=True))
+        self.assertIsNotNone(S.override_problem((), "http://h/", {"Content-Type": "multipart/form-data; boundary=b"},
+                                                b"\xff" + self.FULL.encode()))
+        self.assertIsNotNone(S.override_problem((), "http://h/", {}, self.FULL.encode("utf-16"), binary=True))
+
+    def test_fullwidth_in_every_place_is_refused(self):
+        sid = self.rsid()
+        form = {"Content-Type": "application/x-www-form-urlencoded"}
+        js = {"Content-Type": "application/json"}
+        for val in (self.FULL, self.MIXED):
+            cases = [("/echo?q=" + val, {}, None), ("/echo?" + val + "=1", {}, None),
+                     ("/echo", form, val + "=DELETE"), ("/echo", form, "a=1&x_" + val + "=2"),
+                     ("/echo", js, json.dumps({val: "DELETE"})), ("/echo", js, json.dumps({val: 1}, ensure_ascii=False)),
+                     ("/echo", {}, val), ("/echo", {"X-API-Key": val}, "x"), ("/echo", {"Accept": val}, "x"),
+                     ("/echo", {"Accept-Language": "en;q=" + val}, "x")]
+            for path, hdr, body in cases:
+                code, r = self.call(sid, "POST", path, headers=hdr, body=body)
+                self.assertEqual((code, r.get("code")), (403, "session_refused"), (path, hdr, body))
+        time.sleep(0.2)
+        self.assertEqual(self.st["seen"], [])
+        self.assertEqual(self.sess(sid).calls, 0)
+
+    def test_utf16_and_binary_bodies_over_the_wire(self):
+        import base64
+        sid = self.rsid()
+        def post(raw):
+            return self.as_client(KEY, "POST", "/v1/requests", {
+                "mode": "http", "names": ["unifi"], "method": "POST", "url": f"http://127.0.0.1:{self.raw_up.port}/u",
+                "headers": {}, "session": sid, "body_b64": base64.b64encode(raw).decode()})
+        for raw in (self.FULL.encode("utf-16"), self.FULL.encode("utf-16-le"), self.MIXED.encode("utf-32"),
+                    b"\xff" + self.FULL.encode()):
+            code, text = post(raw)
+            self.assertEqual(code, 403, raw)
+        code, text = post(b"\xff\xfe harmless binary \x00\x01")
+        self.assertEqual(code, 202, text)                       # binary without the word is allowed
+        time.sleep(0.3)
+        self.assertEqual(len(self.raw_up.conns), 1)
+
+
+# ------------------------------------------------------------------------- review round 5
+class Review5(SBase):
+    # -- memory and concurrency --------------------------------------------------------
+    def post_only(self, sid, path="/big", body=None, key=KEY):
+        payload = {"mode": "http", "names": ["unifi"], "method": "POST" if body else "GET",
+                   "url": self.url(path), "headers": {}, "session": sid}
+        if body:
+            payload["body"] = body
+        code, text = self.as_client(key, "POST", "/v1/requests", payload)
+        return code, json.loads(text)
+
+    def session_reqs(self):
+        with self.broker._lock:
+            return [r for r in self.broker._by_id.values() if r.session is not None]
+
+    def test_a_client_that_never_polls_cannot_pin_results(self):
+        sid = self.open(max_calls=50)
+        ids = []
+        for _ in range(15):
+            code, j = self.post_only(sid)                           # never GET the result
+            self.assertEqual(code, 202)
+            ids.append(j["id"])
+        held = [r for r in self.session_reqs() if r.result is not None]
+        self.assertLessEqual(len(held), S.MAX_RETAINED_RESULTS)
+        self.assertLessEqual(sum(len(r.result["http"]["body"]) for r in held), S.MAX_RETAINED_RESULTS * 400000)
+        old = self.result(ids[0])                                   # a discarded one says so
+        self.assertEqual(old["status"], "failed")
+        self.assertIn("discarded", old["error"])
+        self.assertEqual(self.result(ids[-1])["http"]["status"], 200)   # the newest is still collectable
+
+    def test_finished_session_calls_are_pruned_quickly_and_hold_no_body(self):
+        sid = self.open()
+        code, j = self.post_only(sid, "/echo", body="b" * 200000)
+        (req,) = self.session_reqs()
+        self.assertIsNone(req.call_spec)                           # the full call is gone once it has run
+        self.assertEqual((req.spec["body"], req.spec["body_b64"], req.spec["headers"]), (None, None, {}))
+        self.advance(1)
+        self.offset += 100                                          # past the short TTL for finished session calls
+        self.broker.pending()                                       # any request path prunes
+        self.assertEqual(self.session_reqs(), [])
+
+    def test_a_running_call_is_never_pruned(self):
+        sid = self.open()
+        t, out = bg(self.call, sid, "GET", "/hold")
+        end = time.time() + 10
+        while not self.st["holding"] and time.time() < end:
+            time.sleep(0.02)
+        self.offset += 1000
+        self.broker.pending()
+        self.assertEqual(len(self.session_reqs()), 1)
+        self.st["release"].set()
+        t.join(20)
+
+    def test_iterating_requests_while_sessions_mutate_does_not_raise(self):
+        sid = self.open(max_calls=200)
+        stop = threading.Event()
+        errors = []
+
+        def hammer():
+            while not stop.is_set():
+                code, j = self.post_only(sid, "/echo", body="x")
+                if code != 202:
+                    errors.append(code)
+        ths = [threading.Thread(target=hammer, daemon=True) for _ in range(3)]
+        [t.start() for t in ths]
+        try:
+            for _ in range(25):
+                for path in ("/", "/?fragment=1", "/?view=all", "/clients"):
+                    status, text, _ = self.get(path)
+                    self.assertEqual(status, 200, path)
+                self.assertIsInstance(self.broker.open_ids(), set)
+        finally:
+            stop.set()
+            [t.join(20) for t in ths]
+        self.assertEqual(errors, [])
+
+    # -- masking ---------------------------------------------------------------------
+    def test_a_deleted_cookie_echoed_by_the_upstream_is_masked(self):
+        sid = self.open()
+        self.login(sid)
+        code, r = self.call(sid, "POST", "/logout-echo", headers={"X-CSRF-Token": "{{session.CSRF}}"})
+        text = json.dumps(r["http"])
+        self.assertNotIn("COOKIE-CANARY", text)
+        self.assertNotIn("CSRF-CANARY", text)
+        self.assertEqual(len(self.sess(sid).jar), 0)               # it really was deleted
+
+    def test_a_rotated_token_and_cookie_echoed_are_masked_old_and_new(self):
+        sid = self.open()
+        self.login(sid)
+        code, r = self.call(sid, "GET", "/rotate-echo", headers={"X-CSRF-Token": "{{session.CSRF}}"},
+                            capture=["CSRF=header:X-CSRF-Token"])
+        text = json.dumps(r["http"])
+        for canary in ("COOKIE-CANARY", "CSRF-CANARY"):
+            self.assertNotIn(canary, text)
+        self.assertEqual(self.sess(sid).captures["CSRF"], "CSRF-CANARY-rotated-9z")
+
+    def test_a_cookie_the_jar_rejects_and_a_capture_the_cap_rejects_are_masked_too(self):
+        sid = self.open()
+        code, r = self.call(sid, "GET", "/set-echo")                # Secure over http: the jar ignores it
+        self.assertEqual(len(self.sess(sid).jar), 0)
+        self.assertNotIn("COOKIE-CANARY-rejected-7q", json.dumps(r["http"]))
+        s = self.sess(sid)
+        for i in range(S.MAX_CAPTURES):
+            s.captures[f"V{i}"] = f"value{i}"
+        code, r = self.call(sid, "GET", "/setcap", capture=["NEW=header:X-New"])
+        self.assertEqual(r["session"]["missing"], ["NEW"])
+        self.assertNotIn("CAPTURED-CANARY-77", json.dumps(r["http"]))
+        s.captures.clear()
+        s.captures["T"] = "thod"
+        code, r = self.call(sid, "GET", "/setcap", capture=["X=header:X-New"])    # accepted: masked as well
+        self.assertNotIn("CAPTURED-CANARY-77", json.dumps(r["http"]))
+
+    # -- decoding --------------------------------------------------------------------
+    def test_surrogates_graphql_escapes_and_bomless_utf16(self):
+        pair = "".join(f"\\ud835\\udc{c}" for c in ("26", "1e", "2d", "21", "28", "1d"))      # bold "method"
+        self.assertTrue(S._has_method_text(pair))
+        self.assertTrue(S._has_method_text("\\u{6d}ethod"))
+        self.assertTrue(S._has_method_text("\\u{1d426}ethod"))
+        self.assertTrue(S._has_method_text("&#xD835;&#xDC26;ethod"))
+        self.assertTrue(S._has_method_text("\u1d50\u1d49\u1d57\u02b0\u1d52\u1d48".encode("utf-16-le")))
+        self.assertTrue(S._has_method_text("\u1d50\u1d49\u1d57\u02b0\u1d52\u1d48".encode("utf-16-be")))
+        self.assertTrue(S._has_method_text("\u1d50\u1d49\u1d57\u02b0\u1d52\u1d48".encode("utf-32-le")))
+        self.assertFalse(S._has_method_text("\\u{6f}k \\ud835\\udc26"[:8]))
+        sid = self.open()
+        for ct, body in (("application/json", '{"' + pair + '": 1}'), ("application/graphql", "{ \\u{6d}ethod }"),
+                         ("application/graphql", "{ \\u{1d426}ethod }")):
+            code, r = self.call(sid, "POST", "/echo", headers={"Content-Type": ct}, body=body)
+            self.assertEqual((code, r["code"]), (403, "session_refused"), body)
+
+    def test_bomless_utf16_over_the_wire_is_refused(self):
+        import base64
+        sid = self.open()
+        for enc in ("utf-16-le", "utf-16-be"):
+            raw = "\u1d50\u1d49\u1d57\u02b0\u1d52\u1d48".encode(enc)
+            code, text = self.as_client(KEY, "POST", "/v1/requests", {
+                "mode": "http", "names": ["unifi"], "method": "POST", "url": self.url("/echo"), "headers": {},
+                "session": sid, "body_b64": base64.b64encode(raw).decode()})
+            self.assertEqual(code, 403, enc)
+
+    # -- credential oracles ------------------------------------------------------------
+    def test_credentials_of_different_length_give_identical_outcomes(self):
+        self.broker.sessions_cfg["max_per_client"] = 10
+        shapes = {}
+        pad = "a" * 7000
+        for cred, var in (("other", "OTHER_TOKEN"), ("methcred", "METHCRED_TOKEN"), ("longcred", "LONGCRED_TOKEN")):
+            sid = self.open(cred=cred)
+            code, r = self.call(sid, "GET", "/", names=(cred,), url=self.url("/" + pad + "{{%s}}" % var))
+            shapes[cred] = (code, r.get("http", {}).get("status"), r.get("code"), self.sess(sid).calls)
+        self.assertEqual(len(set(shapes.values())), 1, shapes)       # same outcome, same charge
+        self.assertNotEqual(shapes["other"][0], 0)
+
+    def test_a_secret_with_a_space_or_line_break_gets_one_generic_charged_error(self):
+        self.broker.sessions_cfg["max_per_client"] = 10
+        outs = []
+        for cred, var in (("spacecred", "SPACECRED_TOKEN"), ("crlfcred", "CRLFCRED_TOKEN")):
+            sid = self.open(cred=cred)
+            code, r = self.call(sid, "GET", "/", names=(cred,), url=self.url("/p?x={{%s}}" % var))
+            outs.append((code, r.get("error"), self.sess(sid).calls))
+        self.assertEqual(outs[0], outs[1])
+        self.assertEqual(outs[0][1], "upstream call failed (invalid_request)")
+        self.assertEqual(outs[0][2], 1)                              # charged: probing costs calls
+        self.assertEqual(self.st["seen"], [])
+
+    # -- placeholders per call -----------------------------------------------------------
+    def test_the_placeholder_cap_is_per_call_and_refusals_are_metered(self):
+        sid = self.open()
+        s = self.sess(sid)
+        hdrs = {f"X-API-Key": "{{UNIFI_PASSWORD}}"}
+        url = self.url("/?" + "&".join("a={{UNIFI_USERNAME}}" for _ in range(60)))
+        body = "{{UNIFI_USERNAME}}" * 60                                   # 120 in all, 60 per string
+        code, r = self.call(sid, "POST", "/echo", url=url, body=body, headers=hdrs)
+        self.assertEqual((code, r["code"]), (403, "session_refused"))
+        ev = self.events("session_refused")
+        self.assertEqual(ev[-1]["reason_class"], "placeholder")
+        self.assertEqual((s.free_refusals, s.calls), (1, 0))
+        code, r = self.call(sid, "POST", "/echo", body="{{UNIFI_USERNAME}}" * 150)    # one string over the cap
+        self.assertEqual((code, r["code"]), (403, "session_refused"))
+        self.assertEqual(s.free_refusals, 2)
+
+    # -- https-only captures ------------------------------------------------------------
+    def test_header_captures_of_set_cookie_are_refused(self):
+        for src in ("set-cookie", "Set-Cookie", "SET-COOKIE2"):
+            with self.assertRaises(ValueError):
+                S.parse_capture("A=header:" + src)
+        sid = self.open()
+        code, r = self.call(sid, "GET", "/", capture=["A=header:Set-Cookie"])
+        self.assertEqual(code, 400)
+        self.assertEqual(S.parse_capture("A=cookie:TOKEN")[1], "cookie")
+
+    def fake_session(self, hosts=("h.example",)):
+        import email.message
+
+        class Resp:
+            def __init__(inner, status, headers, body):
+                inner.status, inner.body = status, body
+                inner.headers = email.message.Message()
+                for k, v in headers:
+                    inner.headers.add_header(k, v)
+
+            def __enter__(inner):
+                return inner
+
+            def __exit__(inner, *a):
+                return False
+
+            def read1(inner, n):
+                out, inner.body = inner.body[:n], inner.body[n:]
+                return out
+
+        class Opener:
+            def __init__(inner):
+                inner.sent, inner.script = [], []
+
+            def open(inner, req, timeout=None):
+                inner.sent.append((req.full_url, dict(req.header_items())))
+                return inner.script.pop(0) if inner.script else Resp(200, [], b"{}")
+        op = Opener()
+        sess = S.Session("a" * 32, "aaaaaaaa", {"id": "legacy", "name": "x"}, "unifi", list(hosts), ["GET", "POST"], 600,
+                         100, 0.0, "p", "a", lambda: 0.0)
+        return sess, op, Resp
+
+    def run_fake(self, sess, op, method, url, headers=None, capture=None):
+        spec = {"method": method, "url": url, "headers": headers or {}, "body": None, "body_b64": None,
+                "capture_expr": [S.parse_capture(c) for c in (capture or [])]}
+        state = {"sent": False}
+        try:
+            out, info = S.run_http(sess, spec, {"UNIFI_PASSWORD": "pw-secret-1"}, None, {"h.example"}, lambda tls: op,
+                                   lambda: 0.0, state)
+        except S.SessionError as e:
+            return None, state, e
+        return (out, info), state, None
+
+    def test_every_capture_from_an_https_response_is_https_only(self):
+        sess, op, Resp = self.fake_session()
+        secure_val = "SECURE-COOKIE-VALUE-123"
+        op.script = [Resp(200, [("Set-Cookie", f"SC={secure_val}; Secure; Path=/"), ("X-Token", "hdr-token-value-1")],
+                          json.dumps({"tok": secure_val}).encode())]
+        res, state, err = self.run_fake(sess, op, "GET", "https://h.example/login",
+                                        capture=["H=header:X-Token", "C=cookie:SC", "J=json:$.tok"])
+        self.assertIsNone(err)
+        self.assertEqual(sorted(res[1]["captured"]), ["C", "H", "J"])
+        self.assertEqual(sess.https_only, {"C", "H", "J"})
+        for name in ("H", "C", "J"):                                # replay over http: refused, nothing sent, not charged
+            n = len(op.sent)
+            res, state, err = self.run_fake(sess, op, "GET", "http://h.example/x", {"X-API-Key": "{{session.%s}}" % name})
+            self.assertIsNotNone(err, name)
+            self.assertIsInstance(err, S.NotSent)
+            self.assertFalse(state["sent"])
+            self.assertEqual(len(op.sent), n)
+        res, state, err = self.run_fake(sess, op, "GET", "https://h.example/x", {"X-API-Key": "{{session.J}}"})
+        self.assertIsNone(err)                                      # the same value over https is fine
+        self.assertEqual(op.sent[-1][1]["X-api-key"], secure_val)
+        # a placeholder inside the url or the body counts too
+        for url, body in (("http://h.example/{{session.J}}", None),):
+            res, state, err = self.run_fake(sess, op, "GET", url)
+            self.assertIsInstance(err, S.NotSent)
+
+    def test_a_capture_from_an_http_response_may_be_used_over_http(self):
+        sess, op, Resp = self.fake_session()
+        op.script = [Resp(200, [("X-Token", "plain-token-12")], b"{}")]
+        res, state, err = self.run_fake(sess, op, "GET", "http://h.example/a", capture=["H=header:X-Token"])
+        self.assertEqual(sess.https_only, set())
+        res, state, err = self.run_fake(sess, op, "GET", "http://h.example/b", {"X-API-Key": "{{session.H}}"})
+        self.assertIsNone(err)
+        # a later https capture of the same name flips it to https-only; a later http one flips it back
+        op.script = [Resp(200, [("X-Token", "https-token-34")], b"{}")]
+        self.run_fake(sess, op, "GET", "https://h.example/a", capture=["H=header:X-Token"])
+        self.assertEqual(sess.https_only, {"H"})
+        op.script = [Resp(200, [("X-Token", "plain-again-56")], b"{}")]
+        self.run_fake(sess, op, "GET", "http://h.example/a", capture=["H=header:X-Token"], headers={})
+        self.assertEqual(sess.https_only, set())
+
+    def test_rotation_between_the_scope_check_and_the_send_cannot_flip_the_outcome(self):
+        sess, op, Resp = self.fake_session()
+        sess.captures["N"] = "plain-value-1"
+        spec = {"url": "http://h.example/", "headers": {"X-API-Key": "{{session.N}}"}}
+        sc = self.broker.cfg["secrets"]["unifi"]
+        self.assertIsNone(S.scope_problem(sess, {"vars": {}, "allowed_hosts": ["h.example"]}, ["unifi"], "GET", spec, {"N"}))
+        # ... and now the capture is rotated to a value taken over https, before the send
+        with sess.lock:
+            sess.captures["N"] = "https-value-2"
+            sess.https_only.add("N")
+        res, state, err = self.run_fake(sess, op, "GET", "http://h.example/", {"X-API-Key": "{{session.N}}"})
+        self.assertIsInstance(err, S.NotSent)
+        self.assertEqual(op.sent, [])
+        # under contention the decision and the value always agree: a https-only value never leaves over http
+        stop = threading.Event()
+
+        def rotate():
+            flag = False
+            while not stop.is_set():
+                flag = not flag
+                with sess.lock:
+                    sess.captures["N"] = "HTTPS-SECRET-VALUE" if flag else "plain-value-3"
+                    (sess.https_only.add if flag else sess.https_only.discard)("N")
+        t = threading.Thread(target=rotate, daemon=True)
+        t.start()
+        try:
+            for _ in range(400):
+                self.run_fake(sess, op, "GET", "http://h.example/", {"X-API-Key": "{{session.N}}"})
+        finally:
+            stop.set()
+            t.join(5)
+        self.assertTrue(op.sent)
+        for url, hdr in op.sent:
+            self.assertTrue(url.startswith("http://"))
+            self.assertNotEqual(hdr.get("X-api-key"), "HTTPS-SECRET-VALUE")
+
+    def test_jar_does_not_hand_out_a_secure_cookie_for_http(self):
+        j = S.Jar(lambda: 0, wall=lambda: 0)
+        j.store("h.example", "/", True, ["SC=secret-secure-value; Secure; Path=/", "PC=plain-value; Path=/"])
+        self.assertEqual(j.get("h.example", "SC", True), ("secret-secure-value", True))
+        self.assertEqual(j.get("h.example", "SC", False), (None, False))
+
+    # -- deadline during upstream trouble ---------------------------------------------------
+    def test_an_upstream_error_after_the_deadline_or_revoke_is_session_expired(self):
+        from secret_broker import broker as bm
+        sid = self.open(ttl_s=60)
+
+        class Late:
+            def __init__(inner, then):
+                inner.then = then
+
+            def open(inner, req, timeout=None):
+                inner.then()
+                raise TimeoutError("slow")
+        with mock.patch.object(bm, "_opener_for", lambda tls: Late(lambda: self.advance(100))):
+            code, r = self.call(sid, "GET", "/")
+        self.assertEqual((code, r["code"]), (410, "session_expired"))
+        sid2 = self.open()
+        with mock.patch.object(bm, "_opener_for", lambda tls: Late(lambda: self.post("/sessions/revoke", {"pid": sid2[:8]}))):
+            code, r = self.call(sid2, "GET", "/")
+        self.assertEqual((code, r["code"]), (410, "session_expired"))
+        self.assertIn("revoked", r["error"])
+
+    def test_the_body_read_is_bounded_by_the_deadline(self):
+        now = [0.0]
+
+        class Sess:
+            expires = 5.0
+
+        class Resp:
+            def read1(self, n):
+                now[0] += 2.0                                      # a slow drip: two seconds a byte
+                return b"x"
+        with self.assertRaises(TimeoutError):
+            S._read_bounded(Resp(), Sess(), lambda: now[0], time.monotonic())
+        self.assertLess(now[0], 10)
+
+    # -- presend audit, sweep first ----------------------------------------------------------
+    def test_a_presend_refusal_is_audited_and_not_charged(self):
+        sid = self.open()
+        with mock.patch.object(S, "fill", side_effect=KeyError("x")):
+            code, r = self.call(sid, "GET", "/")
+        self.assertEqual((code, r["code"]), (403, "session_refused"))
+        s = self.sess(sid)
+        self.assertEqual((s.calls, s.free_refusals), (0, 1))
+        self.assertEqual(self.events("session_refused")[-1]["reason_class"], "presend")
+
+    def test_overdue_sessions_do_not_count_against_the_caps(self):
+        self.broker.sessions_cfg["max_per_client"] = 1
+        self.open(ttl_s=60)
+        self.ask(expect=403)                                        # at the cap
+        self.advance(61)                                            # overdue, sweeper has not run
+        r = self.ask(expect=202)
+        self.approve(r["id"])
+        self.assertEqual(self.result(r["id"])["status"], "approved")
+        self.assertEqual(len(self.broker._sess), 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

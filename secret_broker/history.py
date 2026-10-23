@@ -32,7 +32,10 @@ _EV_KEYS = ("reason", "reasons", "model", "risk", "error", "via", "channel", "de
             "cred_kind", "cred_mode", "purpose_length", "purpose_sha256", "edited", "requested_name",
             "var_names", "no_hosts",
             # per-client credentials: whose request it was and whom a rule created from it applies to
-            "client_id", "client_name", "rule_client")
+            "client_id", "client_name", "rule_client",
+            # http sessions: public prefix, manifest and counters; never an id, cookie or value
+            "session", "methods", "ttl_s", "max_calls", "calls", "left_s", "reason_class", "lifetime_s",
+            "unused", "shortened", "revoked_by", "suppressed")
 _MAX_EVENTS = 60            # per request
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 

@@ -83,6 +83,18 @@ WHITELIST = {
     "discovery": {"peer": ("peer", _S), "host": ("host", _S), "found": ("found", _L)},
     "catalog_loaded": {"count": ("count", _I), "invalid_count": ("invalid", "count")},
     "catalog_error": {}, "backend_error": {},
+    # http sessions (the agent's own: client-scoped like every event). No approver, no policy.
+    "session_requested": {"names": ("names", _L), "ttl_s": ("ttl_s", _I), "max_calls": ("max_calls", _I)},
+    "session_opened": {"session": ("session", _S), "ttl_s": ("ttl_s", _I), "max_calls": ("max_calls", _I)},
+    "session_used": {"session": ("session", _S), "host": ("host", _S), "calls": ("calls", _I),
+                     "max_calls": ("max_calls", _I)},
+    "session_refused": {"session": ("session", _S), "reason": ("reason_class", _S), "method": ("method", _S),
+                        "host": ("host", _S),
+                        "suppressed": ("suppressed", _I)},
+    "session_ended": {"session": ("session", _S), "calls": ("calls", _I), "reason": ("reason", _S)},
+    "session_closed": {"session": ("session", _S), "calls": ("calls", _I)},
+    "session_expired": {"session": ("session", _S), "calls": ("calls", _I)},
+    "session_revoked": {"session": ("session", _S), "calls": ("calls", _I)},
     "backend_ready": {"duration_ms": ("duration_ms", _I)},
 }
 
@@ -99,7 +111,7 @@ HIDDEN = frozenset({
     # the entry hashes and the per-entry outcome are approval context
     "guidance_proposed", "guidance_proposal_result", "guidance_ignored",
     "ssh_hosts_changed", "ssh_hosts_change_refused", "ssh_hosts_change_failed",
-    "ha_hook_any_device", "config_warning",
+    "ha_hook_any_device", "config_warning", "session_sweep_error",
     # time-boxed grants are approval policy context: a grant-approved request shows as plain "approved"
     "grant_created", "grant_refused", "grant_used", "grant_skipped", "grant_revoked", "grant_expired",
     "grant_dropped", "grants_file_corrupt", "grants_file_write_failed", "standing_change_failed",
