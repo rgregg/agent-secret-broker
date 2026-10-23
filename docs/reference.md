@@ -1134,6 +1134,14 @@ more now that the dashboard can decide many requests: a caller that could reach
 the listener and forge the header would otherwise be able to list and approve
 them all.
 
+Peer trust, in order: `"approval_trust_any_peer": true` trusts everyone (the old behaviour; a loud warning
+is logged at every start); otherwise loopback, link-local and every address of the broker's own host or
+container are **never** trusted, whatever `approval_trusted_peers` lists; then `approval_trusted_peers`
+if set; if unset, only private-range peers are accepted (a startup warning recommends setting it). The
+dashboard's CSRF token is bound to an HttpOnly, SameSite=Strict cookie the first page load issues (see
+"Security notes" below), and both listeners refuse any request carrying the broker's own egress marker
+header (`X-Secret-Broker-Egress`, added to every outbound call).
+
 ### The iOS home-screen app: layout, sign-in expiry and recovery
 
 Every page with the header carries the same shell, so the site works as an iOS home-screen web app.
@@ -2774,6 +2782,104 @@ Residual signals the agent can still infer: a decision with `channel` null is a 
 approval, the time between `requested` and `approved` is milliseconds for one, and `denied`
 or `expired` mean a human was asked (the agent also learns that from its own request status).
 
+## Security notes
+
+Two reports against the 2026-10 tree, what they were, how they are fixed, and what remains. The tests named
+here are in `tests/test_leak_regression.py`, `tests/test_destination_guard.py` and
+`tests/test_self_approval_chain.py` (the last runs, and fails, on a tree without the fixes).
+
+### 1. A credential value returned in an error message
+
+**Issue.** `http.client` puts the filled-in header value or path in the text of the exception it raises
+for a request it cannot send (`ValueError`, and `InvalidURL`, which is not a `ValueError`). The broker
+repeated `str(e)` as `release failed: ...` in the agent's answer, the audit log and the history. An agent could
+make a header or path that breaks the request once the credential was substituted (a CRLF in the template, a
+space in the path, the placeholder used as the port) and read the credential back, while the approval card
+showed only the method and URL.
+
+**Fix.**
+* Exception text is never kept. The release/exchange path turns an exception into a **fixed label** from a closed
+  set (`timeout`, `tls`, `dns`, `connection`, `invalid request`, `vault`, `destination not allowed`, `other`;
+  `secret_broker/errclass.py`) at every settle point (human approved, policy auto, timed grant / Always, SSH rule,
+  sessions, plans). Every settle point catches `Exception`, so nothing escapes the handler and the request always
+  settles. Notification failures are the fixed text `could not notify`. The raise is made outside the `except`
+  block, so no exception chain carries the original text.
+* **Template checks at creation** (`secret_broker/httpcheck.py`): a C0 control character, DEL, CR, LF or NUL in
+  a header name, value template or the URL; whitespace or non-ASCII in the URL or in a header name; a malformed
+  `{{ }}` (anything but a name with at most one space each side); and any placeholder in the scheme or authority
+  (so a value can never choose the host or port) are refused with one generic sentence that does not echo the text.
+  A space inside a header value stays legal.
+* **Filled-value checks** just before sending: a filled URL keeps its template's authority and holds no control
+  character, whitespace or non-ASCII; each filled header is a token name with a printable-ASCII value. Anything else
+  is `release failed: invalid request`, charged like any filled request, with no value in any output.
+* The client `asb` prints broker error text through a filter (printable ASCII, long token-like runs replaced).
+  The broker no longer sends exception text, so this is defence in depth; the client holds no secret values and
+  cannot mask by value.
+
+**Where exception text still appears, and why it is safe** (the full table is in the PR notes; the rules):
+validation errors built only from the agent's own input (the 400 `error` of a rejected create, `rejected` log
+reasons); fixed sentences of the session, plan and guidance modules; operator-side logs of backend list/write
+failures (no credential value is in flight on those paths, and the agent's audit view drops those fields); the
+operator CLIs on the operator's terminal.
+
+**Residual risk.** A new code path that formats an exception into agent-visible text would reintroduce the bug:
+the regression tests inject hostile values through http, policy auto, sessions and plans and look for the secret
+in every output, but only for the paths they cover. Upstream *responses* are masked by exact match as before
+(a transformed secret echoed back is not caught).
+
+### 2. An agent approving its own requests
+
+**Issue.** An agent could (a) create a credential with no tap (`store` defaults to auto and rates low), (b) name
+`127.0.0.1` in `allowed_hosts` (nothing refused loopback, ports or private addresses), (c) call the broker's own
+approval listener, which trusted the identity header from any peer when `approval_trusted_peers` was unset, with
+the approver's username (visible to the agent as `approver` in `/v1/audit`), and (d) read the CSRF token (bound
+only to the user, never rotated) out of the page and then POST `/decide` for anything, including Always grants.
+
+**Fix** (each layer alone breaks the chain):
+* **One destination guard** (`secret_broker/destguard.py`) for every outbound call made for an agent (http,
+  sessions, plans): the host name is resolved once (all A and AAAA records) and the call is refused if **any**
+  address is loopback, link-local (169.254.0.0/16 including 169.254.169.254, fe80::/10), unspecified,
+  multicast, 0.0.0.0/8, an IPv4-embedding form of those (IPv4-mapped, 6to4, NAT64, IPv4-compatible, Teredo), a cloud
+  metadata address, any address of a local interface, or inside `destination_deny_cidrs`. The broker's own
+  listener ports (the configured `client_port`/`approval_port` and the real bound ports) are refused on any private
+  or own address. The connection is made to the **validated IP** and TLS keeps SNI and certificate checks on the
+  original host name, so a second DNS answer (rebinding) is never used. Redirects are never followed and no
+  environment proxy is used. The refusal is the fixed `destination not allowed`; no address is echoed. RFC 1918 and
+  other LAN ranges stay allowed.
+* **Validation time.** Credentials created through `store` or credential requests cannot list `localhost`,
+  `localhost.localdomain`, `ip6-localhost`, `metadata.google.internal`, a dotless name, a loopback / link-local /
+  unspecified / own address or a non-canonical IP spelling (`2130706433`, `0x7f.1`, `0177.0.0.1`). Human-edited
+  catalog entries keep working unless they name one of those (the host is dropped and `dest_guard_config_error`
+  is logged). An IP literal on a port other than 80/443 needs an explicit `host:port` entry in `allowed_hosts`.
+* **Approval listener trust.** Loopback and the broker's own addresses are never trusted; unset
+  `approval_trusted_peers` now means private-range peers only (startup warning);
+  `approval_trust_any_peer: true` restores the old behaviour (loud warning). See Setup, "Upgrading".
+* **Defence in depth.** Every outbound call carries `X-Secret-Broker-Egress: 1` (the agent cannot remove or set
+  it); both listeners answer 403 to any request that has it. The CSRF token is derived from the user **and** a
+  server-issued HttpOnly, SameSite=Strict cookie nonce (set on the first dashboard GET, bound to the user,
+  `Secure` when `approve_base_url` is https), and a POST needs both; a token scraped from a page body is useless
+  without the cookie. The agent's `/v1/audit` view shows `approver: "human"` (or null for policy), never the username.
+
+**Test-only switch.** The test suite keeps using `127.0.0.1` stubs through
+`destguard.allow_loopback_for_tests()` (Python API only; there is no config key and a config key of that name is
+ignored) and an injectable `dest_guard=` argument of `Broker`.
+
+**Residual risks.**
+* The guard decides on addresses the broker can see. Names that resolve differently from the broker than from
+  the agent's host, or private services on RFC 1918 addresses that must be reachable, remain reachable by design:
+  anything the operator allows with a credential can be called once a human approves it.
+* The broker's own listener is also reachable on the Docker host's LAN address; this is covered by the port rule
+  only for the ports it listens on (`client_port`, `approval_port` and the bound ports). A different service on
+  the same private host is not protected.
+* A credential named by the operator for an internal admin API gives an approved call everything that API allows.
+* The SSO proxy is still trusted. If it reaches the listener from an address inside `approval_trusted_peers`
+  and an agent can make *that* address call the listener, the identity header is believed.
+* Several POST endpoints (`/push/decide`, `/presence`, `/push/event`) rely on `X-Requested-With`, JSON content type
+  and same-origin checks rather than the CSRF cookie; they need the identity header, so the peer rule and the
+  egress marker are what protect them from the broker's own calls.
+* The unrestricted `approval_trust_any_peer: true` setting removes the peer layer; the destination guard and the
+  marker still stand.
+
 ## Threat model, honestly
 
 - **Protects against** an agent (or prompt injection steering it) using
@@ -2805,6 +2911,11 @@ or `expired` mean a human was asked (the agent also learns that from its own req
   methods and call cap, without asking, until a deadline that nothing can move. Read the card's methods
   (POST, PUT, PATCH and DELETE change things) and hosts as the worst case, keep the time short, and revoke on the
   Clients tab if in doubt. See [HTTP sessions](#http-sessions-multi-step-flows-with-one-approval).
+- **The broker is not a proxy for itself.** Outbound calls are refused to loopback, link-local, the broker's own
+  addresses and listener ports, and a credential cannot be created for them (see Security notes). A LAN service
+  an operator allows is reachable by an approved call.
+- **Failure text is a label.** A failed call tells the agent only a class (timeout, tls, dns, connection, invalid
+  request, vault, destination not allowed, other); the cause stays in the operator's own logs and reproduction.
 - Output masking is exact-match; a program that transforms a secret before
   printing it (base64, splitting) defeats it.
 

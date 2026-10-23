@@ -12,6 +12,8 @@
   "approve_base_url": "https://secrets.example.com",
   "allowed_user": "alice",
   "identity_header": "X-authentik-username",
+  "approval_trusted_peers": ["172.23.0.0/16"],
+  "destination_deny_cidrs": [],
   "ttl_seconds": 300,
   "risk": {"escalate_auto_at": "medium"},
   "audit_log": "/data/audit.jsonl",
