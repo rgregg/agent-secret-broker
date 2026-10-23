@@ -168,6 +168,32 @@ credential through the normal flow, which still asks you on every use. Details, 
 prompt-injection stance are in
 [reference.md](reference.md#credential-requests-the-agent-asks-the-human-supplies-the-value).
 
+### Plans for unattended jobs
+
+A plan approves an exact list of calls for an unattended job; a session (below) approves hosts and methods for a login-style flow. Use one or the other for a call (`--plan` or `--session`, never both); both are refused, never prompted, outside what you approved, and neither follows redirects.
+
+    asb plan submit FILE|- [--no-wait]      the manifest; waits for you (about 15 minutes), prints the plan id
+    asb http NAME METHOD URL ... --plan ID  (or ASB_PLAN=ID) one call under the plan
+    asb plan status ID [--json]             state, rules, uses used/max, time left (your own plans)
+    asb plan list [--json]                  this client's plans
+    asb plan close ID                       abandon your own plan early
+
+For a job that runs with nobody at the phone: the agent writes a manifest of the calls it will make, you
+read a rendering of every rule once and approve the whole plan (for a duration you may shorten), and calls
+that match a rule then run with no prompt until the deadline. A call that does not match is **refused**
+(exit 8, with a reason class such as `no_rule` and `why: path`), never turned into a prompt; making it
+without `--plan` asks as usual. Do not submit a plan for one call. Plans need this machine's own credential
+(`asb enroll`; the shared key cannot submit), end at their absolute deadline, cannot be renewed and are lost
+when the broker restarts (exit 7, `kind: unknown`: submit again). `asb help plan` has the manifest format and
+the matching rules (exact host, segment-aligned path, no query string on a write unless its keys are listed,
+ASCII paths with only `%20` percent-encoded, a fixed header allowlist, exact GraphQL documents, no redirects); the
+full description is in [reference.md](reference.md#plans-task-scoped-grants-for-unattended-jobs).
+
+Plan exit codes: 7 the plan has ended or is not usable (`kind` is `ended`, `exhausted`, `closed`, `revoked` or
+`unknown`): stop and submit a new plan; 8 the call is outside the approved plan (`no_rule`, `uses_exhausted`,
+`wrong_policy`): do not retry it; 9 slow down (`rate_limited` or `inflight_limit`), retry after the printed
+seconds. These match the http-sessions exit codes.
+
 ### HTTP sessions: login and cookie flows without a script
 
     asb session open NAME --for "purpose" --host H [--host H2]... [--methods GET,HEAD,POST] [--ttl 15m] [--max-calls N]
@@ -211,8 +237,9 @@ it. Details, limits, the threat model and the audit events are in
 | 4 | Denied by you or by policy |
 | 5 | Expired or timed out waiting for approval |
 | 6 | Env mode: a script changed between the request and the run (`asb: script PATH changed after it was reviewed`); nothing was executed |
-| 7 | A session call: the session expired, was closed or revoked, or is unknown (open a new one, if the human agrees) |
-| 8 | A session call was refused: host or method outside the session, call cap used, or a `{{session.NAME}}` not captured |
+| 7 | **Ended** (sessions and plans share this): the session or plan expired, was closed, revoked, used up, or is unknown (also: lost to a broker restart). `asb` prints the kind. Stop; a new one needs the human again |
+| 8 | **Refused by the approved scope** (sessions and plans share this): a call outside the session's hosts, methods or call cap, a missing `{{session.NAME}}`, or a plan call that matches no rule. Never turned into a prompt; do not retry it as is |
+| 9 | **Retry later** (plans): rate or in-flight limit; `asb` prints `retry_after_s` |
 | 22 | `http`: the upstream answered with status 400 or more (body still printed) |
 | other | Env mode returns the wrapped command's own exit code |
 

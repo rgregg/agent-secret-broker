@@ -48,6 +48,7 @@ from email.utils import parsedate_to_datetime
 
 from .backends import BackendError
 from . import clients as clients_mod
+from . import clock as clock_mod
 from . import credreq as credreq_mod
 from . import guidance as guidance_mod
 
@@ -236,7 +237,7 @@ class Jar:
     Domain attribute widens nothing), is sent only to that host, honours Path, Secure, Max-Age and
     Expires, and is bounded in number and size. Memory only."""
 
-    def __init__(self, clock, wall=time.time):
+    def __init__(self, clock, wall=clock_mod.now):
         self._clock = clock             # monotonic seconds: every expiry here is relative to it
         self._wall = wall               # only to turn an absolute Expires date into "seconds from now"
         self._c = OrderedDict()         # (host, path, name) -> {"value", "secure", "exp"}
@@ -1013,7 +1014,7 @@ class SessionsMixin:
 
     def _init_sessions(self, config):
         self.sessions_cfg = parse_config(config.get("sessions"))
-        self.sessions_clock = time.monotonic           # deadlines are monotonic; tests may inject a clock
+        self.sessions_clock = clock_mod.mono           # the shared monotonic clock (clock.py); tests may inject their own
         self._sess = {}                                # sha256(id) -> Session
         self._sess_tomb = OrderedDict()                # sha256(id) -> {"cid", "reason", "t"}
         self._sess_lock = threading.Lock()
@@ -1105,7 +1106,7 @@ class SessionsMixin:
         with self._sess_lock:
             rows = [{"pid": s.pid, "cred": s.cred, "client_id": s.cid, "client_name": s.cname,
                      "hosts": list(s.hosts), "methods": list(s.methods),
-                     "expires_at": time.time() + max(0, s.expires - now),      # wall time, for display only
+                     "expires_at": clock_mod.now() + max(0, s.expires - now),      # wall time, for display only
                      "left_s": max(0, int(s.expires - now)), "calls": s.calls, "max_calls": s.max_calls}
                     for s in self._sess.values()]
         return sorted(rows, key=lambda r: r["left_s"])
@@ -1177,7 +1178,7 @@ class SessionsMixin:
                         sp["purpose"], who.get("approver"), lambda: self.sessions_clock())
             self._sess[self._skey(sid)] = s
         self.audit("session_opened", req, session=s.pid, hosts=sp["hosts"], methods=sp["methods"], ttl_s=ttl,
-                   max_calls=calls, expires_at=int(time.time() + ttl), shortened=(ttl, calls) != (sp["ttl_s"], sp["max_calls"]))
+                   max_calls=calls, expires_at=int(clock_mod.now() + ttl), shortened=(ttl, calls) != (sp["ttl_s"], sp["max_calls"]))
         return {"session": {"id": sid, "expires_in": ttl, "hosts": sp["hosts"], "methods": sp["methods"],
                             "max_calls": calls}}
 
@@ -1360,7 +1361,7 @@ class SessionsMixin:
     def _session_http(self, req, env):
         """Execute one session call (called from _release with the credential values read)."""
         from . import broker as broker_mod
-        s, t0 = req.session, time.time()
+        s, t0 = req.session, clock_mod.now()
         sc = self.cfg["secrets"].get(req.names[0]) or {}
         try:
             out, info = run_http(s, req.call_spec, env, self._tls_policy(req.names), set(sc.get("allowed_hosts") or []),
@@ -1378,7 +1379,7 @@ class SessionsMixin:
             err.public = "upstream call failed (" + cls + ")"
             raise err from None
         self.audit("http_executed", req, upstream_status=out["status"], response_bytes=len(out["body"]),
-                   duration_ms=int((time.time() - t0) * 1000), session=s.pid)
+                   duration_ms=int((clock_mod.now() - t0) * 1000), session=s.pid)
         left = max(0, int(s.expires - self.sessions_clock()))
         return {"http": out, "session": {**info, "calls_left": max(0, s.max_calls - s.calls), "expires_in": left}}
 

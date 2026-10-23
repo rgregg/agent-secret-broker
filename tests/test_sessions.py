@@ -1823,7 +1823,8 @@ class WallClock(SBase):
     inject_clock = False        # the production clock, untouched
 
     def test_production_uses_the_monotonic_clock(self):
-        self.assertIs(self.broker.sessions_clock, time.monotonic)
+        from secret_broker import clock as clock_mod
+        self.assertIs(self.broker.sessions_clock, clock_mod.mono)      # the one shared monotonic clock
 
     def test_a_wall_clock_step_neither_extends_nor_shortens_a_session(self):
         sid = self.open(ttl_s=600)

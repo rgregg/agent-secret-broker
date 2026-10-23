@@ -761,7 +761,124 @@ def scenario_C(rh):
              len(Aux.telegram) > 3 and not any(v in t for t in Aux.telegram for v in S.values()), f"{len(Aux.telegram)} messages")
     credreq_scenario(rh, g)
     clients_scenario(rh, g)
+    plans_scenario(rh, g)
     sessions_scenario(rh, g)
+
+
+def plans_scenario(rh, g):
+    """Plan mode (task-scoped grants) on the main throwaway broker: a fresh per-client credential submits a
+    manifest, the human approves the card on the real approval site, matching calls run through the real
+    `asb http --plan` with no card and no notification, off-manifest calls are refused (exit 3), the use
+    limit holds, close ends the plan (exit 7). A restart dropping every plan is covered by the unit tests."""
+    b = rh.main
+    home = rh.home / "planhome"         # outside the scanned data and log directories
+    home.mkdir(exist_ok=True)
+    quiet = {"HOME": str(home), "SECRET_BROKER_KEY": ""}
+
+    def enroll_card():
+        _, _, page = b.ap.get("/")
+        m = re.search(r"Client enrollment: ([a-z0-9._-]+)</h2>.*?action='/enroll/decide' class=decide>"
+                      r"<input type=hidden name=id value='([^']+)'", page, re.S)
+        return m.groups() if m else None
+    p = rh.asb_popen(b, "enroll", "--name", "plan-box", "--url", b.url, extra_env=quiet)
+    p.stdin.close()
+    p.stdin = None
+    card, end = None, time.time() + 25
+    while time.time() < end and card is None and p.poll() is None:
+        card = enroll_card()
+        time.sleep(0.2)
+    if card:
+        b.ap.post("/enroll/decide", {"id": card[1], "decision": "approve", "name": card[0]})
+    out, err = p.communicate(timeout=60)
+    rh.outputs.append(("asb enroll", out + err))
+    cfgf = home / ".config" / "secret-broker" / "client.json"
+    key = json.loads(cfgf.read_text()).get("key", "") if cfgf.exists() else ""
+    rh.check(g, "plans: a fresh per-client credential enrolled for the plan scenario", p.returncode == 0 and bool(key), f"rc={p.returncode}")
+    if not key:
+        return
+    SECRETS["plankey"] = key
+    env2 = {"HOME": str(home), "SECRET_BROKER_KEY": key}
+    port = rh.up_port
+    task = "rehearsal nightly sync"
+    manifest = {"v": 1, "task": task, "description": "plan scenario", "ttl_seconds": 1800, "rules": [
+        {"secret": "stub", "method": "GET", "host": "127.0.0.1", "port": port, "scheme": "http",
+         "path_prefix": "/plan/read", "max_uses": 2},
+        {"secret": "stub", "method": "POST", "host": "127.0.0.1", "port": port, "scheme": "http",
+         "path_prefix": "/plan/write", "max_uses": 2,
+         "body": {"json": {"keys": ["x", "kind"], "pin": {"kind": "nightly"}}}}]}
+    mf = rh.srcdir / "plan_manifest.json"
+    mf.write_text(json.dumps(manifest))
+    # 1. submit: the legacy shared key may not, the client can; the human approves the card
+    rc, o, e = rh.asb(b, "plan", "submit", str(mf), "--no-wait")
+    rh.check(g, "plans: the shared legacy key cannot submit a plan (exit 3, per-client credential needed)",
+             rc == 3 and "per-client" in e, f"rc={rc} {e.strip()[:80]}")
+    seen = set(b.ap.cards())
+    n_tg = len(Aux.telegram)
+    sp = rh.asb_popen(b, "plan", "submit", str(mf), extra_env=env2)
+    sp.stdin.close()
+    sp.stdin = None
+    rid = b.ap.wait_card(seen, timeout=25, proc=sp)
+    _, _, page = b.ap.get("/")
+    rh.check(g, "plans: the card renders the rules, the worst case and the agent's words in a marked box",
+             rid is not None and "Plan requested" in page and "CAN CHANGE DATA" in page and "Worst case:" in page
+             and "not verified, not used for any decision" in page and f"GET http://127.0.0.1:{port}/plan/read" in page, "")
+    code, loc, body = b.ap.post("/plans/decide", {"id": rid, "decision": "approve", "granted": "1800"}) if rid else (0, "", "")
+    out, err = sp.communicate(timeout=60)
+    rh.outputs.append(("asb plan submit", out + err))
+    pid = out.strip()
+    rh.check(g, "plans: approval on the approval site prints the plan id", sp.returncode == 0 and re.fullmatch(r"[0-9a-f]{32}", pid) is not None
+             and code == 303, f"rc={sp.returncode} {err.strip()[-80:]}")
+    time.sleep(1.0)
+    msgs = Aux.telegram[n_tg:]
+    rh.check(g, "plans: the notification names the client and credentials only, with no task text and no buttons",
+             any("Plan requested: plan-box, 2 rules: stub" in m for m in msgs) and not any(task in m for m in msgs), f"{len(msgs)} messages")
+    if not re.fullmatch(r"[0-9a-f]{32}", pid):
+        return
+    # 2. matching calls: no card, the secret reaches the upstream, never the agent
+    seen = set(b.ap.cards())
+    n_up = len(Upstream.hits)
+    hdr = ["-H", "Authorization: Bearer {{STUB_TOKEN}}"]
+    rc, o, e = rh.asb(b, "http", "stub", "GET", up_url(rh, "/plan/read"), *hdr, "--plan", pid, extra_env=env2, timeout=30)
+    h = last_hit(rh)
+    rh.check(g, "plans: a matching call runs with no card; the upstream got the secret, the agent output is masked",
+             rc == 0 and set(b.ap.cards()) == seen and h and h["headers"].get("Authorization") == "Bearer " + SECRETS["http"]
+             and SECRETS["http"] not in o + e, f"rc={rc} {e.strip()[:80]}")
+    rc, o, e = rh.asb(b, "http", "stub", "POST", up_url(rh, "/plan/write/1"), *hdr, "-H", "Content-Type: application/json",
+                      "-d", '{"x": "anything", "kind": "nightly"}', "--plan", pid, extra_env=env2, timeout=30)
+    rh.check(g, "plans: a matching POST with a pinned field runs", rc == 0 and last_hit(rh)["method"] == "POST", f"rc={rc} {e.strip()[:80]}")
+    # 3. off-manifest: refused with a reason, no card, nothing sent
+    n_up = len(Upstream.hits)
+    for label, args in (("another path", ["GET", up_url(rh, "/plan/other")] + hdr),
+                        ("a smuggled query override", ["GET", up_url(rh, "/plan/read?_method=DELETE")] + hdr),
+                        ("a different pinned value", ["POST", up_url(rh, "/plan/write"), "-H", "Content-Type: application/json",
+                                                       "-d", '{"x": 1, "kind": "other"}'] + hdr),
+                        ("an encoded dot segment", ["GET", up_url(rh, "/plan/read/%2e%2e/secret")] + hdr)):
+        rc, o, e = rh.asb(b, "http", "stub", *args, "--plan", pid, extra_env=env2, timeout=30)
+        rh.check(g, f"plans: off-manifest ({label}) is refused, exit 8, no prompt",
+                 rc == 8 and "outside the plan" in e and set(b.ap.cards()) == seen, f"rc={rc} {e.strip()[:80]}")
+    rh.check(g, "plans: no refused call reached the upstream", len(Upstream.hits) == n_up, "")
+    # 4. the same call without --plan still asks the human (left undecided)
+    rc, o, e, rid2 = rh.asb_decided(b, ["http", "stub", "GET", up_url(rh, "/plan/noplan")] + hdr, decision=None, timeout=60,
+                                    extra_env=env2)
+    rh.check(g, "plans: the same call without --plan still prompts (a normal card appears)", rid2 is not None and rc == 5, f"rc={rc}")
+    # 5. uses
+    rc, o, e = rh.asb(b, "http", "stub", "GET", up_url(rh, "/plan/read"), *hdr, "--plan", pid, extra_env=env2, timeout=30)
+    rc2, o2, e2 = rh.asb(b, "http", "stub", "GET", up_url(rh, "/plan/read"), *hdr, "--plan", pid, extra_env=env2, timeout=30)
+    rh.check(g, "plans: max_uses holds (the third read is refused, uses_exhausted)",
+             rc == 0 and rc2 == 8 and "uses_exhausted" in e2, f"rc={rc} rc2={rc2} {e2.strip()[:80]}")
+    rc, o, e = rh.asb(b, "plan", "status", pid, extra_env=env2)
+    rh.check(g, "plans: asb plan status shows the uses", rc == 0 and "state:   active" in o and "uses:    3 / 4" in o, o.strip()[:120])
+    # 6. close
+    rc, o, e = rh.asb(b, "plan", "close", pid, extra_env=env2)
+    rc2, o2, e2 = rh.asb(b, "http", "stub", "POST", up_url(rh, "/plan/write"), *hdr, "-H", "Content-Type: application/json",
+                         "-d", '{"x": 1, "kind": "nightly"}', "--plan", pid, extra_env=env2, timeout=30)
+    rh.check(g, "plans: close ends the plan (exit 7, kind closed)", rc == 0 and rc2 == 7 and "kind: closed" in e2, f"rc={rc} rc2={rc2}")
+    recs = {r["event"] for r in b.records()}
+    rh.check(g, "plans: audit has plan_issued, plan_used, plan_miss, plan_closed and no task text or secret",
+             {"plan_issued", "plan_used", "plan_miss", "plan_closed"} <= recs and task not in open(b.audit).read()
+             and SECRETS["http"] not in open(b.audit).read() and key not in open(b.audit).read(), "")
+    rc, o, e = rh.asb(b, "audit", "--event", "plan_issued,plan_used,plan_miss", "--json", extra_env=env2)
+    rh.check(g, "plans: the agent audit view shows plan events without the approver", rc == 0 and "plan_used" in o and "alice" not in o, "")
 
 
 def sessions_scenario(rh, g):

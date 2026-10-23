@@ -49,6 +49,9 @@ from . import guidance as guidance_mod
 from . import proposals as proposals_mod
 from . import credreq as credreq_mod
 from . import clients as clients_mod
+from . import clock as clock_mod
+from . import plans as plans_mod
+from . import planflow
 from . import sessions as sessions_mod
 from . import sshhosts as sshhosts_mod
 from . import sshrules as sshrules_mod
@@ -125,12 +128,13 @@ class Request:
         # credential presented), unlike `source`, which is the client's own user@host claim.
         self.client = client or dict(clients_mod.ClientStore.LEGACY_VIEW)
         self.nonce = secrets.token_urlsafe(24)
-        self.mode = mode          # "env" | "http" | "store" | "ssh_sign" | "guidance" | "credential" | "session"
+        self.mode = mode          # "env" | "http" | "store" | "ssh_sign" | "guidance" | "credential" | "plan" | "session"
+        self.plan_id = None       # mode "plan": the plan this card would start
         self.names = names
         self.spec = spec
         self.source = source      # client-claimed
         self.peer = peer          # actual socket peer
-        self.created = time.time()
+        self.created = clock_mod.now()
         self.expires = self.created + ttl
         self.status = "pending"   # pending|approved|denied|expired|failed|released
         self.error = None
@@ -156,7 +160,8 @@ class Request:
         self.done = threading.Event()
 
 
-class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.SessionsMixin):
+class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.SessionsMixin,
+             planflow.PlansMixin):
     def __init__(self, config, backend, notifier, audit=None, summarizer=None,
                  background_load=False, push=None):
         self.push = push                # PushStore when the webpush transport is configured
@@ -228,6 +233,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         self._init_clients(config)
         self._init_sessions(config)
         self._init_grants(config)
+        self._init_plans(config)
         self._init_ssh_rules()
         if background_load:
             # Listen right away; the first requests wait on the same lock.
@@ -307,6 +313,8 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         ssh = meta.get("ssh", False)
         if not isinstance(ssh, bool):
             raise ValueError("ssh must be true or false")
+        if "plans" in meta and not isinstance(meta["plans"], bool):
+            raise ValueError("plans must be true or false")
         if ssh:
             if len(raw_vars) != 1:
                 raise ValueError("an ssh key secret has exactly one variable (the private key)")
@@ -521,6 +529,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                          "timed_grants": bool(self.grants_cfg["enabled"]),
                          "guidance_proposals": bool(self.proposals_cfg["enabled"]),
                          "credential_requests": bool(self.credreq_cfg["enabled"]),
+                         "plans": bool(self.plans_cfg["enabled"]),
                          "client_enrollment": bool(self.clients_cfg["enrollment"]["enabled"]),
                          "legacy_client_key": self.clients_cfg["legacy"],
                          "http_sessions": {k: self.sessions_cfg[k] for k in (
@@ -584,6 +593,14 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                          ("purpose_length", len(sp["purpose"])),
                          ("purpose_sha256", credreq_mod.purpose_digest(sp["purpose"]))):
                 rec.setdefault(k, v)    # an event's own extra fields (the final hosts) win
+        elif req.mode == "plan":
+            sp = req.spec       # counts, hashes and lengths only; never the task, description or any rule text
+            rec.update(plan_id=req.plan_id, plan_rules=len(sp["rules"]), plan_tier=sp["tier"],
+                       manifest_hash=sp["manifest_hash"], rules_hash=sp["rules_hash"],
+                       requested_s=sp["requested_s"], task_length=len(sp["task"]),
+                       task_sha256=plans_mod.text_digest(sp["task"]),
+                       description_length=len(sp["description"]),
+                       description_sha256=plans_mod.text_digest(sp["description"]) if sp["description"] else None)
         elif req.mode == "session":
             sp = req.spec       # the manifest and the purpose's length and hash; never the purpose
             for k, v in (("hosts", sp["hosts"]), ("methods", sp["methods"]), ("ttl_s", sp["ttl_s"]),
@@ -996,6 +1013,8 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
 
     # -- request lifecycle ------------------------------------------------
     def create(self, mode, names, spec, source, peer=None, client=None):
+        if mode == "http" and "plan" in spec:       # a plan call: matched, released or refused; never a prompt
+            return self._plan_call(names, spec, source, peer, client)
         if mode == "http" and isinstance(spec, dict) and spec.get("session") is not None:
             return self._session_call(names, spec, source, peer, client)
         try:
@@ -1062,7 +1081,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                     err = "too many pending guidance proposals"
                 ttl = self.proposals_cfg["ttl_s"]
             else:
-                if sum(r.status == "pending" and r.mode != "guidance"
+                if sum(r.status == "pending" and r.mode not in ("guidance", "plan")
                        for r in self._by_id.values()) >= MAX_PENDING:
                     err = "too many pending requests"
                 if mode == "session":
@@ -1619,6 +1638,10 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             what = f"Guidance change proposed for {k} credential{'' if k == 1 else 's'}"
         elif req.mode == "credential":
             what = f"Credential requested: {req.names[0]}"
+        elif req.mode == "plan":
+            k = len(req.spec["rules"])
+            what = (f"Plan requested: {req.client['name']}, {k} rule{'' if k == 1 else 's'}: "
+                    f"{', '.join(req.names)}")
         elif req.mode == "session":
             sp = req.spec
             what = (f"HTTP session requested: {req.names[0]} on {', '.join(sp['hosts'])} "
@@ -1638,15 +1661,19 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         elif req.mode == "credential":  # name only: no purpose (untrusted agent text), never a value
             msg = f"{what}\nFrom {req.source}. Open the approval page to enter the value or deny."
             title = "Credential requested [HIGH]"
+        elif req.mode == "plan":        # names only: never the task, description or any rule text
+            msg = f"{what}\nOpen the approval page to read the plan and approve or deny it."
+            title = "Plan requested"
         elif req.mode == "session":     # no purpose (untrusted agent text); the card has everything
             msg = f"{what}\nFrom {req.source}. Open the approval page to review and approve or deny."
             title = "HTTP session requested [HIGH]"
         n = notify_mod.make_notification(
             rid=req.id, tag=f"secret-{req.id[:8]}", title=title, text=msg, names=req.names,
-            risk=req.risk["level"] if req.risk else None, url=url, source=req.source,
+            risk=req.risk["level"] if req.risk and req.mode != "plan" else None, url=url,
+            source=req.source if req.mode != "plan" else req.client["name"],
             summary=req.summary, expires_at=req.expires, transport=self.notifier,
             default_policy=self.action_policy)
-        if req.mode in ("guidance", "credential", "session"):
+        if req.mode in ("guidance", "credential", "plan", "session"):
             # no buttons on any transport: only the dashboard or the link page can decide
             n = dataclasses.replace(n, actions=[], action_token=None, transport_actions={
                 id(leaf): [] for leaf in notify_mod.leaves(self.notifier)})
@@ -1909,6 +1936,8 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                 if r.mode == "guidance":
                     r.result = proposals_mod.outcome(r, "expired")
                     self._proposal_settled(r, "expired")
+                if r.mode == "plan" and r.plan_id:
+                    self.plans.settle(r.plan_id, "expired")
                 self._resolved(r, "expired")
                 r.done.set()
         for rid in [k for k, r in self._by_id.items()
@@ -1927,7 +1956,9 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             req.spec.pop("secret", None)
             if req.mode == "guidance" and req.result is None:
                 req.result = proposals_mod.outcome(req, status)
-        if status == "denied" and req.mode != "guidance" and extra.get("via") != "client_revoked":
+        if req.mode == "plan" and status != "approved" and req.plan_id:
+            self.plans.settle(req.plan_id, status, cooldown=extra.get("via") != "client_revoked")  # the plan follows its card
+        if status == "denied" and req.mode not in ("guidance", "plan") and extra.get("via") != "client_revoked":
             now = time.time()
             for n in req.names:
                 self._denied_at[n] = now
@@ -2034,7 +2065,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
 
     def decide_via(self, channel, rid, decision, actor, *, token=None, always=False,
                    nonce=None, peer=None, client_ip=None, grant_minutes=None, ssh_rule=None,
-                   apply=None, credential=None, rule_scope="client", session_limits=None, **audit_extra):
+                   apply=None, credential=None, rule_scope="client", plan=None, session_limits=None, **audit_extra):
         """The single entry for every decision. Returns (http_status, req):
         200 decided; 403 wrong/missing token; 404 unknown; 410 already decided,
         expired or token spent (no state change). `decision` is "approve" or
@@ -2100,7 +2131,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                     if match is None:
                         code, refused_log = (403 if cands else 410), True
                     elif ch.token_required and (decision not in match.offered
-                                                or match.mode in ("guidance", "credential", "session")):
+                                                or match.mode in ("guidance", "credential", "plan", "session")):
                         # Token is valid but this action was never offered (action
                         # policy): refuse like a bad token and do NOT spend it.
                         code, refused_log, unoffered = 403, True, match
@@ -2122,6 +2153,22 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                         req, code = None, 400   # nothing is claimed or changed
                     else:
                         req.apply = sel
+                if req is not None and req.mode == "plan":
+                    # a plan is approved only on the approval pages, with a chosen duration (never
+                    # longer than asked) and, for a high plan, the second confirmation; never an
+                    # Always, grant or SSH rule
+                    pl = plan or {}
+                    gs = pl.get("granted_s")
+                    if (always or grant_minutes is not None or ssh_rule is not None or credential is not None
+                            or (approve and (plan is None or gs not in plans_mod.duration_choices(
+                                req.spec["requested_s"])))):
+                        req, code = None, 400   # nothing is claimed or changed
+                    elif approve and req.spec["tier"] == "high" and not pl.get("confirmed"):
+                        req, code = None, 409   # needs the second confirmation
+                    elif approve:
+                        req.spec["granted_s"] = gs
+                elif req is not None and plan is not None:
+                    req, code = None, 400
                 if req is not None and req.mode == "credential":
                     # approval needs the human's validated entry (see submit_credential) and carries
                     # no Always, grant or SSH rule; a denial needs nothing
@@ -2200,7 +2247,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         self.grants_cfg = grants_mod.parse_config(config.get("timed_grants"))
         apath = self._audit._path
         gpath = os.path.join(os.path.dirname(os.path.abspath(apath)), "grants.json") if apath else None
-        self.grants = grants_mod.GrantStore(gpath, self.log, clock=lambda: time.time(),
+        self.grants = grants_mod.GrantStore(gpath, self.log, clock=clock_mod.now,
                                             max_minutes=self.grants_cfg["max_minutes"])
         if self.grants_cfg["enabled"]:      # disabled: any persisted grants are ignored
             self.grants.load()
@@ -2497,6 +2544,14 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                 return
             self._finish(req, "approved", result=result, **who)
             return
+        if req.mode == "plan":
+            try:
+                result = self._plan_activate(req, who)
+            except Exception as e:  # noqa: BLE001 -- the card must always settle; a class only
+                self._finish(req, "failed", error=f"plan not started: {type(e).__name__}", **who)
+                return
+            self._finish(req, "approved", result=result, **who)
+            return
         if req.mode == "guidance":
             try:
                 result = self._apply_proposal(req, who)
@@ -2608,12 +2663,31 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             raise BackendError("credential requests are stored only by a human decision")
         if req.mode == "guidance":      # applied only by _apply_proposal, after a human decision
             raise BackendError("guidance proposals are applied only by a human decision")
+        if req.mode == "plan":          # started only by _plan_activate, after a human decision
+            raise BackendError("plans are started only by a human decision")
         if req.mode == "session":       # opened only by _session_open, after a human decision
             raise BackendError("sessions are opened only by a human decision")
         if req.mode == "store":
             return self._store(req)
         if req.mode == "ssh_sign":
             return self._ssh_sign(req)
+        env = self._read_env(req)
+        if req.mode == "env":
+            return {"env": env}
+        if req.session is not None:
+            return self._session_http(req, env)
+        t0 = time.time()
+        try:
+            out = _do_http(req.spec, env, self._tls_policy(req.names))
+        except OSError as e:
+            self.audit("http_failed", req, error=str(e)[:200])
+            raise
+        self.audit("http_executed", req, upstream_status=out["status"],
+                   response_bytes=len(out["body"]), duration_ms=int((time.time() - t0) * 1000))
+        return {"http": out}
+
+    def _read_env(self, req):
+        """{VAR: value} for the request's secrets, read from the vault (audited as secret_read)."""
         env, raw = {}, {}
         for n in req.names:
             if n not in self.cfg["secrets"]:
@@ -2628,19 +2702,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                 except structured.StructuredError as e:
                     raise BackendError(f"{var}: {e}") from None
             self.audit("secret_read", req, secret=n, vars=sorted(self.cfg["secrets"][n]["vars"]))
-        if req.mode == "env":
-            return {"env": env}
-        if req.session is not None:
-            return self._session_http(req, env)
-        t0 = time.time()
-        try:
-            out = _do_http(req.spec, env, self._tls_policy(req.names))
-        except OSError as e:
-            self.audit("http_failed", req, error=str(e)[:200])
-            raise
-        self.audit("http_executed", req, upstream_status=out["status"],
-                   response_bytes=len(out["body"]), duration_ms=int((time.time() - t0) * 1000))
-        return {"http": out}
+        return env
 
     def _ssh_sign(self, req):
         name = req.names[0]
@@ -2679,6 +2741,14 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                 out = {"status": st, "error": req.error}
                 if st != "pending" and req.result is not None:
                     out["guidance"] = {k: list(v) for k, v in req.result.items()}
+            return out
+        if req.mode == "plan":
+            # a plan id is an identifier, not a secret: repeatable, so a lost response costs nothing
+            with self._lock:
+                st = "pending" if req.status == "deciding" else req.status
+                out = {"status": st, "error": req.error}
+                if st in ("approved", "released") and req.result:
+                    out["status"], out["plan"] = "approved", dict(req.result)
             return out
         with self._lock:
             if req.status == "approved":
@@ -2788,17 +2858,31 @@ def _do_http(spec, env, tls=None):
         _fill(spec["url"], env), data=data, method=spec["method"],
         headers={k: _fill(v, env) for k, v in spec["headers"].items()},
     )
+    return _exchange(req, list(env.values()), tls)
+
+
+def _exchange(req, values, tls, strip_cookies=False, timeout=30):
+    """Send one urllib request (never following a redirect) and return the masked response."""
     try:
-        with _opener_for(tls).open(req, timeout=30) as r:
+        with _opener_for(tls).open(req, timeout=timeout) as r:
             status, headers, body = r.status, dict(r.headers), r.read(MAX_RESPONSE_BYTES)
     except urllib.error.HTTPError as e:
         status, headers, body = e.code, dict(e.headers), e.read(MAX_RESPONSE_BYTES)
-    values = list(env.values())
+    if strip_cookies and 300 <= status < 400:
+        headers = {k: v for k, v in headers.items() if k.lower() != "set-cookie"}
     return {
         "status": status,
         "headers": {k: _mask(v, values) for k, v in headers.items()},
         "body": _mask(body.decode("utf-8", "replace"), values),
     }
+
+
+def _exchange_frozen(frozen, values, tls, timeout=30):
+    """Send the frozen plan request EXACTLY as matched: its url, method, headers and body bytes."""
+    req = urllib.request.Request(frozen.url, data=frozen.body or None, method=frozen.method,
+                                 headers=dict(frozen.headers))
+    plans_mod.assert_sent_is_matched(frozen, req)
+    return _exchange(req, values, tls, strip_cookies=True, timeout=timeout)
 
 
 # -- HTTP layer -------------------------------------------------------------
@@ -3656,7 +3740,7 @@ def _page(h, code, body, wide=False, nav=True, script=None, tab=None, badge=0, u
            f"<link rel=icon href=\"{_ICON}\">"
            f"<link rel=apple-touch-icon sizes=180x180 href=\"{_ICON_PNG_URI}\">"
            "<link rel=manifest href=/manifest.webmanifest crossorigin=use-credentials>"
-           f"<style>{_CSS}{scripts_mod.CSS}{details_mod.CSS}{proposals_mod.CSS}{credreq_mod.CSS}{clients_mod.CSS}{sessions_mod.CSS}</style><body>{_chrome(tab, badge, user) if nav else ''}"
+           f"<style>{_CSS}{scripts_mod.CSS}{details_mod.CSS}{proposals_mod.CSS}{credreq_mod.CSS}{clients_mod.CSS}{sessions_mod.CSS}{plans_mod.CSS}</style><body>{_chrome(tab, badge, user) if nav else ''}"
            f"<main class='{'wide' if wide else 'narrow'}'>{_SIGNED_OUT if nav else ''}{body}</main>{scr}</body></html>").encode()
     h.send_response(code)
     h.send_header("Content-Type", "text/html; charset=utf-8")
@@ -3687,6 +3771,8 @@ def _describe(req):
         return proposals_mod.describe_html(req)
     if req.mode == "credential":
         return credreq_mod.describe_html(req)
+    if req.mode == "plan":
+        return plans_mod.describe_html(req)
     if req.mode == "session":
         return sessions_mod.describe_html(req)
     if req.mode == "ssh_sign":
@@ -3736,9 +3822,10 @@ def _iso(t):
 _CHANNEL_LABEL = {"dashboard": "web dashboard", "push": "browser push notification",
                   "ha": "Home Assistant", "link": "approval link"}
 _MODE_LABEL = {"http": "web", "env": "run-with-secret", "ssh_sign": "ssh signing",
-               "guidance": "guidance proposal", "credential": "credential request",
+               "guidance": "guidance proposal", "credential": "credential request", "plan": "plan",
                "session": "http session"}
-_CLIENT_NOTES = {"sesrevoked": "Session revoked. Its next call fails.",
+_CLIENT_NOTES = {"planrevoked": "Plan revoked: it stops matching before its next call.",
+                 "plangone": "That plan is no longer active.", "sesrevoked": "Session revoked. Its next call fails.",
                  "sesgone": "That session had already ended.", "renamed": "Client renamed.", "revoked": "Client revoked. Its next request fails.",
                  "revokedmem": "Client revoked in memory, but the client list could not be saved; it is "
                                "retried, and the revoke is lost on a restart until it is saved.",
@@ -3759,6 +3846,8 @@ def _approve_actions(broker, req):
         return proposals_mod.actions_html(broker, req)
     if req.mode == "credential":    # open the entry page, or deny; never an Approve button here
         return credreq_mod.card_actions_html(req)
+    if req.mode == "plan":          # duration, Approve (second step for a high plan), Deny
+        return plans_mod.card_actions_html(req)
     if req.mode == "session":       # shorten-only limits, Approve or Deny; no Always, no timed grant
         return sessions_mod.actions_html(broker, req)
     e = html.escape
@@ -3833,7 +3922,7 @@ def _session_limits(form, req):
 
 def _apply_set(form):
     """The entry indexes ticked on a guidance proposal form (fields apply_<index>)."""
-    return {int(k[6:]) for k in form if k.startswith("apply_") and k[6:].isdigit() and len(k) <= 12}
+    return {int(k[6:]) for k in form if k.startswith("apply_") and k[6:].isascii() and k[6:].isdigit() and len(k) <= 12}
 
 
 def _fmt_minutes(m):
@@ -3846,7 +3935,7 @@ def _parse_decision(decision):
         return decision, False, None
     if decision == "approve_always":
         return "approve", True, None
-    if decision.startswith("approve_grant_") and decision[14:].isdigit() and len(decision) < 22:
+    if decision.startswith("approve_grant_") and decision[14:].isascii() and decision[14:].isdigit() and len(decision) < 22:
         return "approve", False, int(decision[14:])
     return None
 
@@ -3866,6 +3955,12 @@ def _secs(a, b):
         return ""
     d = b - a
     return f"{d:.1f}s" if d < 120 else f"{int(d // 60)}m {int(d % 60)}s"
+
+
+def _hm_sec(s):
+    if not isinstance(s, int) or isinstance(s, bool):
+        return None
+    return f"{s // 3600} h {(s % 3600) // 60} min" if s >= 3600 else f"{s // 60} min"
 
 
 def _ev_val(v):
@@ -3939,6 +4034,18 @@ def _detail_html(r, evs, retained=""):
         add("Edited by the human", ", ".join(prov.get("edited") or []) or ("none" if prov else None))
         if st.get("value_bytes") is not None:
             add("Value size", f"{st['value_bytes']} bytes (never recorded)")
+    elif r["mode"] == "plan":
+        # counts, hash prefixes and lengths only: the task, description and rule text are not retained
+        rq, iss = first("requested") or {}, first("plan_issued") or {}
+        add("Operation", "plan (an agent asked for a set of calls to be approved once)")
+        add("Rules", rq.get("plan_rules"))
+        add("Tier", rq.get("plan_tier"))
+        add("Requested duration", _hm_sec(rq.get("requested_s")))
+        add("Granted duration", _hm_sec(iss.get("granted_s")))
+        add("Plan id", f"<code>{e(str(rq.get('plan_id') or ''))}</code>" if rq.get("plan_id") else None, True)
+        add("Manifest", f"sha256 <code>{e(str(rq.get('manifest_hash') or '')[:8])}</code>", True)
+        add("Task and description", f"not retained ({rq.get('task_length', '?')} and "
+            f"{rq.get('description_length', '?')} characters)")
     elif r["mode"] == "session":
         # manifest and hash prefix only: the purpose text is not retained
         req_ev, opened = first("requested") or {}, first("session_opened") or {}
@@ -4000,6 +4107,11 @@ def _detail_html(r, evs, retained=""):
         add("Decided by", "standing SSH rule (auto-approved): "
             f"{used.get('account') or '?'}@{used.get('rule_host') or sshrules_mod.short_fp(used.get('host_fp')) or '?'}"
             f", rule {str(r['rule_id'])[:16]}")
+    elif r["via"] == "policy" and r.get("plan_id"):
+        left = r.get("plan_left_s")
+        add("Decided by", f"plan {str(r['plan_id'])[:8]} (auto-approved)"
+            + ((f", {_hm_sec(left)} left" if left >= 60 else ", under a minute left")
+               if isinstance(left, int) else ""))
     elif r["via"] == "policy" and r.get("grant_id"):
         left = (final or {}).get("grant_left_s")
         used = first("grant_used") or {}
@@ -4169,8 +4281,10 @@ def client_handler(broker, client_key):
                 return self._enroll_post()
             if not self._authed():
                 return
+            if planflow.client_request(self, broker, "POST", self.path.split("?")[0]):
+                return
             if self.path != "/v1/requests":
-                # the client API has exactly one POST endpoint, and it takes no secret value
+                # the client API has one request endpoint plus the plan endpoints; none takes a secret value
                 return _json(self, 404, {"error": "not found"})
             try:
                 n = int(self.headers.get("Content-Length", 0))
@@ -4189,9 +4303,13 @@ def client_handler(broker, client_key):
                 if mode == "guidance":
                     spec = {"entries": body.get("entries")}
                 elif mode == "http":
-                    spec = {"method": str(body["method"]).upper(), "url": str(body["url"]),
+                    # a plan call keeps its method exactly as sent: the matcher requires uppercase
+                    spec = {"method": str(body["method"]) if "plan" in body else str(body["method"]).upper(),
+                            "url": str(body["url"]),
                             "headers": dict(body.get("headers") or {}), "body": body.get("body"),
                             "body_b64": body.get("body_b64")}
+                    if "plan" in body:
+                        spec["plan"] = body["plan"]
                     if body.get("session") is not None:
                         spec["session"] = body["session"]
                         spec["capture"] = body.get("capture")
@@ -4239,6 +4357,8 @@ def client_handler(broker, client_key):
                     broker.log("bad_request", peer=self.client_address[0], error=str(e)[:200],
                                client_id=self.client["id"], client_name=self.client["name"])
                 return _json(self, 400, {"error": str(e)})
+            except planflow.PlanRefused as e:
+                return _json(self, e.code, e.body, e.headers)
             except PermissionError as e:
                 return _json(self, 403, {"error": str(e)})
             _json(self, 202, {"id": req.id, "status": req.status, "error": req.error,
@@ -4258,6 +4378,8 @@ def client_handler(broker, client_key):
                 return
             if u.path == "/v1/status":
                 return _json(self, 200, broker.status())
+            if planflow.client_request(self, broker, "GET", u.path):
+                return
             if u.path in ("/v1/audit", "/v1/audit/verify"):
                 code, body, hdrs = audit_view.handle(
                     u.path, u.query, self.client["id"], None if self.client["legacy"] else self.client["id"])
@@ -4351,6 +4473,7 @@ def approval_handler(broker):
                      "sshrule": "Approved, and this key is always approved for that account on that server.",
                      "norule": "No standing rule was created; the request is still waiting.",
                      "revoked": "Grant revoked.",
+                     "planok": "Plan approved. The client can make exactly the listed calls until the deadline.",
                      "stale": "That request was already handled or has expired.",
                      "enrolled": "Client enrolled. It starts with no rules of its own.",
                      "enrolldeny": "Enrollment denied.",
@@ -4372,13 +4495,13 @@ def approval_handler(broker):
                 cards.append(
                     f"<article class=req data-id='{html.escape(r.id)}'>"
                     f"<div class=reqhead><h2>"
-                    f"{'Guidance proposal' if r.mode == 'guidance' else html.escape(', '.join(r.names))}</h2>"
+                    f"{'Guidance proposal' if r.mode == 'guidance' else 'Plan: ' + html.escape(', '.join(r.names)) if r.mode == 'plan' else html.escape(', '.join(r.names))}</h2>"
                     f"<time data-exp='{int(r.expires)}'>expires in "
                     f"{max(0, int(r.expires - time.time()))}s</time></div>{_risk_html(r)}"
                     f"<div class=box>{clients_mod.from_html(r)}<br>{what}</div>"
                     f"{details_mod.html(broker.details_view(r))}"
                     f"<p><small>{rnote}</small></p>"
-                    "<form method=post action='/decide' class=decide>"
+                    f"<form method=post action='{'/plans/decide' if r.mode == 'plan' else '/decide'}' class=decide>"
                     f"<input type=hidden name=id value='{html.escape(r.id)}'>"
                     f"<input type=hidden name=csrf value='{token}'>"
                     f"{_approve_actions(broker, r)}</form></article>")
@@ -4396,7 +4519,7 @@ def approval_handler(broker):
             recent = self._recent_history(a, pend_ids)
             msg = notes.get(note, "")
             n_ent = ((q or {}).get("n") or [""])[0]
-            if note == "gapplied" and n_ent.isdigit() and len(n_ent) < 4:
+            if note == "gapplied" and n_ent.isascii() and n_ent.isdigit() and len(n_ent) < 4:
                 msg = f"Applying {n_ent} entr{'y' if n_ent == '1' else 'ies'}... " + msg
             _page(self, 200,
                   f"<div id=flash class=flash{'' if msg else ' hidden'}>{html.escape(msg)}</div>"
@@ -4416,7 +4539,7 @@ def approval_handler(broker):
                 if arg("outcome") in OUTCOMES + ("unknown",) and arg("outcome") != "pending":
                     a["outcome"] = arg("outcome")
                 a["secret"] = arg("secret")
-                if arg("mode") in ("http", "env", "store", "ssh_sign", "guidance", "credential", "session"):
+                if arg("mode") in ("http", "env", "store", "ssh_sign", "guidance", "credential", "plan", "session"):
                     a["mode"] = arg("mode")
             try:
                 n = int(arg("limit") or HIST_PAGE)
@@ -4444,6 +4567,8 @@ def approval_handler(broker):
                     what = r.get("ssh_what") or "ssh signature"
                 elif r["mode"] == "credential":
                     what = "credential request"
+                elif r["mode"] == "plan":
+                    what = "plan"
                 elif r["mode"] == "session":
                     what = "http session for " + ", ".join(r["names"])
                 elif r["mode"] == "guidance":
@@ -4494,7 +4619,7 @@ def approval_handler(broker):
                     f"<select name=secret aria-label=Secret>"
                     f"{opt(broker.history.secrets_seen(), a['secret'], 'any secret')}</select>"
                     f"<select name=mode aria-label=Mode>"
-                    f"{opt(('http', 'env', 'store', 'ssh_sign', 'guidance', 'credential'), a['mode'], 'any mode')}</select>"
+                    f"{opt(('http', 'env', 'store', 'ssh_sign', 'guidance', 'credential', 'plan'), a['mode'], 'any mode')}</select>"
                     "<noscript><button>Filter</button></noscript></form>")
             return ("<section id=recent><h3>History</h3><div class='card flush'>"
                     f"{form}{self._hist_list(a, pend_ids)}</div></section>")
@@ -4562,6 +4687,56 @@ def approval_handler(broker):
             fields are never filled in, so an error re-render cannot echo the value."""
             body = credreq_mod.form_html(req, broker.csrf_token(user), values, errors)
             _page(self, status, body, tab="requests", badge=broker.attention(), user=user)
+
+        def _plan_page(self, req, user):
+            """/a/<nonce> for a plan: the whole card, with its own CSRF-protected form. The nonce
+            page has no other way to decide a plan."""
+            what, note = _describe(req)
+            _page(self, 200,
+                  f"<h1>Plan request</h1><p><b>{html.escape(', '.join(req.names))}</b></p>{_risk_html(req)}"
+                  f"<div class=box>{clients_mod.from_html(req)}<br>{what}</div>"
+                  f"<p><small>{note}</small></p>"
+                  f"<p><small>Expires in {max(0, int(req.expires - time.time()))}s</small></p>"
+                  "<form method=post action='/plans/decide' id=f>"
+                  f"<input type=hidden name=nonce value='{html.escape(req.nonce)}'>"
+                  f"<input type=hidden name=csrf value='{broker.csrf_token(user)}'>"
+                  f"{_approve_actions(broker, req)}</form>", tab="requests", badge=broker.attention(), user=user)
+
+        def _plans_post(self, path, form, user):
+            """POST /plans/decide and /plans/revoke (CSRF already checked): the only way a plan is
+            approved. No notification button, token, hook or link-page button reaches either."""
+            peer, fwd = self.client_address[0], self._fwd()
+            one = lambda k: (form.get(k) or [""])[0]  # noqa: E731
+            if path == "/plans/revoke":
+                done = broker.revoke_plan(one("plan")[:40], user, peer, fwd)
+                return self._redirect("/clients?note=" + ("planrevoked" if done else "plangone"))
+            decision = one("decision")
+            gs = one("granted")
+            nonce, rid = one("nonce")[:64] or None, one("id")[:64] or None
+            code, done = broker.decide_plan(decision, user, rid=rid, nonce=nonce,
+                                            granted_s=int(gs) if gs.isascii() and gs.isdigit() and len(gs) < 9 else None,
+                                            peer=peer, client_ip=fwd)
+            if done is None:
+                if code == 409:
+                    return _page(self, 409, "<h1>This plan needs a second confirmation</h1><p>Go back, open "
+                                 "<b>Approve plan</b> and press <b>Approve anyway</b>. The plan is still "
+                                 "waiting.</p>", tab="requests", badge=broker.attention(), user=user)
+                if nonce:
+                    return _page(self, 400 if code == 400 else 404,
+                                 "<h1>That decision could not be applied</h1><p>The plan may already be "
+                                 "handled, or the chosen duration is not offered.</p>")
+                return self._redirect("/?note=" + ("bad" if code == 400 else "stale"))
+            if decision == "deny":
+                return (_page(self, 200, "<h1>Denied</h1><p>Nothing was granted.</p>") if nonce else
+                        self._redirect("/?note=denied"))
+            done.done.wait(15)
+            if nonce:
+                ok = done.status in ("approved", "released")
+                return _page(self, 200 if ok else 500,
+                             "<h1>Plan approved</h1><p>The client can now make exactly the listed calls until "
+                             "the deadline. You can close this page.</p>" if ok else
+                             "<h1>The plan was not started</h1><p>See the history on the Requests tab.</p>")
+            return self._redirect("/?note=" + ("planok" if done.status in ("approved", "released") else "bad"))
 
         def _credential_get(self, user, rid):
             r = broker._by_id.get(rid)
@@ -4670,6 +4845,9 @@ def approval_handler(broker):
                   "broker config (risk.auto_approve_max).</small></div></div>"
                   "<div class=srow><div class=t><b>Notifications</b><small class=muted>"
                   f"{html.escape(presence_mod.describe(broker.presence_cfg))}</small></div></div>"
+                  "<div class=srow><div class=t><b>Plans</b><small class=muted>"
+                  f"{html.escape(plans_mod.describe_config(broker.plans_cfg))}. Set in the broker config "
+                  "(plans); a plan lasts at most until its deadline and ends on a restart.</small></div></div>"
                   "<div class=srow><div class=t><b>Standing approvals</b><small class=muted>"
                   f"{html.escape(grants_mod.describe(broker.grants_cfg, broker.auto_approve_max()))}. "
                   "Durations are set in the broker config (timed_grants).</small></div></div></section>"
@@ -4798,7 +4976,9 @@ def approval_handler(broker):
 
         def _clients_page(self, user, note="", status=200):
             token = broker.csrf_token(user)
+            # the approvals that belong to a client live together under the clients: plans, then sessions
             _page(self, status, clients_mod.clients_section(broker, token, flash=note)
+                  + plans_mod.active_table_html(broker.active_plans(), token)
                   + sessions_mod.sessions_section(broker, token),
                   script=_GRANTS_JS, tab="clients", badge=broker.attention(), user=user)
 
@@ -4893,6 +5073,8 @@ def approval_handler(broker):
                 return _page(self, 404, "<h1>Request not found or already handled</h1>")
             if req.mode == "credential":
                 return self._credential_page(req, user)
+            if req.mode == "plan":
+                return self._plan_page(req, user)
             what, note = _describe(req)
             summary_html = _risk_html(req)
             _page(self, 200, f"""
@@ -5072,7 +5254,7 @@ def approval_handler(broker):
             if path in ("/decide", "/credential", "/request/retry", "/policies", "/policies/guidance", "/policies/ssh_hosts", "/grants/revoke",
                         "/enroll/decide", "/clients/rename", "/clients/revoke", "/clients/remove", "/sessions/revoke",
                         "/policies/ssh_rules/add", "/policies/ssh_rules/revoke", "/push/subscribe",
-                        "/push/revoke", "/push/test") and not self._csrf_ok(user, form.get("csrf", [""])[0]):
+                        "/push/revoke", "/push/test", "/plans/decide", "/plans/revoke") and not self._csrf_ok(user, form.get("csrf", [""])[0]):
                 broker.log("csrf_refused", path=path, peer=self.client_address[0],
                            client_ip=self._fwd(), origin=(self.headers.get("Origin") or "")[:80],
                            fetch_site=self.headers.get("Sec-Fetch-Site"))
@@ -5081,6 +5263,8 @@ def approval_handler(broker):
                 return self._push_post(path, form, user)
             if path == "/credential":
                 return self._credential_post(user, form)
+            if path in ("/plans/decide", "/plans/revoke"):
+                return self._plans_post(path, form, user)
             if path.startswith("/clients/") or path == "/enroll/decide":
                 return self._clients_post(path, form, user)
             if path == "/sessions/revoke":
@@ -5213,6 +5397,9 @@ def approval_handler(broker):
                 return _page(self, 400, "<h1>Enter the value on the credential page</h1>"
                              "<p>A credential request can only be approved by typing the value into its "
                              "form. The request is still waiting.</p>")
+            if code in (400, 409) and held is not None and held.mode == "plan":
+                return _page(self, 400, "<h1>Use the plan page</h1><p>A plan is approved only on its own "
+                             "page, with a chosen duration. The plan is still waiting.</p>")
             if code == 400 and held is not None and held.mode == "guidance":
                 return _page(self, 400, "<h1>Nothing selected</h1>"
                              "<p>Go back, tick at least one entry to apply (or press Deny all). "
