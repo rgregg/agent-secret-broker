@@ -44,7 +44,7 @@ from . import errclass
 from . import httpcheck
 from . import notify as notify_mod
 from . import presence as presence_mod
-from .notify import NotifyError
+from .notify import NotifyError  # noqa: F401 -- re-exported
 from . import grants as grants_mod
 from . import icon as icon_mod
 from . import standing as standing_mod
@@ -1403,7 +1403,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             return req
         try:
             self._push(req)
-        except (NotifyError, OSError):
+        except Exception:  # noqa: BLE001 -- a request must always settle; the notify error text is never kept
             self._finish(req, "failed", error="could not notify")
         return req
 
@@ -1465,7 +1465,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                    entry_sha256=[e["sha"] for e in ents])
         try:
             self._push(req)
-        except (NotifyError, OSError):
+        except Exception:  # noqa: BLE001 -- a request must always settle; the notify error text is never kept
             self._finish(req, "failed", error="could not notify")
         return req
 
@@ -1547,7 +1547,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                    summary_reason=None)
         try:
             self._push(req)
-        except (NotifyError, OSError):
+        except Exception:  # noqa: BLE001 -- a request must always settle; the notify error text is never kept
             self._finish(req, "failed", error="could not notify")
         return req
 
@@ -2128,7 +2128,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             {notify_mod.transport_type(t) or "?" for t in leaves}))
         try:
             notify_mod.send_to(leaves, h["n"])
-        except (NotifyError, OSError):
+        except Exception:  # noqa: BLE001 -- a request must always settle; the notify error text is never kept
             if not req._sent_to[:-len(leaves)]:         # nothing was ever delivered
                 self._finish(req, "failed", error="could not notify")
         else:
