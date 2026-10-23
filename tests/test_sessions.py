@@ -420,7 +420,7 @@ class Helpers(unittest.TestCase):
         import urllib.error
         for exc, want in ((socket.timeout("secret"), "timeout"), (ssl.SSLError("secret"), "tls"),
                           (socket.gaierror(1, "secret"), "dns"), (ConnectionRefusedError("secret"), "connection"),
-                          (ValueError("secret"), "invalid_request"), (OSError("secret"), "connection"),
+                          (ValueError("secret"), "invalid request"), (OSError("secret"), "connection"),
                           (urllib.error.URLError(ConnectionRefusedError("secret")), "connection"),
                           (RuntimeError("secret"), "other")):
             self.assertEqual(S.coarse_class(exc), want)
@@ -2077,7 +2077,7 @@ class Review3(SBase):
         # a value with a line break is refused with the same fixed class whatever the value is
         sid = self.open(cred="crlfcred")
         code, r = self.call(sid, "POST", "/echo", names=("crlfcred",), headers={"Authorization": "Bearer {{CRLFCRED_TOKEN}}"})
-        self.assertEqual(r["error"], "upstream call failed (invalid_request)")
+        self.assertEqual(r["error"], "upstream call failed (invalid request)")
         self.assertEqual(self.sess(sid).calls, 1)                     # charged like any sent call: no free oracle
         self.assertNotIn("a\r\nb", json.dumps(self.records()))
 
@@ -2484,7 +2484,7 @@ class Review5(SBase):
             code, r = self.call(sid, "GET", "/", names=(cred,), url=self.url("/p?x={{%s}}" % var))
             outs.append((code, r.get("error"), self.sess(sid).calls))
         self.assertEqual(outs[0], outs[1])
-        self.assertEqual(outs[0][1], "upstream call failed (invalid_request)")
+        self.assertEqual(outs[0][1], "upstream call failed (invalid request)")
         self.assertEqual(outs[0][2], 1)                              # charged: probing costs calls
         self.assertEqual(self.st["seen"], [])
 

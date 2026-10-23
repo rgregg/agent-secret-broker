@@ -2209,7 +2209,7 @@ class Dashboard(Harness):
 
     def cev(self, body, user="alice", headers=None, raw=None):
         h = {"X-authentik-username": user, "Content-Type": "application/json",
-             "X-Requested-With": "asb"}
+             "X-Requested-With": "asb", "Origin": self.broker.cfg["approve_base_url"].rstrip("/"),}
         if headers is not None:
             h = {k: v for k, v in {**h, **headers}.items() if v is not None}
         data = raw if raw is not None else json.dumps(body).encode()

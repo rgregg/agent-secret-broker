@@ -314,7 +314,7 @@ class Listener(t.Dashboard):
     def ev(self, body, user="alice", hdr=None, raw=None):
         import urllib.request
         h = {"X-authentik-username": user, "Content-Type": "application/json",
-             "X-Requested-With": "asb"}
+             "X-Requested-With": "asb", "Origin": self.broker.cfg["approve_base_url"].rstrip("/")}
         h.update(hdr or {})
         h = {k: v for k, v in h.items() if v is not None}
         data = raw if raw is not None else json.dumps(body).encode()
@@ -506,7 +506,7 @@ class PushDecide(t.Dashboard):
     def pd(self, body, user="alice", hdr=None, raw=None):
         import urllib.request
         h = {"X-authentik-username": user, "Content-Type": "application/json",
-             "X-Requested-With": "asb"}
+             "X-Requested-With": "asb", "Origin": self.broker.cfg["approve_base_url"].rstrip("/")}
         h.update(hdr or {})
         h = {k: v for k, v in h.items() if v is not None}
         data = raw if raw is not None else json.dumps(body).encode()

@@ -416,19 +416,19 @@ class SessionLeaks(Everywhere, ts.SBase):
         self.broker.backend._data["Spacecred"]["token"] = SPACE
         code, r = self.call_with("spacecred", url=self.url("/p/{{SPACECRED_TOKEN}}"))
         self.assertEqual(r["status"], "failed", r)
-        self.assertEqual(r["error"], "upstream call failed (invalid_request)")
+        self.assertEqual(r["error"], "upstream call failed (invalid request)")
         self.assert_no_leak()
 
     def test_crlf_value(self):
         self.broker.backend._data["Crlfcred"]["token"] = CORE + "\r\nX: y"
         code, r = self.call_with("crlfcred", headers={"X-CSRF-Token": "{{CRLFCRED_TOKEN}}"})
-        self.assertEqual(r["error"], "upstream call failed (invalid_request)")
+        self.assertEqual(r["error"], "upstream call failed (invalid request)")
         self.assert_no_leak()
 
     def test_non_ascii_value(self):
         self.broker.backend._data["Spacecred"]["token"] = CORE + "☃"
         code, r = self.call_with("spacecred", headers={"X-CSRF-Token": "{{SPACECRED_TOKEN}}"})
-        self.assertEqual(r["error"], "upstream call failed (invalid_request)")
+        self.assertEqual(r["error"], "upstream call failed (invalid request)")
         self.assert_no_leak()
 
     def test_value_as_port_is_never_sent(self):

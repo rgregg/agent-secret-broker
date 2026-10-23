@@ -260,7 +260,7 @@ class StrictHarness(t.Harness):
         self.audit = os.path.join(d, "audit.jsonl")
         self.broker = Broker(cfg, FileBackend(vault_path), self.notifier, self.audit, dest_guard=self.guard)
         self.c, self.a = serve(self.broker, ("127.0.0.1", 0), ("127.0.0.1", 0), KEY)
-        self.guard.register_ports(self.c.server_address[1], self.a.server_address[1])
+        # (serve() registers the really bound ports itself)
         self.base = f"http://127.0.0.1:{self.c.server_address[1]}"
         self.abase = f"http://127.0.0.1:{self.a.server_address[1]}"
         self.up = self.stub         # tearDown shuts it down
@@ -349,13 +349,15 @@ class PinnedConnections(StrictHarness):
                                                    "mixed.example", "10.9.8.7", "10.9.8.7:8080"]}
 
     def test_rfc1918_lan_destination_still_works_and_the_marker_is_sent(self):
-        code, got = self.run_call("http://lan.example/x", headers={"Authorization": "Bearer {{SVC_TOKEN}}",
-                                                                  "X-Secret-Broker-Egress": "0"})
+        code, body = self.call("http://lan.example/x", headers={"Authorization": "Bearer {{SVC_TOKEN}}",
+                                                                "X-Secret-Broker-Egress": "0"})
+        self.assertEqual(code, 400)             # an agent may not even try to set the marker
+        code, got = self.run_call("http://lan.example/x")
         self.assertEqual((code, got["status"]), (200, "approved"), got)
         self.assertEqual(got["http"]["status"], 200)
         self.assertEqual(self.connects, [("10.9.8.7", 80)])
         h = {k.lower(): v for k, v in Hit.seen[0]["headers"].items()}
-        self.assertEqual(h["x-secret-broker-egress"], "1")      # the agent's own value is overwritten
+        self.assertEqual(h["x-secret-broker-egress"], "1")
         self.assertEqual(h["authorization"], "Bearer " + SECRET)
 
     def test_ip_literal_lan_destination_on_default_port(self):
@@ -374,12 +376,15 @@ class PinnedConnections(StrictHarness):
         the call to the approval listener with the approver's header; it fails and never connects."""
         url = f"http://evil.example:{self.a.server_address[1]}/"
         code, got = self.run_call(url, headers={"X-authentik-username": "alice"})
-        self.assertEqual((code, got["status"], got["error"]), (200, "failed", "release failed: destination not allowed"))
+        self.assertEqual((code, got["status"], got["error"]), (200, "failed", "release failed: connection"))
         self.assertEqual(self.connects, [])
         self.assertEqual(self.events("dashboard_viewed"), [])
         self.assertEqual(self.events("egress_marker_refused"), [])
         self.assertNotIn("127.0.0.1", json.dumps(got))
-        self.assertEqual(self.events("http_failed")[-1]["error"], "destination not allowed")
+        ev = self.events("http_failed")[-1]
+        self.assertEqual((ev["error"], ev["reason_class"]), ("connection", "destination not allowed"))   # real reason: operator only
+        agent = self.api("GET", "/v1/audit?limit=300")[1]
+        self.assertNotIn("destination", agent)                   # nor in the agent's audit view
 
     def test_dns_rebinding_between_check_and_connect(self):
         code, got = self.run_call("http://rebind.example/x")
@@ -389,14 +394,14 @@ class PinnedConnections(StrictHarness):
 
     def test_a_name_with_any_loopback_record_is_refused(self):
         code, got = self.run_call("http://mixed.example/x")
-        self.assertEqual(got["error"], "release failed: destination not allowed")
+        self.assertEqual(got["error"], "release failed: connection")
         self.assertEqual(self.connects, [])
 
     def test_own_listener_port_on_a_private_address_is_refused(self):
         for port in (self.a.server_address[1], self.c.server_address[1]):
             code, got = self.run_call(f"http://10.9.8.7:{port}/")
             # either refused at creation (port rule) or at connect (own port): never connected
-            self.assertTrue(code == 403 or got["error"] == "release failed: destination not allowed", (code, got))
+            self.assertTrue(code == 403 or got["error"] == "release failed: connection", (code, got))
         self.assertEqual(self.connects, [])
 
     def test_port_spellings_of_the_listeners(self):
@@ -439,7 +444,7 @@ class PinnedConnections(StrictHarness):
         self.broker.backend._data["Svc"]["broker"] = json.dumps(raw)
         self.broker.refresh_catalog()
         code, got = self.run_call("http://echo.example/x")
-        self.assertEqual(got["error"], "release failed: destination not allowed")
+        self.assertEqual(got["error"], "release failed: connection")
         everywhere = json.dumps(got) + open(self.audit).read() + json.dumps(self.notifier.sent, default=str)
         self.assertNotIn("127.66.55.44", everywhere)
 
@@ -453,12 +458,16 @@ class ListenerTrust(StrictHarness):
         self.broker.cfg.update(cfg or {})
         return self.broker.peer_trusted(addr)
 
-    def test_default_is_private_peers_only_never_loopback_or_own(self):
-        for a in ("10.1.2.3", "192.168.1.5", "172.18.0.4", "fd12::9"):
-            self.assertTrue(self.peer(a), a)
-        for a in ("127.0.0.1", "127.9.9.9", "::1", "::ffff:127.0.0.1", OWN, "169.254.1.1", "8.8.8.8",
-                  "2001:4860::1", "0.0.0.0", "garbage", ""):
+    def test_unset_fails_closed_for_everyone(self):
+        for a in ("10.1.2.3", "192.168.1.5", "172.18.0.4", "100.64.0.9", "fd12::9", "127.0.0.1", OWN, "8.8.8.8"):
             self.assertFalse(self.peer(a), a)
+        self.assertFalse(self.broker.listener_open())
+
+    def test_cgnat_peers_work_when_listed(self):
+        cfg = {"approval_trusted_peers": ["100.64.0.0/10"]}
+        self.assertTrue(self.peer("100.100.1.2", cfg))
+        self.assertFalse(self.peer("192.168.1.2", cfg))
+        self.assertFalse(self.peer("127.0.0.1", cfg))
 
     def test_explicit_cidrs_never_include_loopback_or_own(self):
         cfg = {"approval_trusted_peers": ["127.0.0.0/8", "::1/128", "10.0.0.0/8", OWN + "/32"]}
@@ -476,16 +485,18 @@ class ListenerTrust(StrictHarness):
         self.assertTrue(self.peer("127.0.0.1", {"approval_trust_any_peer": True}))
         self.assertFalse(self.peer("127.0.0.1", {"approval_trust_any_peer": "yes"}))   # only a real true
 
-    def test_startup_warnings(self):
-        self.broker.cfg.pop("approval_trusted_peers", None)
-        self.assertTrue(any("not set" in w for w in self.broker.trust_warnings()))
+    def test_startup_error_and_warnings(self):
+        self.assertTrue(any("CLOSED" in e for e in self.broker.trust_errors()))
         self.broker.cfg["approval_trusted_peers"] = ["127.0.0.0/8", OWN + "/32"]
         self.assertTrue(any("loopback" in w for w in self.broker.trust_warnings()))
+        self.assertTrue(any("only check" in w for w in self.broker.trust_warnings()))
+        self.assertEqual(self.broker.trust_errors(), [])
         self.broker.cfg["approval_trust_any_peer"] = True
         self.assertTrue(any("ANY peer" in w for w in self.broker.trust_warnings()))
 
-    def test_warning_is_logged_at_startup(self):
-        self.assertTrue([e for e in self.events("config_warning") if "approval_trusted_peers" in e["warning"]])
+    def test_error_is_logged_at_startup_and_the_broker_still_runs(self):
+        self.assertTrue([e for e in self.events("config_error") if "CLOSED" in e["error"]])
+        self.assertEqual(self.api("GET", "/v1/status")[0], 200)
 
     def test_real_listener_refuses_a_loopback_peer(self):
         r = urllib.request.Request(self.abase + "/", headers={"X-authentik-username": "alice"})

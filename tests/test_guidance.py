@@ -143,7 +143,7 @@ class Prompts(unittest.TestCase):
         def fake(req, timeout=0):
             seen.update(json.loads(req.data))
             return R()
-        with mock.patch("urllib.request.urlopen", fake):
+        with mock.patch("secret_broker.destguard.operator_urlopen", fake):
             got = summarize.OpenRouterSummarizer("k", "m").analyze("http", ["komodo"], dict(HTTP),
                                                                     guidance={"komodo": CANARY})
         self.assertEqual(got["risk"], "low")
