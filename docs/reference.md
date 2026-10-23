@@ -2868,21 +2868,32 @@ only to the user, never rotated) out of the page and then POST `/decide` for any
   audit event, so a call cannot be used to probe which addresses the broker will reach. (Timing still differs
   from a real connect failure.) `own_ports` adds listener ports for published-port setups. Also blocked: IPv4-mapped
   and SIIT forms as raw IPv6, `64:ff9b:1::/48`, ISATAP-embedded addresses, 192.0.0.192 (Oracle), 168.63.129.16 (Azure).
-* **Header rules.** On the plain http path an agent may not set `Host` (unless it equals the URL authority),
-  `Content-Length`, `Transfer-Encoding`, `Connection`, `Cookie`, `Upgrade`, `TE`, `Proxy-*` or `X-Secret-Broker-*`,
-  nor two spellings of one header. Sessions and plans keep their allowlists. Error text echoed to the agent and
+* **Header rules.** ONE list (`httpcheck.FORBIDDEN_HEADERS`) is shared by plain http, sessions and plans: `Host` (plain
+  http allows it only when equal to the URL authority), `Range`, `If-Range`, `Accept-Encoding`, `Content-Encoding`,
+  `Content-Range`, `Transfer-Encoding`, `TE`, `Connection`, `Upgrade`, `Via`, `Forwarded`, the method overrides, `X-Real-IP`,
+  `X-Original-*`, `X-Rewrite-*`, `X-Forwarded-*`, `Proxy-*` and `X-Secret-Broker-*`. Plain http also refuses `Content-Length`
+  and `Cookie`, and two spellings of one header. Sessions and plans additionally keep their allowlists. Error text echoed to the agent and
   to the `rejected` audit event is printable ASCII, at most 200 characters.
 * **One masker** (`secret_broker/masking.py`) for http, sessions and plans: each credential, cookie and capture
-  value is masked in its raw, JSON-escaped (also with `\/`), URL-encoded, base64 (standard and URL-safe, padded or
-  not, of the value and of `Bearer `/`Token `/`Basic ` + value), hex, lower- and upper-case forms and per line of
-  a multi-line value. Values under 4 characters are never masked. A body is masked before it is cut to the limit
+  value is masked in its raw, JSON-escaped (also with `\/`, `\uXXXX` in either case), URL-encoded (once and twice),
+  HTML-entity, base32, hex, lower- and upper-case forms, base64 (standard and URL-safe, padded or not, of the value
+  and of `Bearer `/`Token `/`Basic ` + value, at all three byte alignments) and per line of a multi-line value. Values
+  under 4 characters are never masked; derived spellings exist only for values of 6+ characters and are masked from
+  8 characters (so a `true` or `name` secret does not corrupt JSON). At most 400 forms are used per response (raw forms
+  first), one substring test each. A leading partial secret (4+ characters, as after an honoured `Range`) is masked at
+  the start of a body, as a trailing one is at the cut. A body is masked before it is cut to the limit
   (extra bytes are read for that), and a trailing prefix of a secret (4+ characters) at the cut is masked. Not
-  caught: base64 of a substring that starts at another byte alignment, other encodings, a transformed secret. One
+  caught: other encodings, a transformed secret. One
   trailing newline of a credential is dropped when it is placed in a URL or header. `Set-Cookie` is removed from
   plain http and plan responses (use a session). Request-details and cards replace bidi and zero-width characters
   for display only. Non-ASCII in URL and header templates is rejected by design (punycode hosts, `%C3%A9` in queries).
   Failure labels are spelled the same everywhere (`invalid request`, which only means a filled value broke the request).
-* **Real client addresses.** `trusted_proxies` (CIDRs, default none): from those socket peers only, the audit
+* **CSRF cookie lifetime.** The cookie carries its issue time (signed); the server rejects it after 12 hours, and a request
+  without a valid cookie is given a fresh one (rotation on login, on a navigation without the cookie and on expiry).
+* **`asb` error text.** The client redacts any 20+ character token-like run in broker text. A credential name that long
+  would be shown as `***`; it is not special-cased (that would need a local name cache).
+* **Real client addresses.** `trusted_proxies` (client API only; `approval_trusted_proxies` is the approval listener's own
+  list, and `client_ip` there is the walked address or the socket peer, never a raw header value) (CIDRs, default none): from those socket peers only, the audit
   `peer`/`client_ip`, all per-source limits and caps and the enrollment card's source use the first untrusted hop
   of `X-Forwarded-For` read from the right (a malformed header falls back to the proxy's address). It never feeds a
   trust decision; loopback and own addresses are ignored with a warning. The CSRF cookie nonce is re-issued when a

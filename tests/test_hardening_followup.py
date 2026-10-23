@@ -625,7 +625,7 @@ class PerClientLimitsOff(tc.CBase):
 
 class ApprovalListenerIgnoresIt(t.Harness):
     def tweak(self, cfg):
-        cfg["trusted_proxies"] = ["127.0.0.1/32"]
+        cfg["approval_trusted_proxies"] = ["127.0.0.1/32"]
         cfg["approval_trusted_peers"] = ["203.0.113.0/24"]
 
     def test_forwarded_for_cannot_make_a_peer_trusted(self):

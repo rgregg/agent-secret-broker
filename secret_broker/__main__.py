@@ -48,6 +48,7 @@ def main():
         raise SystemExit(f"config error: {e}") from None
     try:
         parse_trusted_proxies(cfg)
+        parse_trusted_proxies(cfg, "approval_trusted_proxies")
         destguard.DestGuard.from_config(cfg)    # destination_deny_cidrs, own_ports: fail at startup, naming the field
     except ValueError as e:
         raise SystemExit(f"config error: {e}") from None

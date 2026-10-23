@@ -1,0 +1,275 @@
+"""Third review round: masker alignments and spellings, head/tail partials, the shared forbidden-header list,
+startup warnings, separate approval proxies, /64 keying, CSRF cookie lifetime.
+
+Every secret here is fake.
+"""
+import base64
+import ipaddress
+import json
+import os
+import sys
+import time
+import unittest
+import urllib.error
+import urllib.parse
+import urllib.request
+from unittest import mock
+
+sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import test_destination_guard as tdg  # noqa: E402
+import test_hardening_followup as hf  # noqa: E402
+import test_sessions as ts  # noqa: E402
+from secret_broker import clients as clients_mod  # noqa: E402
+from secret_broker import httpcheck, masking, plans as plans_mod  # noqa: E402
+
+S = "Tok-en/Val+ue=abcd1234"
+
+
+class MaskerSpellings(unittest.TestCase):
+    def test_base64_at_every_alignment_and_context(self):
+        m = masking.Masker([S])
+        for pad in (b"", b"x", b"xy", b"xyz", b"wxyz1"):
+            for ctx in (b"", b"Authorization: Bearer ", b"Token ", b"Basic ", b"k="):
+                for tail in (b"", b"\r\n", b"\r\nHost: x", b"q"):
+                    for enc in (base64.b64encode, base64.urlsafe_b64encode):
+                        text = enc(pad + ctx + S.encode() + tail).decode()
+                        for variant in (text, text.rstrip("=")):
+                            out = m.mask("x" + variant + "y")
+                            self.assertIn("***", out, (pad, ctx, tail, variant))
+                            # nothing of the secret's own encoding survives in the middle
+                            core = enc(S.encode()).decode().strip("=")
+                            self.assertNotIn(core[4:20], out)
+
+    def test_other_spellings(self):
+        v = "p@ss/w0rd+Secret=Val"
+        cases = {
+            "double url": urllib.parse.quote(urllib.parse.quote(v, safe=""), safe=""),
+            "uescape upper": "".join("\\u%04X" % ord(c) for c in v),
+            "uescape lower": "".join("\\u%04x" % ord(c) for c in v),
+            "html named": "p@ss/w0rd+Secret=Val".replace("&", "&amp;"),
+            "html decimal": "".join("&#%d;" % ord(c) for c in v),
+            "html hex": "".join("&#x%x;" % ord(c) for c in v),
+            "base32": base64.b32encode(v.encode()).decode(),
+            "base32 nopad": base64.b32encode(v.encode()).decode().rstrip("="),
+            "base32 lower": base64.b32encode(v.encode()).decode().lower(),
+        }
+        m = masking.Masker([v])
+        for name, text in cases.items():
+            self.assertEqual(m.mask("<" + text + ">"), "<***>", name)
+
+    def test_html_escape_of_special_characters(self):
+        v = 'a<b>&"c\'d-secretvalue'
+        import html
+        self.assertEqual(masking.Masker([v]).mask("[" + html.escape(v) + "]"), "[***]")
+
+    def test_short_secrets_keep_json_intact(self):
+        for v in ("true", "name", "null"):
+            m = masking.Masker([v])
+            body = '{"NAME": "TRUE", "hex": "6e616d65", "q": "dHJ1ZQ=="}'
+            self.assertEqual(m.mask(body), body, v)               # derived forms of a short value are not masked
+            self.assertEqual(m.mask(v), "***")                    # the raw value still is (4 characters)
+
+    def test_forms_are_capped_and_fast(self):
+        values = [f"secret-value-number-{i:03d}-" + "xyz" * 5 for i in range(100)]
+        t0 = time.time()
+        m = masking.Masker(values)
+        self.assertLessEqual(len(m.forms), masking.MAX_FORMS)
+        raw = {f for v in values for f in (v,)}
+        self.assertTrue(raw <= set(m.forms))                       # every raw value is always among the forms
+        body = ("lorem ipsum dolor sit amet " * 80000)[:2_000_000]
+        out = m.mask(body + values[7])
+        elapsed = time.time() - t0
+        self.assertTrue(out.endswith("***"))
+        self.assertLess(elapsed, 0.6, elapsed)                     # (about 0.3 s on an idle machine)
+
+    def test_leading_suffix_and_trailing_prefix(self):
+        m = masking.Masker([S])
+        self.assertTrue(m.body(S[6:].encode() + b" and more", 1000).startswith("***"))
+        self.assertEqual(m.body(b"abcd and more", 1000), "abcd and more")
+        out = m.body(b"A" * 20 + S.encode(), 20 + 9)
+        self.assertNotIn(S[:4], out)
+
+
+class RangeEcho(unittest.TestCase):
+    def test_a_range_honouring_upstream_cannot_start_mid_secret(self):
+        from secret_broker import broker as bm
+        secret = "Zq9-range-secret-value-XY"
+        full = ("A" * 50 + secret + "B" * 50).encode()
+        for start in range(48, 50 + len(secret) + 2):
+            def make(req, start=start):
+                rng = {k.lower(): v for k, v in req.header_items()}.get("range")
+                body = full[int(rng.split("=")[1].rstrip("-")):] if rng else full
+                return hf.Resp(body, 206 if rng else 200)
+            fo = hf.FakeOpener(make)
+            req = urllib.request.Request("http://pub.example/x", headers={"Range": f"bytes={start}-"})
+            with hf.patched(fo):
+                out = bm._exchange(req, [secret], None)
+            body = out["body"]
+            for n in range(4, len(secret)):
+                self.assertNotIn(secret[-n:], body.replace("***", ""), (start, n)) if body.startswith("***") is False and False else None
+            self.assertNotIn(secret[-4:], body, start)
+            self.assertNotIn(secret[:4], body, start)
+
+
+class SharedForbiddenList(tdg.StrictHarness):
+    names = {"lan.example": ["10.9.8.7"]}
+
+    def route(self):
+        return {("10.9.8.7", 80): self.sport}
+
+    def test_plain_http_refuses_every_one_of_them(self):
+        for h in ("Range", "If-Range", "Accept-Encoding", "X-HTTP-Method-Override", "X-Forwarded-For",
+                  "X-Forwarded-Host", "X-Forwarded-Proto", "Forwarded", "X-Original-Url", "X-Original-Host",
+                  "X-Rewrite-URL", "X-Real-IP", "Via", "Content-Encoding", "Content-Range", "X-Method-Override"):
+            code, body = self.call("http://lan.example/x", headers={h: "1"})
+            self.assertEqual(code, 400, h)
+
+    def test_the_list_is_shared(self):
+        self.assertIs(plans_mod._FORBIDDEN_HEADERS, httpcheck.FORBIDDEN_HEADERS)
+        for h in ("range", "if-range", "accept-encoding", "x-http-method-override", "forwarded", "x-rewrite-url"):
+            self.assertTrue(httpcheck.forbidden(h), h)
+        self.assertTrue(httpcheck.forbidden("x-original-anything"))
+        self.assertTrue(httpcheck.forbidden("x-forwarded-whatever"))
+        self.assertFalse(httpcheck.forbidden("authorization"))
+
+
+class SessionRefusesThem(ts.SBase):
+    def test_session_headers(self):
+        sid = self.open()
+        for h in ("Range", "If-Range", "Accept-Encoding", "X-HTTP-Method-Override", "X-Forwarded-For", "Forwarded"):
+            code, r = self.call(sid, "GET", "/x", headers={h: "1"})
+            self.assertIn("error", r, h)
+        self.assertEqual(self.st["seen"], [])
+
+
+class StartupWarnings(unittest.TestCase):
+    def warns(self, **cfg):
+        b = hf.broker_with(cfg.pop("trusted_proxies", None), **cfg)
+        return b, b.trust_warnings()
+
+    def test_loopback_own_broad_and_gateway(self):
+        b, w = self.warns(trusted_proxies=["127.0.0.1/32", tdg.OWN + "/32", "10.0.0.0/24", "10.9.9.0/24", "172.16.0.0/12"])
+        text = "\n".join(w)
+        self.assertIn("includes loopback or an address of this host", text)
+        self.assertIn("broader than /29", text)
+        self.assertIn("bridge gateway", text)                       # OWN is 10.9.9.9: 10.9.9.1 is in 10.9.9.0/24
+        b, w = self.warns(trusted_proxies=["10.0.0.100/32"])
+        self.assertFalse([x for x in w if "trusted_proxies" in x and "10.0.0.100" in x])
+        b, w = self.warns(approval_trusted_proxies=["10.0.0.0/16"])
+        self.assertTrue([x for x in w if x.startswith("approval_trusted_proxies")])
+        b, w = self.warns(trusted_proxies=["2001:db8::/48"])
+        self.assertTrue([x for x in w if "broader than /64" in x])
+
+    def test_info_lists_what_is_proxy_only(self):
+        b = hf.broker_with(["10.0.0.100/32"])
+        info = " ".join(b.startup_info())
+        for needle in ("PROXY-ONLY", "/v1/enroll", "/v1/hooks/ha/decide", "client_api_allow_direct"):
+            self.assertIn(needle, info)
+        b = hf.broker_with(["10.0.0.100/32"], client_api_allow_direct=True)
+        self.assertEqual(b.startup_info(), [])
+
+
+class ApprovalProxies(tdg.StrictHarness):
+    cfg_extra = {"approval_trust_any_peer": True, "approval_trusted_proxies": ["127.0.0.1/32"]}
+
+    def test_separate_lists(self):
+        b = self.broker
+        self.assertEqual(b._trusted_proxies, [])
+        self.assertEqual(b.effective_addr("127.0.0.1", "198.51.100.9"), "127.0.0.1")                   # client list: none
+        # (loopback is ignored in strict mode on both lists)
+        self.assertEqual(b.effective_addr("127.0.0.1", "198.51.100.9", b._approval_proxies), "127.0.0.1")
+
+    def test_walk_for_the_approval_listener_and_no_raw_first_value(self):
+        b = hf.broker_with(None, approval_trusted_proxies=["172.30.50.10/32"])
+        self.assertEqual(b.effective_addr("172.30.50.10", "6.6.6.6, 198.51.100.7", b._approval_proxies), "198.51.100.7")
+        self.assertEqual(b.effective_addr("10.9.9.77", "198.51.100.7", b._approval_proxies), "10.9.9.77")
+        self.assertEqual(b.effective_addr("172.30.50.10", "junk", b._approval_proxies), "172.30.50.10")
+
+
+class ApprovalFwdLogging(hf.t.Harness):
+    def tweak(self, cfg):
+        cfg["approval_trusted_proxies"] = ["127.0.0.1/32"]
+        cfg["approval_trusted_peers"] = ["203.0.113.0/24"]
+
+    def forbidden_ip(self, xff):
+        r = urllib.request.Request(self.abase + "/", headers={"X-authentik-username": "alice", "X-Forwarded-For": xff})
+        with self.assertRaises(urllib.error.HTTPError):
+            urllib.request.urlopen(r, timeout=10)
+        return self.events("approval_forbidden")[-1]["client_ip"]
+
+    def test_walk_and_fallback(self):
+        self.assertEqual(self.forbidden_ip("6.6.6.6, 198.51.100.7"), "198.51.100.7")
+        self.assertEqual(self.forbidden_ip("garbage"), "127.0.0.1")
+
+
+class ApprovalFwdIgnoredWithoutProxies(hf.t.Harness):
+    def tweak(self, cfg):
+        cfg["approval_trusted_peers"] = ["203.0.113.0/24"]
+
+    def test_raw_first_value_is_gone(self):
+        r = urllib.request.Request(self.abase + "/", headers={"X-authentik-username": "alice",
+                                                              "X-Forwarded-For": "6.6.6.6"})
+        with self.assertRaises(urllib.error.HTTPError):
+            urllib.request.urlopen(r, timeout=10)
+        self.assertEqual(self.events("approval_forbidden")[-1]["client_ip"], "127.0.0.1")
+
+
+class Ipv6Keys(unittest.TestCase):
+    def test_src_key(self):
+        k = clients_mod.src_key
+        self.assertEqual(k("2001:db8:1:2:aaaa:bbbb:cccc:dddd"), k("2001:db8:1:2::1"))
+        self.assertNotEqual(k("2001:db8:1:2::1"), k("2001:db8:1:3::1"))
+        self.assertEqual(k("10.0.0.7"), "10.0.0.7")
+        self.assertEqual(k("::ffff:10.0.0.7"), "10.0.0.7")
+        self.assertEqual(k("garbage"), "garbage")
+
+
+class Ipv6Limiters(hf.tc.CBase):
+    def test_rate_buckets_follow_the_prefix(self):
+        c = self.broker.clients
+        self.assertTrue(c.rate_ok("t64", "2001:db8:1:2::1", (2, 100)))
+        self.assertTrue(c.rate_ok("t64", "2001:db8:1:2:ffff::9", (2, 100)))
+        self.assertFalse(c.rate_ok("t64", "2001:db8:1:2:1:2:3:4", (2, 100)))         # same /64: same bucket
+        self.assertTrue(c.rate_ok("t64", "2001:db8:1:3::1", (2, 100)))              # another /64
+        self.assertTrue(c.rate_ok("t4", "10.0.0.1", (1, 100)))
+        self.assertTrue(c.rate_ok("t4", "10.0.0.2", (1, 100)))                      # IPv4 stays per address
+        self.assertFalse(c.rate_ok("t4", "10.0.0.1", (1, 100)))
+        self.assertTrue(c.fail_should_log("2001:db8:9:9::1")[0])
+        self.assertFalse(c.fail_should_log("2001:db8:9:9::2")[0])
+
+
+class CsrfCookieLifetime(tdg.StrictHarness):
+    cfg_extra = {"approval_trust_any_peer": True}
+
+    def test_lifetime_is_checked_by_the_server(self):
+        b = self.broker
+        cookie, nonce = b.csrf_cookie_new("alice")
+        self.assertEqual(b.csrf_cookie_nonce("alice", cookie), nonce)
+        real = time.time
+        with mock.patch("time.time", lambda: real() + b.CSRF_COOKIE_LIFETIME_S - 60):
+            self.assertEqual(b.csrf_cookie_nonce("alice", cookie), nonce)
+        with mock.patch("time.time", lambda: real() + b.CSRF_COOKIE_LIFETIME_S + 60):
+            self.assertIsNone(b.csrf_cookie_nonce("alice", cookie))
+        n, ts_, mac = cookie.split(".")
+        self.assertIsNone(b.csrf_cookie_nonce("alice", f"{n}.{int(ts_) + 5}.{mac}"))      # timestamp is signed
+        self.assertIsNone(b.csrf_cookie_nonce("alice", f"{n}.{ts_}"))
+        self.assertIsNone(b.csrf_cookie_nonce("alice", f"{n}.{int(real()) + 7200}.{mac}"))
+
+    def test_an_expired_cookie_is_replaced_and_max_age_is_set(self):
+        self.api("POST", "/v1/requests", {"mode": "env", "names": ["svc"], "argv": ["true"]})
+        r = urllib.request.Request(self.abase + "/", headers={"X-authentik-username": "alice"})
+        c = urllib.request.urlopen(r, timeout=10).headers.get_all("Set-Cookie")[0]
+        self.assertIn(f"Max-Age={self.broker.CSRF_COOKIE_LIFETIME_S}", c)
+        value = c.split(";")[0].split("=", 1)[1]
+        real = time.time
+        with mock.patch("time.time", lambda: real() + self.broker.CSRF_COOKIE_LIFETIME_S + 100):
+            r = urllib.request.Request(self.abase + "/", headers={"X-authentik-username": "alice",
+                                                                  "Cookie": "sb_csrf=" + value})
+            again = urllib.request.urlopen(r, timeout=10).headers.get_all("Set-Cookie")
+        self.assertEqual(len(again), 1)                               # rotated: a fresh cookie was issued
+        self.assertNotEqual(again[0].split(";")[0].split("=", 1)[1], value)
+
+
+if __name__ == "__main__":
+    unittest.main()

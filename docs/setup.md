@@ -228,9 +228,11 @@ Defaults changed for security (see the reference, "Security notes"). Check them 
    `compose.yaml`, set `"approval_proxy_secret_file": "/run/secrets/approval_proxy_secret"`, add the header in
    the proxy, restart, open the approval site and the History page, and check `docker compose logs broker`
    for no `config_error` lines.
-2. **Real client addresses behind a reverse proxy.** If every client request reaches the broker from your
-   reverse proxy (for example nginx proxy manager at 10.0.0.100), set `"trusted_proxies": ["10.0.0.100/32"]`.
-   From those peers only, the effective client address for the audit log, per-source rate limits and caps
+2. **Real client addresses behind a reverse proxy.** There are two separate settings. `trusted_proxies` applies ONLY to
+   the client API (port 8800): if every client request reaches the broker from your reverse proxy (for example nginx
+   proxy manager at 10.0.0.100), set `"trusted_proxies": ["10.0.0.100/32"]`. `approval_trusted_proxies` applies ONLY
+   to the approval listener, for the address it logs: set it to the SSO proxy (for example the outpost, `["172.30.50.10/32"]`),
+   which is the peer there. Neither feeds a trust decision. From those peers only, the effective client address for the audit log, per-source rate limits and caps
    (enrollment, auth failures, plan submits, presence), and the "from ..." shown on enrollment cards is taken
    from `X-Forwarded-For`, walking from the right past other trusted proxies and taking the first
    untrusted hop (a missing or malformed header means the proxy's own address). It never decides trust:
@@ -243,6 +245,13 @@ Defaults changed for security (see the reference, "Security notes"). Check them 
    names the peer; `X-Forwarded-For` is never consulted for this. So everything must reach the client API through
    the proxy: otherwise list the address in `trusted_proxies`, or set `"client_api_allow_direct": true` (a startup
    WARNING says direct clients bypass the proxy). The approval listener is not affected (it has its own rule).
+   **Before you set it, verify that the proxy is NOT on the broker host** (a proxy on loopback or on the broker's own
+   address is ignored, so it would be locked out; the broker warns loudly at start), that the address the broker
+   sees is the proxy's and not a Docker bridge gateway (check the `peer` field of the audit log first; the broker warns
+   when a listed range contains the likely gateway), and that **Home Assistant and every `asb` client go through the
+   proxy** (the `/v1/hooks/ha/decide` hook is part of the client API: it needs the proxy, or
+   `client_api_allow_direct`). At start the broker logs an INFO line saying which routes are proxy-only. It also warns
+   for listed ranges broader than /29 (IPv4) or /64 (IPv6). IPv6 clients count as their /64 for every per-source limit.
    `GET /healthz` returns `ok` to loopback and the container's own address only, for a container healthcheck
    (see `deploy/compose.yaml`). Also restrict the published port at the host firewall to the proxy's address:
    published Docker ports and source NAT can change the peer address the broker sees (a request that looks like

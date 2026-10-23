@@ -242,7 +242,8 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         self.dest_guard = dest_guard or destguard.DestGuard.from_config(config)
         # an explicit null means "default"; the REAL bound ports are registered again in serve()
         self.dest_guard.register_ports(config.get("client_port") or 8800, config.get("approval_port") or 8801)
-        self._trusted_proxies = parse_trusted_proxies(config)
+        self._trusted_proxies = parse_trusted_proxies(config)      # client API listener only
+        self._approval_proxies = parse_trusted_proxies(config, "approval_trusted_proxies")   # approval listener only
         self._peer_refused = {}
         (self._proxy_secret, self._proxy_secret_header,
          self._secret_errors) = self._load_proxy_secret(config)
@@ -315,6 +316,9 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             for e in self.trust_errors():
                 self.log("config_error", error=e)
                 logging.getLogger("secret_broker").error("%s", e)
+            for i in self.startup_info():
+                self.log("config_info", info=i)
+                logging.getLogger("secret_broker").info("%s", i)
         elif self._secret_errors:
             for e in self._secret_errors:
                 self.log("config_error", error=e)
@@ -2345,14 +2349,14 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             self._peer_refused[peer] = now
         self.log("client_peer_refused", peer=peer)
 
-    def effective_addr(self, peer, xff):
+    def effective_addr(self, peer, xff, nets=None):
         """The address to LOG and to key per-source limits on. When the socket peer is one of
         `trusted_proxies` (and not loopback or one of this host's own addresses), walk X-Forwarded-For from
         the RIGHT, skip hops that are themselves trusted proxies and take the first untrusted one. A missing
         or malformed header, or a hop that does not parse, falls back to the socket peer. Otherwise the
         header is ignored. This NEVER feeds a trust decision (peer_trusted, the destination guard, the
         egress marker and the proxy secret all use the socket peer)."""
-        nets = self._trusted_proxies
+        nets = self._trusted_proxies if nets is None else nets
         if not nets:
             return peer
         pip = self._addr_of(peer)
@@ -2413,6 +2417,15 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             return True
         return not strict
 
+    def startup_info(self):
+        """INFO lines about what is proxy-only (logged once at start)."""
+        out = []
+        if self._trusted_proxies and self.cfg.get("client_api_allow_direct") is not True:
+            out.append("client API: PROXY-ONLY. Every route (including /v1/enroll and /v1/hooks/ha/decide) answers "
+                       "403 unless the socket peer is in trusted_proxies; only GET /healthz works from loopback. "
+                       "Home Assistant and asb clients must go through the proxy, or set client_api_allow_direct")
+        return out
+
     def trust_errors(self):
         """Startup ERRORS about the approval listener (it is closed until fixed)."""
         out = list(self._secret_errors)
@@ -2448,11 +2461,26 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             if net.overlaps(ipaddress.ip_network("127.0.0.0/8")) or net.overlaps(ipaddress.ip_network("::1/128")) or own:
                 out.append(f"approval_trusted_peers entry {str(n)[:64]} includes loopback or an address of this "
                            "host: those peers are never trusted")
-        for n in self._trusted_proxies:
-            if n.overlaps(ipaddress.ip_network("127.0.0.0/8")) or n.overlaps(ipaddress.ip_network("::1/128")) or any(
-                    parse_ip_safe(a) in n for a in self.dest_guard.locals()):
-                out.append(f"trusted_proxies entry {str(n)[:64]} includes loopback or an address of this host: "
-                           "those peers are ignored (X-Forwarded-For is never read from them)")
+        gateways = set()
+        for a in self.dest_guard.locals():
+            ip = parse_ip_safe(a)
+            if ip is not None and ip.version == 4 and ip.is_private and not ip.is_loopback:
+                gateways.add(ipaddress.ip_address(int(ip) >> 8 << 8 | 1))       # the usual bridge gateway (.1)
+        for key, nets_ in (("trusted_proxies", self._trusted_proxies), ("approval_trusted_proxies", self._approval_proxies)):
+            for n in nets_:
+                if n.overlaps(ipaddress.ip_network("127.0.0.0/8")) or n.overlaps(ipaddress.ip_network("::1/128")) or any(
+                        parse_ip_safe(a) in n for a in self.dest_guard.locals()):
+                    out.append(f"{key} entry {str(n)[:64]} includes loopback or an address of this host: those "
+                               "peers are IGNORED, so a proxy on this host would be refused" +
+                               (" by the client API" if key == "trusted_proxies" else "") +
+                               " (X-Forwarded-For is never read from them)")
+                if n.prefixlen < (29 if n.version == 4 else 64):
+                    out.append(f"{key} entry {str(n)[:64]} is broader than /{29 if n.version == 4 else 64}: every host "
+                               "in it can set the client address that is logged and rate limited")
+                if any(g in n for g in gateways):
+                    out.append(f"{key} entry {str(n)[:64]} contains a likely Docker bridge gateway (.1): with published "
+                               "ports the peer the broker sees may be the gateway, not the proxy; verify with the audit "
+                               "log's peer field and firewall the published port to the proxy's address")
         if self._trusted_proxies and self.cfg.get("client_api_allow_direct") is True:
             out.append("client_api_allow_direct is true: clients that connect to the client API directly (not through a "
                        "trusted proxy) are accepted, so they bypass the proxy and any per-client checks it makes")
@@ -2483,6 +2511,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         called for requests that presented the correct hook key. The first drop
         in a window is audited."""
         now = time.time()
+        ip = clients_mod.src_key(ip)
         with self._ha_rate_lock:
             st = self._ha_rate.get(ip)
             if st is None:
@@ -2522,18 +2551,28 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
     CSRF_COOKIE = "sb_csrf"
     TEST_NONCE = "test-harness-nonce"
 
+    CSRF_COOKIE_LIFETIME_S = 12 * 3600       # absolute: the server checks the timestamp inside the cookie
+
     def csrf_cookie_new(self, user):
-        """(cookie value, nonce): a server-issued nonce, signed and bound to `user`."""
-        nonce = secrets.token_hex(16)
-        mac = hmac.new(self._csrf_key, f"cookie:{user}:{nonce}".encode(), hashlib.sha256).hexdigest()[:32]
-        return f"{nonce}.{mac}", nonce
+        """(cookie value, nonce): a server-issued nonce with its issue time, signed and bound to `user`."""
+        nonce, ts = secrets.token_hex(16), int(time.time())
+        mac = hmac.new(self._csrf_key, f"cookie:{user}:{nonce}:{ts}".encode(), hashlib.sha256).hexdigest()[:32]
+        return f"{nonce}.{ts}.{mac}", nonce
 
     def csrf_cookie_nonce(self, user, raw):
-        """The nonce inside a cookie value that is genuinely ours and for `user`, else None."""
-        nonce, _, mac = (raw or "").partition(".")
-        if not re.fullmatch(r"[0-9a-f]{32}", nonce) or len(mac) != 32:
+        """The nonce inside a cookie value that is genuinely ours, for `user` and younger than the lifetime,
+        else None (the page then mints a fresh one: a login, a navigation without the cookie or an expired
+        cookie all rotate it)."""
+        parts = (raw or "").split(".")
+        if len(parts) != 3:
             return None
-        want = hmac.new(self._csrf_key, f"cookie:{user}:{nonce}".encode(), hashlib.sha256).hexdigest()[:32]
+        nonce, ts, mac = parts
+        if not re.fullmatch(r"[0-9a-f]{32}", nonce) or not ts.isdigit() or len(ts) > 12 or len(mac) != 32:
+            return None
+        age = time.time() - int(ts)
+        if age < -60 or age > self.CSRF_COOKIE_LIFETIME_S:
+            return None
+        want = hmac.new(self._csrf_key, f"cookie:{user}:{nonce}:{ts}".encode(), hashlib.sha256).hexdigest()[:32]
         return nonce if hmac.compare_digest(mac, want) else None
 
     def csrf_token(self, user, nonce=None):
@@ -3281,14 +3320,14 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         return {"status": req.status, "error": req.error}
 
 
-def parse_trusted_proxies(config):
+def parse_trusted_proxies(config, key="trusted_proxies"):
     """`trusted_proxies`: CIDRs of reverse proxies whose X-Forwarded-For may name the real client for
     logging and per-source limits. ValueError (naming the field) when malformed. Never a trust input."""
-    raw = config.get("trusted_proxies")
+    raw = config.get(key)
     if raw is None:
         return []
     if not isinstance(raw, list) or len(raw) > 32:
-        raise ValueError("trusted_proxies must be a list of up to 32 CIDRs")
+        raise ValueError(f"{key} must be a list of up to 32 CIDRs")
     out = []
     for c in raw:
         try:
@@ -3296,7 +3335,7 @@ def parse_trusted_proxies(config):
                 raise ValueError
             out.append(ipaddress.ip_network(c, strict=False))
         except (ValueError, TypeError):
-            raise ValueError("trusted_proxies: not a CIDR: " + httpcheck.clip(c, 60)) from None
+            raise ValueError(f"{key}: not a CIDR: " + httpcheck.clip(c, 60)) from None
     return out
 
 
@@ -5025,7 +5064,8 @@ def approval_handler(broker):
             memo = getattr(self, "_ip_memo", None)
             if memo is None:
                 memo = self._ip_memo = broker.effective_addr(
-                    self.client_address[0], ", ".join(self.headers.get_all("X-Forwarded-For") or []))
+                    self.client_address[0], ", ".join(self.headers.get_all("X-Forwarded-For") or []),
+                    broker._approval_proxies)
             return memo
 
         def parse_request(self):
@@ -5057,11 +5097,9 @@ def approval_handler(broker):
             return {"every": 10000, "focus": pc["require_focus"]} if pc["enabled"] else None
 
         def _fwd(self):
-            """Client IP for the log. From a `trusted_proxies` peer it is the walked address (see
-            Broker.effective_addr); from any other peer it is the header's first value, informational only."""
-            if broker._trusted_proxies and self._ip != self.client_address[0]:
-                return self._ip
-            return (self.headers.get("X-Forwarded-For", "").split(",")[0].strip()[:64]) or None
+            """Client IP for the log: the walked X-Forwarded-For address when the socket peer is one of
+            `approval_trusted_proxies`, otherwise the socket peer itself (a header from anyone else is ignored)."""
+            return self._ip
 
         def _user(self):
             if not broker.peer_trusted(self.client_address[0]):
@@ -5115,7 +5153,7 @@ def approval_handler(broker):
                            or (self.headers.get("X-Forwarded-Proto", "").split(",")[0].strip().lower() == "https"
                                and broker.peer_trusted(self.client_address[0])))
                 secure = "; Secure" if via_tls else ""
-                self._set_cookie = f"{broker.CSRF_COOKIE}={cookie}; Path=/; HttpOnly; SameSite=Strict{secure}"
+                self._set_cookie = f"{broker.CSRF_COOKIE}={cookie}; Path=/; HttpOnly; SameSite=Strict; Max-Age={broker.CSRF_COOKIE_LIFETIME_S}{secure}"
             elif n is None:
                 n = broker.TEST_NONCE       # test harness only (Python API flag): no cookie jar
             self._nonce_memo[user] = n
