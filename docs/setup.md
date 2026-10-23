@@ -200,6 +200,12 @@ Defaults changed for security (see the reference, "Security notes"). Check them 
    * or, explicitly, `"approval_trust_any_peer": true` (the old behaviour; a loud warning at every start).
    Loopback and the broker's own addresses are never trusted, whatever you list. With none of these set the
    broker still starts and logs a `config_error` / ERROR line ("approval listener is CLOSED").
+   **Do not list `172.16.0.0/12` or `10.0.0.0/8`**: they trust every container and VM in the range (an agent's own
+   VM included). List the proxy's own address or its subnet (`deploy/compose.yaml` pins the outpost to a fixed
+   address on a fixed subnet for that reason); a startup WARNING fires for any entry broader than /24 (IPv4) or /64
+   (IPv6). If `approval_proxy_secret_file` is set but unreadable, empty, too short, a directory or a placeholder,
+   the approval listener refuses every request (a configured secret is never skipped, even with
+   `approval_trusted_peers` or `approval_trust_any_peer` set) and a `config_error` explains why.
    A secret alone is the strongest simple setup if the proxy can add a header; a peer list alone trusts
    every host in the CIDR (including an agent's VM if it is in it); use both when you can. The Docker bridge
    gateway is **not** trusted unless you list it.

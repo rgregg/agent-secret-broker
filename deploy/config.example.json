@@ -12,7 +12,7 @@
   "approve_base_url": "https://secrets.example.com",
   "allowed_user": "alice",
   "identity_header": "X-authentik-username",
-  "approval_trusted_peers": ["172.23.0.0/16"],
+  "approval_trusted_peers": ["172.30.50.10/32"],
   "approval_proxy_secret_file": "/run/secrets/approval_proxy_secret",
   "trusted_proxies": ["10.0.0.100/32"],
   "own_ports": [],

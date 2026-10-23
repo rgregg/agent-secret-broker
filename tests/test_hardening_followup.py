@@ -710,5 +710,56 @@ class ClientApiDefault(tdg.StrictHarness):
         self.assertEqual(urllib.request.urlopen(self.base + "/healthz", timeout=10).read(), b"ok")
 
 
+class SecretNeverSkipped(unittest.TestCase):
+    def write(self, text):
+        p = os.path.join(tempfile.mkdtemp(), "s")
+        open(p, "w").write(text)
+        return p
+
+    def broker(self, path, **extra):
+        return broker_with(None, approval_proxy_secret_file=path, approval_trusted_peers=["10.9.0.5/32"], **extra)
+
+    def test_unusable_secrets_close_the_listener_whatever_else_is_set(self):
+        d = tempfile.mkdtemp()
+        cases = {"unreadable": os.path.join(d, "missing"), "directory": d, "empty": self.write(""),
+                 "short": self.write("abc123\n"), "placeholder": self.write("changeme-changeme-changeme\n"),
+                 "repeated": self.write("aaaaaaaaaaaaaaaaaaaaaaaa\n"), "spaces": self.write("two words in here 123456\n"),
+                 "empty key": ""}
+        for name, path in cases.items():
+            for extra in ({}, {"approval_trust_any_peer": True}):
+                b = self.broker(path, **extra)
+                self.assertFalse(b.listener_open(), name)
+                self.assertFalse(b.peer_trusted("10.9.0.5"), name)
+                self.assertTrue([e for e in b.trust_errors() if "approval_proxy_secret_file" in e], name)
+
+    def test_a_valid_secret_opens_it(self):
+        b = self.broker(self.write("0123456789abcdef0123456789abcdef\n"))
+        self.assertTrue(b.listener_open())
+        self.assertTrue(b.peer_trusted("10.9.0.5"))
+        self.assertEqual(b.trust_errors(), [])
+
+    def test_listener_answers_403_to_everything_with_a_broken_secret(self):
+        h = tdg.StrictHarness
+        # (real listener, trust-any-peer set, secret file missing)
+        class T(h):
+            cfg_extra = {"approval_trust_any_peer": True, "approval_proxy_secret_file": "/nonexistent/secret"}
+
+            def runTest(self):
+                for hdr in ({}, {"X-ASB-Proxy-Secret": "anything-at-all-1234567890"}):
+                    r = urllib.request.Request(self.abase + "/", headers={"X-authentik-username": "alice", **hdr})
+                    with self.assertRaises(urllib.error.HTTPError) as cm:
+                        urllib.request.urlopen(r, timeout=10)
+                    self.assertEqual(cm.exception.code, 403)
+        res = unittest.TextTestRunner(stream=io.StringIO()).run(T())
+        self.assertTrue(res.wasSuccessful(), res.failures + res.errors)
+
+    def test_broad_peer_prefixes_warn(self):
+        for cidr in ("172.16.0.0/12", "10.0.0.0/8", "192.168.0.0/16", "fd00::/48"):
+            b = broker_with(None, approval_trusted_peers=[cidr])
+            self.assertTrue([w for w in b.trust_warnings() if "broader than" in w], cidr)
+        b = broker_with(None, approval_trusted_peers=["172.30.50.10/32", "172.30.50.0/24", "fd00::/64"])
+        self.assertFalse([w for w in b.trust_warnings() if "broader than" in w])
+
+
 if __name__ == "__main__":
     unittest.main()

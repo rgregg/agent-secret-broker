@@ -246,6 +246,8 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         self._peer_refused = {}
         (self._proxy_secret, self._proxy_secret_header,
          self._secret_errors) = self._load_proxy_secret(config)
+        # asked for by the CONFIG KEY, not by whether it loaded: a broken secret never opens the listener
+        self._secret_required = config.get("approval_proxy_secret_file") is not None
         if self._proxy_secret:      # never reaches an agent: stripped from outbound headers, masked in responses
             self.dest_guard.strip_headers = (self._proxy_secret_header,)
             self.dest_guard.mask_values = (self._proxy_secret,)
@@ -2267,16 +2269,24 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             errs.append("approval_proxy_secret_header is not a valid header name")
             header = "X-ASB-Proxy-Secret"
         path = config.get("approval_proxy_secret_file")
-        if path:
+        if path is not None:
             try:
+                if not isinstance(path, str) or not path:
+                    raise OSError
                 with open(path) as f:
                     secret = f.read().strip()
             except (OSError, TypeError, UnicodeError):
-                errs.append("approval_proxy_secret_file cannot be read")
+                errs.append("approval_proxy_secret_file cannot be read (missing, a directory, or not text)")
             else:
                 if len(secret) < 16 or not secret.isascii() or any(c.isspace() or ord(c) < 33 for c in secret):
                     errs.append("approval_proxy_secret_file must hold one token of at least 16 printable "
                                 "ASCII characters (openssl rand -hex 32)")
+                    secret = None
+                elif (len(set(secret)) < 6 or any(w in secret.lower() for w in (
+                        "changeme", "change-me", "change_me", "placeholder", "example", "your-secret",
+                        "your_secret", "secret-here", "xxxxxxxx", "password", "replace"))):
+                    errs.append("approval_proxy_secret_file holds a placeholder, not a random token "
+                                "(openssl rand -hex 32)")
                     secret = None
         return secret, header, errs
 
@@ -2363,6 +2373,8 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         """Is the approval listener configured to answer anyone? Strict mode fails closed unless the
         operator set approval_trusted_peers or a proxy secret (or explicitly trusts any peer)."""
         c = self.cfg
+        if self._secret_required and not self._proxy_secret:
+            return False                # a configured but unusable secret fails closed, whatever else is set
         return bool(c.get("approval_trust_any_peer") is True or c.get("approval_trusted_peers")
                     or self._proxy_secret)
 
@@ -2377,6 +2389,8 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
           * else `approval_proxy_secret_file` set: any other peer (the secret, checked on every
             request, is the authentication);
           * else: nobody (FAIL CLOSED; a startup ERROR says so)."""
+        if self._secret_required and not self._proxy_secret:
+            return False
         if self.cfg.get("approval_trust_any_peer") is True:
             return True
         try:
@@ -2402,7 +2416,10 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
     def trust_errors(self):
         """Startup ERRORS about the approval listener (it is closed until fixed)."""
         out = list(self._secret_errors)
-        if not self.listener_open():
+        if self._secret_required and not self._proxy_secret:
+            out.append("approval listener is CLOSED (every request gets 403): approval_proxy_secret_file is set "
+                       "but unusable, and a configured secret is never skipped")
+        elif not self.listener_open():
             out.append("approval listener is CLOSED (every request gets 403): set approval_trusted_peers "
                        "(the SSO proxy's CIDR) and/or approval_proxy_secret_file; "
                        "approval_trust_any_peer: true restores the old trust-everyone behaviour")
@@ -2423,6 +2440,10 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                 net = ipaddress.ip_network(n, strict=False)
             except ValueError:
                 continue
+            if net.prefixlen < (24 if net.version == 4 else 64):
+                out.append(f"approval_trusted_peers entry {str(n)[:64]} is broader than /{24 if net.version == 4 else 64}: "
+                           "list the SSO proxy's own fixed address or subnet (172.16.0.0/12 and 10.0.0.0/8 trust "
+                           "every container and VM in them)")
             own = [a for a in self.dest_guard.locals() if parse_ip_safe(a) in net]
             if net.overlaps(ipaddress.ip_network("127.0.0.0/8")) or net.overlaps(ipaddress.ip_network("::1/128")) or own:
                 out.append(f"approval_trusted_peers entry {str(n)[:64]} includes loopback or an address of this "
@@ -5013,8 +5034,9 @@ def approval_handler(broker):
             self._nonce_memo = {}
             if not super().parse_request() or _refuse_egress_marker(self, broker, "approval"):
                 return False
-            if broker._proxy_secret and not broker.proxy_secret_ok(self.headers):
-                broker.log("approval_forbidden", reason="proxy secret missing or wrong",
+            if (broker._secret_required and not broker._proxy_secret) or (
+                    broker._proxy_secret and not broker.proxy_secret_ok(self.headers)):
+                broker.log("approval_forbidden", reason="proxy secret missing, wrong or unusable",
                            peer=self._ip, method=self.command)
                 self.close_connection = True
                 _page(self, 403, "<h1>Forbidden</h1>", nav=False)
