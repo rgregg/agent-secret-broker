@@ -122,7 +122,8 @@ class PlansMixin:
                 raise plans_mod.ManifestError(f"{f}.secret: this credential does not allow plans", 403)
             if r["secret"] in deny:
                 raise plans_mod.ManifestError(f"{f}.secret: this credential does not allow plans", 403)
-            if r["host"] not in destguard.host_parts(hosts):
+            if (r["host"] not in destguard.host_parts(hosts) or self.dest_guard.host_refused(r["host"])
+                    or not self.dest_guard.port_ok(hosts, r["host"], r["port"])):
                 raise plans_mod.ManifestError(f"{f}.host: not one of this credential's allowed hosts")
             sigs[r["secret"]] = source_sig(sc)
         return sigs
@@ -478,9 +479,9 @@ def _submit(h, broker, _json):
     if not isinstance(body, dict) or set(body) - {"manifest", "source"} or "manifest" not in body:
         _json(h, 400, {"error": "manifest: the request must be an object with a manifest"})
         return True
-    src = body.get("source", h.client_address[0])
-    src = clean_source(src, h.client_address[0])
-    req = broker.submit_plan(body["manifest"], src, peer=h.client_address[0], client=h.client)
+    src = body.get("source", h._ip)
+    src = clean_source(src, h._ip)             # (the effective address; the socket peer decides no trust here)
+    req = broker.submit_plan(body["manifest"], src, peer=h._ip, client=h.client)
     _json(h, 202, {"id": req.id, "plan": req.plan_id, "status": req.status,
                    "expires_in": int(req.expires - time.time())})
     return True

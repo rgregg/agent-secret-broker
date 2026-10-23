@@ -15,7 +15,7 @@ services:
     environment:
       HOME: /tmp
       BITWARDENCLI_APPDATA_DIR: /bw   # persistent: keeps ONE stable device identity
-      BROKER_CONFIG: '{"backend": {"type": "bw", "server_url": "https://vault.example.com", "master_password_file": "/run/secrets/bw_master_password", "organization": "My Org", "collection": "Secrets", "serve": true}, "client_key_file": "/run/secrets/client_key", "approve_base_url": "https://secrets.example.com", "allowed_user": "alice", "identity_header": "X-authentik-username", "audit_log": "/data/audit.jsonl", "approval_trusted_peers": ["172.30.50.10/32"], "approval_proxy_secret_file": "/run/secrets/approval_proxy_secret"}'
+      BROKER_CONFIG: '{"backend": {"type": "bw", "server_url": "https://vault.example.com", "master_password_file": "/run/secrets/bw_master_password", "organization": "My Org", "collection": "Secrets", "serve": true}, "client_key_file": "/run/secrets/client_key", "approve_base_url": "https://secrets.example.com", "allowed_user": "alice", "identity_header": "X-authentik-username", "audit_log": "/data/audit.jsonl", "approval_trusted_peers": ["172.30.50.10/32"], "approval_trusted_proxies": ["172.30.50.10/32"], "approval_proxy_secret_file": "/run/secrets/approval_proxy_secret"}'
     volumes:
       - ./data:/data
       - ./bw:/bw               # owned by uid 65534, mode 700
@@ -24,6 +24,13 @@ services:
     tmpfs: [/tmp]
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
+    # CLIENT API GATE: adding "trusted_proxies": ["<your reverse proxy>/32"] to BROKER_CONFIG makes port 8800 answer 403
+    # to every other socket peer. DO NOT turn it on blindly: published ports go through Docker's userland proxy or
+    # bridge NAT, which can rewrite the source address to the bridge gateway (172.30.50.1 here), and then the gate
+    # would refuse everybody, including the proxy. First send a few requests through the proxy and read the
+    # `client_peer_observed` lines in the audit log / `docker compose logs broker` (the first 20 requests are
+    # logged with the socket peer the broker really sees); list THAT address. Set "client_api_allow_direct": true
+    # if some clients (Home Assistant, asb on this host) connect directly.
     healthcheck:               # /healthz answers only loopback / the container's own address, with "ok"
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8800/healthz', timeout=3)"]
       interval: 30s

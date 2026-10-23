@@ -62,6 +62,18 @@ def check_url_template(url):
     return u
 
 
+def url_ok(url):
+    """True for a url with no control character (TAB and DEL included), no whitespace and no non-ASCII."""
+    return (isinstance(url, str) and bool(url) and not _CTRL.search(url) and not re.search(r"\s", url)
+            and url.isascii())
+
+
+def check_url(url):
+    """ValueError (generic) unless url_ok(url)."""
+    if not url_ok(url):
+        raise ValueError(GENERIC)
+
+
 def check_header_name(name):
     if not isinstance(name, str) or not _HEADER_TOKEN.match(name):
         raise ValueError(GENERIC)

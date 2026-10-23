@@ -194,12 +194,14 @@ class DestGuard:
         return str(ip) in self.locals() or (not self.locals() and _is_local_bind(ip))
 
     def port_ok(self, entries, host, port):
-        """destguard.ip_port_ok, except that the test harness' loopback stubs (random ports) pass."""
+        """entry_allows, except that the test harness' loopback stubs (random ports) pass."""
         if self.allow_loopback:
             ip = parse_ip((host or "").strip("[]"))
             if ip is not None and ip.is_loopback:
                 return True
-        return ip_port_ok(entries, host, port)
+            if (host or "").lower() in LOOPBACK_NAMES and (host or "").lower() in {str(e).lower().split(":")[0] for e in entries or ()}:
+                return True
+        return entry_allows(entries, host, port)
 
     def register_ports(self, *ports):
         self.own_ports.update(int(p) for p in ports if p)
@@ -318,25 +320,27 @@ def host_parts(entries):
     return {split_entry(e)[0].lower() for e in entries or () if split_entry(e)[0]}
 
 
-def ip_port_ok(entries, host, port):
-    """The IP-literal rule. A host that is an IP literal may be called on its scheme's default port
-    (80 or 443) only if listed bare, and on any other port only if an entry says `host:port`.
-    A hostname is not restricted here (its entry is a host match). An entry `host:port` alone
-    never allows other ports of that host."""
+def entry_allows(entries, host, port):
+    """THE rule for "is this host and port allowed by these allowed_hosts entries" (every place that decides
+    it uses this): a bare `host` entry allows a host name on any port and an IP literal on the default ports
+    (80 and 443) only; a `host:port` entry allows exactly that port of that host (so a name with only
+    `host:port` entries is restricted to those ports); a port is never allowed by another host's entry."""
     h = (host or "").lower().strip("[]")
     ents = [str(e).lower() for e in entries or ()]
-    if parse_ip(h) is None:
-        return True
     if f"{h}:{port}" in ents:
         return True
-    return port in (80, 443) and h in ents
+    if h in ents:
+        return parse_ip(h) is None or port in (80, 443)
+    return False
 
 
-def entry_allows(entries, host, port):
-    """True when `host` (and for explicit entries, `port`) is covered by allowed_hosts."""
-    h = (host or "").lower()
-    ents = [str(e).lower() for e in entries or ()]
-    return h in ents or f"{h}:{port}" in ents
+def ip_port_ok(entries, host, port):
+    """The IP-literal part of entry_allows: True for a host name (its entry is a host match), and for an
+    IP literal only on default ports with a bare entry or on an explicit `host:port` entry."""
+    h = (host or "").lower().strip("[]")
+    if parse_ip(h) is None:
+        return True
+    return entry_allows(entries, h, port)
 
 
 # -- connections that connect through the guard -------------------------------------------------

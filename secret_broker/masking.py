@@ -218,7 +218,11 @@ class Masker:
         text = self.mask_head(text)
         enc = text.encode("utf-8")
         if len(enc) > cut:
-            text = self.mask_tail(enc[:cut].decode("utf-8", "ignore"))
+            text = enc[:cut].decode("utf-8", "ignore")
+        if len(raw) > cut:
+            # the read went past the cut, so the end of what we hold may be the middle of a secret - whether we
+            # cut it just now or earlier replacements shrank the text below the cut: mask the longest partial
+            text = self.mask_tail(text)
         return text
 
 

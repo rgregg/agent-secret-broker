@@ -245,6 +245,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         self._trusted_proxies = parse_trusted_proxies(config)      # client API listener only
         self._approval_proxies = parse_trusted_proxies(config, "approval_trusted_proxies")   # approval listener only
         self._peer_refused = {}
+        self._peer_obs = 0
         (self._proxy_secret, self._proxy_secret_header,
          self._secret_errors) = self._load_proxy_secret(config)
         # asked for by the CONFIG KEY, not by whether it loaded: a broken secret never opens the listener
@@ -1900,8 +1901,8 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         port = u.port or (443 if u.scheme == "https" else 80)
         entries = self._dest_entries(names)
         if not self.dest_guard.port_ok(entries, u.hostname, port):
-            raise PermissionError("that port is not allowed for this host (an IP address needs an explicit "
-                                  "host:port entry in allowed_hosts)")
+            raise PermissionError("that port is not allowed for this host (a host:port entry in allowed_hosts "
+                                  "allows only that port, and an IP address needs an explicit host:port entry)")
         if self.dest_guard.host_refused(u.hostname):
             raise PermissionError(f"host {httpcheck.clip(u.hostname, 100)} is not allowed for {','.join(names)}")   # same as any other
         if spec.get("body_b64") is not None:
@@ -2336,6 +2337,25 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         if method == "GET" and path == "/healthz" and self._is_self_peer(peer):
             return True
         return self._is_proxy_peer(peer)
+
+    PEER_OBSERVED_N = 20
+
+    def peer_observed(self, peer, effective, method, path):
+        """Log the socket peer of the first PEER_OBSERVED_N client API requests (operator audit + INFO), so the
+        operator can verify which address the broker really sees behind a proxy or Docker NAT BEFORE relying on
+        the trusted_proxies gate."""
+        if self.dest_guard.allow_loopback:
+            return                  # (the test harness keeps its audit streams exact)
+        with self._ha_rate_lock:
+            if self._peer_obs >= self.PEER_OBSERVED_N:
+                return
+            self._peer_obs += 1
+        gated = bool(self._trusted_proxies) and self.cfg.get("client_api_allow_direct") is not True
+        self.log("client_peer_observed", peer=peer, effective=effective, method=method, path=path[:40],
+                 in_trusted_proxies=self._is_proxy_peer(peer), gated=gated)
+        logging.getLogger("secret_broker").info("client API request %d/%d: socket peer %s (effective %s), in "
+                                                "trusted_proxies=%s", self._peer_obs, self.PEER_OBSERVED_N,
+                                                peer, effective, self._is_proxy_peer(peer))
 
     def client_peer_refused(self, peer):
         """Audit (rate limited: once a minute per peer, bounded map) that the gate refused `peer`."""
@@ -4801,6 +4821,7 @@ def client_handler(broker, client_key):
             if not super().parse_request() or _refuse_egress_marker(self, broker, "client"):
                 return False
             raw = self.client_address[0]            # the REAL socket peer; X-Forwarded-For is never consulted here
+            broker.peer_observed(raw, self._ip, self.command, self.path.split("?")[0])
             if not broker.client_peer_allowed(raw, self.command, self.path.split("?")[0]):
                 broker.client_peer_refused(raw)
                 self.close_connection = True
@@ -5088,10 +5109,9 @@ def approval_handler(broker):
 
         def _origin_strict(self):
             """For the JSON endpoints a browser calls itself: an Origin header is REQUIRED (a browser
-            sends one on every same-origin POST) and must be ours; only a request that carries the proxy
-            secret may omit it."""
-            if not self.headers.get("Origin") and not broker.proxy_secret_ok(self.headers):
-                return False
+            sends one on every same-origin POST) and must be ours, whatever else the request carries."""
+            if not self.headers.get("Origin") and not broker.dest_guard.allow_loopback:
+                return False        # unconditional: the proxy secret does not excuse it (only the test switch relaxes it)
             return self._same_origin()
 
         @property
@@ -5801,6 +5821,7 @@ def approval_handler(broker):
 <p><small>{note}</small></p>
 <p><small>Expires in {int(req.expires - time.time())}s</small></p>
 <form method=post id=f>
+<input type=hidden name=csrf value='{self._tok(user)}'>
 {_approve_actions(broker, req)}
 </form>
 <p id=w hidden>Working...</p>""", script=_WORKING_JS + proposals_mod.JS + proposals_mod.JS_INIT)
@@ -5966,10 +5987,12 @@ def approval_handler(broker):
                 return _page(self, 413, "<h1>Too large</h1>")
             form = urllib.parse.parse_qs(
                 self.rfile.read(min(int(self.headers.get("Content-Length", 0)), limit)).decode())
-            if path in ("/decide", "/credential", "/request/retry", "/policies", "/policies/guidance", "/policies/ssh_hosts", "/grants/revoke",
+            link = path.startswith("/a/") and not broker.dest_guard.allow_loopback   # the notification link page
+            if (link or path in ("/decide", "/credential", "/request/retry", "/policies", "/policies/guidance", "/policies/ssh_hosts", "/grants/revoke",
                         "/enroll/decide", "/clients/rename", "/clients/revoke", "/clients/remove", "/sessions/revoke",
                         "/policies/ssh_rules/add", "/policies/ssh_rules/revoke", "/push/subscribe",
-                        "/push/revoke", "/push/test", "/plans/decide", "/plans/revoke") and not self._csrf_ok(user, form.get("csrf", [""])[0]):
+                        "/push/revoke", "/push/test", "/plans/decide", "/plans/revoke")) and not (
+                    self._csrf_ok(user, form.get("csrf", [""])[0]) and (not link or bool(self.headers.get("Origin")))):
                 broker.log("csrf_refused", path=path, peer=self._ip,
                            client_ip=self._fwd(), origin=(self.headers.get("Origin") or "")[:80],
                            fetch_site=self.headers.get("Sec-Fetch-Site"))

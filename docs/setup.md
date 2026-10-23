@@ -223,11 +223,22 @@ Defaults changed for security (see the reference, "Security notes"). Check them 
    and directly (the direct call must be 403). For any other proxy: a plain `proxy_set_header` /
    `RequestHeader set` of the same header.
 
+   *nginx proxy manager (or any reverse proxy) as the simplest alternative:* add the header there instead of in
+   Authentik, in the proxy host's Advanced tab: `proxy_set_header X-ASB-Proxy-Secret "<the token>";` (it sets the
+   header on the request it forwards to the outpost). Not verified here: that the outpost passes an inbound
+   `X-ASB-Proxy-Secret` header through to the upstream broker unchanged on every path (test with a request that
+   carries the wrong value and one that carries none: both must give 403 from the broker). Also: Authentik user and
+   group attributes (the `additionalHeaders` method) can be edited by anyone who may edit those objects, so a scope
+   mapping on the provider (admin-only) is the safer Authentik route, and the shared secret is only as private as
+   the people who can read the provider/proxy configuration.
+
    Example live migration: put the proxy's address in `approval_trusted_peers` (for example
    `["172.23.0.0/16"]`, or `["100.64.0.0/10"]` for a Tailscale proxy), create the secret file, mount it in
    `compose.yaml`, set `"approval_proxy_secret_file": "/run/secrets/approval_proxy_secret"`, add the header in
    the proxy, restart, open the approval site and the History page, and check `docker compose logs broker`
    for no `config_error` lines.
+   `approval_trusted_proxies` is set in `deploy/compose.yaml` and `deploy/config.example.json` to the outpost's fixed
+   address (add your NPM address if it also sits in front of the approval site).
 2. **Real client addresses behind a reverse proxy.** There are two separate settings. `trusted_proxies` applies ONLY to
    the client API (port 8800): if every client request reaches the broker from your reverse proxy (for example nginx
    proxy manager at 10.0.0.100), set `"trusted_proxies": ["10.0.0.100/32"]`. `approval_trusted_proxies` applies ONLY
@@ -239,6 +250,12 @@ Defaults changed for security (see the reference, "Security notes"). Check them 
    `approval_trusted_peers`, the proxy secret, the destination guard and the egress marker use the real
    socket peer. Loopback and the broker's own addresses are ignored here too. The same trusted peers
    may also set `X-Forwarded-Proto: https` so the CSRF cookie gets the Secure flag.
+   **WARNING: check what peer address the broker really sees before you rely on `trusted_proxies` as a gate.**
+   Docker's userland proxy and bridge NAT can rewrite the source of a published port to the bridge gateway
+   (for example 172.30.50.1), so the proxy would appear as the gateway and the gate would answer 403 to everyone.
+   The broker logs the socket peer of the first 20 client API requests as `client_peer_observed` events (and INFO log
+   lines) with `gated` and `in_trusted_proxies`: send a few requests through the proxy FIRST (or start with
+   `client_api_allow_direct: true`), read which address appears, and list that one.
    **Setting `trusted_proxies` also closes the client API (port 8800) to everyone else.** Connections whose
    real socket peer is not in `trusted_proxies` get `403 forbidden` before authentication and before the
    unauthenticated enrollment endpoints, and a rate-limited operator-only `client_peer_refused` audit event

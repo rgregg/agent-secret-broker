@@ -720,8 +720,7 @@ def run_http(sess, spec, env, tls, allowed_now, opener_for, clock, state):
     if scheme not in ("http", "https") or not sess.in_scope(scheme, host, port) or host not in destguard.host_parts(allowed_now):
         raise NotSent("that host or port is outside this session's scope")
     # Everything below depends on credential content: one generic error for every cause, charged like a sent call.
-    if _ILLEGAL_HEADER_VALUE.search(url) or " " in url:
-        raise ValueError("bad request")
+    httpcheck.check_url(url)        # (one rule for every path: no control character incl. TAB, no whitespace, ASCII)
     for k, v in headers.items():
         if not _HEADER_TOKEN.match(k) or _ILLEGAL_HEADER_VALUE.search(v) or not v.isascii():
             raise ValueError("bad request")
@@ -797,7 +796,7 @@ def run_http(sess, spec, env, tls, allowed_now, opener_for, clock, state):
     return out, {"captured": sorted(caps), "missing": sorted(set(missing)), "_over_budget": masker.over_budget}
 
 
-def scope_problem(s, sc, names, method, spec, capture_names=()):
+def scope_problem(s, sc, names, method, spec, capture_names=(), allowed=destguard.entry_allows):
     """None when a call is inside the session's scope, else (reason_class, fixed message). `sc` is the
     credential's current catalog entry (None if it vanished), `capture_names` the names captured so far.
     Pure and linear in the size of the call: it reads only fields that never change after the session
@@ -812,7 +811,8 @@ def scope_problem(s, sc, names, method, spec, capture_names=()):
         return "url", "the url contains characters a session call cannot send"
     if list(names) != [s.cred]:
         return "credential", "the call names a different credential than the session's"
-    if sc is None or sc.get("ssh") or host not in destguard.host_parts(sc.get("allowed_hosts")):
+    if (sc is None or sc.get("ssh") or host not in destguard.host_parts(sc.get("allowed_hosts"))
+            or not allowed(sc.get("allowed_hosts"), host, port)):
         return "host", "that host is not allowed for this session's credential"
     if scheme not in ("http", "https") or not s.in_scope(scheme, host, port):
         return "host", "that host or port is outside this session's scope; open a new session for it"
@@ -827,7 +827,7 @@ def scope_problem(s, sc, names, method, spec, capture_names=()):
     # characters and length are checked on what the agent wrote (placeholders neutral), so these refusals never depend
     # on a secret; credential content is only checked after substitution, with one generic error, and charged
     nurl = neutralize(spec["url"])
-    if len(nurl) > MAX_URL or _ILLEGAL_HEADER_VALUE.search(nurl) or " " in nurl:
+    if len(nurl) > MAX_URL or not httpcheck.url_ok(nurl):
         return "url", "the url contains characters a session call cannot send"
     for k, v in spec["headers"].items():
         nv = neutralize(v)
@@ -861,7 +861,7 @@ def scope_problem(s, sc, names, method, spec, capture_names=()):
 
 
 # ---------------------------------------------------------------- agent-side checks
-def validate_open(cfg, spec, allowed_hosts):
+def validate_open(cfg, spec, allowed_hosts, allowed=destguard.entry_allows, refused=lambda h: False):
     """The agent's open request -> the normalized spec, or ValueError/PermissionError with fixed
     text. `allowed_hosts` is the credential's list. Never repeats the agent's input."""
     purpose = credreq_mod.validate_purpose(spec.get("purpose"))
@@ -870,7 +870,9 @@ def validate_open(cfg, spec, allowed_hosts):
         raise ValueError(f"hosts must be 1 to {MAX_HOSTS} plain host names, each optionally with :port (--host)")
     parsed = [parse_host_entry(h) for h in hosts]
     hosts = sorted({h if p is None else f"{h}:{p}" for h, p in parsed})
-    if any(h not in destguard.host_parts(allowed_hosts) for h, _ in parsed):
+    def ok(h, p):       # a bare manifest host means ports 80 and 443; host:port means exactly that port
+        return allowed(allowed_hosts, h, p) if p is not None else (allowed(allowed_hosts, h, 80) or allowed(allowed_hosts, h, 443))
+    if any(h not in destguard.host_parts(allowed_hosts) or not ok(h, p) or refused(h) for h, p in parsed):
         raise PermissionError("a session host is outside this credential's allowed hosts: a session can "
                               "only narrow what the credential allows (see `asb list`)")
     methods = spec.get("methods")
@@ -1147,7 +1149,8 @@ class SessionsMixin:
         if not sc.get("allowed_hosts"):
             raise PermissionError("this credential has no allowed hosts, so it is not an http credential; "
                                   "a session works only with http credentials")
-        out = validate_open(self.sessions_cfg, spec, sc["allowed_hosts"])
+        out = validate_open(self.sessions_cfg, spec, sc["allowed_hosts"], self.dest_guard.port_ok,
+                            self.dest_guard.host_refused)
         spec.clear()
         spec.update(out)
 
@@ -1176,7 +1179,12 @@ class SessionsMixin:
         sc = self.cfg["secrets"].get(req.names[0])
         if sc is None or sc.get("ssh") or not sc.get("allowed_hosts"):
             raise SessionOpenError("the credential is no longer available for http")
-        if any(parse_host_entry(h)[0] not in destguard.host_parts(sc["allowed_hosts"]) for h in sp["hosts"]):
+        if any(parse_host_entry(h)[0] not in destguard.host_parts(sc["allowed_hosts"])
+               or self.dest_guard.host_refused(parse_host_entry(h)[0])
+               or not (self.dest_guard.port_ok(sc["allowed_hosts"], parse_host_entry(h)[0], parse_host_entry(h)[1] or 80)
+                       or (parse_host_entry(h)[1] is None
+                           and self.dest_guard.port_ok(sc["allowed_hosts"], parse_host_entry(h)[0], 443)))
+               for h in sp["hosts"]):
             raise SessionOpenError("a host is no longer allowed for this credential")
         self.sweep_sessions()
         with self._sess_lock:
@@ -1303,7 +1311,7 @@ class SessionsMixin:
         with s.lock:
             have = frozenset(s.captures)
         sc_now = None if self._internal_hit([s.cred]) else self.cfg["secrets"].get(s.cred)
-        problem = scope_problem(s, sc_now, names, method, spec, have)   # no lock held
+        problem = scope_problem(s, sc_now, names, method, spec, have, self.dest_guard.port_ok)   # no lock held
         if problem is None:
             with self._sess_lock:                       # charge the call: re-check life and cap atomically
                 s2, state = self._sess_lookup(sid, cid, self.sessions_clock())

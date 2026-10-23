@@ -1144,7 +1144,10 @@ makes every approval-listener request carry that header with a constant-time-equ
 peer rule when a peer list is set. The secret is deleted from any agent-supplied outbound header, masked in every
 response, and never written to the audit log, logs, status or errors. `/push/decide`, `/presence` and
 `/push/event` also require an `Origin` header (a browser sends one on every same-origin POST, from the page and
-the service worker alike) unless the request carries the secret. Setup has the Authentik recipe. The
+the service worker alike), with no exemption: the proxy secret does not excuse a missing Origin (only the test-only
+loopback switch relaxes it). The notification link page `/a/<nonce>` carries a CSRF token too: its GET issues the
+cookie and renders the hidden field, and its POST needs a valid token, the matching cookie and an Origin header
+that is ours (the nonce stays a capability; this is defence in depth). Setup has the Authentik recipe. The
 dashboard's CSRF token is bound to an HttpOnly, SameSite=Strict cookie the first page load issues (see
 "Security notes" below), and both listeners refuse any request carrying the broker's own egress marker
 header (`X-Secret-Broker-Egress`, added to every outbound call).
@@ -2857,7 +2860,10 @@ only to the user, never rotated) out of the page and then POST `/decide` for any
   `localhost.localdomain`, `ip6-localhost`, `metadata.google.internal`, a dotless name, a loopback / link-local /
   unspecified / own address or a non-canonical IP spelling (`2130706433`, `0x7f.1`, `0177.0.0.1`). Human-edited
   catalog entries keep working unless they name one of those (the host is dropped and `dest_guard_config_error`
-  is logged). An IP literal on a port other than 80/443 needs an explicit `host:port` entry in `allowed_hosts`.
+  is logged). ONE rule (`destguard.entry_allows`) decides host and port everywhere (http, session open and calls, plan
+  submit and calls, and the connection itself): a bare `host` entry allows a name on any port and an IP literal on 80/443;
+  a `host:port` entry allows exactly that port (a name with only `host:port` entries is limited to those ports). Session
+  open and plan submit also run the guard's static host check.
 * **Approval listener trust.** Loopback and the broker's own addresses are never trusted. The listener fails
   closed unless `approval_trusted_peers` and/or `approval_proxy_secret_file` is set (see Setup, "Upgrading"):
   an RFC 1918 peer is no longer enough, because the agent's own VM is usually inside such a range.
