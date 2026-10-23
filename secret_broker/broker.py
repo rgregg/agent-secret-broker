@@ -2340,6 +2340,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
     def client_peer_refused(self, peer):
         """Audit (rate limited: once a minute per peer, bounded map) that the gate refused `peer`."""
         now = time.time()
+        peer = clients_mod.src_key(peer)
         with self._ha_rate_lock:
             st = self._peer_refused.get(peer)
             if st is not None and now - st < 60:

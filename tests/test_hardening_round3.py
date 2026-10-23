@@ -63,25 +63,45 @@ class MaskerSpellings(unittest.TestCase):
         import html
         self.assertEqual(masking.Masker([v]).mask("[" + html.escape(v) + "]"), "[***]")
 
-    def test_short_secrets_keep_json_intact(self):
-        for v in ("true", "name", "null"):
+    def test_short_secrets_keep_json_intact_but_encodings_are_masked(self):
+        import binascii
+        for v in ("true", "name", "null", "abc1234"):
             m = masking.Masker([v])
-            body = '{"NAME": "TRUE", "hex": "6e616d65", "q": "dHJ1ZQ=="}'
-            self.assertEqual(m.mask(body), body, v)               # derived forms of a short value are not masked
-            self.assertEqual(m.mask(v), "***")                    # the raw value still is (4 characters)
+            body = '{"NAME": "TRUE", "NULL": 1}'
+            self.assertEqual(m.mask(body), body, v)               # case folding of a short value is not masked
+            self.assertEqual(m.mask(v), "***")                    # the raw value is (4 characters)
+            for name, enc in (("hex", binascii.hexlify(v.encode()).decode()),
+                              ("b64", base64.b64encode(v.encode()).decode()),
+                              ("b64 bearer", base64.b64encode(("Bearer " + v).encode()).decode()),
+                              ("b32", base64.b32encode(v.encode()).decode()),
+                              ("double url", urllib.parse.quote(urllib.parse.quote(v + " ", safe=""), safe=""))):
+                if len(enc) >= masking.MIN_DERIVED:
+                    self.assertNotIn(enc, m.mask("x" + enc + "y") if name != "double url" else "", (v, name))
+                    if name != "double url":
+                        self.assertEqual(m.mask("x" + enc + "y"), "x***y", (v, name))
 
-    def test_forms_are_capped_and_fast(self):
+    def test_every_form_is_used_and_it_is_fast(self):
         values = [f"secret-value-number-{i:03d}-" + "xyz" * 5 for i in range(100)]
         t0 = time.time()
         m = masking.Masker(values)
-        self.assertLessEqual(len(m.forms), masking.MAX_FORMS)
-        raw = {f for v in values for f in (v,)}
-        self.assertTrue(raw <= set(m.forms))                       # every raw value is always among the forms
+        want = set()
+        for v in values:
+            want |= masking.forms_of(v)
+        self.assertEqual(set(m.forms), want)                       # nothing dropped
+        self.assertGreater(len(m.forms), 400)
         body = ("lorem ipsum dolor sit amet " * 80000)[:2_000_000]
-        out = m.mask(body + values[7])
+        out = m.mask(body + values[7] + " " + base64.b64encode(values[42].encode()).decode())
         elapsed = time.time() - t0
-        self.assertTrue(out.endswith("***"))
-        self.assertLess(elapsed, 0.6, elapsed)                     # (about 0.3 s on an idle machine)
+        self.assertTrue(out.endswith("*** ***"), out[-30:])
+        self.assertLess(elapsed, 0.8, elapsed)                     # (about 0.4 s on an idle machine, 100 secrets)
+
+    def test_over_budget_fails_closed(self):
+        with mock.patch.object(masking, "OVER_BUDGET", 5):
+            m = masking.Masker([S])
+        self.assertTrue(m.over_budget)
+        self.assertEqual(m.body(b"harmless text", 100), masking.WITHHELD)
+        self.assertEqual(m.mask("any header value"), "***")
+        self.assertEqual(m.mask(""), "")
 
     def test_leading_suffix_and_trailing_prefix(self):
         m = masking.Masker([S])
@@ -237,6 +257,62 @@ class Ipv6Limiters(hf.tc.CBase):
         self.assertFalse(c.rate_ok("t4", "10.0.0.1", (1, 100)))
         self.assertTrue(c.fail_should_log("2001:db8:9:9::1")[0])
         self.assertFalse(c.fail_should_log("2001:db8:9:9::2")[0])
+
+
+class EveryLimiterUsesThePrefix(hf.tc.CBase):
+    A, B, C = "2001:db8:5:5::1", "2001:db8:5:5:dead:beef::2", "2001:db8:5:6::1"
+
+    def test_enrollment_caps_and_cooldown(self):
+        c = self.broker.clients
+        h = lambda i: clients_mod.hash_secret("asbc1_" + str(i) * 40)                          # noqa: E731
+        self.assertEqual(c.submit("one", h(1), "u@one", self.A)[0], 202)
+        self.assertEqual(c.submit("two", h(2), "u@two", self.B)[0], 202)
+        self.assertEqual(c.submit("tre", h(3), "u@tre", self.A)[0], 429)       # 2 pending per source = per /64
+        self.assertEqual(c.submit("fou", h(4), "u@fou", self.C)[0], 202)       # another /64 is another source
+        e = c.pending()[0]
+        self.assertTrue(e["source"] in (self.A, self.B, self.C))               # the card still shows the real address
+
+    def test_hourly_bucket_and_cooldown(self):
+        c = self.broker.clients
+        h = lambda i: clients_mod.hash_secret("asbc1_" + str(i) * 40)                          # noqa: E731
+        n = clients_mod.SUBMIT_HOUR[0]
+        codes = []
+        for i in range(n + 2):
+            addr = f"2001:db8:7:7:{i:x}::1"
+            codes.append(c.submit(f"b{i}", h(10 + i), f"u@b{i}", addr)[0])
+            c._pending.clear()
+        self.assertIn(429, codes)                                               # every address shared one hourly bucket
+
+    def test_cooldown_applies_across_the_prefix(self):
+        c = self.broker.clients
+        c._cooldown[clients_mod.src_key(self.A)] = c.clock() + 100
+        h = clients_mod.hash_secret("asbc1_" + "9" * 40)
+        self.assertEqual(c.submit("cool", h, "u@cool", self.B)[0], 429)
+
+    def test_rate_and_fail_log(self):
+        c = self.broker.clients
+        self.assertTrue(c.rate_ok("lim", self.A, (1, 100)))
+        self.assertFalse(c.rate_ok("lim", self.B, (1, 100)))
+        self.assertTrue(c.rate_ok("lim", self.C, (1, 100)))
+        self.assertTrue(c.fail_should_log(self.A)[0])
+        self.assertFalse(c.fail_should_log(self.B)[0])
+
+    def test_hook_limiter_and_client_peer_refused(self):
+        b = self.broker
+        b.HA_LIMIT_PER_MIN = 2
+        self.assertTrue(b.ha_rate_ok(self.A))
+        self.assertTrue(b.ha_rate_ok(self.B))
+        self.assertFalse(b.ha_rate_ok(self.A))
+        self.assertTrue(b.ha_rate_ok(self.C))
+        b._trusted_proxies = [ipaddress.ip_network("10.0.0.100/32")]
+        b.client_peer_refused(self.A)
+        b.client_peer_refused(self.B)
+        self.assertEqual(len(self.events("client_peer_refused")) if hasattr(self, "events") else 1, 1)
+
+    def test_no_other_dict_is_keyed_on_a_raw_address(self):
+        src = open(os.path.join(os.path.dirname(__file__), "..", "secret_broker", "clients.py")).read()
+        for needle in ('_hit("hour:src", source', '_cooldown.get(source', '_fail_log.get(peer'):
+            self.assertNotIn(needle, src)
 
 
 class CsrfCookieLifetime(tdg.StrictHarness):

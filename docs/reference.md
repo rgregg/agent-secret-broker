@@ -2878,9 +2878,11 @@ only to the user, never rotated) out of the page and then POST `/decide` for any
   value is masked in its raw, JSON-escaped (also with `\/`, `\uXXXX` in either case), URL-encoded (once and twice),
   HTML-entity, base32, hex, lower- and upper-case forms, base64 (standard and URL-safe, padded or not, of the value
   and of `Bearer `/`Token `/`Basic ` + value, at all three byte alignments) and per line of a multi-line value. Values
-  under 4 characters are never masked; derived spellings exist only for values of 6+ characters and are masked from
-  8 characters (so a `true` or `name` secret does not corrupt JSON). At most 400 forms are used per response (raw forms
-  first), one substring test each. A leading partial secret (4+ characters, as after an honoured `Range`) is masked at
+  under 4 characters are never masked. The unambiguous encodings (hex, base64, base32, double URL-encoding) exist for every
+  value of 4+ characters; spellings that collide with ordinary text (case folding, JSON/URL/HTML escapes) only for 6+, and
+  derived forms are masked from 8 characters (so a `true` or `name` secret does not corrupt JSON). Every form is used;
+  many forms are searched with one compiled prefix tree, and beyond 20000 forms in one response the whole body is withheld
+  (fail closed) instead of being partly masked. A leading partial secret (4+ characters, as after an honoured `Range`) is masked at
   the start of a body, as a trailing one is at the cut. A body is masked before it is cut to the limit
   (extra bytes are read for that), and a trailing prefix of a secret (4+ characters) at the cut is masked. Not
   caught: other encodings, a transformed secret. One

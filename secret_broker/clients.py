@@ -445,6 +445,7 @@ class ClientStore:
     def _hit(self, kind, key, window, limit, now):
         """Fixed-window counter: True while under `limit`. `key` None is the global bucket."""
         m = self._rates.setdefault((kind, window), {})
+        key = None if key is None else src_key(key)          # every per-source bucket is keyed on the /64 for IPv6
         st = m.get(key)
         if st is None or now - st["t"] >= window:
             if st is None:
@@ -489,6 +490,7 @@ class ClientStore:
         message is a fixed string; nothing says which names or hashes already exist except
         a name that is PENDING (an attacker can only learn what they could create)."""
         cfg = self.cfg["enrollment"]
+        key = src_key(source)       # limiters and caps use this; `source` itself is kept as shown on the card
         if self.broken:
             return 503, {"error": "enrollment is not available"}, None
         if not cfg["enabled"]:
@@ -503,9 +505,9 @@ class ClientStore:
         now = self.clock()
         with self._lock:
             self._expire_locked()
-            if self._cooldown.get(src_key(source), 0) > now:
+            if self._cooldown.get(key, 0) > now:
                 return 429, {"error": "too many enrollment requests; try again later"}, None
-            if not (self._hit("hour:src", source, 3600, SUBMIT_HOUR[0], now)
+            if not (self._hit("hour:src", key, 3600, SUBMIT_HOUR[0], now)
                     & self._hit("hour:all", None, 3600, SUBMIT_HOUR[1], now)):
                 return 429, {"error": "too many enrollment requests; try again later"}, None
             same = next((e for e in self._pending.values()
@@ -517,7 +519,7 @@ class ClientStore:
             pend = [e for e in self._pending.values() if e["status"] == "pending"]
             if len(pend) >= cfg["max_pending"]:
                 return 429, {"error": "too many pending enrollments; try again later"}, None
-            if sum(src_key(e["source"]) == src_key(source) for e in pend) >= SOURCE_PENDING:
+            if sum(src_key(e["source"]) == key for e in pend) >= SOURCE_PENDING:
                 return 429, {"error": "too many pending enrollments from this address"}, None
             if any(e["name"] == name for e in pend):
                 return 409, {"error": "an enrollment with that name is already waiting"}, None
