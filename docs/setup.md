@@ -82,6 +82,7 @@ Settings are a JSON object in the `BROKER_CONFIG` environment variable of
 | `backend` | `{"type": "bw", "server_url": "https://vault.example.com", "master_password_file": "/run/secrets/bw_master_password", "organization": "Agents", "collection": "Agent Secrets", "serve": true}` |
 | `client_key_file` | The key the CLI sends (`/run/secrets/client_key`) |
 | `approve_base_url` | The exact public URL of the approval site, for example `https://asb.example.com`. Also used for the link in notifications and for CSRF checks |
+| `approve_extra_origins` | Optional. Up to 4 more origins the approval site is reached under (`https://host[:port]`, no path or wildcard). Origin checks accept these as well as `approve_base_url`; links and push stay on `approve_base_url` |
 | `allowed_user` | The SSO username that may approve |
 | `identity_header` | Header your proxy sets with that username (for example `X-authentik-username`, `X-Forwarded-User`) |
 | `approval_trusted_peers` | CIDR of the proxy's network, for example `["172.23.0.0/16"]`. The listener refuses every other caller. Strongly recommended |
@@ -117,6 +118,14 @@ vault session and cannot trip the vault's login rate limit.
   be TLS. It does not go through SSO (the client key protects it); you may
   restrict it to your own networks.
 - Do not publish 8801 anywhere else.
+
+Exposing the approval site under a second name (for example publicly through a tunnel while
+the LAN name keeps working): make the public name `approve_base_url` and list the other as
+`approve_extra_origins`, e.g. `"approve_extra_origins": ["https://asb-lan.example.com"]`.
+When an authentik proxy outpost fronts the public name, its `external_host` must equal that
+public origin exactly (scheme and host), or the outpost's redirects and the browser's
+`Origin` will not match. Expose only the approval site (8801) this way, never the client API
+(8800). The extra name must also reach the broker through a proxy that sets `identity_header`.
 
 ## 5. Choose how you get notified
 

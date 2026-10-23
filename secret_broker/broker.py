@@ -105,6 +105,49 @@ CHANNELS = {
 }
 
 
+_ORIGIN_RE = re.compile(r"(https?)://([A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?)(?::([0-9]{1,5}))?")
+MAX_EXTRA_ORIGINS = 4
+
+
+def parse_extra_origins(raw, field="approve_extra_origins"):
+    """Validate `approve_extra_origins` -> a tuple of normalised (scheme, host[:port]) pairs.
+    Each entry is exactly `https://host[:port]` or `http://host[:port]`: no path, no
+    wildcard, no userinfo. None means no extras. Raises ValueError naming the field."""
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise ValueError(f"{field} must be a list of origins")
+    if len(raw) > MAX_EXTRA_ORIGINS:
+        raise ValueError(f"{field} may list at most {MAX_EXTRA_ORIGINS} origins")
+    out = []
+    for i, v in enumerate(raw):
+        m = _ORIGIN_RE.fullmatch(v) if isinstance(v, str) and v.isascii() else None
+        if m is None or ".." in m.group(2) or (m.group(3) and not 1 <= int(m.group(3)) <= 65535):
+            shown = v[:80] if isinstance(v, str) and v.isprintable() and v.isascii() else "(not a plain origin string)"
+            raise ValueError(f"{field}[{i}] must be exactly https://host[:port] or http://host[:port], "
+                             f"with no path or wildcard (got {shown!r})")
+        out.append((m.group(1), m.group(2).lower() + (":" + str(int(m.group(3))) if m.group(3) else "")))
+    return tuple(dict.fromkeys(out))
+
+
+def origin_allowed(origin, base_url, extras):
+    """True when an Origin header names the approval site: the primary (`approve_base_url`,
+    compared by netloc as before) or an exact scheme+host+port match of a listed extra.
+    No suffix, prefix or wildcard matching."""
+    want = urllib.parse.urlsplit(base_url or "").netloc
+    if want and urllib.parse.urlsplit(origin).netloc == want:
+        return True
+    m = _ORIGIN_RE.fullmatch(origin) if origin.isascii() else None
+    if m is None:
+        return False
+    try:
+        allowed = parse_extra_origins(extras)
+    except ValueError:
+        return False        # a bad list never widens the check
+    key = (m.group(1), m.group(2).lower() + (":" + str(int(m.group(3))) if m.group(3) else ""))
+    return key in allowed
+
+
 class SshRefused(PermissionError):
     """A sign request refused on server identity; audited as ssh_sign_refused,
     not as a plain rejection (its reason class is policy context)."""
@@ -4206,8 +4249,8 @@ def approval_handler(broker):
                 return False
             origin = self.headers.get("Origin")
             if origin and origin != "null":
-                want = urllib.parse.urlsplit(cfg.get("approve_base_url", "")).netloc
-                return bool(want) and urllib.parse.urlsplit(origin).netloc == want
+                return origin_allowed(origin, cfg.get("approve_base_url", ""),
+                                      cfg.get("approve_extra_origins"))
             return origin is None
 
         def _csrf_ok(self, user, token):

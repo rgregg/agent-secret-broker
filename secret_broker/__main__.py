@@ -12,7 +12,7 @@ import signal
 import threading
 
 from .backends import BackendConfigError, registry
-from .broker import Broker, serve
+from .broker import Broker, parse_extra_origins, serve
 from . import clients, credreq, grants, notify, presence, proposals, request_details, risk, riskmodel
 
 
@@ -42,6 +42,10 @@ def main():
     cfg = load_settings(args.config)
     if not cfg:
         ap.error("no settings: set BROKER_CONFIG or pass --config")
+    try:
+        parse_extra_origins(cfg.get("approve_extra_origins"))
+    except ValueError as e:
+        raise SystemExit(f"config error: {e}") from None
     risk.parse_auto_approve_max(cfg.get("risk"), "risk")    # fail at startup, naming the field
     risk.parse_auto_modes(cfg.get("risk"), "risk")          # fail at startup, naming the field
     grants.parse_config(cfg.get("timed_grants"))            # fail at startup, naming the field
