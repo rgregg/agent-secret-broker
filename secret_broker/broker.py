@@ -486,6 +486,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin):
             self._backend_ok = True
             self._catalog_stats = {"count": len(out), "invalid": len(bad), "adopted": len(adopted),
                                    "loaded_at": _iso(self._catalog_at)}
+        self._sync_summary_key(out)
         ginv = {n: e["guidance_invalid"] for n, e in sorted(out.items()) if e.get("guidance_invalid")}
         sig = json.dumps([sorted(out), bad, ginv], sort_keys=True)
         if sig != self._catalog_sig:
@@ -494,6 +495,53 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin):
                      adopted=sorted(adopted))
             for n, why in ginv.items():
                 self.log("guidance_ignored", secret=n, reason=why)
+
+    def _internal_secrets(self):
+        """(names, vault items lowercased) of the credentials the broker uses for its own
+        summary key, plus any catalog entry that points at the same vault item (an alias would
+        be a way round the name). Agents can never request, list or change any of them."""
+        names = {kp.name for kp in getattr(self.summarizer, "key_providers", ())}
+        if not names:
+            return frozenset(), frozenset()
+        with self._cfg_lock:
+            secrets_ = dict(self.cfg["secrets"])
+        items = {str(r.get("item")).lower() for n in names for r in (secrets_.get(n, {}).get("vars") or {}).values()}
+        names |= {n for n, sc in secrets_.items()
+                  if any(str(r.get("item")).lower() in items for r in (sc.get("vars") or {}).values())}
+        return frozenset(names), frozenset(items)
+
+    def _sync_summary_key(self, catalog):
+        """The catalog was reloaded: if the key credential's source (item, field, key) changed,
+        drop the cached key so the next use re-reads it."""
+        for kp in getattr(self.summarizer, "key_providers", ()):
+            try:
+                ref = ((catalog.get(kp.name) or {}).get("vars") or {}).get(kp.var)
+                sig = json.dumps(ref, sort_keys=True, default=str) if ref is not None else None
+                if getattr(kp, "_src_sig", sig) != sig:
+                    kp.invalidate()
+                kp._src_sig = sig
+            except Exception:  # noqa: BLE001
+                pass
+
+    def is_internal_secret(self, name):
+        return name in self._internal_secrets()[0]
+
+    def _deny_internal(self, mode, names, spec, source, peer, client):
+        """Refuse a request that names the summary key (or its vault item) with the same
+        wording as an unknown credential, and audit a hidden event with the reason class."""
+        internal, items = self._internal_secrets()
+        if not internal:
+            return
+        hit = next((n for n in names if isinstance(n, str) and n in internal), None)
+        if hit is None and mode == "store" and isinstance(spec, dict):
+            it = spec.get("item")
+            if isinstance(it, str) and it.lower() in items:
+                hit = it
+        if hit is not None:
+            self.log("internal_secret_refused", secret=hit if hit in internal else None,
+                     reason="internal_secret", mode=mode, source=source, peer=peer,
+                     **self._client_fields(client))
+            raise ValueError("unknown secret name")
 
     def _check_summary_key_catalog(self):
         """Startup warning (not an error) when summary.api_key_secret names a credential the
@@ -1012,7 +1060,10 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin):
             threading.Thread(target=self._refresh_if, args=(self.CATALOG_BG_TTL, False),
                              daemon=True).start()
         out = []
+        internal = self._internal_secrets()[0]
         for name, sc in sorted(self.cfg["secrets"].items()):
+            if name in internal:
+                continue                    # the broker's own summary key is never offered
             hosts = sc.get("allowed_hosts") or []
             if host is None or host in hosts:
                 # Deliberately no approval policy or sensitivity here: whether a
@@ -1032,6 +1083,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin):
                                    and any(n not in self.cfg["secrets"] for n in names))
                              else self.CATALOG_TTL)
             secrets_cfg = self.cfg["secrets"]
+            self._deny_internal(mode, names, spec, source, peer, client)
             if mode == "env":
                 spec["scripts"] = scripts_mod.validate(spec.get("scripts"))
                 spec["cwd"] = scripts_mod.validate_cwd(spec.get("cwd"))
@@ -2246,11 +2298,13 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin):
                          "minutes": g["minutes"]})
         with self._cfg_lock:
             secrets_now = sorted(self.cfg["secrets"].items())
+        internal = self._internal_secrets()[0]
+        internal_tag = lambda n: " (internal: summary key)" if n in internal else ""  # noqa: E731
         for name, sc in secrets_now:
             for e in sc.get("standing") or []:
                 off = e["mode"] not in self._effective_auto_modes(sc, e.get("client") if e.get("client", clients_mod.ANY) != clients_mod.ANY
                                                                    else None)
-                rows.append({"kind": "always", "id": e["id"], "secrets": [name], "mode": e["mode"],
+                rows.append({"kind": "always", "id": e["id"], "secrets": [name + internal_tag(name)], "mode": e["mode"],
                              "client": e.get("client", clients_mod.ANY), "scope": e["scope"], "covers": standing_mod.covers_label(e["mode"], e["scope"])
                              + (" (not active: mode not enabled)" if off else ""),
                              "expires_at": None, "left_s": None, "created_by": e["created_by"],
@@ -2261,7 +2315,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin):
             ch = sc.get("approval_changed") or {}
             at = ch.get("at") or ""
             modes = ", ".join(_MODE_LABEL.get(m, m) for m in self._auto_modes(sc)) or "none"
-            rows.append({"kind": "legacy", "id": "", "name": name, "secrets": [name], "mode": None,
+            rows.append({"kind": "legacy", "id": "", "name": name, "secrets": [name + internal_tag(name)], "mode": None,
                          "client": clients_mod.ANY, "scope": "any", "covers": f"whole credential, any method, any covered mode ({modes})",
                          "expires_at": None, "left_s": None, "created_by": ch.get("by") or "",
                          "created_at": at.replace("T", " ").replace("Z", " UTC")})

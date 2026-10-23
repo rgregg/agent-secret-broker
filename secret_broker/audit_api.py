@@ -91,7 +91,7 @@ WHITELIST = {
 # on an auto-approved request would give the policy away; `decided` is also
 # redundant with approved/denied.
 HIDDEN = frozenset({
-    "startup", "assessed", "summary_key_read", "escalated", "notified", "decided",
+    "startup", "assessed", "summary_key_read", "internal_secret_refused", "escalated", "notified", "decided",
     "policy_changed", "policy_change_refused", "policy_change_failed", "policies_viewed",
     "guidance_changed", "guidance_change_refused", "guidance_change_failed",
     "guidance_change_retry", "guidance_retry_requested", "guidance_retry_refused",
