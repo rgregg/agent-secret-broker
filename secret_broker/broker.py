@@ -3249,6 +3249,13 @@ _DASH_JS = r'''
   function title(){if(!cards)return;var n=cards.querySelectorAll('article').length;
     document.title=(n?'('+n+') ':'')+'Agent Secret Broker';}
   function parse(h){return new DOMParser().parseFromString(h,'text/html');}
+  // The Requests tab count lives in the page chrome, outside the polled fragment, so the
+  // poll carries it (data-attention) and updates it here, on every poll, whether or not the cards changed.
+  function badge(n){var a=document.querySelector('nav.tabs a[href="/"]');if(!a)return;
+    var c=a.querySelector('.count');n=parseInt(n,10)||0;
+    if(!n){if(c)c.remove();return;}
+    if(!c){c=document.createElement('span');c.className='count';a.appendChild(document.createTextNode(' '));a.appendChild(c);}
+    c.textContent=String(n);}
   var nbtn=document.getElementById('notify'), nmsg=document.getElementById('notify-state'),
       seen={};
   function ids(root){var o={};root.querySelectorAll('article[data-id]').forEach(function(a){
@@ -3427,6 +3434,7 @@ _DASH_JS = r'''
       .then(function(h){if(h===null)return;
         var d=parse(h),c=d.getElementById('cards'),nl=d.getElementById('hlist');
         if(!c){A.mark();return;}      // a 200 without the cards is the login page
+        badge(c.getAttribute('data-attention'));
         if(c.getAttribute('data-version')!==last){
           last=c.getAttribute('data-version');var wasopen=asbOpenKeys(cards),wasck=asbChecked(cards);
           cards.innerHTML=c.innerHTML;asbReopen(cards,wasopen);asbRecheck(cards,wasck);asbGSync(cards);bind();
@@ -4536,7 +4544,8 @@ def approval_handler(broker):
                          + [f"enroll:{e['id']}" for e in enrolls]).encode()).hexdigest()[:16]
             inner = ("".join(cards) if cards else
                      "<div class='card empty'>Nothing is waiting for approval.</div>")
-            block = f"<div id=cards class=cards data-version='{version}'>{inner}</div>"
+            attn = len(reqs) + len(enrolls)       # same number every other tab shows (Broker.attention)
+            block = f"<div id=cards class=cards data-version='{version}' data-attention='{attn}'>{inner}</div>"
             pend_ids = broker.open_ids()
             a = self._hist_args(q or {})
             if fragment:
@@ -4551,7 +4560,7 @@ def approval_handler(broker):
                   "<div id=offline class='flash offline' hidden>Cannot reach the broker. "
                   "Retrying; reload this page if it does not recover.</div><h3 style='margin-top:0'>Waiting for you</h3>"
                   + block + recent + self._detail_dialog(), script=_DASH_JS, tab="requests",
-                  badge=len(reqs), user=user)
+                  badge=attn, user=user)
 
         def _hist_args(self, q):
             """History list state from a query string: view=all turns on the search
