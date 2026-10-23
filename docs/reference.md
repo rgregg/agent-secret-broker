@@ -2880,9 +2880,10 @@ only to the user, never rotated) out of the page and then POST `/decide` for any
   and of `Bearer `/`Token `/`Basic ` + value, at all three byte alignments) and per line of a multi-line value. Values
   under 4 characters are never masked. The unambiguous encodings (hex, base64, base32, double URL-encoding) exist for every
   value of 4+ characters; spellings that collide with ordinary text (case folding, JSON/URL/HTML escapes) only for 6+, and
-  derived forms are masked from 8 characters (so a `true` or `name` secret does not corrupt JSON). Every form is used;
-  many forms are searched with one compiled prefix tree, and beyond 20000 forms in one response the whole body is withheld
-  (fail closed) instead of being partly masked. A leading partial secret (4+ characters, as after an honoured `Range`) is masked at
+  derived forms are masked from 8 characters (so a `true` or `name` secret does not corrupt JSON). Every form is used and
+  found with plain `str.find` (overlapping spans are merged, then replaced in one pass). Beyond 200 values, 2000 forms,
+  400000 summed form characters or 200000 occurrences in one response, the body is withheld whole (status and headers kept;
+  the operator audit's `http_executed` says `masked_over_budget`), never partly masked. A leading partial secret (4+ characters, as after an honoured `Range`) is masked at
   the start of a body, as a trailing one is at the cut. A body is masked before it is cut to the limit
   (extra bytes are read for that), and a trailing prefix of a secret (4+ characters) at the cut is masked. Not
   caught: other encodings, a transformed secret. One
