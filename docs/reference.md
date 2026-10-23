@@ -1027,11 +1027,31 @@ protected against cross-site requests:
 
 - every decision carries a per-user token the page was rendered with, and a
   request without it is refused and audited (`csrf_refused`);
-- `Origin` must match `approve_base_url` and `Sec-Fetch-Site` must be
-  same-origin, so set `approve_base_url` to the exact public URL of this site;
+- `Origin` must match `approve_base_url` (or an `approve_extra_origins` entry, below) and
+  `Sec-Fetch-Site` must be same-origin, so set `approve_base_url` to the exact public URL of
+  this site;
 - the page never contains a request's approval nonce (it decides by request id);
 - a per-response Content-Security-Policy allows only the page's own script
   (`script-src` nonce), `connect-src 'self'`, and no framing.
+
+### `approve_extra_origins`
+
+| Key | Type | Meaning |
+|---|---|---|
+| `approve_extra_origins` | list of strings, at most 4, default none | Additional origins the approval site is reached under, for example `["https://secrets.lan.example.com"]` while `approve_base_url` is the public name |
+
+Each entry is exactly `https://host[:port]` or `http://host[:port]`: no path, no wildcard, no
+user info. A POST is accepted when its `Origin` is the primary (`approve_base_url`) or an
+exact match of a listed extra (scheme, host and port; the host is case-insensitive; no suffix
+or prefix matching, so `https://evil-host.example` and `https://host.example.evil.com` are
+refused). Everything else about the check is unchanged: `Sec-Fetch-Site` must be
+`same-origin` or `none`, a `null` Origin is refused, and a request with no Origin is held to
+the per-user CSRF token as before. An invalid entry, a non-list value or more than four
+entries stops the broker at startup with `config error: approve_extra_origins...`.
+
+Extras only widen the Origin check. Links in notifications, the Web Push VAPID subject and
+every other generated URL keep using `approve_base_url`; the manifest, service worker scope
+and push payloads are origin-relative or carry no URL, so each origin serves its own copy.
 
 The Revoke buttons on the Policies tab use the same token.
 
