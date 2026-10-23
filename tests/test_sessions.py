@@ -2608,28 +2608,55 @@ class Review5(SBase):
         res, state, err = self.run_fake(sess, op, "GET", "http://h.example/", {"X-API-Key": "{{session.N}}"})
         self.assertIsInstance(err, S.NotSent)
         self.assertEqual(op.sent, [])
-        # under contention the decision and the value always agree: a https-only value never leaves over http
-        stop = threading.Event()
+        # The decision and the value always agree, however the capture is rotated while the call is in flight. This is
+        # driven deterministically (a thread flipping N on a timer is at the mercy of the GIL scheduler and can leave
+        # the sender seeing only one state): a lock proxy sets the state the call READS on its first acquisition, and
+        # rotates to the opposite state on every later acquisition, i.e. between the check and the send.
+        real = sess.lock
 
-        def rotate():
-            flag = False
-            while not stop.is_set():
-                flag = not flag
-                with sess.lock:
-                    sess.captures["N"] = "HTTPS-SECRET-VALUE" if flag else "plain-value-3"
-                    (sess.https_only.add if flag else sess.https_only.discard)("N")
-        t = threading.Thread(target=rotate, daemon=True)
-        t.start()
+        class Rotating:
+            def __init__(inner):
+                inner.pre, inner.n = False, 0
+
+            def put(inner, https):
+                sess.captures["N"] = "HTTPS-SECRET-VALUE" if https else "plain-value-3"
+                (sess.https_only.add if https else sess.https_only.discard)("N")
+
+            def __enter__(inner):
+                real.acquire()
+                inner.put(inner.pre if inner.n == 0 else not inner.pre)
+                inner.n += 1
+                return inner
+
+            def __exit__(inner, *exc):
+                real.release()
+        rot = Rotating()
+        sess.lock = rot
+        outcomes = {True: [], False: []}
         try:
-            for _ in range(400):
-                self.run_fake(sess, op, "GET", "http://h.example/", {"X-API-Key": "{{session.N}}"})
+            for i in range(40):
+                rot.pre, rot.n = bool(i % 2), 0
+                n = len(op.sent)
+                res, state, err = self.run_fake(sess, op, "GET", "http://h.example/", {"X-API-Key": "{{session.N}}"})
+                outcomes[rot.pre].append((err, state["sent"], len(op.sent) - n))
         finally:
-            stop.set()
-            t.join(5)
-        self.assertTrue(op.sent)
+            sess.lock = real
+        # read as https-only: always refused and nothing sent, even though the capture is plain again by the send
+        self.assertEqual(len(outcomes[True]), 20)
+        for err, sent, delta in outcomes[True]:
+            self.assertIsInstance(err, S.NotSent)
+            self.assertFalse(sent)
+            self.assertEqual(delta, 0)
+        # read as plain: always sent, with the plain value, even though the capture turned https-only before the send
+        self.assertEqual(len(outcomes[False]), 20)
+        for err, sent, delta in outcomes[False]:
+            self.assertIsNone(err)
+            self.assertTrue(sent)
+            self.assertEqual(delta, 1)
+        self.assertEqual(len(op.sent), 20)
         for url, hdr in op.sent:
             self.assertTrue(url.startswith("http://"))
-            self.assertNotEqual(hdr.get("X-api-key"), "HTTPS-SECRET-VALUE")
+            self.assertEqual(hdr.get("X-api-key"), "plain-value-3")
 
     def test_jar_does_not_hand_out_a_secure_cookie_for_http(self):
         j = S.Jar(lambda: 0, wall=lambda: 0)
