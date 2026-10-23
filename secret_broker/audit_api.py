@@ -120,6 +120,8 @@ HIDDEN = frozenset({
     "guidance_proposed", "guidance_proposal_result", "guidance_ignored",
     "ssh_hosts_changed", "ssh_hosts_change_refused", "ssh_hosts_change_failed",
     "ha_hook_any_device", "config_warning", "session_sweep_error",
+    # destination guard and listener hardening: operator-side events about the broker's own network
+    "dest_guard_config_error", "egress_marker_refused",
     # time-boxed grants are approval policy context: a grant-approved request shows as plain "approved"
     "grant_created", "grant_refused", "grant_used", "grant_skipped", "grant_revoked", "grant_expired",
     "grant_dropped", "grants_file_corrupt", "grants_file_write_failed", "standing_change_failed",
@@ -221,8 +223,10 @@ def redact(rec, show_client=False):
         return None                     # deny by default: unlisted event types are not shown at all
     for name, (src, kind) in spec.items():
         val = _clean(rec.get(src), kind, rec, event)
-        if name == "approver" and isinstance(val, str) and val.startswith("policy"):
-            val = None
+        if name == "approver" and isinstance(val, str):
+            # Who approved is the human's business: the agent learns only that a person did (never
+            # the username, which is also the value the approval listener's identity header must carry)
+            val = None if (not val or val.startswith("policy")) else "human"
         if val is not None or event in ("approved", "denied", "expired", "failed") and name in (
                 "channel", "approver"):
             out[name] = val

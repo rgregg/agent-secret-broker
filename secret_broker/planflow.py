@@ -10,13 +10,12 @@ No exception text ever leaves this module: refusals are fixed sentences plus a c
 import json
 import math
 import re
-import socket
-import ssl
 import threading
 import time
-import urllib.error
 
 from . import clients as clients_mod
+from . import destguard
+from . import errclass
 from . import plans as plans_mod
 
 BODY_LIMIT = 64 * 1024              # bytes of a manifest submission
@@ -33,26 +32,16 @@ class PlanRefused(Exception):
 
 def error_class(exc):
     """A coarse category word for an upstream or vault failure: never the exception text."""
-    if isinstance(exc, (socket.timeout, TimeoutError)):
-        return "timeout"
-    if isinstance(exc, urllib.error.URLError) and not isinstance(exc, urllib.error.HTTPError):
-        return error_class(exc.reason) if isinstance(exc.reason, BaseException) else "connection"
-    if isinstance(exc, ssl.SSLError):
-        return "tls"
-    if isinstance(exc, socket.gaierror):
-        return "dns"
-    if isinstance(exc, (ConnectionError, OSError)):
-        return "connection"
-    if type(exc).__name__ == "BackendError":
-        return "vault"
     if isinstance(exc, PlanEnded):
         return "ended"
-    return "other"
+    return errclass.classify(exc)
 
 
 _RELEASE_TEXT = {"timeout": "release failed: timeout", "tls": "release failed: tls",
                  "dns": "release failed: name resolution", "connection": "release failed: connection",
                  "vault": "release failed: vault", "other": "release failed: other",
+                 "invalid request": "release failed: invalid request",
+                 "destination not allowed": "release failed: destination not allowed",
                  "ended": "release failed: plan or client ended",
                  "nomatch": "release failed: the request no longer matches the plan"}
 
@@ -133,7 +122,7 @@ class PlansMixin:
                 raise plans_mod.ManifestError(f"{f}.secret: this credential does not allow plans", 403)
             if r["secret"] in deny:
                 raise plans_mod.ManifestError(f"{f}.secret: this credential does not allow plans", 403)
-            if r["host"] not in hosts:
+            if r["host"] not in destguard.host_parts(hosts):
                 raise plans_mod.ManifestError(f"{f}.host: not one of this credential's allowed hosts")
             sigs[r["secret"]] = source_sig(sc)
         return sigs
@@ -376,7 +365,8 @@ class PlansMixin:
                  **self._client_fields(req.client))           # audited only once the call is cleared to go out
         t0 = time.time()
         out = _exchange_frozen(done, list(env.values()), self._tls_policy(req.names),
-                               timeout=max(1, min(30, math.ceil(left))))
+                               timeout=max(1, min(30, math.ceil(left))), guard=self.dest_guard,
+                               entries=self._dest_entries(req.names))
         self.audit("http_executed", req, upstream_status=out["status"], response_bytes=len(out["body"]),
                    duration_ms=int((time.time() - t0) * 1000))
         # Re-check after the upstream answered (the sessions rule): a revoked client, or a plan that was

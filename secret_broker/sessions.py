@@ -31,6 +31,7 @@ Invariants (enforced in broker.py and here, tested in tests/test_sessions.py):
 import hashlib
 import hmac
 import html
+import http.client
 import json
 import math
 import re
@@ -47,6 +48,7 @@ from collections import OrderedDict
 from email.utils import parsedate_to_datetime
 
 from .backends import BackendError
+from . import destguard
 from . import clients as clients_mod
 from . import clock as clock_mod
 from . import credreq as credreq_mod
@@ -412,9 +414,11 @@ def coarse_class(exc):
         return "dns"
     if isinstance(exc, ConnectionError):
         return "connection"
-    if isinstance(exc, ValueError):
+    if isinstance(exc, destguard.DestinationRefused):
+        return "destination not allowed"
+    if isinstance(exc, (ValueError, http.client.InvalidURL)):
         return "invalid_request"
-    if isinstance(exc, OSError):
+    if isinstance(exc, (OSError, http.client.HTTPException)):
         return "connection"
     return "other"
 
@@ -712,7 +716,7 @@ def run_http(sess, spec, env, tls, allowed_now, opener_for, clock, state):
         if problem:
             raise NotSent(problem)
     scheme, host, port, path = _origin(url)
-    if scheme not in ("http", "https") or not sess.in_scope(scheme, host, port) or host not in allowed_now:
+    if scheme not in ("http", "https") or not sess.in_scope(scheme, host, port) or host not in destguard.host_parts(allowed_now):
         raise NotSent("that host or port is outside this session's scope")
     # Everything below depends on credential content: one generic error for every cause, charged like a sent call.
     if _ILLEGAL_HEADER_VALUE.search(url) or " " in url:
@@ -798,9 +802,15 @@ def scope_problem(s, sc, names, method, spec, capture_names=()):
     opens, and the caller runs it WITHOUT holding the store lock. The call cap is checked where the call
     is charged. (Extension point: a manifest rule check belongs here.)"""
     scheme, host, port, _ = _origin(spec["url"])
+    try:
+        has_ph_authority = "{{" in urllib.parse.urlsplit(spec["url"]).netloc
+    except ValueError:
+        has_ph_authority = True
+    if has_ph_authority:                    # a value must never choose the host, port or userinfo
+        return "url", "the url contains characters a session call cannot send"
     if list(names) != [s.cred]:
         return "credential", "the call names a different credential than the session's"
-    if sc is None or sc.get("ssh") or host not in (sc.get("allowed_hosts") or []):
+    if sc is None or sc.get("ssh") or host not in destguard.host_parts(sc.get("allowed_hosts")):
         return "host", "that host is not allowed for this session's credential"
     if scheme not in ("http", "https") or not s.in_scope(scheme, host, port):
         return "host", "that host or port is outside this session's scope; open a new session for it"
@@ -858,7 +868,7 @@ def validate_open(cfg, spec, allowed_hosts):
         raise ValueError(f"hosts must be 1 to {MAX_HOSTS} plain host names, each optionally with :port (--host)")
     parsed = [parse_host_entry(h) for h in hosts]
     hosts = sorted({h if p is None else f"{h}:{p}" for h, p in parsed})
-    if any(h not in allowed_hosts for h, _ in parsed):
+    if any(h not in destguard.host_parts(allowed_hosts) for h, _ in parsed):
         raise PermissionError("a session host is outside this credential's allowed hosts: a session can "
                               "only narrow what the credential allows (see `asb list`)")
     methods = spec.get("methods")
@@ -1164,7 +1174,7 @@ class SessionsMixin:
         sc = self.cfg["secrets"].get(req.names[0])
         if sc is None or sc.get("ssh") or not sc.get("allowed_hosts"):
             raise SessionOpenError("the credential is no longer available for http")
-        if any(parse_host_entry(h)[0] not in sc["allowed_hosts"] for h in sp["hosts"]):
+        if any(parse_host_entry(h)[0] not in destguard.host_parts(sc["allowed_hosts"]) for h in sp["hosts"]):
             raise SessionOpenError("a host is no longer allowed for this credential")
         self.sweep_sessions()
         with self._sess_lock:
@@ -1369,7 +1379,8 @@ class SessionsMixin:
         sc = self.cfg["secrets"].get(req.names[0]) or {}
         try:
             out, info = run_http(s, req.call_spec, env, self._tls_policy(req.names), set(sc.get("allowed_hosts") or []),
-                                 broker_mod._opener_for, lambda: self.sessions_clock(), req.sess_state)
+                                 lambda tls: broker_mod._opener_for(tls, self.dest_guard, self._dest_entries(req.names)),
+                                 lambda: self.sessions_clock(), req.sess_state)
             with s.lock:                            # last look: nothing survives a revoke, close or the deadline
                 _alive(s, self.sessions_clock)
         except SessionError:
