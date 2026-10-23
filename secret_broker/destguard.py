@@ -39,8 +39,9 @@ LOOPBACK_NAMES = frozenset({"localhost", "localhost.localdomain", "ip6-localhost
 
 _ALWAYS_BLOCKED = [ipaddress.ip_network(n) for n in (
     "0.0.0.0/8", "127.0.0.0/8", "169.254.0.0/16", "224.0.0.0/4", "255.255.255.255/32",
-    "100.100.100.200/32",                       # Alibaba metadata
-    "::/128", "::1/128", "fe80::/10", "ff00::/8", "fd00:ec2::254/128")]   # AWS IPv6 metadata
+    "100.100.100.200/32", "192.0.0.192/32", "168.63.129.16/32",   # Alibaba, Oracle, Azure metadata / wireserver
+    "::/128", "::1/128", "fe80::/10", "ff00::/8", "fd00:ec2::254/128",     # AWS IPv6 metadata
+    "::ffff:0:0/96", "::ffff:0:0:0/96", "64:ff9b:1::/48")]   # IPv4-mapped / SIIT / local-use NAT64 as raw v6
 
 # Only ever flipped from Python (the test harness): never read from the JSON config.
 _TEST_ALLOW_LOOPBACK = False
@@ -80,6 +81,8 @@ def _embedded(ip):
             out.append(ipaddress.IPv4Address(n & 0xFFFFFFFF))
         if ip.teredo:
             out.append(ip.teredo[1])
+        if (n >> 32) & 0xFFFFFFFF in (0x00005EFE, 0x02005EFE):    # ISATAP ::5efe:a.b.c.d
+            out.append(ipaddress.IPv4Address(n & 0xFFFFFFFF))
     return out
 
 
@@ -152,6 +155,8 @@ class DestGuard:
         self.allow_loopback = bool(allow_loopback)
         self._connector = connector or socket.create_connection
         self._lcache = (0.0, frozenset())
+        self.strip_headers = ()        # header names deleted from every outbound call (the proxy secret's)
+        self.mask_values = ()          # extra values masked in every response (the proxy secret)
         self._lock = threading.Lock()
 
     @classmethod
@@ -165,7 +170,14 @@ class DestGuard:
                 ipaddress.ip_network(c, strict=False)
             except (ValueError, TypeError):
                 raise ValueError("destination_deny_cidrs: not a CIDR: " + str(c)[:60]) from None
+        ports = cfg.get("own_ports")
+        if ports is None:
+            ports = []
+        if (not isinstance(ports, list) or len(ports) > 32
+                or not all(isinstance(p, int) and not isinstance(p, bool) and 1 <= p <= 65535 for p in ports)):
+            raise ValueError("own_ports must be a list of port numbers (1-65535)")
         kw.setdefault("allow_loopback", _TEST_ALLOW_LOOPBACK)
+        kw["own_ports"] = list(kw.get("own_ports") or ()) + ports
         return cls(deny_cidrs=cidrs, **kw)
 
     # -- own addresses ----------------------------------------------------------------
@@ -196,9 +208,7 @@ class DestGuard:
     def address_refused(self, ip, port):
         """True when `ip` (an ipaddress object) may not be connected to on `port`."""
         for a in _embedded(ip):
-            if any(a in n for n in _ALWAYS_BLOCKED):
-                if self.allow_loopback and a.is_loopback:
-                    continue
+            if any(a in n for n in _ALWAYS_BLOCKED) and not (self.allow_loopback and a.is_loopback):
                 return True
             if not self.allow_loopback and self.is_local(a):
                 return True
@@ -339,9 +349,11 @@ def _factory(base, guard, entries):
     return G
 
 
-def _mark(req):
-    for k in [k for k in req.headers if k.lower() == EGRESS_MARKER.lower()]:
-        del req.headers[k]
+def _mark(req, strip=()):
+    drop = {EGRESS_MARKER.lower(), *(h.lower() for h in strip)}
+    for d in (req.headers, req.unredirected_hdrs):
+        for k in [k for k in d if k.lower() in drop]:
+            del d[k]
     req.add_unredirected_header(EGRESS_MARKER, "1")
 
 
@@ -380,12 +392,39 @@ def build_opener(guard, tls=None, entries=None):
 
     class H(urllib.request.HTTPHandler):
         def http_open(self, req):
-            _mark(req)
+            _mark(req, guard.strip_headers)
             return self.do_open(plain, req)
 
     class S(urllib.request.HTTPSHandler):
         def https_open(self, req):
-            _mark(req)
+            _mark(req, guard.strip_headers)
             return self.do_open(secure, req, context=self._context)
     sh = S(context=ctx) if ctx is not None else S()
     return urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect, H(), sh)
+
+
+# -- operator-configured outbound clients ---------------------------------------------------------
+class _OpHTTP(urllib.request.HTTPHandler):
+    def http_open(self, req):
+        _mark(req)
+        return self.do_open(http.client.HTTPConnection, req)
+
+
+class _OpHTTPS(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        _mark(req)
+        return self.do_open(http.client.HTTPSConnection, req, context=self._context)
+
+
+_OP_OPENER = None
+
+
+def operator_urlopen(req, timeout=None):
+    """urlopen for the broker's OWN, operator-configured clients (notification transports, the model
+    clients, the local vault CLI): the target is fixed by the operator, so loopback and LAN are allowed,
+    but the environment's HTTP(S)_PROXY is never used and the egress marker is set like on every other
+    outbound call. (Agent-chosen targets never come through here: they use DestGuard.opener.)"""
+    global _OP_OPENER
+    if _OP_OPENER is None:
+        _OP_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _OpHTTP, _OpHTTPS)
+    return _OP_OPENER.open(req, timeout=timeout)

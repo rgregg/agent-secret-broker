@@ -75,12 +75,48 @@ def check_header_value_template(value):
         raise ValueError(GENERIC)
 
 
-def check_headers_template(headers):
+# Headers an agent may not set on a plain http call: the transport owns framing and routing, the
+# broker owns its own marker, and cookies belong to sessions.
+_FORBIDDEN = frozenset({"content-length", "transfer-encoding", "connection", "cookie", "cookie2", "upgrade",
+                        "te", "trailer", "expect", "keep-alive", "http2-settings"})
+
+
+def clip(text, n=200):
+    """Agent-chosen text echoed in an error or a log: printable ASCII only, control characters replaced,
+    at most n characters."""
+    return "".join(c if " " <= c < "\x7f" else "?" for c in str(text))[:n]
+
+
+def _authority(host, port, scheme):
+    return (host or "").lower().rstrip("."), port or (443 if scheme == "https" else 80)
+
+
+def check_headers_template(headers, url=None, extra_forbidden=()):
+    """`url`: the urlsplit of the call, to compare a Host header with. ValueError (generic) otherwise."""
     if not isinstance(headers, dict):
         raise ValueError("headers must be an object")
+    seen = set()
     for k, v in headers.items():
         check_header_name(k)
+        low = k.lower()
+        if low in seen:
+            raise ValueError(GENERIC)            # urllib would silently keep only one of two spellings
+        seen.add(low)
+        if (low in _FORBIDDEN or low.startswith(("proxy-", "x-secret-broker-"))
+                or low in {h.lower() for h in extra_forbidden}):
+            raise ValueError(GENERIC)
         check_header_value_template(v)
+        if low == "host":
+            ok = False
+            if url is not None and "{{" not in v:
+                try:
+                    h = urllib.parse.urlsplit("//" + v.strip())
+                    ok = (_authority(h.hostname, h.port, url.scheme) == _authority(url.hostname, url.port, url.scheme)
+                          and not h.username and not h.path and not h.query)
+                except ValueError:
+                    ok = False
+            if not ok:
+                raise ValueError(GENERIC)
 
 
 def check_filled(url, headers, template_netloc):

@@ -24,6 +24,8 @@ import time
 import urllib.parse
 import urllib.request
 
+from . import destguard
+
 from . import guidance as guidance_mod
 from . import keyprovider
 from . import scripts as scripts_mod
@@ -287,7 +289,7 @@ def _post_json(url, key, payload, timeout):
     req = urllib.request.Request(
         url, data=json.dumps(payload).encode(),
         headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    with destguard.operator_urlopen(req, timeout=timeout) as r:
         return json.loads(r.read(MAX_RESPONSE_BYTES + 1)[:MAX_RESPONSE_BYTES])
 
 

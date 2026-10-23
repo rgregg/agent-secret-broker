@@ -14,6 +14,8 @@ import json
 import urllib.parse
 import urllib.request
 
+from . import destguard
+
 from . import guidance as guidance_mod
 from . import keyprovider
 from . import scripts as scripts_mod
@@ -94,7 +96,7 @@ class OpenRouterSummarizer:
             f"{self._base}/chat/completions", data=json.dumps(payload).encode(),
             headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"})
         try:
-            with urllib.request.urlopen(req, timeout=self._timeout) as r:
+            with destguard.operator_urlopen(req, timeout=self._timeout) as r:
                 text = json.load(r)["choices"][0]["message"]["content"]
         except Exception:
             return None

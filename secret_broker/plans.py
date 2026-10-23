@@ -1052,6 +1052,8 @@ def substitute(frozen, env, rule, cfg, own_vars):
         if name.lower() in ph:
             m = _ph(value)
             val = env.get(m[1])
+            if isinstance(val, str):
+                val = val[:-2] if val.endswith("\r\n") else (val[:-1] if val.endswith("\n") else val)
             if not isinstance(val, str) or re.search(r"[\x00-\x1f\x7f]", val) or not val.isascii():
                 raise NoMatch("placeholder")
             value = m[0] + val

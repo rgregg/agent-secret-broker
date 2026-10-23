@@ -51,7 +51,7 @@ _CRED_WORDS = ("token", "secret", "key", "password", "auth", "credential")
 _PLACEHOLDER = re.compile(r"\{\{\s*[A-Za-z_][A-Za-z0-9_]*\s*\}\}")
 _SCHEMES = frozenset(("bearer", "basic", "token", "digest", "apikey", "negotiate", "bot", "oauth",
                       "hmac", "jwt", "key"))
-_CTRL = re.compile(r"[\x00-\x1f\x7f-\x9f‪-‮⁦-⁩​-‏﻿]")
+_CTRL = re.compile("[\x00-\x1f\x7f-\x9f\u00ad\u034f\u061c\u180e\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff\u115f\u1160\u3164]")   # controls, bidi, zero-width, invisible fillers
 _TEXT_CT = ("json", "xml", "x-www-form-urlencoded", "graphql", "javascript", "yaml", "form-data",
             "csv", "html", "plain", "x-ndjson", "toml", "sql", "markdown")
 
@@ -101,6 +101,9 @@ def placeholders_only(value):
     if not _PLACEHOLDER.search(v):
         return False
     return _PLACEHOLDER.sub("", v).strip(" \t:;,") == ""
+
+
+_INVIS = re.compile("[\u00ad\u034f\u061c\u180e\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff\u115f\u1160\u3164]")
 
 
 def _clean(s):
@@ -279,7 +282,8 @@ def html(view):
     """The collapsed 'Request details' block (server-escaped), or '' when empty."""
     if not has_content(view):
         return ""
-    e = _html.escape
+    def e(t):       # display only: bidi controls and zero-width characters are replaced, what is sent is unchanged
+        return _html.escape(_INVIS.sub("?", str(t)))
     parts = []
     if view["headers"]:
         more = view["headers_total"] - len(view["headers"])

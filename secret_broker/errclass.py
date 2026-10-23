@@ -61,6 +61,13 @@ def classify(exc):
     return OTHER
 
 
+def public(label):
+    """The label an AGENT may see. A guard refusal reads as a plain connection failure, so a call
+    cannot be used to probe which addresses the broker is willing to reach; the real reason
+    (`destination not allowed`) goes to the operator audit only, as `reason_class`."""
+    return CONNECTION if label == DENIED else label
+
+
 def release_text(exc):
     """The only text a failed release carries anywhere an agent, a log or a page could see it."""
-    return "release failed: " + classify(exc)
+    return "release failed: " + public(classify(exc))
