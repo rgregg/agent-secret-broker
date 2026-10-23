@@ -327,7 +327,7 @@ def entry_allows(entries, host, port):
     `host:port` entries is restricted to those ports); a port is never allowed by another host's entry."""
     h = (host or "").lower().strip("[]")
     ents = [str(e).lower() for e in entries or ()]
-    if f"{h}:{port}" in ents:
+    if f"{h}:{port}" in ents or f"{h}:*" in ents:       # `host:*` is only ever built by the broker (ip_literal_any_port)
         return True
     if h in ents:
         return parse_ip(h) is None or port in (80, 443)

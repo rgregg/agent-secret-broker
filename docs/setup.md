@@ -277,6 +277,14 @@ Defaults changed for security (see the reference, "Security notes"). Check them 
    unspecified and multicast addresses, to any address of its own interfaces, to cloud metadata addresses,
    and to its own listener ports on private addresses; it connects to the address it validated. LAN
    addresses (10/8, 172.16/12, 192.168/16, 100.64/10) keep working. If the listener ports are published as
+   *Migration aid for existing catalogs:* credentials whose `allowed_hosts` are bare IP literals used on non-default
+   ports (for example `10.0.1.175` for InfluxDB on :8086, `10.0.1.5` for Proxmox on :8006, `100.96.41.13` for Komodo
+   on :9120, `10.0.0.100` for NPM on :81) stop working until each entry says `host:port`. If you cannot edit the vault
+   metadata at once, set `"ip_literal_any_port": true`: bare IP-literal entries of **human-managed** catalog entries
+   match any port again. Credentials created or updated through store / credential requests (they carry a `created`
+   stamp) never get this and still need `host:port`; loopback, the broker's own addresses, its own listener ports and
+   `own_ports` stay refused. A startup WARNING reminds you to migrate `allowed_hosts` to `host:port` and remove the flag.
+   If the listener ports are published as
    other host ports (for example `9801:8801`), add them as `"own_ports": [9801, 9800]` so a call to
    `lan-host:9801` is refused. A credential whose `allowed_hosts` names `localhost`, a loopback or
    link-local address, or one of the broker's own addresses loses that host at load (a

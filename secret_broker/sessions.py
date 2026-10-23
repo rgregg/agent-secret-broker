@@ -1149,7 +1149,7 @@ class SessionsMixin:
         if not sc.get("allowed_hosts"):
             raise PermissionError("this credential has no allowed hosts, so it is not an http credential; "
                                   "a session works only with http credentials")
-        out = validate_open(self.sessions_cfg, spec, sc["allowed_hosts"], self.dest_guard.port_ok,
+        out = validate_open(self.sessions_cfg, spec, self.allowed_entries(names[0]), self.dest_guard.port_ok,
                             self.dest_guard.host_refused)
         spec.clear()
         spec.update(out)
@@ -1181,9 +1181,10 @@ class SessionsMixin:
             raise SessionOpenError("the credential is no longer available for http")
         if any(parse_host_entry(h)[0] not in destguard.host_parts(sc["allowed_hosts"])
                or self.dest_guard.host_refused(parse_host_entry(h)[0])
-               or not (self.dest_guard.port_ok(sc["allowed_hosts"], parse_host_entry(h)[0], parse_host_entry(h)[1] or 80)
+               or not (self.dest_guard.port_ok(self.allowed_entries(req.names[0]), parse_host_entry(h)[0],
+                                               parse_host_entry(h)[1] or 80)
                        or (parse_host_entry(h)[1] is None
-                           and self.dest_guard.port_ok(sc["allowed_hosts"], parse_host_entry(h)[0], 443)))
+                           and self.dest_guard.port_ok(self.allowed_entries(req.names[0]), parse_host_entry(h)[0], 443)))
                for h in sp["hosts"]):
             raise SessionOpenError("a host is no longer allowed for this credential")
         self.sweep_sessions()
@@ -1311,7 +1312,8 @@ class SessionsMixin:
         with s.lock:
             have = frozenset(s.captures)
         sc_now = None if self._internal_hit([s.cred]) else self.cfg["secrets"].get(s.cred)
-        problem = scope_problem(s, sc_now, names, method, spec, have, self.dest_guard.port_ok)   # no lock held
+        problem = scope_problem(s, None if sc_now is None else {**sc_now, "allowed_hosts": self.allowed_entries(s.cred)},
+                                names, method, spec, have, self.dest_guard.port_ok)   # no lock held
         if problem is None:
             with self._sess_lock:                       # charge the call: re-check life and cap atomically
                 s2, state = self._sess_lookup(sid, cid, self.sessions_clock())

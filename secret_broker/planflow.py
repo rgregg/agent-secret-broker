@@ -123,7 +123,7 @@ class PlansMixin:
             if r["secret"] in deny:
                 raise plans_mod.ManifestError(f"{f}.secret: this credential does not allow plans", 403)
             if (r["host"] not in destguard.host_parts(hosts) or self.dest_guard.host_refused(r["host"])
-                    or not self.dest_guard.port_ok(hosts, r["host"], r["port"])):
+                    or not self.dest_guard.port_ok(self.allowed_entries(r["secret"]), r["host"], r["port"])):
                 raise plans_mod.ManifestError(f"{f}.host: not one of this credential's allowed hosts")
             sigs[r["secret"]] = source_sig(sc)
         return sigs

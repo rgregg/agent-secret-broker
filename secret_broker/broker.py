@@ -454,6 +454,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         except guidance_mod.HiddenCharsError as e:
             note, ginvalid = None, str(e)       # ignored for classification; the credential stays valid
         entry = {**meta, "vars": vars_, "allowed_hosts": [h.lower() for h in hosts],
+                 "_human": "created" not in meta,     # not made by a store / credential request
                  "approval": approval, "_item": item, "_meta": meta,
                  "_tls": {"fingerprint": fp, "verify": verify}}
         entry.pop("guidance", None)
@@ -2462,6 +2463,11 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
     def trust_warnings(self):
         """Startup warnings about who the approval listener believes (logged once at start)."""
         out = []
+        if self.cfg.get("ip_literal_any_port") is True:
+            out.append("ip_literal_any_port is true: bare IP-literal allowed_hosts entries of human-managed catalog "
+                       "entries match ANY port again. Migrate allowed_hosts to host:port (for example "
+                       "10.0.1.175:8086), then remove the flag. Loopback, own addresses, the broker's own listener "
+                       "ports and own_ports stay refused; credentials created through requests still need host:port")
         if self.cfg.get("approval_trust_any_peer") is True:
             out.append("approval_trust_any_peer is true: the approval listener believes the identity header "
                        "from ANY peer. Anything that can reach it, including this broker's own outbound "
@@ -3255,11 +3261,25 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                    response_bytes=len(out["body"]), duration_ms=int((time.time() - t0) * 1000))
         return {"http": out}
 
+    def allowed_entries(self, name):
+        """The allowed_hosts entries of one credential as the port rule reads them. With `ip_literal_any_port`
+        (a migration aid), a bare IP-literal entry of a HUMAN-MANAGED catalog entry also matches any port
+        (`ip:*`); a credential created through a store or credential request (it carries a `created` stamp)
+        never gets that. Loopback and own addresses are not in the list at all (dropped at load), and the
+        guard still refuses the broker's own listener ports and `own_ports` on every private address."""
+        sc = self.cfg["secrets"].get(name) or {}
+        ents = [str(h).lower() for h in sc.get("allowed_hosts") or ()]
+        if self.cfg.get("ip_literal_any_port") is True and sc.get("_human"):
+            for e in list(ents):
+                h, p = destguard.split_entry(e)
+                if h and p is None and destguard.parse_ip(h) is not None:
+                    ents.append(f"{h}:*")
+        return ents
+
     def _dest_entries(self, names):
         """The allowed_hosts entries every named credential shares: what the destination guard
         holds an IP-literal destination's port against."""
-        sets = [{str(h).lower() for h in (self.cfg["secrets"].get(n) or {}).get("allowed_hosts") or ()}
-                for n in names]
+        sets = [set(self.allowed_entries(n)) for n in names]
         return sorted(set.intersection(*sets)) if sets else []
 
     def _read_env(self, req):

@@ -2863,7 +2863,10 @@ only to the user, never rotated) out of the page and then POST `/decide` for any
   is logged). ONE rule (`destguard.entry_allows`) decides host and port everywhere (http, session open and calls, plan
   submit and calls, and the connection itself): a bare `host` entry allows a name on any port and an IP literal on 80/443;
   a `host:port` entry allows exactly that port (a name with only `host:port` entries is limited to those ports). Session
-  open and plan submit also run the guard's static host check.
+  open and plan submit also run the guard's static host check. `ip_literal_any_port: true` (migration aid, default off,
+  startup WARNING) lets a bare IP-literal entry of a human-managed catalog entry match any port, e.g. live
+  `allowed_hosts: ["10.0.1.175"]` for InfluxDB on :8086; entries created by store / credential requests (they carry a
+  `created` stamp) never do, and loopback, own addresses, the listener ports and `own_ports` stay refused.
 * **Approval listener trust.** Loopback and the broker's own addresses are never trusted. The listener fails
   closed unless `approval_trusted_peers` and/or `approval_proxy_secret_file` is set (see Setup, "Upgrading"):
   an RFC 1918 peer is no longer enough, because the agent's own VM is usually inside such a range.
