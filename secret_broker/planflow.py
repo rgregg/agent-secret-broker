@@ -112,7 +112,7 @@ class PlansMixin:
         """Check every rule against the credential catalog and the plan policy. Returns {secret:
         source signature}. Raises ManifestError (400 or 403) with a fixed sentence."""
         sigs, deny = {}, self.plans_cfg["deny_secrets"]
-        internal = self._internal_secrets()[0]
+        internal = self.internal_snapshot()     # after the refresh in submit_plan
         for i, r in enumerate(rules):
             f = f"rules[{i}]"
             sc = self.cfg["secrets"].get(r["secret"])
@@ -161,8 +161,8 @@ class PlansMixin:
             rej(403, "plans need a per-client credential: run `asb enroll` first", "legacy_client")
         if not self.plan_client_ok(cid):
             rej(403, "this client may not use plans", "client_policy")
-        internal = self._internal_secrets()[0]
-        self._refresh_if(0 if any(n not in self.cfg["secrets"] or n in internal for n in _named(raw))
+        pre = self.internal_snapshot()      # pre-refresh: only decides how to refresh, never a decision
+        self._refresh_if(0 if any(n not in self.cfg["secrets"] or n in pre for n in _named(raw))
                          else self.CATALOG_TTL)
         try:
             man = plans_mod.validate_manifest(raw, cfg, self.plan_max_minutes(cid))

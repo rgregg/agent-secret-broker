@@ -554,6 +554,31 @@ class Oracles(AgentPath):
         self.assertIn("not healthy", a)
 
 
+class Toctou(AgentPath):
+    def flip_after_refresh(self, member="svc"):
+        """`member` is an ordinary credential until the catalog refresh, internal after it."""
+        state = {"refreshed": False}
+        real_refresh, real_int = self.broker._refresh_if, self.broker._internal_secrets
+
+        def refresh(stale, wait=True):
+            state["refreshed"] = True
+            return real_refresh(stale, wait)
+        self.broker._refresh_if = refresh
+        self.broker._internal_secrets = lambda: (
+            (frozenset({member}), frozenset({"svc"})) if state["refreshed"] else (frozenset(), frozenset()))
+        return state
+
+    def test_a_reload_that_makes_a_name_internal_still_refuses_it(self):
+        self.flip_after_refresh()
+        for mk in ({"mode": "env", "names": ["svc"], "argv": ["echo"]},
+                   {"mode": "http", "names": ["svc"], "method": "GET", "url": "http://127.0.0.1:1/x",
+                    "headers": {}},
+                   {"mode": "guidance", "entries": [{"name": "svc", "text": "x"}]}):
+            code, body = self.api("POST", "/v1/requests", mk)
+            self.assertEqual((code, json.loads(body)), (400, {"error": "unknown secret name"}), mk["mode"])
+        self.assertEqual(self.broker.pending(), [])
+
+
 class KeyItemKnowledge(AgentPath):
     def test_item_stays_protected_while_the_entry_is_missing_from_the_catalog(self):
         self.broker.refresh_catalog()

@@ -554,6 +554,11 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             except Exception:  # noqa: BLE001
                 pass
 
+    def internal_snapshot(self):
+        """The internal credential names as of NOW. Take it after the catalog was refreshed and use
+        that one value for every decision in a request; never reuse an earlier one."""
+        return self._internal_secrets()[0]
+
     def is_internal_secret(self, name):
         return name in self._internal_secrets()[0]
 
@@ -1168,11 +1173,14 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         if mode == "http" and isinstance(spec, dict) and spec.get("session") is not None:
             return self._session_call(names, spec, source, peer, client)
         try:
-            internal = self._internal_secrets()[0]
+            # Pre-refresh membership test: it only decides HOW to refresh (a name that is unknown or
+            # internal forces a reload, so both cost the same). It is never used for a decision.
+            pre = self._internal_secrets()[0]
             self._refresh_if(0 if (mode not in ("store", "credential")
-                                   and any(n not in self.cfg["secrets"] or n in internal for n in names))
+                                   and any(n not in self.cfg["secrets"] or n in pre for n in names))
                              else self.CATALOG_TTL)
             secrets_cfg = self.cfg["secrets"]
+            internal = self.internal_snapshot()     # ONE snapshot, taken after the refresh, for every check below
             if mode == "env":
                 spec["scripts"] = scripts_mod.validate(spec.get("scripts"))
                 spec["cwd"] = scripts_mod.validate_cwd(spec.get("cwd"))

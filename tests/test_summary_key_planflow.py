@@ -119,6 +119,16 @@ class Plans(pb.PBase):
             self.api("POST", "/v1/plans", {"manifest": self.manifest([self.rule(secret=n)]), "source": "t"})
             self.assertEqual(calls[0], 0, n)
 
+    def test_a_reload_that_makes_a_name_internal_still_refuses_the_submit(self):
+        state = {"r": False}
+        real_refresh = self.broker._refresh_if
+        self.broker._refresh_if = lambda stale, wait=True: (state.update(r=True), real_refresh(stale, wait))[1]
+        self.broker._internal_secrets = lambda: ((frozenset({"svc"}), frozenset()) if state["r"]
+                                                 else (frozenset(), frozenset()))
+        code, r = self.api("POST", "/v1/plans", {"manifest": self.manifest([self.read_rule()]), "source": "t"})
+        self.assertEqual((code, r), (400, {"error": "rules[0].secret: unknown credential"}))
+        self.assertEqual(self.broker.pending(), [])
+
     def test_prefix_sharing_name_is_unaffected(self):
         self.manifest([self.rule(secret="ledger")])
         self.approve(self.manifest([self.read_rule(), self.rule()]))
@@ -193,6 +203,15 @@ class Sessions(ts.SBase):
             self.ask(cred=n, expect=400)
             self.assertIn(0, calls, n)
         self.assertEqual(self.ask(cred="nosuch", expect=400, hosts=[]), self.ask(cred=NAME, expect=400, hosts=[]))
+
+    def test_a_reload_that_makes_the_name_internal_still_refuses_the_open(self):
+        state = {"r": False}
+        real_refresh = self.broker._refresh_if
+        self.broker._refresh_if = lambda stale, wait=True: (state.update(r=True), real_refresh(stale, wait))[1]
+        self.broker._internal_secrets = lambda: ((frozenset({"unifi"}), frozenset()) if state["r"]
+                                                 else (frozenset(), frozenset()))
+        r = self.ask(cred="unifi", expect=400)
+        self.assertEqual(r, {"error": "unknown secret name"})
 
     def test_unhealthy_backend_open_text(self):
         self.broker._refresh_if = lambda *a, **k: None
