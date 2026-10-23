@@ -97,7 +97,7 @@ and fails open when the analysis model is down; see the reference),
 `summary` (a one-line AI summary of each request via OpenRouter, marked
 unverified; prefer `"api_key_secret": {"name": "<credential>", "var": "<VARIABLE>"}`, which
 reads the OpenRouter key from the broker's own vault, over `api_key_file`, which needs the key
-copied to a host file. Add the key as an ordinary credential, keep its approval at `prompt`,
+copied to a host file. Add the key as an ordinary credential (the broker then refuses to hand it to any agent and hides it from `asb list`),
 and rotate it by editing the vault item: the broker picks it up within `api_key_ttl_s`,
 default 5 minutes, with no restart; see the reference), `ttl_seconds` (how long a request waits, default 300),
 `audit_log`, `timed_grants` ("Automatically approve... 5/15/30 min" chips on the approval

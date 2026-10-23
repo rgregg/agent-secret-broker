@@ -733,7 +733,8 @@ Set `type` to pick another:
 | `type` | both | `openrouter` | `openrouter` (chat model) or `jev` (decision model) |
 | `api_key_file` | both | one of the two | file holding the OpenRouter key, read once at startup |
 | `api_key_secret` | both | one of the two | `{"name": "<credential>", "var": "<VARIABLE>"}`: read the key from the broker's own vault instead of a host file. `name` is a catalog credential, `var` one of its variable names. Exactly one of `api_key_file` / `api_key_secret` must be set |
-| `api_key_ttl_s` | both | 300 | with `api_key_secret` only: seconds a vault read is cached (30-3600). Editing the vault item takes effect after at most this long, with no restart |
+| `api_key_ttl_s` | both | 300 | with `api_key_secret` only: seconds a vault read is cached (30-3600). Editing the vault item takes effect after at most this long (plus one request), with no restart |
+| `api_key_grace_s` | both | 900 | with `api_key_secret` only (0-3600): how long the last good key keeps being used after the TTL while a refresh runs or the vault is down; 0 turns that off |
 | `model` | both | required for `openrouter`; `typesafe/jev-1.14` for `jev` | OpenRouter model id |
 | `timeout` | both | 4 (`openrouter`), 6 (`jev`) | seconds; a timeout is a HIGH verdict |
 | `max_content_chars` | both | 300 / 400 | body or command characters sent |
@@ -753,28 +754,51 @@ Set `type` to pick another:
 
 #### Key from the vault (`api_key_secret`)
 
-The key is resolved lazily at first use and cached for `api_key_ttl_s`; there is
-no host file. If the credential, the variable or its value is missing or empty,
-the vault is down or locked, or the value is not a plain token, the analyzers
-behave exactly as on a provider failure (the `auto:` summary and the HIGH
-fail-safe rating); nothing raises into the request path. A failed read is
-remembered for 30 seconds so a dead vault is not hammered. A credential that is
-not in the catalog at startup is a WARNING (the catalog may still be loading),
-not an error.
+The key is resolved lazily and cached; there is no host file.
 
-The read is internal. It is not a request: no approval, card, notification or
-`secret_read` event, and nothing an agent sends can trigger or observe it. Each
-vault read (at most one per TTL) writes one `summary_key_read` audit event with
-only `secret` (the credential name) and `result` (`ok`, `not_found`,
-`backend_unavailable`, `rate_limited`, `empty`, `invalid`, `other`); failures
-also write one WARNING log line per 5 minutes with the reason class only. The
-event is hidden from the agent audit API. The key is only ever sent in the
-`Authorization` header of calls to `base_url` / `summary_base_url`, never in a
-body, log, audit record, status or error text.
-
-The item stays an ordinary credential: an agent can still request it through
-the normal path, which still asks the approver. Keep its policy `approval:
-prompt` (the default) and do not give it `allowed_hosts` you do not need.
+- **Never waits on the vault.** Within `api_key_ttl_s` of a good read the cached
+  key is used. After that exactly one background read refreshes it while every
+  request keeps using the old key (stale-while-revalidate, for at most
+  `api_key_grace_s`). With no key yet (first use after a start, or after the
+  catalog entry for it changed) requests get no key until the background read
+  finishes: they get the `auto:` summary and the HIGH fail-safe rating, exactly
+  as on a provider failure. Nothing raises into the request path.
+- **Failures.** A transient failure (`backend_unavailable`, `rate_limited`,
+  `other`) keeps the last good key for the grace period and retries every 30
+  seconds. `not_found` (no such credential or variable), `empty` and `invalid`
+  (whitespace, control characters or non-ASCII) drop the key at once. With no
+  key the analyzers fail closed as above. The TTL is counted from when the read
+  finished.
+- **Rotation.** Edit the vault item; the new key is used within
+  `api_key_ttl_s` plus one request. If the catalog reload sees the credential's
+  source (item, field or key) change, the cached key is dropped immediately.
+  There is no signal or admin endpoint to force a refresh; restart the broker or
+  wait for the TTL.
+- **Startup.** A credential that is not in the catalog at startup is a WARNING
+  (the catalog may still be loading), not an error.
+- **Audit.** Each vault read (at most one per TTL) writes one hidden
+  `summary_key_read` event with only `secret` (the credential name) and
+  `result` (`ok`, `not_found`, `backend_unavailable`, `rate_limited`, `empty`,
+  `invalid`, `other`). Failures also write one WARNING log line per 5 minutes
+  with the reason class only. The event is hidden from the agent audit API. The
+  key is only ever sent in the `Authorization` header of calls to `base_url` /
+  `summary_base_url`, never in a body, log, audit record, status or error text.
+- **Internal credential.** The credential named by `api_key_secret.name` (and
+  any catalog entry that points at the same vault item) can never be released
+  to an agent. A request that names it, in any mode (http, env, ssh_sign, store
+  create/update, credential request, guidance proposal) or a `store` create that
+  targets its vault item, is refused at once with the same text as an unknown
+  secret name (`unknown secret name`), so it is not an oracle. Timed grants,
+  Always approvals and `approval: allow` therefore never apply to it. It is
+  omitted from `GET /v1/secrets` (`asb list` / `asb which`). The refusal is audited as
+  the hidden `internal_secret_refused` event (`secret`, `reason:
+  internal_secret`, mode, client). The approval site still lists it, marked
+  "(internal: summary key)", and a human can still edit it there. (This
+  codebase has no sessions or plan manifests.)
+- **Idle lock.** The backend contract has no read-without-touch option, so each
+  vault read (one per TTL) renews a backend's idle-logout timer such as the
+  local store's `idle_timeout`; with a TTL shorter than the idle timeout the
+  store never idles out.
 
 Config with an explicit `type` rejects unknown keys at startup, naming the field
 (`summary.<key>`); a block without `type` keeps ignoring extra keys as before.

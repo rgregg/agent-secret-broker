@@ -534,9 +534,9 @@ class FloorAnalyzer:
 
 TYPES = ("openrouter", "jev")
 _KEYS = {
-    "openrouter": {"type", "api_key_file", "api_key_secret", "api_key_ttl_s", "model", "timeout", "max_content_chars", "send_content",
+    "openrouter": {"type", "api_key_file", "api_key_secret", "api_key_ttl_s", "api_key_grace_s", "model", "timeout", "max_content_chars", "send_content",
                    "prompt", "base_url"},
-    "jev": {"type", "api_key_file", "api_key_secret", "api_key_ttl_s", "model", "timeout", "max_content_chars", "send_content",
+    "jev": {"type", "api_key_file", "api_key_secret", "api_key_ttl_s", "api_key_grace_s", "model", "timeout", "max_content_chars", "send_content",
             "max_script_chars", "base_url", "high_threshold", "low_threshold", "summary_text", "summary_model",
             "summary_timeout", "summary_max_per_minute", "summary_concurrency", "summary_base_url", "summary_read_endpoints"},
 }
@@ -566,11 +566,13 @@ def validate_config(sc):
     if "api_key_file" in sc:
         if not isinstance(sc["api_key_file"], str) or not sc["api_key_file"]:
             raise ValueError("summary.api_key_file must be a path to a file holding the OpenRouter key")
-        if "api_key_ttl_s" in sc:
-            raise ValueError("summary.api_key_ttl_s applies only with api_key_secret")
+        for k in ("api_key_ttl_s", "api_key_grace_s"):
+            if k in sc:
+                raise ValueError(f"summary.{k} applies only with api_key_secret")
     else:
         keyprovider.parse_secret(sc["api_key_secret"])
         keyprovider.parse_ttl(sc)
+        keyprovider.parse_grace(sc)
     if typ == "openrouter" and not (isinstance(sc.get("model"), str) and sc["model"]):
         raise ValueError("summary.model is required for type 'openrouter'")
     if "model" in sc and not (isinstance(sc["model"], str) and sc["model"]):
@@ -626,7 +628,8 @@ def build(sc, read, clock=time.monotonic):
     typ = validate_config(sc)
     if "api_key_secret" in sc:
         name, var = keyprovider.parse_secret(sc["api_key_secret"])
-        key = keyprovider.VaultKey(name, var, keyprovider.parse_ttl(sc), clock=clock)
+        key = keyprovider.VaultKey(name, var, keyprovider.parse_ttl(sc), clock=clock,
+                                 grace=keyprovider.parse_grace(sc))
         providers = (key,)
     else:
         key, providers = keyprovider.ConstKey(read(sc["api_key_file"])), ()
