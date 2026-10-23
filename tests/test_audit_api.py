@@ -13,6 +13,8 @@ import urllib.parse
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import test_e2e as t  # noqa: E402  (module import only)
 
+from secret_broker import destguard as _destguard  # noqa: E402
+_destguard.allow_loopback_for_tests()   # test stubs live on 127.0.0.1; no config key does this
 from secret_broker import audit as audit_mod  # noqa: E402
 from secret_broker import audit_api  # noqa: E402
 from secret_broker.broker import Broker  # noqa: E402
@@ -111,7 +113,7 @@ class Redaction(unittest.TestCase):
         self.assertEqual((auto2["channel"], auto2["approver"]), (None, None))
         human = audit_api.redact(rec("approved", id="r1", via="user", channel="push",
                                      approver="alice"))
-        self.assertEqual((human["channel"], human["approver"]), ("push", "alice"))
+        self.assertEqual((human["channel"], human["approver"]), ("push", "human"))
         self.assertEqual(set(auto), set(human))                                    # same shape
         bad = audit_api.redact(rec("approved", id="r1", via="user", channel="auto", approver="x"))
         self.assertIsNone(bad["channel"])                                          # not an allowed channel
@@ -425,7 +427,7 @@ class Api(ApiBase):
             self.assertIn(ev, seen)
         self.assertTrue(seen.isdisjoint(audit_api.HIDDEN), seen & audit_api.HIDDEN)
         dec = [e for e in json.loads(self.get(f"request={r4}")[2])["events"] if e["event"] == "approved"]
-        self.assertEqual((dec[0]["channel"], dec[0]["approver"]), ("dashboard", "alice"))
+        self.assertEqual((dec[0]["channel"], dec[0]["approver"]), ("dashboard", "human"))
 
     # -- rate limit -----------------------------------------------------------
     def test_rate_limit_per_key(self):
@@ -538,7 +540,7 @@ class Cli(ApiBase):
         self.assertTrue(all(rid[:8] in l for l in lines))
         self.assertTrue(re.match(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ  requested ", lines[0]), lines[0])
         self.assertIn("names=svc", lines[0])
-        self.assertIn("channel=link approver=alice", lines[2])
+        self.assertIn("channel=link approver=human", lines[2])
         for bad in (t.SECRET, "risk", "POISON"):
             self.assertNotIn(bad, p.stdout)
         j = self.asb("audit", "--request", rid, "--json")

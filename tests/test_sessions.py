@@ -23,6 +23,8 @@ sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import test_e2e as t  # noqa: E402
 from test_clients import CBase  # noqa: E402
+from secret_broker import destguard as _destguard  # noqa: E402
+_destguard.allow_loopback_for_tests()   # test stubs live on 127.0.0.1; no config key does this
 from secret_broker import audit_api, sessions as S  # noqa: E402
 from secret_broker.broker import Broker  # noqa: E402
 
@@ -1595,14 +1597,14 @@ class Hardening(SBase):
             def open(self, req, timeout=None):
                 seen.append(timeout)
                 raise OSError("x")
-        with mock.patch.object(bm, "_opener_for", lambda tls: Boom()):
+        with mock.patch.object(bm, "_opener_for", lambda tls, *a, **k: Boom()):
             self.call(sid, "GET", "/")
         self.assertEqual(len(seen), 1)
         self.assertLessEqual(seen[0], 10.5)
         self.assertGreater(seen[0], 0)
         sid2 = self.open(ttl_s=3600)
         seen.clear()
-        with mock.patch.object(bm, "_opener_for", lambda tls: Boom()):
+        with mock.patch.object(bm, "_opener_for", lambda tls, *a, **k: Boom()):
             self.call(sid2, "GET", "/")
         self.assertEqual(seen, [S.CALL_TIMEOUT_S])
 
@@ -2676,11 +2678,11 @@ class Review5(SBase):
             def open(inner, req, timeout=None):
                 inner.then()
                 raise TimeoutError("slow")
-        with mock.patch.object(bm, "_opener_for", lambda tls: Late(lambda: self.advance(100))):
+        with mock.patch.object(bm, "_opener_for", lambda tls, *a, **k: Late(lambda: self.advance(100))):
             code, r = self.call(sid, "GET", "/")
         self.assertEqual((code, r["code"]), (410, "session_expired"))
         sid2 = self.open()
-        with mock.patch.object(bm, "_opener_for", lambda tls: Late(lambda: self.post("/sessions/revoke", {"pid": sid2[:8]}))):
+        with mock.patch.object(bm, "_opener_for", lambda tls, *a, **k: Late(lambda: self.post("/sessions/revoke", {"pid": sid2[:8]}))):
             code, r = self.call(sid2, "GET", "/")
         self.assertEqual((code, r["code"]), (410, "session_expired"))
         self.assertIn("revoked", r["error"])

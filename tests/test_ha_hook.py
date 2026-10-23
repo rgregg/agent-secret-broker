@@ -16,6 +16,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import test_e2e as t  # noqa: E402  (module import only)
 
+from secret_broker import destguard as _destguard  # noqa: E402
+_destguard.allow_loopback_for_tests()   # test stubs live on 127.0.0.1; no config key does this
 from secret_broker import notify  # noqa: E402
 from secret_broker.broker import CHANNELS, Broker, serve  # noqa: E402
 

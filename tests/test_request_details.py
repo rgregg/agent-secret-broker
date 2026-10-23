@@ -18,6 +18,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, ".."))
 sys.path.insert(0, HERE)
 import test_e2e  # noqa: E402
+from secret_broker import destguard as _destguard  # noqa: E402
+_destguard.allow_loopback_for_tests()   # test stubs live on 127.0.0.1; no config key does this
 from secret_broker import audit_api, broker as broker_mod, request_details as D, scripts as S  # noqa: E402
 from secret_broker.backends import FileBackend  # noqa: E402
 from secret_broker.broker import Broker  # noqa: E402
@@ -138,8 +140,9 @@ class CardTests(Base):
 
     def test_hostile_text_is_escaped(self):
         hostile = "<script>alert(1)</script>\n<img src=x onerror=alert(2)>\n" + "A" * 3000 + "\x1b[2J</pre><details open>"
-        rid = self.post({"Content-Type": "text/html", "X-Evil": "<b>bold</b>\x07\x1b[31m</pre>",
-                         "X-Long": "L" * 4000, "X-Line<br>": "v"}, body=hostile)
+        # (control characters and markup in a header NAME or value are refused at creation now; the body is free text)
+        rid = self.post({"Content-Type": "text/html", "X-Evil": "<b>bold</b></pre>",
+                         "X-Long": "L" * 4000}, body=hostile)
         for page in (self.card(rid), self.dash()):
             for bad in ("<script>alert(1)", "<img src=x", "<b>bold</b>", "X-Line<br>", "\x1b", "\x07", "<details open>"):
                 self.assertNotIn(bad, page, bad)

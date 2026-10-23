@@ -22,6 +22,8 @@ import test_e2e as t  # noqa: E402
 import test_grants as tg  # noqa: E402
 import test_ssh_rules as sr  # noqa: E402
 from test_e2e import _Stub  # noqa: E402
+from secret_broker import destguard as _destguard  # noqa: E402
+_destguard.allow_loopback_for_tests()   # test stubs live on 127.0.0.1; no config key does this
 from secret_broker import clients as clients_mod  # noqa: E402
 from secret_broker import grants as grants_mod  # noqa: E402
 from secret_broker import sshrules, standing as standing_mod  # noqa: E402

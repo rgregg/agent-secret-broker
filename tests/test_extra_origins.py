@@ -8,6 +8,8 @@ import urllib.parse
 
 sys.path.insert(0, os.path.dirname(__file__))
 import test_e2e as t  # noqa: E402  (module import only: its tests are not re-collected)
+from secret_broker import destguard as _destguard  # noqa: E402
+_destguard.allow_loopback_for_tests()   # test stubs live on 127.0.0.1; no config key does this
 from secret_broker import broker as broker_mod  # noqa: E402
 from secret_broker.broker import origin_allowed, parse_extra_origins  # noqa: E402
 

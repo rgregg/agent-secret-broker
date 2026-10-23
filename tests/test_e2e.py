@@ -12,6 +12,8 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from secret_broker import destguard as _destguard  # noqa: E402
+_destguard.allow_loopback_for_tests()   # test stubs live on 127.0.0.1; no config key does this
 from secret_broker import audit as audit_mod  # noqa: E402
 from secret_broker import risk as risk_mod  # noqa: E402
 from secret_broker.backends import BwServeBackend  # noqa: E402
@@ -1812,7 +1814,7 @@ class TlsPinnedWrong(TlsModes):
     def test_wrong_fingerprint_is_refused(self):
         r = self.go()
         self.assertEqual(r["status"], "failed")
-        self.assertIn("pinned fingerprint", " ".join(e.get("error", "") for e in self.events("failed")))
+        self.assertIn("release failed: tls", " ".join(e.get("error", "") for e in self.events("failed")))   # a label, never the library's text
 
 
 class TlsNoVerifyPrivate(TlsModes):
@@ -2331,14 +2333,14 @@ class Dashboard(Harness):
         self.assertNotIn("data-body", body)
 
     def test_lists_pending_without_exposing_the_nonce(self):
-        rid = self.ask("/<img src=x onerror=alert(1)>")
+        rid = self.ask("/<img/src=x/onerror=alert(1)>")      # (a space in a URL is refused at creation)
         code, body = self.get()
         self.assertEqual(code, 200)
         self.assertIn("svc", body)
         self.assertIn("name=csrf", body)
         self.assertIn(f"data-id='{rid}'", body)
         self.assertNotIn(self.broker._by_id[rid].nonce, body)         # ids, never the capability URL
-        self.assertNotIn("<img src=x", body)                          # escaped
+        self.assertNotIn("<img/src=x", body)                          # escaped
         self.assertIn("script-src 'nonce-", urllib.request.urlopen(urllib.request.Request(
             self.abase + "/", headers={"X-authentik-username": "alice"})).headers["Content-Security-Policy"])
 
