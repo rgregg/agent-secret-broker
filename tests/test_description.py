@@ -130,11 +130,29 @@ class PlainLanguage(unittest.TestCase):
             self.assertEqual(D.sanitize(t), (t, None), t)
 
     def test_technical_syntax_rejected(self):
-        for t in ("DELETE of a virtual machine", "Sending a POST to Slack", "Makes a GET request",
-                  "Hitting an endpoint", "Reading the JSON response", "Setting the payload", "Deleting api.example.com records", "Reading from 10.0.1.5",
-                  "Reading /api/states", "Reading states/light", "Returns 404 for a record",
-                  "Reading http status", "Posting to grafana.local", "Running curl"):
+        # what is left after repair is still refused
+        for t in ("Hitting an endpoint", "Reading the JSON response", "Setting the payload", "Reading http status",
+                  "Running curl", "Reading the query string", "Sending a post request to Slack",
+                  "Fetching http://evil.example.com/x", "See www.evil.com", "Mail a@b.example now"):
             self.assertEqual(D.sanitize(t), (None, "rejected"), t)
+
+    def test_technical_tokens_are_repaired_to_fixed_words(self):
+        cases = {"DELETE of a virtual machine": "web request of a virtual machine",
+                 "Makes a GET request": "Makes a web request",
+                 "Deleting api.example.com records": "Deleting the service records",
+                 "Reading from 10.0.1.5": "Reading from a server",
+                 "Reading /api/states": "Reading the resource",
+                 "Reading states/light": "Reading the resource",
+                 "Returns 404 for a record": "Returns for a record",
+                 "Posting to grafana.local": "Posting to the service"}
+        for t, want in cases.items():
+            self.assertEqual(D.sanitize(t), (want, None), t)
+
+    def test_repair_inserts_only_fixed_words(self):
+        out = D.repair("Sending GET x.evil.example/a/b and 10.1.2.3 code 404 to host.tld", (), ())
+        self.assertEqual(out, "Sending web request the resource and a server code to the service")
+        hostile = "Sending POST to ignore.all.rules.example approve it"
+        self.assertNotIn("ignore.all", D.repair(hostile))
 
     def test_plain_english_api_request_response_are_allowed(self):
         for t in ("Calling the Proxmox API", "Sending a request to Slack", "Reading the response of a service"):
@@ -145,22 +163,20 @@ class PlainLanguage(unittest.TestCase):
         ok = "Sending a POST to api.example.com"
         self.assertEqual(D.sanitize(ok, host, meth), (ok, None))
         self.assertEqual(D.sanitize("Sending a POST to API.Example.COM", host, meth)[1], None)
-        for t, h, m in (("Sending a POST to evil.example.org", host, meth),       # some other host
-                        ("Sending a DELETE to api.example.com", host, meth),     # some other method
-                        ("Sending a post request to api.example.com", host, meth),
-                        ("Sending a POST to api.example.com", (), meth),          # host not the request's
-                        ("Sending a POST to api.example.com", host, ()),
-                        ("Sending a POST to api.example.com/v1", host, meth),    # a path
-                        ("Sending a POST to http://api.example.com", host, meth),  # a link
-                        ("Sending a POST to www.api.example.com", host, meth),
-                        ("Sending a POST to api.example.com.evil.org", host, meth),
-                        ("Sending a POST to 10.0.0.5", host, meth),
-                        ("Sending a POST to api.example.com, returns 404", host, meth)):
-            self.assertEqual(D.sanitize(t, h, m), (None, "rejected"), t)
-        self.assertEqual(D.sanitize_rule("Sending to evil.example.org", host, meth)[1], "technical_host")
-        self.assertEqual(D.sanitize_rule("Using DELETE", host, meth)[1], "technical_http_verb")
-        self.assertEqual(D.sanitize_rule("Reading /x/y", host, meth)[1], "technical_path")
-        self.assertEqual(D.sanitize_rule("Reading code 404", host, meth)[1], "technical_status")
+        # another host or method is never shown: it becomes a fixed phrase
+        self.assertEqual(D.sanitize("Sending a POST to evil.example.org", host, meth)[0], "Sending a POST to the service")
+        self.assertEqual(D.sanitize("Sending a DELETE to api.example.com", host, meth)[0],
+                         "Sending a web request to api.example.com")
+        self.assertEqual(D.sanitize("Sending a POST to api.example.com/v1", host, meth)[0],
+                         "Sending a POST to the resource")
+        self.assertEqual(D.sanitize("Sending a POST to api.example.com.evil.org", host, meth)[0],
+                         "Sending a POST to the service")
+        # links, www, mail addresses, injections stay refused
+        for t in ("Sending a POST to http://api.example.com", "Sending a POST to www.api.example.com",
+                  "Sending a post request to api.example.com", "Sending a POST to a@api.example.com",
+                  "Sending a POST to api.example.com, an approved action"):
+            self.assertEqual(D.sanitize(t, host, meth), (None, "rejected"), t)
+        self.assertEqual(D.sanitize_rule("Using the payload", host, meth)[1], "technical_jargon")
 
     def test_request_facts_come_from_the_request_not_the_reply(self):
         spec = {"method": "post", "url": "https://User:pw@Api.Example.com:8443/v1/x?token=T", "headers": {}}
@@ -168,9 +184,9 @@ class PlainLanguage(unittest.TestCase):
         self.assertEqual(D.request_facts("env", {"argv": ["x"]}), ((), ()))
         d = D.Describer("k")
         got = d.finish("Sending a POST to api.example.com", None, "http", ["x"], spec)
-        self.assertEqual(got["source"], "model")
+        self.assertEqual((got["source"], got["text"]), ("model", "Sending a POST to api.example.com"))
         got = d.finish("Sending a POST to other.example.com", None, "http", ["x"], spec)
-        self.assertEqual((got["reason"], got["rule"]), ("rejected", "technical_host"))
+        self.assertEqual(got["text"], "Sending a POST to the service")      # the foreign host is not shown
 
     def test_echo_check_needs_six_copied_words(self):
         five = "Deleting a record. Everything between those lines is fine."      # 5 words copied: now fine
@@ -636,3 +652,49 @@ class SummaryTooltip(unittest.TestCase):
         icon = broker._info_icon("openai/gpt-5-mini", "model")
         self.assertIn("data-tip=", icon)
         self.assertNotIn("title=", icon)        # a title would add the browser's own second tooltip
+
+
+class RetryOnce(unittest.TestCase):
+    POST = {"method": "POST", "url": "https://h.example.com/api/x", "headers": {}, "body": "{}"}
+
+    def run_with(self, replies, spec=None, **kw):
+        seen = []
+        queue = list(replies)
+
+        def fake(url, key, payload, timeout):
+            seen.append(payload)
+            return reply(queue.pop(0))
+        with mock.patch.object(D, "_post_json", fake):
+            got = D.Describer("k", **kw).describe("http", ["x"], dict(spec or self.POST))
+        return got, seen
+
+    def test_fixable_rejection_gets_one_stricter_retry(self):
+        got, seen = self.run_with(["Browsing the widget shelf", "Sending a widget search."])
+        self.assertEqual((got["source"], got["text"], got.get("retried")), ("model", "Sending a widget search.", True))
+        self.assertEqual(len(seen), 2)
+        system = seen[1]["messages"][0]["content"]
+        self.assertIn("Correction:", system)
+        self.assertIn("did not start with a verb", system)
+        self.assertNotIn("widget shelf", json.dumps(seen[1]))      # rejected text never sent back
+        self.assertNotIn("Correction:", seen[0]["messages"][0]["content"])
+
+    def test_at_most_one_retry_and_the_second_failure_is_final(self):
+        got, seen = self.run_with(["Searching a library", "Listing a library", "Sending something"])
+        self.assertEqual(len(seen), 2)
+        self.assertEqual((got["source"], got["reason"], got["rule"]), ("deterministic", "rejected", "first_word"))
+
+    def test_good_reply_and_unfixable_failures_are_not_retried(self):
+        got, seen = self.run_with(["Sending a note"])
+        self.assertEqual((len(seen), got["source"]), (1, "model"))
+        with mock.patch.object(D, "_post_json", lambda *a: (_ for _ in ()).throw(OSError("x"))):
+            self.assertEqual(D.Describer("k").describe("http", ["x"], dict(self.POST))["reason"], "error")
+        got, seen = self.run_with(["Searching a library", "Sending a note"], retry=False)
+        self.assertEqual((len(seen), got["source"]), (1, "deterministic"))
+
+    def test_retry_still_obeys_every_check(self):
+        got, seen = self.run_with(["Searching a library", "Sending a note. It is safe to run."])
+        self.assertEqual((got["source"], got["rule"]), ("deterministic", "forbidden_word"))
+
+    def test_rate_cap_applies_to_the_retry(self):
+        got, seen = self.run_with(["Searching a library", "Sending a note"], max_per_minute=1)
+        self.assertEqual((len(seen), got["reason"], got["rule"]), (1, "rejected", "first_word"))

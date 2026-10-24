@@ -67,8 +67,8 @@ class DescribeEval(unittest.TestCase):
         self.assertNotIn("stub-key", out)
 
     def test_assumed_realistic_replies_fallback_table(self):
-        """Before the sanitizer review these 30 phrasings fell back 9 times (all technical_syntax);
-        now only the ones that really name a foreign host, number, GraphQL or a method on a script."""
+        """Before the sanitizer review these 30 phrasings fell back 9 times (all technical_syntax); after the
+        loosening 5; with fail-soft repair only the two that cannot be repaired."""
         data = R.load_corpus(CORPUS)
         with open(os.path.join(os.path.dirname(R.__file__), "realistic_replies.json")) as f:
             replies = {k: v for k, v in json.load(f).items() if not k.startswith("_")}
@@ -79,10 +79,8 @@ class DescribeEval(unittest.TestCase):
         finally:
             srv.shutdown()
         got = {r["id"]: (r["reason"], r["rule"]) for r in rows if r["kind"] == "fallback"}
-        self.assertEqual(got, {
-            "graphql": ("rejected", "technical_jargon"), "search-post": ("rejected", "first_word"),
-            "delete-vm": ("rejected", "technical_status"), "post-dns": ("rejected", "technical_host"),
-            "env-curl-ua": ("rejected", "technical_http_verb")})
+        self.assertEqual(got, {"graphql": ("rejected", "technical_jargon"),
+                               "search-post": ("rejected", "first_word")})
 
     def test_show_rejected_is_for_the_shipped_corpus_only(self):
         import shutil

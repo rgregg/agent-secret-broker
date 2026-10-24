@@ -224,6 +224,22 @@ with a test that the dangerous variants are still rejected:
   gets `{"effort": "none"}` because "minimal" left it spending its 400-token budget on hidden
   reasoning. A 400 reply from the provider is retried once without the field.
 
+### Fail-soft repair and one retry
+
+Instead of discarding a description for a benign technical token, `description.repair` swaps it
+for a fixed phrase after the markup, link, e-mail, banned-word and shouting checks have passed:
+another host name becomes "the service", a slash token "the resource", an address "a server", a
+method name "web request", a 100-599 number is dropped. Only those fixed phrases are ever
+inserted, and the repaired text still goes through the technical check (JSON, payload, endpoint,
+header, curl stay refused), the consistency check and the length and sentence caps. The request's
+own host and method are left as written.
+
+A reply refused for a reason a rewrite can fix (`RETRY_HINTS`: technical_*, first_word, read_word,
+minimizing, forbidden_word, sentences, too_long, prompt_echo, shouting) gets ONE retry with a
+fixed-wording correction added to the system prompt. The rejected text is never sent back. The
+retry counts against the same per-minute cap and concurrency; its outcome is final, and the audit
+still records one reason class and rule. Disable with `Describer(retry=False)`.
+
 ## Late descriptions and late ratings
 
 The card is drawn after at most `summary_timeout` (description) and `timeout` (rating) seconds, as

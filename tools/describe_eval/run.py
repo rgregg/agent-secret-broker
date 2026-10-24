@@ -109,7 +109,7 @@ def run_model(model, cases, key, base_url, timeout, read_endpoints, stub=None, k
             if replies and c["id"] in replies:
                 r = replies[c["id"]]
                 r = r.get(model, r.get("default")) if isinstance(r, dict) else r
-            stub.queue.append("" if r is None else r)
+            stub.queue[:] = ["" if r is None else r] * 2     # a second copy answers the one stricter retry
         captured.clear()
         t0 = time.monotonic()
         got = d.describe(c["mode"], list(c["names"]), json.loads(json.dumps(c["spec"])))

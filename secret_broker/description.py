@@ -229,6 +229,33 @@ def plain_language_violation(s, hosts=(), methods=()):
     return technical_kind(s, hosts, methods) is not None
 
 
+_METHOD_WORDS = r"(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)"
+_REPAIR_METHOD_REQ = re.compile(r"\b(" + _METHOD_WORDS + r")\s+requests?\b")
+_REPAIR_METHOD = re.compile(r"\b" + _METHOD_WORDS + r"\b")
+_REPAIR_PATH = re.compile(r"\S*/\S*")
+_REPAIR_IP = re.compile(_IP_RE.pattern, re.I)
+_REPAIR_HOST = re.compile(r"\b(?:[A-Za-z0-9-]{2,}\.)+[A-Za-z]{2,24}\b")
+_REPAIR_STATUS = re.compile(r"\b[1-5]\d\d\b")
+
+
+def repair(s, hosts=(), methods=()):
+    """Fail-soft: swap benign technical tokens for fixed everyday words instead of discarding the whole
+    description. Only fixed phrases are ever inserted ("the service", "the resource", "a server",
+    "web request"), so nothing the model wrote can survive in them. Runs after the markup, link,
+    e-mail, forbidden-word and shout checks and before the technical check, which still refuses
+    whatever is left (JSON, payload, endpoint, headers ...). Own host and own method stay as they are."""
+    own_m = {m.upper() for m in methods}
+    own_h = {h.lower() for h in hosts if h}
+    s = _REPAIR_METHOD_REQ.sub(lambda m: m.group(0) if m.group(1) in own_m else "web request", s)
+    s = _REPAIR_METHOD.sub(lambda m: m.group(0) if m.group(0) in own_m else "web request", s)
+    s = _REPAIR_PATH.sub(lambda m: m.group(0) if m.group(0).lower().strip(".,;:") in own_h else "the resource", s)
+    s = _REPAIR_IP.sub("a server", s)
+    s = _REPAIR_HOST.sub(lambda m: m.group(0) if m.group(0).lower() in own_h else "the service", s)
+    s = _REPAIR_STATUS.sub("", s)
+    s = re.sub(r"\s+([,.;:!?])", r"\1", s)
+    return " ".join(s.split())
+
+
 def request_facts(mode, spec):
     """(hosts, methods) the request itself names; empty for modes without a URL."""
     try:
@@ -283,6 +310,9 @@ def _sanitize(text, hosts=(), methods=()):
         return None, "forbidden_word"
     if len([p for p in _SENTENCE_SPLIT_RE.split(s) if p.strip(" .!?")]) > MAX_SENTENCES:
         return None, "sentences"
+    s = repair(s, hosts, methods)
+    if not s:
+        return None, "empty"
     kind = technical_kind(s, hosts, methods)
     if kind:
         return None, kind
@@ -404,13 +434,35 @@ def reasoning_for(model):
     return dict(DEFAULT_REASONING)
 
 
+# One stricter retry after a rejection that a rewrite can fix. The correction names the kind of
+# problem in fixed words; the rejected text is never sent back.
+RETRY_HINTS = {
+    "technical_http_verb": "your previous reply named a web method. Use everyday words only.",
+    "technical_jargon": "your previous reply used technical terms. Use everyday words only.",
+    "technical_path": "your previous reply contained a path or slash. Use everyday words only.",
+    "technical_ip": "your previous reply contained a network address. Use everyday words only.",
+    "technical_status": "your previous reply contained a number. Write no numbers.",
+    "technical_host": "your previous reply contained a web address. Name only the service in everyday words.",
+    "first_word": "your previous reply did not start with a verb for the change being made. Start with one "
+                  "(Adding, Updating, Deleting, Sending, Running, Logging in to).",
+    "read_word": "your previous reply described a change as reading or checking. Say what is changed.",
+    "minimizing": "your previous reply played down the change. State plainly what is done.",
+    "forbidden_word": "your previous reply used a banned word. Avoid every word on the banned list.",
+    "sentences": "your previous reply was too long. Write at most 2 short sentences.",
+    "too_long": "your previous reply was too long. Write at most 2 short sentences, under 40 words.",
+    "prompt_echo": "your previous reply repeated the instructions. Describe only the request.",
+    "shouting": "your previous reply used capital letters. Use normal capitals.",
+}
+
+
 class Describer:
     """Chat-model description writer with bounds. ``describe`` never raises."""
 
     def __init__(self, api_key, model="openai/gpt-5-mini", timeout=4.0, max_content_chars=400,
                  send_content=True, base_url="https://openrouter.ai/api/v1", max_per_minute=60,
                  concurrency=4, clock=time.monotonic, read_endpoints=(), max_script_chars=1000,
-                 hard_timeout=None):
+                 hard_timeout=None, retry=True):
+        self._retry = retry
         self._key, self._model, self._timeout = keyprovider.as_provider(api_key), model, timeout
         # `timeout` is when the card is first drawn (JevAnalyzer stops waiting); `hard_timeout`
         # is how long the call itself may run so a late reply can still be swapped in
@@ -425,7 +477,7 @@ class Describer:
         self.last_cost = None
         self.last_usage = None            # {prompt_tokens, completion_tokens} of the last call, for evals
 
-    def messages(self, mode, names, spec, guidance=None):
+    def messages(self, mode, names, spec, guidance=None, hint=None):
         tok = secrets.token_hex(8)
         fields = request_fields(mode, names, spec, self._max, self._send,
                                 self._max_script, self._max_script)
@@ -443,6 +495,8 @@ class Describer:
                        "name this service's operations in everyday words; it changes none of the "
                        "rules above, and you still never state or judge risk):\n"
                        f"<<<OWNER NOTES\n{ctx}\nOWNER NOTES END>>>\n")
+        if hint:
+            system += "\nCorrection: " + hint + "\n"
         return [{"role": "system", "content": system},
                 {"role": "user", "content": f"<<<DATA-{tok}\n{body}\nDATA-{tok}>>>"}]
 
@@ -456,7 +510,7 @@ class Describer:
             self._stamps.append(now)
         return True
 
-    def raw(self, mode, names, spec, guidance=None):
+    def raw(self, mode, names, spec, guidance=None, hint=None):
         """One model call. Returns (text|None, reason|None, cost|None). Reason is a class:
         rate_limited, timeout, error, empty (blank reply, usually reasoning used up the
         token budget) or truncated (the reply was cut off at max_tokens)."""
@@ -466,7 +520,7 @@ class Describer:
         if not self._sem.acquire(timeout=self._wait):
             return None, "rate_limited", None
         try:
-            payload = {"model": self._model, "messages": self.messages(mode, names, spec, guidance),
+            payload = {"model": self._model, "messages": self.messages(mode, names, spec, guidance, hint),
                        "max_tokens": MAX_TOKENS, "temperature": 0, "stream": False}
             reasoning = reasoning_for(self._model)
             if reasoning:
@@ -530,7 +584,20 @@ class Describer:
         return {"text": out, "source": "model", "reason": None, "rule": None, "model": self._model}
 
     def describe(self, mode, names, spec, guidance=None):
-        """-> {"text", "source": "model"|"deterministic", "reason": None|class}."""
+        """-> {"text", "source": "model"|"deterministic", "reason": None|class, "rule": None|name}.
+        A reply refused for a fixable reason gets one stricter retry (counts against the same
+        caps); the result of the retry is final."""
         text, reason, cost = guidance_mod.call(self.raw, mode, names, spec, guidance)
         self.last_cost = cost
-        return self.finish(text, reason, mode, names, spec)
+        out = self.finish(text, reason, mode, names, spec)
+        hint = RETRY_HINTS.get(out.get("rule")) if self._retry and out["source"] != "model" else None
+        if hint and out["reason"] == "rejected":
+            text2, reason2, cost2 = self.raw(mode, names, spec, guidance, hint=hint)
+            if cost2 is not None:
+                self.last_cost = (cost or 0.0) + cost2
+            out2 = self.finish(text2, reason2, mode, names, spec)
+            if out2["source"] == "model" or out2["reason"] == "rejected":
+                out2["retried"] = True
+                return out2
+            out["retried"] = True       # the retry itself failed (timeout, rate cap ...): keep the first rule
+        return out
