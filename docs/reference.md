@@ -746,8 +746,9 @@ Set `type` to pick another:
 | `low_threshold` | `jev` | 0.5 | a `low` answer with P(low) below this becomes `medium` |
 | `summary_text` | `jev` | `chat` | `chat` (a chat model writes a plain-language description, in parallel with the decision call, display only), `deterministic` (a technical one-liner prefixed `auto:`) or `none` |
 | `summary_model` | `jev` | `openai/gpt-5-mini` | chat model for `summary_text: chat` |
-| `summary_timeout` | `jev` | 4 | seconds for the description call; slow or failed falls back to the `auto:` line |
-| `summary_max_per_minute` | `jev` | 30 | cap on description calls; excess uses the `auto:` line |
+| `summary_timeout` | `jev` | 4 | seconds the broker waits for the description before drawing the card with the plain `auto:` line (marked "model description pending"); the call is not cancelled then |
+| `summary_hard_timeout` | `jev` | 30 | ceiling in seconds (at least `summary_timeout`, at most 120) for the description call and for the rating call. A description that arrives before it replaces the plain line in the card, the history row and the details pop-over; after it the plain line is final and the reason class (`timeout`, `error`, ...) is recorded. A late rating is shown as "rated later" and never changes how the request is handled. See docs/risk.md |
+| `summary_max_per_minute` | `jev` | 60 | cap on description calls; excess uses the `auto:` line |
 | `summary_concurrency` | `jev` | 4 | simultaneous description calls |
 | `summary_base_url` | `jev` | `https://openrouter.ai/api/v1` | chat endpoint root for descriptions. Required when `base_url` is custom (otherwise descriptions are disabled with a startup warning, so request details and the key are never sent to the default endpoint) |
 | `summary_read_endpoints` | `jev` | `[]` | list of `{"host": "name[:port]", "path": "/exact/path"}` for POST endpoints that are pure reads (exact host, case-insensitive, and exact path; request must have no query string, userinfo or method-override header); their descriptions may use read verbs. Other writes get the technical `auto:` line unless the AI phrase starts with a write verb |

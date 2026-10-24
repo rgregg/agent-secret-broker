@@ -1,0 +1,595 @@
+{
+ "about": "Scrubbed request shapes for tools/describe_eval/run.py. Hosts are example names; no secrets. stub_reply is what --stub serves; the real run ignores it.",
+ "read_endpoints": [],
+ "cases": [
+  {
+   "id": "get-models",
+   "label": "plain GET",
+   "mode": "http",
+   "names": [
+    "svc"
+   ],
+   "spec": {
+    "method": "GET",
+    "url": "https://api.example.com/v1/models",
+    "headers": {
+     "Authorization": "Bearer {{TOKEN}}"
+    }
+   },
+   "stub_reply": "Retrieving the list of AI models offered by the example service."
+  },
+  {
+   "id": "get-paged",
+   "label": "paging GET (query string is never sent)",
+   "mode": "http",
+   "names": [
+    "svc"
+   ],
+   "spec": {
+    "method": "GET",
+    "url": "https://api.example.com/v1/items?page=7&per_page=100",
+    "headers": {
+     "Authorization": "Bearer {{TOKEN}}"
+    }
+   },
+   "stub_reply": "Listing one page of items from the example service."
+  },
+  {
+   "id": "get-health",
+   "label": "status check",
+   "mode": "http",
+   "names": [
+    "svc"
+   ],
+   "spec": {
+    "method": "GET",
+    "url": "https://grafana.example.com/api/health",
+    "headers": {
+     "Authorization": "Bearer {{TOKEN}}"
+    }
+   },
+   "stub_reply": "Checking whether the Grafana server is healthy."
+  },
+  {
+   "id": "get-bigpath",
+   "label": "long odd path",
+   "mode": "http",
+   "names": [
+    "svc"
+   ],
+   "spec": {
+    "method": "GET",
+    "url": "https://api.example.com/v1/accounts/0123456789abcdef/projects/alpha-beta/environments/staging/services/web/deployments/latest/logs/stream",
+    "headers": {
+     "Authorization": "Bearer {{TOKEN}}"
+    }
+   },
+   "stub_reply": "Retrieving the latest deployment logs for the web service in the staging environment."
+  },
+  {
+   "id": "login-post",
+   "label": "login-style POST to a controller",
+   "mode": "http",
+   "names": [
+    "svc"
+   ],
+   "spec": {
+    "method": "POST",
+    "url": "https://unifi.example.com/api/auth/login",
+    "headers": {
+     "Content-Type": "application/json"
+    },
+    "body": "{\"username\":\"claude\",\"password\":\"{{UNIFI_PASSWORD}}\",\"remember\":true}"
+   },
+   "stub_reply": "Logging in to the UniFi controller. This starts a session that later calls can use."
+  },
+  {
+   "id": "graphql",
+   "label": "GraphQL POST that only reads",
+   "mode": "http",
+   "names": [
+    "svc"
+   ],
+   "spec": {
+    "method": "POST",
+    "url": "https://api.example.com/graphql",
+    "headers": {
+     "Authorization": "Bearer {{TOKEN}}"
+    },
+    "body": "{\"query\":\"{ viewer { login repositories(first: 10) { nodes { name } } } }\"}"
+   },
+   "stub_reply": "Sending a query to the example service. It looks up the names of the first ten repositories of the signed-in account."
+  },
+  {
+   "id": "search-post",
+   "label": "search-style POST",
+   "mode": "http",
+   "names": [
+    "svc"
+   ],
+   "spec": {
+    "method": "POST",
+    "url": "https://photos.example.com/api/search/metadata",
+    "headers": {
+     "Authorization": "Bearer {{TOKEN}}"
+    },
+    "body": "{\"query\":\"beach sunset 2024\",\"size\":50}"
+   },
+   "stub_reply": "Sending a photo search for beach sunsets. It returns the matching pictures."
+  },
+  {
+   "id": "webhook",
+   "label": "webhook-like call",
+   "mode": "http",
+   "names": [
+    "svc"
+   ],
+   "spec": {
+    "method": "POST",
+    "url": "https://hooks.example.com/services/T000/B000/XXXX",
+    "headers": {
+     "Authorization": "Bearer {{TOKEN}}"
+    },
+    "body": "{\"text\":\"Backup finished\"}"
+   },
+   "stub_reply": "Sending a message to a chat channel saying that the backup has finished."
+  },
+  {
+   "id": "custom-ua",
+   "label": "POST with a custom User-Agent",
+   "mode": "http",
+   "names": [
+    "svc"
+   ],
+   "spec": {
+    "method": "POST",
+    "url": "https://api.example.com/v1/tickets",
+    "headers": {
+     "Authorization": "Bearer {{TOKEN}}",
+     "User-Agent": "asb-agent/2.1 (+https://example.com/bot)"
+    },
+    "body": "{\"title\":\"Printer is jammed\"}"
+   },
+   "stub_reply": "Creating a new support ticket titled Printer is jammed."
+  },
+  {
+   "id": "put-light",
+   "label": "PUT service call",
+   "mode": "http",
+   "names": [
+    "svc"
+   ],
+   "spec": {
+    "method": "PUT",
+    "url": "http://homeassistant.example.lan:8123/api/states/light.desk",
+    "headers": {
+     "Authorization": "Bearer {{TOKEN}}"
+    },
+    "body": "{\"state\":\"off\"}"
+   },
+   "stub_reply": "Turning off the desk light in Home Assistant."
+  },
+  {
+   "id": "delete-vm",
+   "label": "DELETE a VM",
+   "mode": "http",
+   "names": [
+    "svc"
+   ],
+   "spec": {
+    "method": "DELETE",
+    "url": "https://pve.example.com:8006/api2/json/nodes/pve1/qemu/104",
+    "headers": {
+     "Authorization": "Bearer {{TOKEN}}"
+    }
+   },
+   "stub_reply": "Deleting a virtual machine on the pve1 host in Proxmox. The machine and its disks are removed."
+  },
+  {
+   "id": "patch-rename",
+   "label": "PATCH rename",
+   "mode": "http",
+   "names": [
+    "svc"
+   ],
+   "spec": {
+    "method": "PATCH",
+    "url": "https://api.example.com/v1/projects/42",
+    "headers": {
+     "Authorization": "Bearer {{TOKEN}}"
+    },
+    "body": "{\"name\":\"Website redesign\"}"
+   },
+   "stub_reply": "Renaming a project to Website redesign."
+  },
+  {
+   "id": "post-dns",
+   "label": "create a DNS record",
+   "mode": "http",
+   "names": [
+    "svc"
+   ],
+   "spec": {
+    "method": "POST",
+    "url": "https://api.cloudflare.example.com/client/v4/zones/z1/dns_records",
+    "headers": {
+     "Authorization": "Bearer {{TOKEN}}"
+    },
+    "body": "{\"type\":\"A\",\"name\":\"app.example.com\",\"content\":\"203.0.113.10\"}"
+   },
+   "stub_reply": "Adding a DNS record in Cloudflare that points a website name to a new address."
+  },
+  {
+   "id": "restart-container",
+   "label": "restart through a manager API",
+   "mode": "http",
+   "names": [
+    "svc"
+   ],
+   "spec": {
+    "method": "POST",
+    "url": "https://komodo.example.com/execute/RestartContainer",
+    "headers": {
+     "Authorization": "Bearer {{TOKEN}}"
+    },
+    "body": "{\"server\":\"media\",\"container\":\"plex\"}"
+   },
+   "stub_reply": "Restarting the Plex container on the media server."
+  },
+  {
+   "id": "session-open",
+   "label": "session open (login)",
+   "mode": "http",
+   "names": [
+    "svc"
+   ],
+   "spec": {
+    "method": "POST",
+    "url": "https://portal.example.com/session",
+    "headers": {
+     "Content-Type": "application/json"
+    },
+    "body": "{\"user\":\"claude\",\"password\":\"{{PORTAL_PASSWORD}}\"}"
+   },
+   "stub_reply": "Logging in to the portal. This opens a session for the calls that follow.",
+   "note": "Sessions are not in this build; shape of a login that would open one"
+  },
+  {
+   "id": "session-call",
+   "label": "call made with a session cookie",
+   "mode": "http",
+   "names": [
+    "svc"
+   ],
+   "spec": {
+    "method": "GET",
+    "url": "https://portal.example.com/api/reports/weekly",
+    "headers": {
+     "Cookie": "{{SESSION}}"
+    }
+   },
+   "stub_reply": "Retrieving the weekly report from the portal.",
+   "note": "session call shape"
+  },
+  {
+   "id": "plan-submit",
+   "label": "plan submission",
+   "mode": "http",
+   "names": [
+    "svc"
+   ],
+   "spec": {
+    "method": "POST",
+    "url": "https://planner.example.com/api/plans",
+    "headers": {
+     "Authorization": "Bearer {{TOKEN}}"
+    },
+    "body": "{\"steps\":[\"stop web\",\"backup db\",\"start web\"]}"
+   },
+   "stub_reply": "Submitting a three-step maintenance plan to the planner. The steps stop the website, back up the database and start the website again.",
+   "note": "Plans are not in this build; shape only"
+  },
+  {
+   "id": "plan-step",
+   "label": "plan step call",
+   "mode": "http",
+   "names": [
+    "svc"
+   ],
+   "spec": {
+    "method": "POST",
+    "url": "https://planner.example.com/api/plans/9/steps/2/run",
+    "headers": {
+     "Authorization": "Bearer {{TOKEN}}"
+    },
+    "body": "{}"
+   },
+   "stub_reply": "Running the second step of a maintenance plan.",
+   "note": "shape only"
+  },
+  {
+   "id": "env-backup-bash",
+   "label": "bash backup script",
+   "mode": "env",
+   "names": [
+    "svc"
+   ],
+   "spec": {
+    "argv": [
+     "./backup.sh"
+    ],
+    "scripts": [
+     {
+      "path": "./backup.sh",
+      "text": "#!/bin/bash\nset -e\nrsync -a --delete /srv/photos/ backup.example.com:/mnt/backups/photos/\necho done\n"
+     }
+    ]
+   },
+   "stub_reply": "Running a backup script. It copies the photo folder to the backup server and removes files there that no longer exist."
+  },
+  {
+   "id": "env-sync-python",
+   "label": "python sync script",
+   "mode": "env",
+   "names": [
+    "svc"
+   ],
+   "spec": {
+    "argv": [
+     "python3",
+     "sync.py"
+    ],
+    "scripts": [
+     {
+      "path": "sync.py",
+      "text": "import os, subprocess\nsubprocess.run(['rclone','sync','/srv/media','remote:media'], check=True)\n"
+     }
+    ]
+   },
+   "stub_reply": "Running a Python script. It copies the media folder to a remote storage service."
+  },
+  {
+   "id": "env-check",
+   "label": "script that only reads",
+   "mode": "env",
+   "names": [
+    "svc"
+   ],
+   "spec": {
+    "argv": [
+     "./check.sh"
+    ],
+    "scripts": [
+     {
+      "path": "./check.sh",
+      "text": "#!/bin/sh\ncurl -sf https://status.example.com/health || exit 1\n"
+     }
+    ]
+   },
+   "stub_reply": "Checking whether the status page of the example service reports healthy."
+  },
+  {
+   "id": "env-deploy",
+   "label": "deploy script",
+   "mode": "env",
+   "names": [
+    "svc"
+   ],
+   "spec": {
+    "argv": [
+     "bash",
+     "deploy.sh"
+    ],
+    "scripts": [
+     {
+      "path": "deploy.sh",
+      "text": "#!/bin/bash\ncd /opt/stacks/web && docker compose pull && docker compose up -d\n"
+     }
+    ]
+   },
+   "stub_reply": "Running a deploy script. It downloads new images and restarts the web stack."
+  },
+  {
+   "id": "env-unreadable",
+   "label": "script that could not be read",
+   "mode": "env",
+   "names": [
+    "svc"
+   ],
+   "spec": {
+    "argv": [
+     "./mystery.sh"
+    ],
+    "scripts": [
+     {
+      "path": "./mystery.sh",
+      "unreadable": "permission"
+     }
+    ]
+   },
+   "stub_reply": "Running a script whose contents could not be seen."
+  },
+  {
+   "id": "env-stdin",
+   "label": "script from standard input",
+   "mode": "env",
+   "names": [
+    "svc"
+   ],
+   "spec": {
+    "argv": [
+     "bash",
+     "-s"
+    ],
+    "scripts": [
+     {
+      "stdin": true
+     }
+    ]
+   },
+   "stub_reply": "Running a script that was typed in directly, so its job is unknown."
+  },
+  {
+   "id": "env-compose",
+   "label": "docker compose up",
+   "mode": "env",
+   "names": [
+    "svc"
+   ],
+   "spec": {
+    "argv": [
+     "docker",
+     "compose",
+     "up",
+     "-d"
+    ]
+   },
+   "stub_reply": "Starting the containers of a stack in the background."
+  },
+  {
+   "id": "env-ssh",
+   "label": "ssh command",
+   "mode": "env",
+   "names": [
+    "svc"
+   ],
+   "spec": {
+    "argv": [
+     "ssh",
+     "root@host.example.lan",
+     "uptime"
+    ]
+   },
+   "stub_reply": "Checking how long a server has been running."
+  },
+  {
+   "id": "env-git-push",
+   "label": "git push",
+   "mode": "env",
+   "names": [
+    "svc"
+   ],
+   "spec": {
+    "argv": [
+     "git",
+     "push",
+     "origin",
+     "main"
+    ]
+   },
+   "stub_reply": "Pushing code changes to the main branch of a repository."
+  },
+  {
+   "id": "env-curl-ua",
+   "label": "curl with a custom User-Agent",
+   "mode": "env",
+   "names": [
+    "svc"
+   ],
+   "spec": {
+    "argv": [
+     "curl",
+     "-A",
+     "asb-agent/2.1",
+     "-X",
+     "POST",
+     "https://api.example.com/v1/ping"
+    ]
+   },
+   "stub_reply": "Sending a ping to the example service."
+  },
+  {
+   "id": "store-create",
+   "label": "store: create a credential",
+   "mode": "store",
+   "names": [
+    "new"
+   ],
+   "spec": {
+    "op": "create",
+    "item": "newapi",
+    "field": "notes",
+    "value": "x"
+   },
+   "stub_reply": "Saving a new credential so that it can be used later."
+  },
+  {
+   "id": "store-update",
+   "label": "store: update a credential",
+   "mode": "store",
+   "names": [
+    "svc"
+   ],
+   "spec": {
+    "op": "update",
+    "item": "svc",
+    "field": "token",
+    "value": "x"
+   },
+   "stub_reply": "Updating a saved credential with a new value."
+  },
+  {
+   "id": "ssh-login",
+   "label": "ssh signing: login",
+   "mode": "ssh_sign",
+   "names": [
+    "key"
+   ],
+   "spec": {
+    "ssh": {
+     "text": "login as root"
+    }
+   },
+   "stub_reply": null,
+   "pipeline": "never_sent"
+  },
+  {
+   "id": "ssh-commit",
+   "label": "ssh signing: git commit",
+   "mode": "ssh_sign",
+   "names": [
+    "key"
+   ],
+   "spec": {
+    "ssh": {
+     "text": "git commit signature"
+    }
+   },
+   "stub_reply": null,
+   "pipeline": "never_sent"
+  },
+  {
+   "id": "credential-request",
+   "label": "credential request",
+   "mode": "credential",
+   "names": [
+    "grafana"
+   ],
+   "spec": {},
+   "pipeline": "none",
+   "note": "high by code, no model, no description"
+  },
+  {
+   "id": "guidance-proposal",
+   "label": "guidance proposal",
+   "mode": "guidance",
+   "names": [
+    "svc"
+   ],
+   "spec": {},
+   "pipeline": "none",
+   "note": "high by code, no model, no description"
+  },
+  {
+   "id": "enrollment",
+   "label": "client enrollment",
+   "mode": "enrollment",
+   "names": [
+    "laptop"
+   ],
+   "spec": {},
+   "pipeline": "none",
+   "note": "decided by a human on the Clients tab; no model, no description"
+  }
+ ]
+}

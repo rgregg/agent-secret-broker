@@ -43,6 +43,8 @@ RUBRIC_VERSION = 3   # 2: generic action/execute endpoints paragraph; 3: truncat
 DEFAULT_JEV_MODEL = "typesafe/jev-1.14"
 DEFAULT_JEV_BASE = "https://openrouter.ai/api"
 DESCRIBER_DEFAULT_BASE = "https://openrouter.ai/api/v1"
+DEFAULT_HARD_TIMEOUT = 30.0    # how long a description or rating call may run before it is given up for good
+_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=32, thread_name_prefix="asb-model")
 DEFAULT_MAX_SCRIPT_CHARS = 4000       # summary.max_script_chars: script text per script sent to jev
 MAX_SCRIPT_CHARS_LIMIT = 20000
 
@@ -356,8 +358,12 @@ class JevAnalyzer:
 
     def __init__(self, api_key, model=DEFAULT_JEV_MODEL, timeout=6.0, base_url=DEFAULT_JEV_BASE,
                  max_content_chars=400, send_content=True, high_threshold=0.5, low_threshold=0.5,
-                 summary_mode="chat", describer=None, max_script_chars=DEFAULT_MAX_SCRIPT_CHARS):
+                 summary_mode="chat", describer=None, max_script_chars=DEFAULT_MAX_SCRIPT_CHARS,
+                 hard_timeout=None):
         self._key, self._model, self._timeout = keyprovider.as_provider(api_key), model, timeout
+        # the rating is waited for `timeout` seconds; the call may run to `hard_timeout`, so a late
+        # rating can still be shown (display only: the gate never reads it)
+        self._hard = max(float(timeout), min(float(hard_timeout), 120.0)) if hard_timeout else float(timeout)
         self._base = base_url.rstrip("/")
         self._max, self._send = max_content_chars, send_content
         self._hi, self._lo = high_threshold, low_threshold
@@ -392,7 +398,7 @@ class JevAnalyzer:
             return None, None           # no usable key: same as a provider failure
         try:
             resp = _post_json(f"{self._base}/alpha/decisions", key,
-                              self.payload(mode, names, spec, guidance), self._timeout)
+                              self.payload(mode, names, spec, guidance), self._hard)
         except Exception:  # noqa: BLE001  (HTTP error, timeout, bad JSON, ...)
             return None, None
         cost = None
@@ -407,23 +413,46 @@ class JevAnalyzer:
 
     def analyze(self, mode, names, spec, guidance=None):
         """The level comes from classify() alone. The description (display only)
-        is produced independently and can never change it."""
-        src = reason = None
-        if self._summary_mode == "chat" and self._describer is not None:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-                fut = ex.submit(self._describe, mode, names, spec, guidance)
-                level, cost = self.classify(mode, names, spec, guidance)
-                d = fut.result()
-            summary, src, reason = d["text"], d["source"], d["reason"]
+        is produced independently and can never change it.
+
+        Both model calls run off this thread. The caller waits for the rating up to ``timeout``
+        (no verdict then counts as high, as before) and for the description up to the describer's
+        ``timeout``; a call that is still running is NOT cancelled: it is returned as a future
+        ("rating_late", "summary_late") so the broker can show the answer when it arrives. The
+        rating decision is already taken by then and never revisited."""
+        t0 = time.monotonic()
+        src = reason = rule = None
+        dfut = rfut_late = dlate = None
+        chat = self._summary_mode == "chat" and self._describer is not None
+        if chat:
+            dfut = _POOL.submit(self._describe, mode, names, spec, guidance)
+        rfut = _POOL.submit(self.classify, mode, names, spec, guidance)
+        try:
+            level, cost = rfut.result(timeout=self._timeout if self._hard > self._timeout else None)
+        except concurrent.futures.TimeoutError:
+            level, cost, rfut_late = None, None, rfut
+        except Exception:  # noqa: BLE001
+            level, cost = None, None
+        pending = False
+        if chat:
+            soft = float(getattr(self._describer, "_timeout", self._timeout))
+            progressive = float(getattr(self._describer, "_hard", soft)) > soft
+            try:
+                d = dfut.result(timeout=max(0.0, soft - (time.monotonic() - t0)) if progressive else None)
+            except concurrent.futures.TimeoutError:
+                d = {"text": deterministic_summary(mode, names, spec), "source": "deterministic",
+                     "reason": "pending", "rule": None}
+                pending, dlate = True, dfut
+            summary, src, reason, rule = d["text"], d["source"], d["reason"], d.get("rule")
+        elif self._summary_mode == "none":
+            summary = None
         else:
-            level, cost = self.classify(mode, names, spec, guidance)
-            if self._summary_mode == "none":
-                summary = None
-            else:
-                summary, src = deterministic_summary(mode, names, spec), "deterministic"
+            summary, src = deterministic_summary(mode, names, spec), "deterministic"
+            reason = "disabled"       # configured off: no model was asked
         self.last_cost = cost
         return {"summary": summary, "risk": level, "cost": cost,
-                "summary_source": src, "summary_reason": reason,
+                "summary_source": src, "summary_reason": reason, "summary_rule": rule,
+                "summary_pending": pending, "summary_late": dlate, "rating_late": rfut_late,
                 "summary_model": (getattr(self._describer, "_model", None)
                                   if src == "model" else None)}
 
@@ -455,8 +484,8 @@ class ChatAnalyzer(summarize.OpenRouterSummarizer):
         if self._prompt == "rubric":
             system = (RUBRIC + (SCRIPT_RUBRIC if (spec or {}).get("scripts") else "")
                       + "\n" + extra
-                      + 'Reply with ONLY a JSON object: {"summary": "<=12 words saying what '
-                      'the request does", "risk": "low|medium|high"}.')
+                      + 'Reply with ONLY a JSON object: {"summary": "1 or 2 plain sentences '
+                      '(about 15 to 40 words) saying what the request does and on which service", "risk": "low|medium|high"}.')
             return [{"role": "system", "content": system},
                     {"role": "user", "content": chat_user_text(mode, names, spec, self._max, self._send,
                                                                        self._max_script)}]
@@ -465,7 +494,7 @@ class ChatAnalyzer(summarize.OpenRouterSummarizer):
 
     def analyze(self, mode, names, spec, guidance=None):
         payload = {"model": self._model, "messages": self._messages(mode, names, spec, guidance),
-                   "max_tokens": 200, "temperature": 0, "reasoning": {"effort": "minimal"}}
+                   "max_tokens": 400, "temperature": 0, "reasoning": {"effort": "minimal"}}
         key = self._key.get()
         if not key:
             self.last_cost = None
@@ -489,7 +518,7 @@ class ChatAnalyzer(summarize.OpenRouterSummarizer):
                 summary, risk = str(obj.get("summary") or ""), str(obj.get("risk") or "").lower()
             except (json.JSONDecodeError, AttributeError):
                 pass
-        summary = " ".join(summary.split())[:100] or None
+        summary = " ".join(summary.split())[:summarize.MAX_SUMMARY] or None
         return {"summary": summary, "risk": risk if risk in LEVELS else None, "cost": self.last_cost}
 
 
@@ -509,7 +538,8 @@ class FloorAnalyzer:
     def analyze(self, mode, names, spec, guidance=None):
         if mode == "ssh_sign":
             return {"summary": deterministic_summary(mode, names, spec), "risk": "high",
-                    "cost": None, "summary_source": "deterministic", "summary_reason": None}
+                    "cost": None, "summary_source": "deterministic", "summary_reason": "not_sent",
+                    "summary_rule": None}
         res = guidance_mod.call(self.inner.analyze, mode, names, spec, guidance)
         try:
             # floor: any request (every method, known or not; a safe method only when it carries
@@ -540,7 +570,7 @@ _KEYS = {
                    "prompt", "base_url"},
     "jev": {"type", "api_key_file", "api_key_secret", "api_key_ttl_s", "api_key_grace_s", "model", "timeout", "max_content_chars", "send_content",
             "max_script_chars", "base_url", "high_threshold", "low_threshold", "summary_text", "summary_model",
-            "summary_timeout", "summary_max_per_minute", "summary_concurrency", "summary_base_url", "summary_read_endpoints"},
+            "summary_timeout", "summary_hard_timeout", "summary_max_per_minute", "summary_concurrency", "summary_base_url", "summary_read_endpoints"},
 }
 
 
@@ -607,6 +637,11 @@ def validate_config(sc):
         t = sc.get("summary_timeout", 4.0)
         if isinstance(t, bool) or not isinstance(t, (int, float)) or not 0 < t <= 60:
             raise ValueError("summary.summary_timeout must be a number of seconds, 0 < t <= 60")
+        h = sc.get("summary_hard_timeout", DEFAULT_HARD_TIMEOUT)
+        if isinstance(h, bool) or not isinstance(h, (int, float)) or not 0 < h <= 120:
+            raise ValueError("summary.summary_hard_timeout must be a number of seconds, 0 < t <= 120")
+        if h < t:
+            raise ValueError("summary.summary_hard_timeout must be at least summary.summary_timeout")
         for k, hi in (("summary_max_per_minute", 6000), ("summary_concurrency", 64)):
             v = sc.get(k, 1)
             if isinstance(v, bool) or not isinstance(v, int) or not 1 <= v <= hi:
@@ -662,15 +697,17 @@ def build(sc, read, clock=time.monotonic):
             key, sc.get("summary_model", "openai/gpt-5-mini"), timeout=sc.get("summary_timeout", 4.0),
             max_content_chars=sc.get("max_content_chars", 400), send_content=sc.get("send_content", True),
             base_url=sc.get("summary_base_url", DESCRIBER_DEFAULT_BASE),
-            max_per_minute=sc.get("summary_max_per_minute", 30), concurrency=sc.get("summary_concurrency", 4),
-            read_endpoints=sc.get("summary_read_endpoints", []))
+            max_per_minute=sc.get("summary_max_per_minute", 60), concurrency=sc.get("summary_concurrency", 4),
+            read_endpoints=sc.get("summary_read_endpoints", []),
+            hard_timeout=sc.get("summary_hard_timeout", DEFAULT_HARD_TIMEOUT))
     fa = FloorAnalyzer(JevAnalyzer(
         key, sc.get("model", DEFAULT_JEV_MODEL), timeout=sc.get("timeout", 6.0),
         base_url=sc.get("base_url", DEFAULT_JEV_BASE),
         max_content_chars=sc.get("max_content_chars", 400), send_content=sc.get("send_content", True),
         high_threshold=sc.get("high_threshold", 0.5), low_threshold=sc.get("low_threshold", 0.5),
         summary_mode=mode, describer=describer,
-        max_script_chars=sc.get("max_script_chars", DEFAULT_MAX_SCRIPT_CHARS)))
+        max_script_chars=sc.get("max_script_chars", DEFAULT_MAX_SCRIPT_CHARS),
+        hard_timeout=sc.get("summary_hard_timeout", DEFAULT_HARD_TIMEOUT)))
     fa.config_warnings = warnings
     fa.key_providers = providers
     return fa
