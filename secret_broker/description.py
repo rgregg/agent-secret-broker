@@ -229,29 +229,22 @@ def plain_language_violation(s, hosts=(), methods=()):
     return technical_kind(s, hosts, methods) is not None
 
 
-_METHOD_WORDS = r"(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)"
-_REPAIR_METHOD_REQ = re.compile(r"\b(" + _METHOD_WORDS + r")\s+requests?\b")
-_REPAIR_METHOD = re.compile(r"\b" + _METHOD_WORDS + r"\b")
 _REPAIR_PATH = re.compile(r"\S*/\S*")
 _REPAIR_IP = re.compile(_IP_RE.pattern, re.I)
 _REPAIR_HOST = re.compile(r"\b(?:[A-Za-z0-9-]{2,}\.)+[A-Za-z]{2,24}\b")
-_REPAIR_STATUS = re.compile(r"\b[1-5]\d\d\b")
 
 
-def repair(s, hosts=(), methods=()):
-    """Fail-soft: swap benign technical tokens for fixed everyday words instead of discarding the whole
-    description. Only fixed phrases are ever inserted ("the service", "the resource", "a server",
-    "web request"), so nothing the model wrote can survive in them. Runs after the markup, link,
-    e-mail, forbidden-word and shout checks and before the technical check, which still refuses
-    whatever is left (JSON, payload, endpoint, headers ...). Own host and own method stay as they are."""
-    own_m = {m.upper() for m in methods}
+def repair(s, hosts=()):
+    """Fail-soft: swap a host name, address or path for wording that is plainly NOT the real target,
+    instead of discarding the whole description. Only fixed phrases are inserted ("another service",
+    "another server", "another resource"), so nothing the model wrote survives in them. Never touched
+    (the text is refused instead): numbers, HTTP method names and technical terms, because dropping
+    or rewording those could change what the text claims. The caller re-runs every check on the
+    result. The request's own host stays as written."""
     own_h = {h.lower() for h in hosts if h}
-    s = _REPAIR_METHOD_REQ.sub(lambda m: m.group(0) if m.group(1) in own_m else "web request", s)
-    s = _REPAIR_METHOD.sub(lambda m: m.group(0) if m.group(0) in own_m else "web request", s)
-    s = _REPAIR_PATH.sub(lambda m: m.group(0) if m.group(0).lower().strip(".,;:") in own_h else "the resource", s)
-    s = _REPAIR_IP.sub("a server", s)
-    s = _REPAIR_HOST.sub(lambda m: m.group(0) if m.group(0).lower() in own_h else "the service", s)
-    s = _REPAIR_STATUS.sub("", s)
+    s = _REPAIR_PATH.sub(lambda m: m.group(0) if m.group(0).lower().strip(".,;:") in own_h else "another resource", s)
+    s = _REPAIR_IP.sub("another server", s)
+    s = _REPAIR_HOST.sub(lambda m: m.group(0) if m.group(0).lower() in own_h else "another service", s)
     s = re.sub(r"\s+([,.;:!?])", r"\1", s)
     return " ".join(s.split())
 
@@ -306,23 +299,36 @@ def _sanitize(text, hosts=(), methods=()):
     s = re.sub(r"[*_#~|\\]+", "", s).strip()   # stray markdown emphasis
     if not s:
         return None, "empty"
+    rule = _validate(s, hosts, methods)
+    if rule is None:
+        return s, None
+    if not rule.startswith("technical_"):
+        return None, rule
+    fixed = repair(s, hosts)
+    if not fixed or fixed == s:
+        return None, rule
+    rule = _validate(fixed, hosts, methods)       # EVERY check again, on the text that would be shown
+    return (fixed, None) if rule is None else (None, rule)
+
+
+def _validate(s, hosts, methods):
+    """The name of the first check the (single-line, ASCII) text fails, or None."""
+    if "`" in s or _URL_RE.search(s) or _EMAIL_RE.search(s) or _HTML_RE.search(s) or _MD_LINK_RE.search(s):
+        return "markup"
     if _FORBIDDEN_RE.search(s):
-        return None, "forbidden_word"
+        return "forbidden_word"
     if len([p for p in _SENTENCE_SPLIT_RE.split(s) if p.strip(" .!?")]) > MAX_SENTENCES:
-        return None, "sentences"
-    s = repair(s, hosts, methods)
-    if not s:
-        return None, "empty"
+        return "sentences"
     kind = technical_kind(s, hosts, methods)
     if kind:
-        return None, kind
+        return kind
     if any(m not in _SHOUT_OK for m in _SHOUTING_RE.findall(s)):
-        return None, "shouting"                # echoed canary/shouted tokens
+        return "shouting"                      # echoed canary/shouted tokens
     if _quotes_prompt(s):
-        return None, "prompt_echo"
+        return "prompt_echo"
     if len(s) > MAX_LEN:
-        return None, "too_long"                # never cut a sentence short: the fallback is honest
-    return s, None
+        return "too_long"                      # never cut a sentence short: the fallback is honest
+    return None
 
 
 def _quotes_prompt(s):

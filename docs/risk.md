@@ -226,13 +226,14 @@ with a test that the dangerous variants are still rejected:
 
 ### Fail-soft repair and one retry
 
-Instead of discarding a description for a benign technical token, `description.repair` swaps it
-for a fixed phrase after the markup, link, e-mail, banned-word and shouting checks have passed:
-another host name becomes "the service", a slash token "the resource", an address "a server", a
-method name "web request", a 100-599 number is dropped. Only those fixed phrases are ever
-inserted, and the repaired text still goes through the technical check (JSON, payload, endpoint,
-header, curl stay refused), the consistency check and the length and sentence caps. The request's
-own host and method are left as written.
+Instead of discarding a description for a host name, address or path, `description.repair` swaps
+it for wording that is plainly not the real target ("another service", "another server", "another
+resource"). Only those fixed phrases are inserted. Numbers (status codes, quantities), HTTP method
+names and technical terms are never rewritten or dropped: the text is refused instead, because
+changing them could change what it claims. After repair EVERY check runs again on the text that
+would be shown (markup, banned words, sentences, technical syntax, shouting, prompt copy, length),
+and the consistency check (write verb first, no read or minimizing words) runs on it too; any
+failure rejects the description. The request's own host and method are left as written.
 
 A reply refused for a reason a rewrite can fix (`RETRY_HINTS`: technical_*, first_word, read_word,
 minimizing, forbidden_word, sentences, too_long, prompt_echo, shouting) gets ONE retry with a
