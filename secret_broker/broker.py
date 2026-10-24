@@ -19,7 +19,6 @@ import dataclasses
 import hashlib
 import hmac
 import html
-import http.client
 import ipaddress
 import json
 import logging
@@ -28,7 +27,6 @@ import queue
 import random
 import re
 import secrets
-import ssl
 import threading
 import time
 import urllib.error
@@ -41,9 +39,13 @@ from .backends import BackendError
 from .backends.base import BackendNotFound
 from .backends import base as backend_base
 from . import audit_api
+from . import destguard
+from . import errclass
+from . import httpcheck
+from . import masking
 from . import notify as notify_mod
 from . import presence as presence_mod
-from .notify import NotifyError
+from .notify import NotifyError  # noqa: F401 -- re-exported
 from . import grants as grants_mod
 from . import icon as icon_mod
 from . import standing as standing_mod
@@ -73,6 +75,9 @@ MAX_REQUEST_BYTES = 8_000_000
 MAX_STORE_VALUE = 65_536
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,40}$")
 _HOST_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
+# an allowed_hosts entry: a host name, optionally with :port (a port is how an IP literal is allowed
+# off the default ports; see destguard.ip_port_ok)
+_HOST_ENTRY_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?(:[0-9]{1,5})?$")
 _VAR_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,60}$")
 # Variable names that change how a process loads code or resolves commands: a
 # secret exposed under one of these in env mode would be a code-execution primitive.
@@ -214,7 +219,7 @@ class _InternalRefused(ValueError):
 class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.SessionsMixin,
              planflow.PlansMixin):
     def __init__(self, config, backend, notifier, audit=None, summarizer=None,
-                 background_load=False, push=None):
+                 background_load=False, push=None, dest_guard=None):
         self.push = push                # PushStore when the webpush transport is configured
         self.cfg = config
         self.cfg["secrets"] = {}        # the catalog lives in the vault; see refresh_catalog()
@@ -232,6 +237,22 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         self.action_policy = notify_mod.parse_action_policy(
             config.get("notify_actions"), "notify_actions")
         self._audit = audit if isinstance(audit, AuditLog) else AuditLog(audit)
+        # ONE destination guard for every outbound call made for an agent (http, sessions, plans).
+        # `dest_guard` is the Python-API injection point (tests); the JSON config only adds deny CIDRs.
+        self.dest_guard = dest_guard or destguard.DestGuard.from_config(config)
+        # an explicit null means "default"; the REAL bound ports are registered again in serve()
+        self.dest_guard.register_ports(config.get("client_port") or 8800, config.get("approval_port") or 8801)
+        self._trusted_proxies = parse_trusted_proxies(config)      # client API listener only
+        self._approval_proxies = parse_trusted_proxies(config, "approval_trusted_proxies")   # approval listener only
+        self._peer_refused = {}
+        self._peer_obs = 0
+        (self._proxy_secret, self._proxy_secret_header,
+         self._secret_errors) = self._load_proxy_secret(config)
+        # asked for by the CONFIG KEY, not by whether it loaded: a broken secret never opens the listener
+        self._secret_required = config.get("approval_proxy_secret_file") is not None
+        if self._proxy_secret:      # never reaches an agent: stripped from outbound headers, masked in responses
+            self.dest_guard.strip_headers = (self._proxy_secret_header,)
+            self.dest_guard.mask_values = (self._proxy_secret,)
         self.ha_hook = notify_mod.parse_ha_hook(
             config.get("ha_hook"), lambda p: open(p).read().strip())
         self._ha_rate = {}              # source ip -> {"t", "n", "drop"}; <= RATE_MAP_CAP
@@ -263,6 +284,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         self._nq_threads = 0
         self._presence_rate = {}                # user -> {"t","n"}; <= RATE_MAP_CAP
         self._csrf_key = secrets.token_bytes(32)    # per process: tokens die with a restart
+        self._dest_warned = set()
         self._lock = threading.Lock()
         self._by_id = {}
         self._by_nonce = {}
@@ -289,6 +311,18 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         self._init_grants(config)
         self._init_plans(config)
         self._init_ssh_rules()
+        if not self.dest_guard.allow_loopback:
+            for w in self.trust_warnings():
+                self.log("config_warning", warning=w)
+            for e in self.trust_errors():
+                self.log("config_error", error=e)
+                logging.getLogger("secret_broker").error("%s", e)
+            for i in self.startup_info():
+                self.log("config_info", info=i)
+                logging.getLogger("secret_broker").info("%s", i)
+        elif self._secret_errors:
+            for e in self._secret_errors:
+                self.log("config_error", error=e)
         if background_load:
             # Listen right away; the first requests wait on the same lock.
             self._refreshing.acquire()
@@ -346,7 +380,8 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         # be used in http mode, only fetched with approval in env mode.
         hosts = meta.get("allowed_hosts") or []
         if (not isinstance(hosts, list) or len(hosts) > 10
-                or not all(isinstance(h, str) and _HOST_RE.match(h) for h in hosts)):
+                or not all(isinstance(h, str) and _HOST_ENTRY_RE.match(h)
+                           and destguard.split_entry(h)[0] is not None for h in hosts)):
             raise ValueError("allowed_hosts must be up to 10 plain hostnames")
         fp = meta.get("tls_fingerprint")
         if fp is not None:
@@ -419,6 +454,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         except guidance_mod.HiddenCharsError as e:
             note, ginvalid = None, str(e)       # ignored for classification; the credential stays valid
         entry = {**meta, "vars": vars_, "allowed_hosts": [h.lower() for h in hosts],
+                 "_human": "created" not in meta,     # not made by a store / credential request
                  "approval": approval, "_item": item, "_meta": meta,
                  "_tls": {"fingerprint": fp, "verify": verify}}
         entry.pop("guidance", None)
@@ -502,6 +538,21 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             return None
         return {"allowed_hosts": hosts[:10], "vars": vars_, "approval": "prompt"}
 
+    def _guard_entry_hosts(self, name, entry):
+        """A catalog entry that came from the vault or config (human-edited): an allowed host that
+        is loopback, link-local, one of this host's own addresses or a metadata name keeps the
+        credential but loses that host, and the operator is told (once per host)."""
+        keep = []
+        for h in entry.get("allowed_hosts") or []:
+            why = self.dest_guard.entry_problem(h, from_store=False)
+            if why is None:
+                keep.append(h)
+            elif (name, h) not in self._dest_warned:
+                self._dest_warned.add((name, h))
+                self.log("dest_guard_config_error", error="allowed host removed: not an allowed destination",
+                         secret=name, host=h[:100])
+        entry["allowed_hosts"] = keep
+
     def refresh_catalog(self):
         """Rebuild the secret catalog from the vault's items. Raises if the vault
         cannot be read, leaving the previous catalog in place."""
@@ -517,6 +568,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                 if row["meta"] is None:
                     raise ValueError("broker metadata is not a JSON object")
                 name, entry = self._entry(row["item"], row["meta"])
+                self._guard_entry_hosts(name, entry)
                 out[name] = entry
                 owners.setdefault(name, []).append(row["item"])
             except ValueError as e:
@@ -535,6 +587,8 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             meta = self._auto_meta(row["item"], row["auto"])
             try:
                 name, entry = self._entry(row["item"], meta) if meta else (None, None)
+                if entry is not None:
+                    self._guard_entry_hosts(name, entry)
             except ValueError as e:
                 bad.append({"item": row["item"], "reason": str(e)[:120]})
                 continue
@@ -1198,7 +1252,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             if name in internal:
                 continue                    # the broker's own summary key is never offered
             hosts = sc.get("allowed_hosts") or []
-            if host is None or host in hosts:
+            if host is None or host in destguard.host_parts(hosts):
                 # Deliberately no approval policy or sensitivity here: whether a
                 # credential prompts must not influence which one an agent picks.
                 if sc.get("ssh"):
@@ -1271,7 +1325,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                 else names)
             if hit is not None:
                 self._log_internal_refusal(hit, mode, source, peer, client)
-            self.log("rejected", reason=str(e), names=names, mode=mode, source=source, peer=peer,
+            self.log("rejected", reason=httpcheck.clip(e), names=names, mode=mode, source=source, peer=peer,
                      **self._client_fields(client),
                      url=spec.get("url") if isinstance(spec, dict) and mode == "http" else None)
             raise
@@ -1362,8 +1416,8 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                 req.approver = "policy:auto-create"
             try:
                 result = self._release(req)
-            except (BackendError, OSError, ValueError) as e:
-                self._finish(req, "failed", error=f"release failed: {e}", via="policy",
+            except Exception as e:  # noqa: BLE001 -- the request must always settle; a fixed label only
+                self._finish(req, "failed", error=errclass.release_text(e), via="policy",
                              auto_max=auto_max)
             else:
                 self._finish(req, "approved", result=result, via="policy", auto_max=auto_max)
@@ -1372,8 +1426,8 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             return req
         try:
             self._push(req)
-        except (NotifyError, OSError) as e:
-            self._finish(req, "failed", error=f"could not notify: {e}")
+        except Exception:  # noqa: BLE001 -- a request must always settle; the notify error text is never kept
+            self._finish(req, "failed", error="could not notify")
         return req
 
     def details_view(self, req):
@@ -1434,8 +1488,8 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                    entry_sha256=[e["sha"] for e in ents])
         try:
             self._push(req)
-        except (NotifyError, OSError) as e:
-            self._finish(req, "failed", error=f"could not notify: {e}")
+        except Exception:  # noqa: BLE001 -- a request must always settle; the notify error text is never kept
+            self._finish(req, "failed", error="could not notify")
         return req
 
     def _apply_proposal(self, req, who):
@@ -1492,8 +1546,9 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         purpose = credreq_mod.validate_purpose(spec.get("purpose"))
         hosts = spec.get("hosts") or []
         if (not isinstance(hosts, list) or len(hosts) > 10
-                or not all(isinstance(h, str) and _HOST_RE.match(h) for h in hosts)):
+                or not all(isinstance(h, str) and _HOST_ENTRY_RE.match(h) for h in hosts)):
             raise ValueError("hosts must be up to 10 plain hostnames")
+        self._hosts_problem(hosts)
         var = spec.get("var")
         if var is not None and (not isinstance(var, str) or not _VAR_RE.match(var)
                                 or _DANGEROUS_VAR_RE.match(var)):
@@ -1515,8 +1570,8 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                    summary_reason=None)
         try:
             self._push(req)
-        except (NotifyError, OSError) as e:
-            self._finish(req, "failed", error=f"could not notify: {e}")
+        except Exception:  # noqa: BLE001 -- a request must always settle; the notify error text is never kept
+            self._finish(req, "failed", error="could not notify")
         return req
 
     def _credential_check(self, req, form):
@@ -1541,8 +1596,12 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                 continue
             if "://" in h:
                 h = urllib.parse.urlsplit(h).hostname or ""
-            if not _HOST_RE.match(h):
+            if not _HOST_ENTRY_RE.match(h):
                 errs.append("hosts must be plain host names, separated by commas or spaces")
+                break
+            why = self.dest_guard.entry_problem(h, from_store=True)
+            if why:
+                errs.append(why)
                 break
             hosts.append(h)
         hosts = sorted(set(hosts))
@@ -1666,8 +1725,9 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                 raise ValueError(f"{name} already exists; use update")
             hosts = spec.get("allowed_hosts")
             if (not isinstance(hosts, list) or not (0 if spec.get("ssh") else 1) <= len(hosts) <= 10
-                    or not all(isinstance(h, str) and _HOST_RE.match(h) for h in hosts)):
+                    or not all(isinstance(h, str) and _HOST_ENTRY_RE.match(h) for h in hosts)):
                 raise ValueError("allowed_hosts must be 1-10 plain hostnames")
+            self._hosts_problem(hosts)
             spec["allowed_hosts"] = sorted(set(h.lower() for h in hosts))
             spec["field"] = spec.get("field") or ("private_key" if spec.get("ssh") else "notes")
             if spec.get("ssh") and spec["field"] != "private_key":
@@ -1817,16 +1877,35 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                                  claimed_dest=claimed, host_fp=host["fp"], host_type=host["type"])
         return host
 
+    def _hosts_problem(self, hosts):
+        """ValueError (fixed text, nothing echoed) when a host in a credential an agent asks to have
+        created or stored is not an acceptable destination: loopback, link-local, an address of
+        this host, a metadata or dotless name, a non-canonical IP form."""
+        for h in hosts:
+            why = self.dest_guard.entry_problem(h, from_store=True)
+            if why:
+                raise ValueError(why)
+
     def _validate_http(self, names, spec):
-        u = urllib.parse.urlsplit(spec["url"])
+        # The agent's own text first: control characters and whitespace where they do not belong are
+        # refused with a generic sentence (never echoed), so an approval card shows what will be sent.
+        u = httpcheck.check_url_template(spec["url"])
+        httpcheck.check_headers_template(spec["headers"], u, (self._proxy_secret_header,))
         if u.scheme not in ("http", "https") or not u.hostname:
             raise ValueError("bad url")
         allowed = None
         for n in names:
-            hosts = set(self.cfg["secrets"][n].get("allowed_hosts") or [])
+            hosts = destguard.host_parts(self.cfg["secrets"][n].get("allowed_hosts") or [])
             allowed = hosts if allowed is None else allowed & hosts
         if u.hostname not in (allowed or set()):
-            raise PermissionError(f"host {u.hostname} is not allowed for {','.join(names)}")
+            raise PermissionError(f"host {httpcheck.clip(u.hostname, 100)} is not allowed for {','.join(names)}")
+        port = u.port or (443 if u.scheme == "https" else 80)
+        entries = self._dest_entries(names)
+        if not self.dest_guard.port_ok(entries, u.hostname, port):
+            raise PermissionError("that port is not allowed for this host (a host:port entry in allowed_hosts "
+                                  "allows only that port, and an IP address needs an explicit host:port entry)")
+        if self.dest_guard.host_refused(u.hostname):
+            raise PermissionError(f"host {httpcheck.clip(u.hostname, 100)} is not allowed for {','.join(names)}")   # same as any other
         if spec.get("body_b64") is not None:
             try:
                 base64.b64decode(spec["body_b64"], validate=True)
@@ -1838,7 +1917,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         for text in [spec["url"], spec.get("body") or ""] + list(spec["headers"].values()):
             for var in _placeholders(text):
                 if var not in known:
-                    raise ValueError(f"placeholder {var} not provided by requested secrets")
+                    raise ValueError(f"placeholder {httpcheck.clip(var, 60)} not provided by requested secrets")
 
     def _push(self, req):
         url = f"{self.cfg['approve_base_url'].rstrip('/')}/a/{req.nonce}"
@@ -1981,7 +2060,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                 return
             req.status = "deciding"
             req.action_hash = None
-        self._finish(req, "failed", error=f"could not notify: {err}")
+        self._finish(req, "failed", error="could not notify")
 
     # -- presence: hold phone notifications while an approval page is open ----
     # Every request is treated alike (SSH signing and high risk included): while
@@ -2072,9 +2151,9 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             {notify_mod.transport_type(t) or "?" for t in leaves}))
         try:
             notify_mod.send_to(leaves, h["n"])
-        except (NotifyError, OSError) as e:
+        except Exception:  # noqa: BLE001 -- a request must always settle; the notify error text is never kept
             if not req._sent_to[:-len(leaves)]:         # nothing was ever delivered
-                self._finish(req, "failed", error=f"could not notify: {e}")
+                self._finish(req, "failed", error="could not notify")
         else:
             self.audit("notified", req)
         if req.status not in ("pending", "deciding"):   # settled while sending
@@ -2187,18 +2266,255 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         req.done.set()
         return True
 
-    def peer_trusted(self, peer):
-        """`approval_trusted_peers`: CIDRs the approval listener will answer.
-        The listener trusts the identity header, so it should only ever hear
-        from the SSO proxy; unset means no restriction (network isolation)."""
-        nets = self.cfg.get("approval_trusted_peers")
+    def _load_proxy_secret(self, config):
+        """(secret, header, errors) for approval_proxy_secret_file. A bad setting never crashes the
+        broker: it is an ERROR and the listener stays closed (fail closed)."""
+        errs, secret = [], None
+        header = config.get("approval_proxy_secret_header") or "X-ASB-Proxy-Secret"
+        if not isinstance(header, str) or not httpcheck._HEADER_TOKEN.match(header):
+            errs.append("approval_proxy_secret_header is not a valid header name")
+            header = "X-ASB-Proxy-Secret"
+        path = config.get("approval_proxy_secret_file")
+        if path is not None:
+            try:
+                if not isinstance(path, str) or not path:
+                    raise OSError
+                with open(path) as f:
+                    secret = f.read().strip()
+            except (OSError, TypeError, UnicodeError):
+                errs.append("approval_proxy_secret_file cannot be read (missing, a directory, or not text)")
+            else:
+                if len(secret) < 16 or not secret.isascii() or any(c.isspace() or ord(c) < 33 for c in secret):
+                    errs.append("approval_proxy_secret_file must hold one token of at least 16 printable "
+                                "ASCII characters (openssl rand -hex 32)")
+                    secret = None
+                elif (len(set(secret)) < 6 or any(w in secret.lower() for w in (
+                        "changeme", "change-me", "change_me", "placeholder", "example", "your-secret",
+                        "your_secret", "secret-here", "xxxxxxxx", "password", "replace"))):
+                    errs.append("approval_proxy_secret_file holds a placeholder, not a random token "
+                                "(openssl rand -hex 32)")
+                    secret = None
+        return secret, header, errs
+
+    def proxy_secret_ok(self, headers):
+        """True when a proxy secret is configured and `headers` carries it (constant-time compare)."""
+        if not self._proxy_secret:
+            return False
+        got = headers.get(self._proxy_secret_header) or ""
+        return hmac.compare_digest(got.encode("utf-8", "replace"), self._proxy_secret.encode())
+
+    @staticmethod
+    def _addr_of(text):
+        """An ipaddress from one X-Forwarded-For hop (brackets, zone and IPv4-mapped forms handled), else None."""
+        t = (text or "").strip()
+        if t.startswith("[") and "]" in t:
+            t = t[1:t.index("]")]
+        try:
+            ip = ipaddress.ip_address(t.split("%", 1)[0])
+        except ValueError:
+            return None
+        return ip.ipv4_mapped if ip.version == 6 and ip.ipv4_mapped else ip
+
+    def _is_proxy_peer(self, peer):
+        """Is the socket peer one of `trusted_proxies` (never loopback or an own address in strict mode)?"""
+        pip = self._addr_of(peer)
+        if pip is None or not self._trusted_proxies:
+            return False
+        if not self.dest_guard.allow_loopback and (pip.is_loopback or self.dest_guard.is_local(pip)):
+            return False
+        return any(pip in n for n in self._trusted_proxies)
+
+    def _is_self_peer(self, peer):
+        """Loopback or one of this host's own addresses (the health check's caller)."""
+        pip = self._addr_of(peer)
+        return pip is not None and (pip.is_loopback or self.dest_guard.is_local(pip))
+
+    def client_peer_allowed(self, peer, method, path):
+        """The client API's peer gate. With `trusted_proxies` set (and not `client_api_allow_direct`)
+        only those socket peers may use it - the real peer, never X-Forwarded-For - before authentication
+        and before the unauthenticated enrollment endpoints. A loopback/own caller may GET /healthz."""
+        if not self._trusted_proxies or self.cfg.get("client_api_allow_direct") is True:
+            return True
+        if method == "GET" and path == "/healthz" and self._is_self_peer(peer):
+            return True
+        return self._is_proxy_peer(peer)
+
+    PEER_OBSERVED_N = 20
+
+    def peer_observed(self, peer, effective, method, path):
+        """Log the socket peer of the first PEER_OBSERVED_N client API requests (operator audit + INFO), so the
+        operator can verify which address the broker really sees behind a proxy or Docker NAT BEFORE relying on
+        the trusted_proxies gate."""
+        if self.dest_guard.allow_loopback:
+            return                  # (the test harness keeps its audit streams exact)
+        with self._ha_rate_lock:
+            if self._peer_obs >= self.PEER_OBSERVED_N:
+                return
+            self._peer_obs += 1
+        gated = bool(self._trusted_proxies) and self.cfg.get("client_api_allow_direct") is not True
+        self.log("client_peer_observed", peer=peer, effective=effective, method=method, path=path[:40],
+                 in_trusted_proxies=self._is_proxy_peer(peer), gated=gated)
+        logging.getLogger("secret_broker").info("client API request %d/%d: socket peer %s (effective %s), in "
+                                                "trusted_proxies=%s", self._peer_obs, self.PEER_OBSERVED_N,
+                                                peer, effective, self._is_proxy_peer(peer))
+
+    def client_peer_refused(self, peer):
+        """Audit (rate limited: once a minute per peer, bounded map) that the gate refused `peer`."""
+        now = time.time()
+        peer = clients_mod.src_key(peer)
+        with self._ha_rate_lock:
+            st = self._peer_refused.get(peer)
+            if st is not None and now - st < 60:
+                return
+            while st is None and len(self._peer_refused) >= self.RATE_MAP_CAP:
+                del self._peer_refused[min(self._peer_refused, key=self._peer_refused.get)]
+            self._peer_refused[peer] = now
+        self.log("client_peer_refused", peer=peer)
+
+    def effective_addr(self, peer, xff, nets=None):
+        """The address to LOG and to key per-source limits on. When the socket peer is one of
+        `trusted_proxies` (and not loopback or one of this host's own addresses), walk X-Forwarded-For from
+        the RIGHT, skip hops that are themselves trusted proxies and take the first untrusted one. A missing
+        or malformed header, or a hop that does not parse, falls back to the socket peer. Otherwise the
+        header is ignored. This NEVER feeds a trust decision (peer_trusted, the destination guard, the
+        egress marker and the proxy secret all use the socket peer)."""
+        nets = self._trusted_proxies if nets is None else nets
         if not nets:
+            return peer
+        pip = self._addr_of(peer)
+        strict = not self.dest_guard.allow_loopback        # (the test harness's peers are all on loopback)
+        if (pip is None or (strict and (pip.is_loopback or self.dest_guard.is_local(pip)))
+                or not any(pip in n for n in nets)):
+            return peer
+        for hop in reversed([h for h in (xff or "").split(",")]):
+            ip = self._addr_of(hop)
+            if ip is None:
+                return peer
+            if any(ip in n for n in nets):
+                continue
+            return str(ip)
+        return peer
+
+    def listener_open(self):
+        """Is the approval listener configured to answer anyone? Strict mode fails closed unless the
+        operator set approval_trusted_peers or a proxy secret (or explicitly trusts any peer)."""
+        c = self.cfg
+        if self._secret_required and not self._proxy_secret:
+            return False                # a configured but unusable secret fails closed, whatever else is set
+        return bool(c.get("approval_trust_any_peer") is True or c.get("approval_trusted_peers")
+                    or self._proxy_secret)
+
+    def peer_trusted(self, peer):
+        """May the approval listener believe the identity header of a request from `peer`?
+
+        The listener trusts that header, so it may only ever hear from the SSO proxy. Rules:
+          * `approval_trust_any_peer: true` (explicit, loud warning at startup): anyone, as before;
+          * loopback and every address of this host's own interfaces are NEVER trusted, whatever
+            `approval_trusted_peers` says (the broker's own outbound calls come from there);
+          * `approval_trusted_peers` set: only those CIDRs;
+          * else `approval_proxy_secret_file` set: any other peer (the secret, checked on every
+            request, is the authentication);
+          * else: nobody (FAIL CLOSED; a startup ERROR says so)."""
+        if self._secret_required and not self._proxy_secret:
+            return False
+        if self.cfg.get("approval_trust_any_peer") is True:
             return True
         try:
-            ip = ipaddress.ip_address(peer)
-            return any(ip in ipaddress.ip_network(n, strict=False) for n in nets)
-        except ValueError:
+            ip = ipaddress.ip_address(peer.split("%", 1)[0])
+        except (ValueError, AttributeError):
             return False
+        if ip.version == 6 and ip.ipv4_mapped:
+            ip = ip.ipv4_mapped
+        strict = not self.dest_guard.allow_loopback      # tests (Python API only) keep 127.0.0.1 peers
+        nets = self.cfg.get("approval_trusted_peers")
+        if strict and (ip.is_loopback or ip.is_unspecified or ip.is_link_local or ip.is_multicast
+                       or self.dest_guard.is_local(ip)):
+            return False
+        if nets:
+            try:
+                return any(ip in ipaddress.ip_network(n, strict=False) for n in nets)
+            except ValueError:
+                return False
+        if self._proxy_secret:
+            return True
+        return not strict
+
+    def startup_info(self):
+        """INFO lines about what is proxy-only (logged once at start)."""
+        out = []
+        if self._trusted_proxies and self.cfg.get("client_api_allow_direct") is not True:
+            out.append("client API: PROXY-ONLY. Every route (including /v1/enroll and /v1/hooks/ha/decide) answers "
+                       "403 unless the socket peer is in trusted_proxies; only GET /healthz works from loopback. "
+                       "Home Assistant and asb clients must go through the proxy, or set client_api_allow_direct")
+        return out
+
+    def trust_errors(self):
+        """Startup ERRORS about the approval listener (it is closed until fixed)."""
+        out = list(self._secret_errors)
+        if self._secret_required and not self._proxy_secret:
+            out.append("approval listener is CLOSED (every request gets 403): approval_proxy_secret_file is set "
+                       "but unusable, and a configured secret is never skipped")
+        elif not self.listener_open():
+            out.append("approval listener is CLOSED (every request gets 403): set approval_trusted_peers "
+                       "(the SSO proxy's CIDR) and/or approval_proxy_secret_file; "
+                       "approval_trust_any_peer: true restores the old trust-everyone behaviour")
+        return out
+
+    def trust_warnings(self):
+        """Startup warnings about who the approval listener believes (logged once at start)."""
+        out = []
+        if self.cfg.get("ip_literal_any_port") is True:
+            out.append("ip_literal_any_port is true: bare IP-literal allowed_hosts entries of human-managed catalog "
+                       "entries match ANY port again. Migrate allowed_hosts to host:port (for example "
+                       "10.0.1.175:8086), then remove the flag. Loopback, own addresses, the broker's own listener "
+                       "ports and own_ports stay refused; credentials created through requests still need host:port")
+        if self.cfg.get("approval_trust_any_peer") is True:
+            out.append("approval_trust_any_peer is true: the approval listener believes the identity header "
+                       "from ANY peer. Anything that can reach it, including this broker's own outbound "
+                       "calls, can act as the approver. Set approval_trusted_peers or "
+                       "approval_proxy_secret_file instead.")
+            return out
+        nets = self.cfg.get("approval_trusted_peers") or []
+        for n in nets:
+            try:
+                net = ipaddress.ip_network(n, strict=False)
+            except ValueError:
+                continue
+            if net.prefixlen < (24 if net.version == 4 else 64):
+                out.append(f"approval_trusted_peers entry {str(n)[:64]} is broader than /{24 if net.version == 4 else 64}: "
+                           "list the SSO proxy's own fixed address or subnet (172.16.0.0/12 and 10.0.0.0/8 trust "
+                           "every container and VM in them)")
+            own = [a for a in self.dest_guard.locals() if parse_ip_safe(a) in net]
+            if net.overlaps(ipaddress.ip_network("127.0.0.0/8")) or net.overlaps(ipaddress.ip_network("::1/128")) or own:
+                out.append(f"approval_trusted_peers entry {str(n)[:64]} includes loopback or an address of this "
+                           "host: those peers are never trusted")
+        gateways = set()
+        for a in self.dest_guard.locals():
+            ip = parse_ip_safe(a)
+            if ip is not None and ip.version == 4 and ip.is_private and not ip.is_loopback:
+                gateways.add(ipaddress.ip_address(int(ip) >> 8 << 8 | 1))       # the usual bridge gateway (.1)
+        for key, nets_ in (("trusted_proxies", self._trusted_proxies), ("approval_trusted_proxies", self._approval_proxies)):
+            for n in nets_:
+                if n.overlaps(ipaddress.ip_network("127.0.0.0/8")) or n.overlaps(ipaddress.ip_network("::1/128")) or any(
+                        parse_ip_safe(a) in n for a in self.dest_guard.locals()):
+                    out.append(f"{key} entry {str(n)[:64]} includes loopback or an address of this host: those "
+                               "peers are IGNORED, so a proxy on this host would be refused" +
+                               (" by the client API" if key == "trusted_proxies" else "") +
+                               " (X-Forwarded-For is never read from them)")
+                if n.prefixlen < (29 if n.version == 4 else 64):
+                    out.append(f"{key} entry {str(n)[:64]} is broader than /{29 if n.version == 4 else 64}: every host "
+                               "in it can set the client address that is logged and rate limited")
+                if any(g in n for g in gateways):
+                    out.append(f"{key} entry {str(n)[:64]} contains a likely Docker bridge gateway (.1): with published "
+                               "ports the peer the broker sees may be the gateway, not the proxy; verify with the audit "
+                               "log's peer field and firewall the published port to the proxy's address")
+        if self._trusted_proxies and self.cfg.get("client_api_allow_direct") is True:
+            out.append("client_api_allow_direct is true: clients that connect to the client API directly (not through a "
+                       "trusted proxy) are accepted, so they bypass the proxy and any per-client checks it makes")
+        if nets and not self._proxy_secret:
+            out.append("approval_trusted_peers is the only check: any host in those CIDRs (including an agent's own "
+                       "VM, if it is inside) can send the identity header. Add approval_proxy_secret_file.")
+        return out
 
     HA_LIMIT_PER_MIN = 60
     RATE_MAP_CAP = 4096     # hard bound on every per-IP / per-user limiter map
@@ -2222,6 +2538,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         called for requests that presented the correct hook key. The first drop
         in a window is audited."""
         now = time.time()
+        ip = clients_mod.src_key(ip)
         with self._ha_rate_lock:
             st = self._ha_rate.get(ip)
             if st is None:
@@ -2258,10 +2575,43 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                      unauthenticated=True)
         return False
 
-    def csrf_token(self, user):
-        """Token a page must echo back with a decision. Bound to the identity, so
-        one user's page cannot be replayed by another session."""
-        return hmac.new(self._csrf_key, ("csrf:" + user).encode(), hashlib.sha256).hexdigest()
+    CSRF_COOKIE = "sb_csrf"
+    TEST_NONCE = "test-harness-nonce"
+
+    CSRF_COOKIE_LIFETIME_S = 12 * 3600       # absolute: the server checks the timestamp inside the cookie
+
+    def csrf_cookie_new(self, user):
+        """(cookie value, nonce): a server-issued nonce with its issue time, signed and bound to `user`."""
+        nonce, ts = secrets.token_hex(16), int(time.time())
+        mac = hmac.new(self._csrf_key, f"cookie:{user}:{nonce}:{ts}".encode(), hashlib.sha256).hexdigest()[:32]
+        return f"{nonce}.{ts}.{mac}", nonce
+
+    def csrf_cookie_nonce(self, user, raw):
+        """The nonce inside a cookie value that is genuinely ours, for `user` and younger than the lifetime,
+        else None (the page then mints a fresh one: a login, a navigation without the cookie or an expired
+        cookie all rotate it)."""
+        parts = (raw or "").split(".")
+        if len(parts) != 3:
+            return None
+        nonce, ts, mac = parts
+        if not re.fullmatch(r"[0-9a-f]{32}", nonce) or not ts.isdigit() or len(ts) > 12 or len(mac) != 32:
+            return None
+        age = time.time() - int(ts)
+        if age < -60 or age > self.CSRF_COOKIE_LIFETIME_S:
+            return None
+        want = hmac.new(self._csrf_key, f"cookie:{user}:{nonce}:{ts}".encode(), hashlib.sha256).hexdigest()[:32]
+        return nonce if hmac.compare_digest(mac, want) else None
+
+    def csrf_token(self, user, nonce=None):
+        """Token a page must echo back with a decision: bound to the identity AND to the browser's
+        cookie nonce (double submit), so one user's page, or a token scraped from a body, cannot be
+        replayed without the HttpOnly cookie. Without a nonce only the test harness (Python API
+        flag) gets a token, for its fixed nonce."""
+        if nonce is None:
+            if not self.dest_guard.allow_loopback:
+                raise ValueError("a csrf token needs the browser's cookie nonce")
+            nonce = self.TEST_NONCE
+        return hmac.new(self._csrf_key, f"csrf:{user}:{nonce}".encode(), hashlib.sha256).hexdigest()
 
     def open_ids(self):
         """Ids of requests still open (pending or running), taken under the lock."""
@@ -2680,8 +3030,8 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                        grant_minutes=g.get("minutes") if kind == "timed" else None, grant_left_s=left)
             try:
                 result = self._release(req)
-            except (BackendError, OSError, ValueError) as e:
-                self._finish(req, "failed", error=f"release failed: {e}", via="policy",
+            except Exception as e:  # noqa: BLE001 -- the request must always settle; a fixed label only
+                self._finish(req, "failed", error=errclass.release_text(e), via="policy",
                              grant_id=g["id"], grant_left_s=left)
             else:
                 self._finish(req, "approved", result=result, via="policy",
@@ -2782,8 +3132,8 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             return
         try:
             result = self._release(req)
-        except (BackendError, OSError, ValueError) as e:
-            self._finish(req, "failed", error=f"release failed: {e}", **who)
+        except Exception as e:  # noqa: BLE001 -- the request must always settle; a fixed label only
+            self._finish(req, "failed", error=errclass.release_text(e), **who)
             return
         self._finish(req, "approved", result=result, **who)
 
@@ -2897,14 +3247,40 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         if req.session is not None:
             return self._session_http(req, env)
         t0 = time.time()
+        cat = None
         try:
-            out = _do_http(req.spec, env, self._tls_policy(req.names))
-        except OSError as e:
-            self.audit("http_failed", req, error=str(e)[:200])
-            raise
-        self.audit("http_executed", req, upstream_status=out["status"],
+            out = _do_http(req.spec, env, self._tls_policy(req.names), self.dest_guard,
+                           self._dest_entries(req.names))
+        except Exception as e:  # noqa: BLE001 -- the text of an exception here can hold a filled value
+            cat = errclass.classify(e)
+        if cat is not None:     # raised outside the handler: nothing is chained to the original exception
+            self.audit("http_failed", req, error=errclass.public(cat), reason_class=cat)   # reason: operator only
+            raise errclass.ReleaseFailed(cat)
+        over = out.pop("_over_budget", False)
+        self.audit("http_executed", req, masked_over_budget=over, upstream_status=out["status"],
                    response_bytes=len(out["body"]), duration_ms=int((time.time() - t0) * 1000))
         return {"http": out}
+
+    def allowed_entries(self, name):
+        """The allowed_hosts entries of one credential as the port rule reads them. With `ip_literal_any_port`
+        (a migration aid), a bare IP-literal entry of a HUMAN-MANAGED catalog entry also matches any port
+        (`ip:*`); a credential created through a store or credential request (it carries a `created` stamp)
+        never gets that. Loopback and own addresses are not in the list at all (dropped at load), and the
+        guard still refuses the broker's own listener ports and `own_ports` on every private address."""
+        sc = self.cfg["secrets"].get(name) or {}
+        ents = [str(h).lower() for h in sc.get("allowed_hosts") or ()]
+        if self.cfg.get("ip_literal_any_port") is True and sc.get("_human"):
+            for e in list(ents):
+                h, p = destguard.split_entry(e)
+                if h and p is None and destguard.parse_ip(h) is not None:
+                    ents.append(f"{h}:*")
+        return ents
+
+    def _dest_entries(self, names):
+        """The allowed_hosts entries every named credential shares: what the destination guard
+        holds an IP-literal destination's port against."""
+        sets = [set(self.allowed_entries(n)) for n in names]
+        return sorted(set.intersection(*sets)) if sets else []
 
     def _read_env(self, req):
         """{VAR: value} for the request's secrets, read from the vault (audited as secret_read)."""
@@ -2986,6 +3362,32 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         return {"status": req.status, "error": req.error}
 
 
+def parse_trusted_proxies(config, key="trusted_proxies"):
+    """`trusted_proxies`: CIDRs of reverse proxies whose X-Forwarded-For may name the real client for
+    logging and per-source limits. ValueError (naming the field) when malformed. Never a trust input."""
+    raw = config.get(key)
+    if raw is None:
+        return []
+    if not isinstance(raw, list) or len(raw) > 32:
+        raise ValueError(f"{key} must be a list of up to 32 CIDRs")
+    out = []
+    for c in raw:
+        try:
+            if not isinstance(c, str):
+                raise ValueError
+            out.append(ipaddress.ip_network(c, strict=False))
+        except (ValueError, TypeError):
+            raise ValueError(f"{key}: not a CIDR: " + httpcheck.clip(c, 60)) from None
+    return out
+
+
+def parse_ip_safe(a):
+    try:
+        return ipaddress.ip_address(a)
+    except ValueError:
+        return None
+
+
 def _placeholders(text):
     out, i = [], 0
     while True:
@@ -2999,29 +3401,9 @@ def _placeholders(text):
         i = b + 2
 
 
-def _fill(text, env):
-    for var in _placeholders(text):
-        text = text.replace("{{" + var + "}}", env[var]).replace("{{ " + var + " }}", env[var])
-    return text
-
-
 def _mask(text, values):
-    for v in sorted(values, key=len, reverse=True):
-        if len(v) >= 6:
-            text = text.replace(v, "***")
-    return text
-
-
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    """Never follow redirects: only the originally approved URL is contacted,
-    so injected credentials cannot be forwarded to a host outside allowed_hosts.
-    The 3xx is returned to the caller as-is."""
-
-    def redirect_request(self, *args, **kwargs):
-        return None
-
-
-_opener = urllib.request.build_opener(_NoRedirect)
+    """Mask credential values (and their escaped, encoded and per-line forms) in `text`; see masking.py."""
+    return masking.mask_values(text, values)
 
 
 def _private_host(host):
@@ -3035,74 +3417,79 @@ def _private_host(host):
     return "." not in h or h.endswith((".lan", ".local", ".internal", ".home.arpa", ".localdomain"))
 
 
-class _PinnedHTTPSConnection(http.client.HTTPSConnection):
-    """TLS with the CA/hostname check replaced by an exact certificate match."""
-    pins = ()
-
-    def connect(self):
-        super().connect()
-        der = self.sock.getpeercert(binary_form=True)
-        if not der or hashlib.sha256(der).hexdigest() not in self.pins:
-            self.close()
-            raise ssl.SSLError("server certificate does not match any pinned fingerprint")
+def _opener_for(tls, guard, entries=None):
+    """The opener for one outbound call: every connection goes through the destination guard
+    (see destguard.py), nothing follows a redirect, no proxy is used."""
+    return guard.opener(tls, entries)
 
 
-def _opener_for(tls):
-    if not tls or (tls.get("verify", True) and not tls.get("fingerprint")):
-        return _opener
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    pins = tls.get("fingerprint")
-    if pins:
-        if isinstance(pins, str):
-            pins = (pins,)
-        conn = type("_Pinned", (_PinnedHTTPSConnection,), {"pins": tuple(pins)})
-        handler = type("_PinnedHandler", (urllib.request.HTTPSHandler,), {
-            "https_open": lambda self, req: self.do_open(
-                lambda host, **kw: conn(host, context=ctx, **{k: v for k, v in kw.items() if k != "context"}),
-                req)})()
-    else:
-        handler = urllib.request.HTTPSHandler(context=ctx)
-    return urllib.request.build_opener(_NoRedirect, handler)
+def _fill(text, env):
+    """Substitute {{NAME}} / {{ NAME }} in ONE pass: a substituted value is never scanned again."""
+    out, i = [], 0
+    while True:
+        a = text.find("{{", i)
+        b = text.find("}}", a + 2) if a >= 0 else -1
+        if a < 0 or b < 0:
+            out.append(text[i:])
+            return "".join(out)
+        raw = text[a + 2:b]
+        var = raw.strip()
+        out.append(text[i:a])
+        out.append(env[var] if raw in (var, " " + var + " ") and var in env else text[a:b + 2])
+        i = b + 2
 
 
-def _do_http(spec, env, tls=None):
+def _do_http(spec, env, tls=None, guard=None, entries=None):
     if spec.get("body_b64") is not None:
         data = base64.b64decode(spec["body_b64"])
     elif spec.get("body"):
         data = _fill(spec["body"], env).encode()
     else:
         data = None
-    req = urllib.request.Request(
-        _fill(spec["url"], env), data=data, method=spec["method"],
-        headers={k: _fill(v, env) for k, v in spec["headers"].items()},
-    )
-    return _exchange(req, list(env.values()), tls)
-
-
-def _exchange(req, values, tls, strip_cookies=False, timeout=30):
-    """Send one urllib request (never following a redirect) and return the masked response."""
+    # one trailing newline of a credential is never part of a url or header value (a body keeps the value as is)
+    henv = {k: masking.strip_one_newline(v) for k, v in env.items()}
+    url = _fill(spec["url"], henv)
+    headers = {k: _fill(v, henv) for k, v in spec["headers"].items()}
+    # a filled value may be anything: one fixed label for every way it can break the request
+    httpcheck.check_filled(url, headers, urllib.parse.urlsplit(spec["url"]).netloc)
+    req = None
     try:
-        with _opener_for(tls).open(req, timeout=timeout) as r:
-            status, headers, body = r.status, dict(r.headers), r.read(MAX_RESPONSE_BYTES)
+        req = urllib.request.Request(url, data=data, method=spec["method"], headers=headers)
+    except ValueError:
+        pass
+    if req is None:
+        raise errclass.InvalidRequest()
+    return _exchange(req, list(env.values()), tls, guard=guard, entries=entries)
+
+
+def _exchange(req, values, tls, strip_cookies=False, timeout=30, guard=None, entries=None):
+    """Send one urllib request (never following a redirect) and return the masked response.
+    Set-Cookie never reaches the agent in plain http mode (a session is the way to carry cookies). The body is
+    masked BEFORE it is cut to MAX_RESPONSE_BYTES, and a straddling prefix of a secret is masked too."""
+    if guard is None:
+        guard = destguard.DestGuard.from_config({})
+    masker = masking.get_masker(list(values) + list(guard.mask_values))
+    want = MAX_RESPONSE_BYTES + masker.margin
+    try:
+        with _opener_for(tls, guard, entries).open(req, timeout=timeout) as r:
+            status, headers, body = r.status, dict(r.headers), r.read(want)
     except urllib.error.HTTPError as e:
-        status, headers, body = e.code, dict(e.headers), e.read(MAX_RESPONSE_BYTES)
-    if strip_cookies and 300 <= status < 400:
-        headers = {k: v for k, v in headers.items() if k.lower() != "set-cookie"}
+        status, headers, body = e.code, dict(e.headers), e.read(want)
+    headers = {k: v for k, v in headers.items() if k.lower() not in ("set-cookie", "set-cookie2")}
     return {
         "status": status,
-        "headers": {k: _mask(v, values) for k, v in headers.items()},
-        "body": _mask(body.decode("utf-8", "replace"), values),
+        "headers": {k: masker.mask(v) for k, v in headers.items()},
+        "body": masker.body(body, MAX_RESPONSE_BYTES),
+        "_over_budget": masker.over_budget,       # popped by the caller: operator audit only, never the agent
     }
 
 
-def _exchange_frozen(frozen, values, tls, timeout=30):
+def _exchange_frozen(frozen, values, tls, timeout=30, guard=None, entries=None):
     """Send the frozen plan request EXACTLY as matched: its url, method, headers and body bytes."""
     req = urllib.request.Request(frozen.url, data=frozen.body or None, method=frozen.method,
                                  headers=dict(frozen.headers))
     plans_mod.assert_sent_is_matched(frozen, req)
-    return _exchange(req, values, tls, strip_cookies=True, timeout=timeout)
+    return _exchange(req, values, tls, strip_cookies=True, timeout=timeout, guard=guard, entries=entries)
 
 
 # -- HTTP layer -------------------------------------------------------------
@@ -4008,7 +4395,7 @@ def _page(h, code, body, wide=False, nav=True, script=None, tab=None, badge=0, u
 def _describe(req):
     """(what_html, note_html) for a request, escaped."""
     if req.mode == "http":
-        return (f"{html.escape(req.spec['method'])} {html.escape(req.spec['url'])}",
+        return (f"{html.escape(details_mod._clean(req.spec['method']))} {html.escape(details_mod._clean(req.spec['url']))}",
                 "The broker will make this call itself; the secret never leaves it.")
     if req.mode == "store":
         sp = req.spec
@@ -4420,12 +4807,47 @@ def _detail_html(r, evs, retained=""):
             f"<dl class=kv>{''.join(rows)}</dl>{retained}<h3>Timeline</h3><ol class=tl>{''.join(tl)}</ol>")
 
 
+def _refuse_egress_marker(handler, broker, listener):
+    """True (and the 403 sent) when the request carries the marker every outbound call of this broker
+    carries: an agent's http call made through the broker reached one of the broker's own listeners.
+    The real SSO proxy and real clients never send it."""
+    if any(k.lower() == destguard.EGRESS_MARKER.lower() for k in handler.headers.keys()):
+        broker.log("egress_marker_refused", listener=listener, peer=handler.client_address[0])
+        handler.close_connection = True
+        _json(handler, 403, {"error": "forbidden"})
+        return True
+    return False
+
+
+
 def client_handler(broker, client_key):
     audit_view = audit_api.AuditApi(broker._audit._path, Broker.rate_map_make_room)
 
     class H(BaseHTTPRequestHandler):
         def log_message(self, *a):
             pass
+
+        @property
+        def _ip(self):
+            """Effective client address (logging and per-source limits only; never a trust input)."""
+            memo = getattr(self, "_ip_memo", None)
+            if memo is None:
+                memo = self._ip_memo = broker.effective_addr(
+                    self.client_address[0], ", ".join(self.headers.get_all("X-Forwarded-For") or []))
+            return memo
+
+        def parse_request(self):
+            self._ip_memo = None
+            if not super().parse_request() or _refuse_egress_marker(self, broker, "client"):
+                return False
+            raw = self.client_address[0]            # the REAL socket peer; X-Forwarded-For is never consulted here
+            broker.peer_observed(raw, self._ip, self.command, self.path.split("?")[0])
+            if not broker.client_peer_allowed(raw, self.command, self.path.split("?")[0]):
+                broker.client_peer_refused(raw)
+                self.close_connection = True
+                _json(self, 403, {"error": "forbidden"})
+                return False
+            return True
 
         client = None           # who this request authenticated as: {"id", "name", "legacy"}
 
@@ -4437,7 +4859,7 @@ def client_handler(broker, client_key):
 
         def _authed(self):
             view, why = broker.client_auth(self.headers.get("X-Client-Key", ""), client_key,
-                                           self.client_address[0], self.command, self.path.split("?")[0])
+                                           self._ip, self.command, self.path.split("?")[0])
             if view is None:
                 _json(self, 401, {"error": self._AUTH_MSG.get(why, "bad client key")})
                 return False
@@ -4448,7 +4870,7 @@ def client_handler(broker, client_key):
         # one pending enrollment (see clients.py); every body is bounded and every reply is a
         # fixed string.
         def _enroll_post(self):
-            peer = self.client_address[0]
+            peer = self._ip
             try:
                 n = int(self.headers.get("Content-Length", ""))
             except ValueError:
@@ -4470,7 +4892,7 @@ def client_handler(broker, client_key):
             _json(self, code, out)
 
         def _enroll_get(self, path):
-            peer = self.client_address[0]
+            peer = self._ip
             if not broker.clients.rate_ok("enrollpoll", peer, clients_mod.POLL_MIN):
                 self.close_connection = True
                 return _json(self, 429, {"error": "slow down"}, {"Retry-After": "10"})
@@ -4482,7 +4904,7 @@ def client_handler(broker, client_key):
             only (the agent client key is refused here, the hook key everywhere
             else). Responses never carry request details."""
             hook = broker.ha_hook
-            peer = self.client_address[0]
+            peer = self._ip
             if hook is None:
                 return _json(self, 404, {"error": "not found"})
             auth = self.headers.get("Authorization", "")
@@ -4601,19 +5023,19 @@ def client_handler(broker, client_key):
                     raise ValueError("bad mode")
                 if mode != "env" and body.get("scripts") is not None:
                     raise ValueError("scripts are only allowed for env requests")
-                req = broker.create(mode, names, spec, str(body.get("source", self.client_address[0]))[:80],
-                                    peer=self.client_address[0], client=self.client)
+                req = broker.create(mode, names, spec, str(body.get("source", self._ip))[:80],
+                                    peer=self._ip, client=self.client)
             except sessions_mod.SessionError as e:
                 return _json(self, e.http, {"error": str(e), "code": e.code})
             except (ValueError, KeyError, TypeError, json.JSONDecodeError) as e:
                 if not str(e) or not isinstance(e, ValueError) or isinstance(e, json.JSONDecodeError):
-                    broker.log("bad_request", peer=self.client_address[0], error=str(e)[:200],
+                    broker.log("bad_request", peer=self._ip, error=httpcheck.clip(e),
                                client_id=self.client["id"], client_name=self.client["name"])
-                return _json(self, 400, {"error": str(e)})
+                return _json(self, 400, {"error": httpcheck.clip(e)})
             except planflow.PlanRefused as e:
                 return _json(self, e.code, e.body, e.headers)
             except PermissionError as e:
-                return _json(self, 403, {"error": str(e)})
+                return _json(self, 403, {"error": httpcheck.clip(e)})
             _json(self, 202, {"id": req.id, "status": req.status, "error": req.error,
                               "expires_in": int(req.expires - time.time())})
 
@@ -4625,6 +5047,13 @@ def client_handler(broker, client_key):
 
         def do_GET(self):
             u = urllib.parse.urlsplit(self.path)
+            if u.path == "/healthz" and broker._is_self_peer(self.client_address[0]):
+                raw = b"ok"         # no information: for a container healthcheck on loopback
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                return self.wfile.write(raw)
             if u.path.startswith("/v1/enroll/"):
                 return self._enroll_get(u.path)
             if not self._authed():
@@ -4649,7 +5078,7 @@ def client_handler(broker, client_key):
                 if q.get("url"):
                     host = urllib.parse.urlsplit(q["url"][0]).hostname
                 found = broker.available(host)
-                broker.log("discovery", peer=self.client_address[0], host=host,
+                broker.log("discovery", peer=self._ip, host=host,
                            found=[f["name"] for f in found], client_id=self.client["id"],
                            client_name=self.client["name"])
                 return _json(self, 200, {"host": host, "secrets": found})
@@ -4661,7 +5090,7 @@ def client_handler(broker, client_key):
             if req is None or req.client["id"] != self.client["id"]:
                 # another client's request id is as unknown to this client as a made-up one
                 return _json(self, 404, {"error": "unknown request"})
-            _json(self, 200, broker.take_result(req, self.client_address[0]))
+            _json(self, 200, broker.take_result(req, self._ip))
 
     return H
 
@@ -4674,24 +5103,56 @@ def approval_handler(broker):
             pass
 
         @property
+        def _ip(self):
+            """Effective client address (logging and per-source limits only; never a trust input)."""
+            memo = getattr(self, "_ip_memo", None)
+            if memo is None:
+                memo = self._ip_memo = broker.effective_addr(
+                    self.client_address[0], ", ".join(self.headers.get_all("X-Forwarded-For") or []),
+                    broker._approval_proxies)
+            return memo
+
+        def parse_request(self):
+            self._ip_memo = None
+            self._set_cookie = None
+            self._nonce_memo = {}
+            if not super().parse_request() or _refuse_egress_marker(self, broker, "approval"):
+                return False
+            if (broker._secret_required and not broker._proxy_secret) or (
+                    broker._proxy_secret and not broker.proxy_secret_ok(self.headers)):
+                broker.log("approval_forbidden", reason="proxy secret missing, wrong or unusable",
+                           peer=self._ip, method=self.command)
+                self.close_connection = True
+                _page(self, 403, "<h1>Forbidden</h1>", nav=False)
+                return False
+            return True
+
+        def _origin_strict(self):
+            """For the JSON endpoints a browser calls itself: an Origin header is REQUIRED (a browser
+            sends one on every same-origin POST) and must be ours, whatever else the request carries."""
+            if not self.headers.get("Origin") and not broker.dest_guard.allow_loopback:
+                return False        # unconditional: the proxy secret does not excuse it (only the test switch relaxes it)
+            return self._same_origin()
+
+        @property
         def presence_page_cfg(self):
             pc = broker.presence_cfg
             return {"every": 10000, "focus": pc["require_focus"]} if pc["enabled"] else None
 
         def _fwd(self):
-            """Client IP as reported by the proxy chain. Informational: it is
-            only as trustworthy as the proxies in front of this listener."""
-            return (self.headers.get("X-Forwarded-For", "").split(",")[0].strip()[:64]) or None
+            """Client IP for the log: the walked X-Forwarded-For address when the socket peer is one of
+            `approval_trusted_proxies`, otherwise the socket peer itself (a header from anyone else is ignored)."""
+            return self._ip
 
         def _user(self):
             if not broker.peer_trusted(self.client_address[0]):
                 broker.log("approval_forbidden", reason="peer is not a trusted proxy",
-                           peer=self.client_address[0], client_ip=self._fwd(), method=self.command)
+                           peer=self._ip, client_ip=self._fwd(), method=self.command)
                 _page(self, 403, "<h1>Forbidden</h1>", nav=False)
                 return None
             user = self.headers.get(cfg.get("identity_header", "X-authentik-username"), "")
             if user != cfg["allowed_user"]:
-                broker.log("approval_forbidden", claimed_user=user[:80], peer=self.client_address[0],
+                broker.log("approval_forbidden", claimed_user=user[:80], peer=self._ip,
                            client_ip=self._fwd(), method=self.command)
                 _page(self, 403, "<h1>Forbidden</h1>", nav=False)
                 return None
@@ -4709,9 +5170,49 @@ def approval_handler(broker):
                                       cfg.get("approve_extra_origins"))
             return origin is None
 
+        def end_headers(self):
+            c = getattr(self, "_set_cookie", None)
+            if c:
+                self.send_header("Set-Cookie", c)
+            super().end_headers()
+
+        def _cookie_raw(self):
+            raw = ""
+            for part in (self.headers.get("Cookie") or "").split(";"):
+                k, _, v = part.strip().partition("=")
+                if k == broker.CSRF_COOKIE:
+                    raw = v
+            return raw
+
+        def _csrf_nonce(self, user):
+            """The per-browser nonce of this request's CSRF cookie. The first page a browser loads
+            mints it (HttpOnly, SameSite=Strict, bound to the user); later pages reuse it."""
+            if user in self._nonce_memo:
+                return self._nonce_memo[user]
+            n = broker.csrf_cookie_nonce(user, self._cookie_raw())
+            if n is None and not broker.dest_guard.allow_loopback:
+                cookie, n = broker.csrf_cookie_new(user)
+                via_tls = (str(cfg.get("approve_base_url", "")).startswith("https://")
+                           or (self.headers.get("X-Forwarded-Proto", "").split(",")[0].strip().lower() == "https"
+                               and broker.peer_trusted(self.client_address[0])))
+                secure = "; Secure" if via_tls else ""
+                self._set_cookie = f"{broker.CSRF_COOKIE}={cookie}; Path=/; HttpOnly; SameSite=Strict; Max-Age={broker.CSRF_COOKIE_LIFETIME_S}{secure}"
+            elif n is None:
+                n = broker.TEST_NONCE       # test harness only (Python API flag): no cookie jar
+            self._nonce_memo[user] = n
+            return n
+
+        def _tok(self, user):
+            return broker.csrf_token(user, self._csrf_nonce(user))
+
         def _csrf_ok(self, user, token):
-            return (self._same_origin()
-                    and hmac.compare_digest(token or "", broker.csrf_token(user)))
+            """Double submit: the form token is derived from the user AND the cookie nonce, so a token
+            read out of a page body is useless without the HttpOnly cookie that goes with it."""
+            n = broker.csrf_cookie_nonce(user, self._cookie_raw())
+            if n is None and broker.dest_guard.allow_loopback:
+                n = broker.TEST_NONCE
+            return (n is not None and self._same_origin()
+                    and hmac.compare_digest(token or "", broker.csrf_token(user, n)))
 
         def _dashboard(self, user, fragment=False, note="", q=None):
             notes = {"approved": "Approved. Releasing now.", "denied": "Denied.",
@@ -4737,7 +5238,7 @@ def approval_handler(broker):
                      "push_failed": "The test push was not delivered to any device.",
                      "bad": "That request could not be processed."}
             reqs = broker.pending()
-            token = broker.csrf_token(user)
+            token = self._tok(user)
             cards = []
             enrolls = broker.clients.pending()
             now = time.time()
@@ -4897,7 +5398,7 @@ def approval_handler(broker):
                     return self._fragment(code, f"<p class=muted>{msg}</p>")
                 return _page(self, code, f"<h1>{msg}</h1>", tab="requests",
                              badge=broker.attention(), user=user)
-            broker.log("request_detail_viewed", peer=self.client_address[0],
+            broker.log("request_detail_viewed", peer=self._ip,
                        client_ip=self._fwd(), request_id=rid)
             body = _detail_html(row, evs, self._retained_html(row) + self._retry_html(row, user))
             if fragment:
@@ -4913,7 +5414,7 @@ def approval_handler(broker):
                 return ""
             return ("<form method=post action='/request/retry' class=retry>"
                     f"<input type=hidden name=id value='{html.escape(row['id'])}'>"
-                    f"<input type=hidden name=csrf value='{broker.csrf_token(user)}'>"
+                    f"<input type=hidden name=csrf value='{self._tok(user)}'>"
                     f"<button class='btn approve' type=submit>Retry failed ({n})</button> "
                     "<small class=muted>Applies only the entries that failed, the same way.</small></form>")
 
@@ -4939,7 +5440,7 @@ def approval_handler(broker):
         def _credential_page(self, req, user, status=200, values=None, errors=()):
             """The credential entry page. Served only to the authenticated approver. The secret
             fields are never filled in, so an error re-render cannot echo the value."""
-            body = credreq_mod.form_html(req, broker.csrf_token(user), values, errors)
+            body = credreq_mod.form_html(req, self._tok(user), values, errors)
             _page(self, status, body, tab="requests", badge=broker.attention(), user=user)
 
         def _plan_page(self, req, user):
@@ -4953,13 +5454,13 @@ def approval_handler(broker):
                   f"<p><small>Expires in {max(0, int(req.expires - time.time()))}s</small></p>"
                   "<form method=post action='/plans/decide' id=f>"
                   f"<input type=hidden name=nonce value='{html.escape(req.nonce)}'>"
-                  f"<input type=hidden name=csrf value='{broker.csrf_token(user)}'>"
+                  f"<input type=hidden name=csrf value='{self._tok(user)}'>"
                   f"{_approve_actions(broker, req)}</form>", tab="requests", badge=broker.attention(), user=user)
 
         def _plans_post(self, path, form, user):
             """POST /plans/decide and /plans/revoke (CSRF already checked): the only way a plan is
             approved. No notification button, token, hook or link-page button reaches either."""
-            peer, fwd = self.client_address[0], self._fwd()
+            peer, fwd = self._ip, self._fwd()
             one = lambda k: (form.get(k) or [""])[0]  # noqa: E731
             if path == "/plans/revoke":
                 done = broker.revoke_plan(one("plan")[:40], user, peer, fwd)
@@ -4997,7 +5498,7 @@ def approval_handler(broker):
             if r is None or r.mode != "credential" or r.status != "pending" or time.time() > r.expires:
                 return _page(self, 404, "<h1>Request not found or already handled</h1>", tab="requests",
                              badge=broker.attention(), user=user)
-            broker.log("approval_viewed", user=user, peer=self.client_address[0], client_ip=self._fwd(),
+            broker.log("approval_viewed", user=user, peer=self._ip, client_ip=self._fwd(),
                        request_id=r.id, found=True)
             self._credential_page(r, user)
 
@@ -5005,7 +5506,7 @@ def approval_handler(broker):
             """POST /credential (CSRF already checked): deny, or store what the human typed."""
             rid = form.get("id", [""])[0][:64]
             decision = form.get("decision", [""])[0]
-            peer, fwd = self.client_address[0], self._fwd()
+            peer, fwd = self._ip, self._fwd()
             r = broker._by_id.get(rid)
             if r is None or r.mode != "credential" or decision not in ("approve", "deny"):
                 return self._redirect("/?note=stale")
@@ -5045,7 +5546,7 @@ def approval_handler(broker):
             """POST /enroll/decide, /clients/rename|revoke|remove (CSRF already checked). Only
             this authenticated approver listener can reach them: no notification button, link,
             token or hook decides an enrollment."""
-            peer, fwd = self.client_address[0], self._fwd()
+            peer, fwd = self._ip, self._fwd()
             one = lambda k: (form.get(k) or [""])[0]  # noqa: E731
             if path == "/enroll/decide":
                 status, _e = broker.decide_enrollment(one("id")[:40], one("decision"), one("name")[:40],
@@ -5081,7 +5582,7 @@ def approval_handler(broker):
             self.wfile.write(raw)
 
         def _settings_page(self, user, note=""):
-            token = broker.csrf_token(user)
+            token = self._tok(user)
             notes = {"push_removed": "Device removed.",
                      "push_test_ok": "Test push sent. It should arrive even with the browser closed.",
                      "push_failed": "The test push was not delivered to any device."}
@@ -5220,16 +5721,16 @@ def approval_handler(broker):
 
         def _policies_page(self, user, note="", status=200, ssh_state=None, rule_state=None):
             _page(self, status, f"<h1>Policies</h1>{note}{self._standing_section(user)}"
-                  + guidance_mod.policies_section(cfg["secrets"], broker.csrf_token(user))
-                  + sshhosts_mod.policies_section(cfg["secrets"], broker.csrf_token(user), ssh_state)
-                  + sshrules_mod.policies_section(cfg["secrets"], broker.csrf_token(user),
+                  + guidance_mod.policies_section(cfg["secrets"], self._tok(user))
+                  + sshhosts_mod.policies_section(cfg["secrets"], self._tok(user), ssh_state)
+                  + sshrules_mod.policies_section(cfg["secrets"], self._tok(user),
                                                   broker.ssh_rule_usage, state=rule_state,
                                                   client_names=broker.clients.names(),
                                                   client_choices=broker.clients.active_choices()),
                   script=_GRANTS_JS + guidance_mod.JS + sshhosts_mod.JS, tab="policies", badge=broker.attention(), user=user)
 
         def _clients_page(self, user, note="", status=200):
-            token = broker.csrf_token(user)
+            token = self._tok(user)
             # the approvals that belong to a client live together under the clients: plans, then sessions
             _page(self, status, clients_mod.clients_section(broker, token, flash=note)
                   + plans_mod.active_table_html(broker.active_plans(), token)
@@ -5240,7 +5741,7 @@ def approval_handler(broker):
             """'Standing approvals' on the Policies tab: every timed grant, Always
             approval and legacy always-allowed credential, with Revoke."""
             e = html.escape
-            token = broker.csrf_token(user)
+            token = self._tok(user)
             head = ("<h3 style='margin-top:0'>Standing approvals</h3><p><small class=muted>Requests "
                     "these cover are approved without asking. A time-boxed approval has no risk limit "
                     "and ends at its deadline. An Always approval never expires and is used only when the "
@@ -5294,7 +5795,7 @@ def approval_handler(broker):
                 q = urllib.parse.parse_qs(u.query)
                 frag = q.get("fragment", [""])[0] == "1"
                 if not frag:
-                    broker.log("dashboard_viewed", peer=self.client_address[0], client_ip=self._fwd())
+                    broker.log("dashboard_viewed", peer=self._ip, client_ip=self._fwd())
                 return self._dashboard(user, fragment=frag, note=(q.get("note") or [""])[0][:12], q=q)
             if self.path.split("?")[0].rstrip("/") == "/history":
                 # the old standalone table: the same list now lives on the Requests tab
@@ -5312,7 +5813,7 @@ def approval_handler(broker):
                 q = urllib.parse.parse_qs(u.query)
                 return self._settings_page(user, (q.get("note") or [""])[0][:12])
             if self.path.split("?")[0].rstrip("/") == "/policies":
-                broker.log("policies_viewed", peer=self.client_address[0], client_ip=self._fwd())
+                broker.log("policies_viewed", peer=self._ip, client_ip=self._fwd())
                 return self._policies_page(user)
             if self.path.split("?")[0].rstrip("/") == "/clients":
                 q = urllib.parse.parse_qs(u.query)
@@ -5320,7 +5821,7 @@ def approval_handler(broker):
             nonce = self._nonce()
             req = broker._by_nonce.get(nonce) if nonce else None
             broker.log("approval_viewed", user=self.headers.get(
-                cfg.get("identity_header", "X-authentik-username"), ""), peer=self.client_address[0],
+                cfg.get("identity_header", "X-authentik-username"), ""), peer=self._ip,
                 client_ip=self._fwd(), request_id=req.id if req else None,
                 found=bool(req and req.status == "pending" and time.time() <= req.expires))
             if req is None or req.status != "pending" or time.time() > req.expires:
@@ -5340,12 +5841,13 @@ def approval_handler(broker):
 <p><small>{note}</small></p>
 <p><small>Expires in {int(req.expires - time.time())}s</small></p>
 <form method=post id=f>
+<input type=hidden name=csrf value='{self._tok(user)}'>
 {_approve_actions(broker, req)}
 </form>
 <p id=w hidden>Working...</p>""", script=_WORKING_JS + proposals_mod.JS + proposals_mod.JS_INIT)
 
         def _push_post(self, path, form, user):
-            peer, fwd = self.client_address[0], self._fwd()
+            peer, fwd = self._ip, self._fwd()
             if broker.push is None:
                 return self._json(404, {"ok": False})
             if path == "/push/subscribe":
@@ -5376,14 +5878,14 @@ def approval_handler(broker):
         _ce_state = {}
 
         def _client_event(self, user):
-            peer, fwd = self.client_address[0], self._fwd()
+            peer, fwd = self._ip, self._fwd()
             try:
                 n = int(self.headers.get("Content-Length", 0))
             except ValueError:
                 n = -1
             ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
             if (self.headers.get("X-Requested-With") != "asb" or ctype != "application/json"
-                    or not self._same_origin()):
+                    or not self._origin_strict()):
                 self.close_connection = True
                 return self._json(403, {"ok": False})
             if n < 0 or n > 2048:
@@ -5432,7 +5934,7 @@ def approval_handler(broker):
                 n = -1
             ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
             if (self.headers.get("X-Requested-With") != "asb" or ctype != "application/json"
-                    or not self._same_origin()):
+                    or not self._origin_strict()):
                 self.close_connection = True
                 return self._json(403, {"ok": False})
             if n < 0 or n > 256:
@@ -5450,7 +5952,7 @@ def approval_handler(broker):
                 self.send_response(204)         # nothing is held: accept and ignore
                 self.send_header("Cache-Control", "no-store")
                 return self.end_headers()
-            if not broker.presence_beat(user, body["v"], tab, self.client_address[0]):
+            if not broker.presence_beat(user, body["v"], tab, self._ip):
                 return self._json(429, {"ok": False})
             self.send_response(204)
             self.send_header("Cache-Control", "no-store")
@@ -5463,9 +5965,9 @@ def approval_handler(broker):
             except ValueError:
                 n = -1
             if (self.headers.get("X-Requested-With") != "asb" or ctype != "application/json"
-                    or not self._same_origin()):
+                    or not self._origin_strict()):
                 self.close_connection = True
-                broker.log("push_decide_refused", user=user, peer=self.client_address[0],
+                broker.log("push_decide_refused", user=user, peer=self._ip,
                            client_ip=self._fwd(), status=403, reason="guard")
                 return self._json(403, {"ok": False})
             if n < 0 or n > 2048:
@@ -5481,7 +5983,7 @@ def approval_handler(broker):
                 return self._json(400, {"ok": False})
             code, _ = broker.decide_push(body.get("rid") or None, body["token"],
                                          body["decision"] == "approve", user,
-                                         self.client_address[0], self._fwd())
+                                         self._ip, self._fwd())
             if code == 200:
                 return self._json(200, {"ok": True, "decision": body["decision"]})
             return self._json(code, {"ok": False})
@@ -5505,11 +6007,13 @@ def approval_handler(broker):
                 return _page(self, 413, "<h1>Too large</h1>")
             form = urllib.parse.parse_qs(
                 self.rfile.read(min(int(self.headers.get("Content-Length", 0)), limit)).decode())
-            if path in ("/decide", "/credential", "/request/retry", "/policies", "/policies/guidance", "/policies/ssh_hosts", "/grants/revoke",
+            link = path.startswith("/a/") and not broker.dest_guard.allow_loopback   # the notification link page
+            if (link or path in ("/decide", "/credential", "/request/retry", "/policies", "/policies/guidance", "/policies/ssh_hosts", "/grants/revoke",
                         "/enroll/decide", "/clients/rename", "/clients/revoke", "/clients/remove", "/sessions/revoke",
                         "/policies/ssh_rules/add", "/policies/ssh_rules/revoke", "/push/subscribe",
-                        "/push/revoke", "/push/test", "/plans/decide", "/plans/revoke") and not self._csrf_ok(user, form.get("csrf", [""])[0]):
-                broker.log("csrf_refused", path=path, peer=self.client_address[0],
+                        "/push/revoke", "/push/test", "/plans/decide", "/plans/revoke")) and not (
+                    self._csrf_ok(user, form.get("csrf", [""])[0]) and (not link or bool(self.headers.get("Origin")))):
+                broker.log("csrf_refused", path=path, peer=self._ip,
                            client_ip=self._fwd(), origin=(self.headers.get("Origin") or "")[:80],
                            fetch_site=self.headers.get("Sec-Fetch-Site"))
                 return _page(self, 403, "<h1>Forbidden</h1><p>Reload the page and try again.</p>")
@@ -5522,7 +6026,7 @@ def approval_handler(broker):
             if path.startswith("/clients/") or path == "/enroll/decide":
                 return self._clients_post(path, form, user)
             if path == "/sessions/revoke":
-                done = broker.revoke_session(form.get("pid", [""])[0][:16], user, self.client_address[0],
+                done = broker.revoke_session(form.get("pid", [""])[0][:16], user, self._ip,
                                              self._fwd())
                 return self._redirect("/clients?note=" + ("sesrevoked" if done else "sesgone"))
             if path == "/decide":
@@ -5537,7 +6041,7 @@ def approval_handler(broker):
                     "dashboard", rid, parsed[0], user, always=parsed[1], grant_minutes=parsed[2],
                     ssh_rule=rule, apply=_apply_set(form), rule_scope=_rule_scope(form),
                     session_limits=_session_limits(form, r),
-                    peer=self.client_address[0], client_ip=self._fwd())
+                    peer=self._ip, client_ip=self._fwd())
                 if done is None:
                     return self._redirect("/?note=" + ("bad" if code == 400 else
                                                        "norule" if code in (403, 409) else "stale"))
@@ -5551,12 +6055,12 @@ def approval_handler(broker):
                 return self._redirect(f"/?note={tag}")
             if path == "/request/retry":
                 code, n = broker.retry_proposal(form.get("id", [""])[0][:64], user, "dashboard",
-                                                self.client_address[0], self._fwd())
+                                                self._ip, self._fwd())
                 return self._redirect("/?note=" + ("gretry" if code == 202 else
                                                    "gbusy" if code == 409 else "gstale"))
             if path == "/grants/revoke":
                 gid = form.get("grant", [""])[0][:16]
-                done = broker.revoke_grant(gid, user, self.client_address[0], self._fwd())
+                done = broker.revoke_grant(gid, user, self._ip, self._fwd())
                 return self._policies_page(
                     user, "<p>" + ("Standing approval revoked" if done else
                                    "That standing approval is no longer active" if done is False else
@@ -5566,7 +6070,7 @@ def approval_handler(broker):
                 name, rid = form.get("secret", [""])[0], form.get("rule", [""])[0][:16]
                 if name not in cfg["secrets"] or not cfg["secrets"][name].get("ssh"):
                     return _page(self, 400, "<h1>Bad request</h1>")
-                res = broker.revoke_ssh_rule(name, rid, user, self.client_address[0], self._fwd())
+                res = broker.revoke_ssh_rule(name, rid, user, self._ip, self._fwd())
                 msg = {"revoked": "SSH rule revoked", "missing": "That SSH rule no longer exists",
                        "failed": "Could not revoke the SSH rule"}[res]
                 return self._policies_page(user, f"<p>{msg}: {html.escape(name)}</p>",
@@ -5578,7 +6082,7 @@ def approval_handler(broker):
                     return _page(self, 400, "<h1>Bad request</h1>")
                 one = lambda k: form.get(k, [""])[0]  # noqa: E731
                 res = broker.add_ssh_rule(name, one("host") or one("fp"), one("account"), one("expires"),
-                                          one("confirm") == "1", user, self.client_address[0], self._fwd(),
+                                          one("confirm") == "1", user, self._ip, self._fwd(),
                                           client=one("client") or clients_mod.ANY)
                 if res["status"] in ("created", "exists"):
                     return self._policies_page(
@@ -5596,7 +6100,7 @@ def approval_handler(broker):
                 res = broker.set_ssh_hosts(
                     name, one("known_hosts"), one("allowed_hosts"), one("allow_forwarded") == "1", user,
                     confirm_weaken=one("confirm_weaken") == "1", save_anyway=one("save_anyway") == "1",
-                    peer=self.client_address[0], client_ip=self._fwd())
+                    peer=self._ip, client_ip=self._fwd())
                 if res["status"] in ("saved", "unchanged"):
                     msg = ("SSH host policy saved" if res["status"] == "saved" else "SSH host policy unchanged")
                     note = f"<p>{msg}: {html.escape(name)}</p>"
@@ -5615,7 +6119,7 @@ def approval_handler(broker):
                 if name not in cfg["secrets"]:
                     return _page(self, 400, "<h1>Bad request</h1>")
                 text = form.get("guidance", [""])[0]
-                done = broker.set_guidance(name, text, user, self.client_address[0], self._fwd())
+                done = broker.set_guidance(name, text, user, self._ip, self._fwd())
                 why = ""
                 if not done:
                     try:
@@ -5630,7 +6134,7 @@ def approval_handler(broker):
                 # this page can only *tighten*: granting happens in the context of a request
                 if form.get("approval", [""])[0] != "prompt" or name not in cfg["secrets"]:
                     return _page(self, 400, "<h1>Bad request</h1>")
-                done = broker.set_approval(name, "prompt", user, self.client_address[0], self._fwd())
+                done = broker.set_approval(name, "prompt", user, self._ip, self._fwd())
                 return self._policies_page(
                     user, f"<p>{'Updated' if done else 'Could not update'}: {html.escape(name)}</p>")
             nonce = self._nonce()
@@ -5644,7 +6148,7 @@ def approval_handler(broker):
                                            ssh_rule=rule or None, apply=_apply_set(form),
                                            rule_scope=_rule_scope(form),
                                            session_limits=_session_limits(form, broker._by_nonce.get(nonce)),
-                                           peer=self.client_address[0], client_ip=self._fwd())
+                                           peer=self._ip, client_ip=self._fwd())
                          if nonce and rule is not False else (404, None))
             held = broker._by_nonce.get(nonce) if nonce else None
             if code == 400 and held is not None and held.mode == "credential":
@@ -5706,6 +6210,7 @@ def serve(broker, client_addr, approval_addr, client_key):
         raise ValueError("ha_hook key must differ from the agent client key")
     c = ThreadingHTTPServer(client_addr, client_handler(broker, client_key))
     a = ThreadingHTTPServer(approval_addr, approval_handler(broker))
+    broker.dest_guard.register_ports(c.server_address[1], a.server_address[1])   # what is really bound
     for s in (c, a):
         s.daemon_threads = True
         threading.Thread(target=s.serve_forever, daemon=True).start()

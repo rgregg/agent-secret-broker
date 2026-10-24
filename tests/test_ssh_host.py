@@ -17,6 +17,8 @@ from cryptography.hazmat.primitives.asymmetric import ec, ed25519, padding, rsa
 sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import test_ssh as ts  # noqa: E402
+from secret_broker import destguard as _destguard  # noqa: E402
+_destguard.allow_loopback_for_tests()   # test stubs live on 127.0.0.1; no config key does this
 from secret_broker import sshkey  # noqa: E402
 from secret_broker.broker import Broker, _describe  # noqa: E402
 from test_e2e import KEY, Harness, req  # noqa: E402

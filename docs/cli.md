@@ -71,6 +71,18 @@ Check it:
 - `{{VAR}}` placeholders (the names `which` and `list` show) are replaced
   **inside the broker** in the URL, headers and body, so the agent never sees the
   value. This is `http` mode and it is the one to prefer.
+  * The URL and header names/templates must be plain ASCII with no spaces or control
+    characters (percent-encode: `?q=caf%C3%A9`; an internationalised host must be written as
+    punycode). A `{{VAR}}` may not appear in the scheme, host or port. A trailing newline in
+    a stored value is dropped when it is placed in a URL or header.
+  * You may not set `Host` (unless it equals the URL's host), `Content-Length`,
+    `Transfer-Encoding`, `Connection`, `Cookie`, `Upgrade`, `TE`, `Proxy-*` or
+    `X-Secret-Broker-*`, nor the same header twice with different spelling.
+  * `Set-Cookie` is removed from the response in plain `http` mode. Cookie flows need an HTTP
+    session (below).
+  * A failed call says only `release failed: <timeout|tls|dns|connection|invalid request|vault|other>`.
+    `invalid request` means that a value filled into the request could not be sent as written; it
+    reveals nothing else. A destination the broker refuses reads as `connection`.
 - `NAME -- command` (env mode) hands the value to a command on the agent's host.
   The broker cannot check what the command does with it. If the credential is
   `approval: allow` (and not limited to `auto_modes: ["http"]`) and the request

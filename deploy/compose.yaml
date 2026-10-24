@@ -8,13 +8,14 @@ services:
     image: ghcr.io/rgregg/agent-secret-broker:latest
     container_name: secret-broker
     restart: unless-stopped
+    networks: [asb]
     ports:
       - "8800:8800"            # client API (CLI): needs X-Client-Key. Do NOT publish 8801.
     env_file: ./secrets/broker.env      # BW_CLIENTID / BW_CLIENTSECRET (bw backend)
     environment:
       HOME: /tmp
       BITWARDENCLI_APPDATA_DIR: /bw   # persistent: keeps ONE stable device identity
-      BROKER_CONFIG: '{"backend": {"type": "bw", "server_url": "https://vault.example.com", "master_password_file": "/run/secrets/bw_master_password", "organization": "My Org", "collection": "Secrets", "serve": true}, "client_key_file": "/run/secrets/client_key", "approve_base_url": "https://secrets.example.com", "allowed_user": "alice", "identity_header": "X-authentik-username", "audit_log": "/data/audit.jsonl"}'
+      BROKER_CONFIG: '{"backend": {"type": "bw", "server_url": "https://vault.example.com", "master_password_file": "/run/secrets/bw_master_password", "organization": "My Org", "collection": "Secrets", "serve": true}, "client_key_file": "/run/secrets/client_key", "approve_base_url": "https://secrets.example.com", "allowed_user": "alice", "identity_header": "X-authentik-username", "audit_log": "/data/audit.jsonl", "approval_trusted_peers": ["172.30.50.10/32"], "approval_trusted_proxies": ["172.30.50.10/32"], "approval_proxy_secret_file": "/run/secrets/approval_proxy_secret"}'
     volumes:
       - ./data:/data
       - ./bw:/bw               # owned by uid 65534, mode 700
@@ -23,6 +24,18 @@ services:
     tmpfs: [/tmp]
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
+    # CLIENT API GATE: adding "trusted_proxies": ["<your reverse proxy>/32"] to BROKER_CONFIG makes port 8800 answer 403
+    # to every other socket peer. DO NOT turn it on blindly: published ports go through Docker's userland proxy or
+    # bridge NAT, which can rewrite the source address to the bridge gateway (172.30.50.1 here), and then the gate
+    # would refuse everybody, including the proxy. First send a few requests through the proxy and read the
+    # `client_peer_observed` lines in the audit log / `docker compose logs broker` (the first 20 requests are
+    # logged with the socket peer the broker really sees); list THAT address. Set "client_api_allow_direct": true
+    # if some clients (Home Assistant, asb on this host) connect directly.
+    healthcheck:               # /healthz answers only loopback / the container's own address, with "ok"
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8800/healthz', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
     deploy:
       resources:
         limits: {cpus: "1.0", memory: 256M}
@@ -34,9 +47,25 @@ services:
     image: ghcr.io/goauthentik/proxy:2026.8.3   # keep == your authentik server version
     container_name: secret-broker-outpost
     restart: unless-stopped
+    networks:
+      asb:
+        ipv4_address: 172.30.50.10   # PLACEHOLDER: the outpost's own fixed address; it is what
+                                     # approval_trusted_peers lists (a /32). Never list 172.16.0.0/12 or
+                                     # 10.0.0.0/8: that trusts every container and VM in the range.
     ports:
       - "9000:9000"            # point your TLS reverse proxy at this
     environment:
       AUTHENTIK_HOST: https://authentik.example.com
       AUTHENTIK_INSECURE: "false"
     env_file: ./secrets/outpost.env     # AUTHENTIK_TOKEN
+
+# A fixed subnet, so the outpost's address (and the CIDR above) is stable across restarts.
+networks:
+  asb:
+    ipam:
+      config:
+        - subnet: 172.30.50.0/24
+
+# Recommended in addition to the peer address: a shared secret the outpost adds to every request
+# (header X-ASB-Proxy-Secret, see docs/setup.md "Upgrading"). Create it with `openssl rand -hex 32`, mode 600,
+# in ./secrets/approval_proxy_secret (the broker reads it from /run/secrets/approval_proxy_secret above).

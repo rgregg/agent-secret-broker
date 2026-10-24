@@ -13,6 +13,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import test_e2e as t  # noqa: E402
 import test_ssh_host as th  # noqa: E402
+from secret_broker import destguard as _destguard  # noqa: E402
+_destguard.allow_loopback_for_tests()   # test stubs live on 127.0.0.1; no config key does this
 from secret_broker import audit_api, sshhosts  # noqa: E402
 from secret_broker.backends import MemoryBackend  # noqa: E402
 from secret_broker.broker import Broker  # noqa: E402

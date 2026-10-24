@@ -46,15 +46,19 @@ def _host_ok(host, allowed):
 
 def _send_with_pywebpush(sub, data, key_path, subject, ttl):
     from pywebpush import WebPushException, webpush   # imported lazily: only when sending
+    import requests
+    session = requests.Session()
+    session.trust_env = False       # never the environment's HTTP(S)_PROXY, .netrc or CA overrides
     try:
         webpush(subscription_info={"endpoint": sub["endpoint"], "keys": sub["keys"]},
                 data=data, vapid_private_key=key_path, vapid_claims={"sub": subject},
-                ttl=ttl, headers={"Urgency": "high"}, timeout=10)
+                ttl=ttl, headers={"Urgency": "high", "X-Secret-Broker-Egress": "1"}, timeout=10,
+                requests_session=session)
     except WebPushException as e:
         resp = getattr(e, "response", None)
-        raise PushError(getattr(resp, "status_code", None), str(e)[:160]) from None
+        raise PushError(getattr(resp, "status_code", None), "push service refused") from None
     except OSError as e:
-        raise PushError(None, f"network error: {e}"[:160]) from None
+        raise PushError(None, "network error") from None
 
 
 class PushStore:

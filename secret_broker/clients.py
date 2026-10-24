@@ -202,6 +202,21 @@ def _record(r):
             "revoked_by": text(r.get("revoked_by"), 120)}
 
 
+def src_key(addr):
+    """The key a per-source limiter uses: an IPv6 address counts as its /64 (one host can rotate through
+    2^64 addresses), anything else as itself."""
+    import ipaddress
+    try:
+        ip = ipaddress.ip_address(str(addr).split("%", 1)[0])
+    except ValueError:
+        return addr
+    if ip.version == 6:
+        if ip.ipv4_mapped:
+            return str(ip.ipv4_mapped)
+        return str(ipaddress.IPv6Network((int(ip) >> 64 << 64, 64)))
+    return str(ip)
+
+
 class ClientStore:
     """The enrolled clients (persisted), the pending enrollments (memory) and the limiters.
     `log(event, **fields)` receives audit records; it must not call back in."""
@@ -377,6 +392,7 @@ class ClientStore:
     def fail_should_log(self, source):
         """True for the first authentication failure from `source` in each FAIL_LOG_S window;
         the count of the ones skipped since is returned with it."""
+        source = src_key(source)
         now = self.clock()
         with self._lock:
             st = self._fail_log.get(source)
@@ -429,6 +445,7 @@ class ClientStore:
     def _hit(self, kind, key, window, limit, now):
         """Fixed-window counter: True while under `limit`. `key` None is the global bucket."""
         m = self._rates.setdefault((kind, window), {})
+        key = None if key is None else src_key(key)          # every per-source bucket is keyed on the /64 for IPv6
         st = m.get(key)
         if st is None or now - st["t"] >= window:
             if st is None:
@@ -439,6 +456,7 @@ class ClientStore:
 
     def rate_ok(self, kind, source, limits, window=60):
         """Charge one hit to the global and the per-source bucket. False when either is full."""
+        source = src_key(source)
         now = self.clock()
         with self._lock:
             a = self._hit(kind + ":src", source, window, limits[0], now)
@@ -451,7 +469,7 @@ class ClientStore:
         for e in self._pending.values():
             if e["status"] == "pending" and now >= e["expires"]:
                 e["status"], e["decided_at"] = "expired", now
-                self._cooldown[e["source"]] = now + COOLDOWN_S
+                self._cooldown[src_key(e["source"])] = now + COOLDOWN_S
                 self._lapsed.append(dict(e))
         for eid in [k for k, e in self._pending.items()
                     if e["status"] != "pending" and now - e["decided_at"] > RESOLVED_KEEP_S]:
@@ -472,6 +490,7 @@ class ClientStore:
         message is a fixed string; nothing says which names or hashes already exist except
         a name that is PENDING (an attacker can only learn what they could create)."""
         cfg = self.cfg["enrollment"]
+        key = src_key(source)       # limiters and caps use this; `source` itself is kept as shown on the card
         if self.broken:
             return 503, {"error": "enrollment is not available"}, None
         if not cfg["enabled"]:
@@ -486,9 +505,9 @@ class ClientStore:
         now = self.clock()
         with self._lock:
             self._expire_locked()
-            if self._cooldown.get(source, 0) > now:
+            if self._cooldown.get(key, 0) > now:
                 return 429, {"error": "too many enrollment requests; try again later"}, None
-            if not (self._hit("hour:src", source, 3600, SUBMIT_HOUR[0], now)
+            if not (self._hit("hour:src", key, 3600, SUBMIT_HOUR[0], now)
                     & self._hit("hour:all", None, 3600, SUBMIT_HOUR[1], now)):
                 return 429, {"error": "too many enrollment requests; try again later"}, None
             same = next((e for e in self._pending.values()
@@ -500,7 +519,7 @@ class ClientStore:
             pend = [e for e in self._pending.values() if e["status"] == "pending"]
             if len(pend) >= cfg["max_pending"]:
                 return 429, {"error": "too many pending enrollments; try again later"}, None
-            if sum(e["source"] == source for e in pend) >= SOURCE_PENDING:
+            if sum(src_key(e["source"]) == key for e in pend) >= SOURCE_PENDING:
                 return 429, {"error": "too many pending enrollments from this address"}, None
             if any(e["name"] == name for e in pend):
                 return 409, {"error": "an enrollment with that name is already waiting"}, None
@@ -564,7 +583,7 @@ class ClientStore:
             now = self.clock()
             if not approve:
                 e["status"], e["decided_at"], e["decided_by"] = "denied", now, actor
-                self._cooldown[e["source"]] = now + COOLDOWN_S
+                self._cooldown[src_key(e["source"])] = now + COOLDOWN_S
                 return "denied", dict(e), None
             final = name if name else e["name"]
             if not valid_name(final):

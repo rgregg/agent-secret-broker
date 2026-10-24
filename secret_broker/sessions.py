@@ -31,6 +31,7 @@ Invariants (enforced in broker.py and here, tested in tests/test_sessions.py):
 import hashlib
 import hmac
 import html
+import http.client
 import json
 import math
 import re
@@ -47,6 +48,9 @@ from collections import OrderedDict
 from email.utils import parsedate_to_datetime
 
 from .backends import BackendError
+from . import destguard
+from . import httpcheck
+from . import masking
 from . import clients as clients_mod
 from . import clock as clock_mod
 from . import credreq as credreq_mod
@@ -412,9 +416,11 @@ def coarse_class(exc):
         return "dns"
     if isinstance(exc, ConnectionError):
         return "connection"
-    if isinstance(exc, ValueError):
-        return "invalid_request"
-    if isinstance(exc, OSError):
+    if isinstance(exc, destguard.DestinationRefused):
+        return "destination not allowed"
+    if isinstance(exc, (ValueError, http.client.InvalidURL)):
+        return "invalid request"
+    if isinstance(exc, (OSError, http.client.HTTPException)):
         return "connection"
     return "other"
 
@@ -456,9 +462,7 @@ def fill(text, values):
 def mask_values(text, values):
     """Replace every value of MASK_MIN or more characters (longest first) with ***. Shorter values are
     not masked: that would corrupt ordinary words and numbers in a response."""
-    for v in sorted({v for v in values if isinstance(v, str) and len(v) >= MASK_MIN}, key=len, reverse=True):
-        text = text.replace(v, "***")
-    return text
+    return masking.mask_values(text, values)
 
 
 def _origin(url):
@@ -564,7 +568,7 @@ def header_problem(headers):
     seen = set()
     for k, v in headers.items():
         low = k.lower()
-        if low in seen or low not in ALLOWED_HEADERS:
+        if low in seen or low not in ALLOWED_HEADERS or httpcheck.forbidden(low):
             return HEADER_REFUSED
         seen.add(low)
         if low == "content-type":
@@ -641,12 +645,12 @@ def _alive(sess, clock):
         raise SessionError(*ENDED["expired"])
 
 
-def _read_bounded(resp, sess, clock, t0):
+def _read_bounded(resp, sess, clock, t0, limit=READ_LIMIT):
     """Read at most READ_LIMIT bytes, giving up (TimeoutError) when the session deadline or CALL_TIMEOUT_S passes, so a
     slow-drip upstream cannot hold a call past either. Best effort on the per-read socket timeout too."""
     read = getattr(resp, "read1", None) or resp.read
     chunks, n = [], 0
-    while n < READ_LIMIT:
+    while n < limit:
         left = min(CALL_TIMEOUT_S - (time.monotonic() - t0), sess.expires - clock())
         if left <= 0:
             raise TimeoutError("deadline")
@@ -655,7 +659,7 @@ def _read_bounded(resp, sess, clock, t0):
             sock.settimeout(max(0.1, left))
         except AttributeError:
             pass
-        chunk = read(min(65536, READ_LIMIT - n))
+        chunk = read(min(65536, limit - n))
         if not chunk:
             break
         chunks.append(chunk)
@@ -687,8 +691,9 @@ def run_http(sess, spec, env, tls, allowed_now, opener_for, clock, state):
             data = fill(spec["body"], values).encode("utf-8")
         else:
             data = None
-        url = fill(spec["url"], values)
-        headers = {k: fill(v, values) for k, v in spec["headers"].items()}
+        hvalues = {k: masking.strip_one_newline(v) for k, v in values.items()}   # a header / url never ends in one
+        url = fill(spec["url"], hvalues)
+        headers = {k: fill(v, hvalues) for k, v in spec["headers"].items()}
     except (KeyError, ValueError, UnicodeError):
         raise NotSent("a placeholder or value in this call cannot be used", "session_refused") from None
     # ONE rule: a capture taken from an https response is only ever substituted into an https call (its final url)
@@ -712,11 +717,10 @@ def run_http(sess, spec, env, tls, allowed_now, opener_for, clock, state):
         if problem:
             raise NotSent(problem)
     scheme, host, port, path = _origin(url)
-    if scheme not in ("http", "https") or not sess.in_scope(scheme, host, port) or host not in allowed_now:
+    if scheme not in ("http", "https") or not sess.in_scope(scheme, host, port) or host not in destguard.host_parts(allowed_now):
         raise NotSent("that host or port is outside this session's scope")
     # Everything below depends on credential content: one generic error for every cause, charged like a sent call.
-    if _ILLEGAL_HEADER_VALUE.search(url) or " " in url:
-        raise ValueError("bad request")
+    httpcheck.check_url(url)        # (one rule for every path: no control character incl. TAB, no whitespace, ASCII)
     for k, v in headers.items():
         if not _HEADER_TOKEN.match(k) or _ILLEGAL_HEADER_VALUE.search(v) or not v.isascii():
             raise ValueError("bad request")
@@ -731,12 +735,13 @@ def run_http(sess, spec, env, tls, allowed_now, opener_for, clock, state):
         timeout = min(CALL_TIMEOUT_S, max(0.1, sess.expires - clock()))
     r = urllib.request.Request(url, data=data, method=method, headers=headers)
     t0 = time.monotonic()
+    margin = masking.get_masker(list(env.values()) + before).margin + 4096    # read past the cut: mask, then cut
     try:
         with opener_for(tls).open(r, timeout=timeout) as resp:
-            status, msg, body = resp.status, resp.headers, _read_bounded(resp, sess, clock, t0)
+            status, msg, body = resp.status, resp.headers, _read_bounded(resp, sess, clock, t0, READ_LIMIT + margin)
     except urllib.error.HTTPError as e:
         try:
-            status, msg, body = e.code, e.headers, _read_bounded(e, sess, clock, t0)
+            status, msg, body = e.code, e.headers, _read_bounded(e, sess, clock, t0, READ_LIMIT + margin)
         finally:
             e.close()
     caps, missing = {}, []
@@ -781,26 +786,33 @@ def run_http(sess, spec, env, tls, allowed_now, opener_for, clock, state):
         # set or offered (even if a cap or rule rejected it), and what is held now
         secret_values = (list(env.values()) + before + seen_values + sess.jar.values()
                          + list(sess.captures.values()))
+    masker = masking.get_masker(secret_values)
     out_headers = {}
     for k, v in msg.items():
         if k.lower() in ("set-cookie", "set-cookie2"):
             continue
-        out_headers[k] = mask_values(v, secret_values)
-    out = {"status": status, "headers": out_headers,
-           "body": mask_values(body.decode("utf-8", "replace"), secret_values)}
-    return out, {"captured": sorted(caps), "missing": sorted(set(missing))}
+        out_headers[k] = masker.mask(v)
+    out = {"status": status, "headers": out_headers, "body": masker.body(body, READ_LIMIT)}
+    return out, {"captured": sorted(caps), "missing": sorted(set(missing)), "_over_budget": masker.over_budget}
 
 
-def scope_problem(s, sc, names, method, spec, capture_names=()):
+def scope_problem(s, sc, names, method, spec, capture_names=(), allowed=destguard.entry_allows):
     """None when a call is inside the session's scope, else (reason_class, fixed message). `sc` is the
     credential's current catalog entry (None if it vanished), `capture_names` the names captured so far.
     Pure and linear in the size of the call: it reads only fields that never change after the session
     opens, and the caller runs it WITHOUT holding the store lock. The call cap is checked where the call
     is charged. (Extension point: a manifest rule check belongs here.)"""
     scheme, host, port, _ = _origin(spec["url"])
+    try:
+        has_ph_authority = "{{" in urllib.parse.urlsplit(spec["url"]).netloc
+    except ValueError:
+        has_ph_authority = True
+    if has_ph_authority:                    # a value must never choose the host, port or userinfo
+        return "url", "the url contains characters a session call cannot send"
     if list(names) != [s.cred]:
         return "credential", "the call names a different credential than the session's"
-    if sc is None or sc.get("ssh") or host not in (sc.get("allowed_hosts") or []):
+    if (sc is None or sc.get("ssh") or host not in destguard.host_parts(sc.get("allowed_hosts"))
+            or not allowed(sc.get("allowed_hosts"), host, port)):
         return "host", "that host is not allowed for this session's credential"
     if scheme not in ("http", "https") or not s.in_scope(scheme, host, port):
         return "host", "that host or port is outside this session's scope; open a new session for it"
@@ -815,7 +827,7 @@ def scope_problem(s, sc, names, method, spec, capture_names=()):
     # characters and length are checked on what the agent wrote (placeholders neutral), so these refusals never depend
     # on a secret; credential content is only checked after substitution, with one generic error, and charged
     nurl = neutralize(spec["url"])
-    if len(nurl) > MAX_URL or _ILLEGAL_HEADER_VALUE.search(nurl) or " " in nurl:
+    if len(nurl) > MAX_URL or not httpcheck.url_ok(nurl):
         return "url", "the url contains characters a session call cannot send"
     for k, v in spec["headers"].items():
         nv = neutralize(v)
@@ -849,7 +861,7 @@ def scope_problem(s, sc, names, method, spec, capture_names=()):
 
 
 # ---------------------------------------------------------------- agent-side checks
-def validate_open(cfg, spec, allowed_hosts):
+def validate_open(cfg, spec, allowed_hosts, allowed=destguard.entry_allows, refused=lambda h: False):
     """The agent's open request -> the normalized spec, or ValueError/PermissionError with fixed
     text. `allowed_hosts` is the credential's list. Never repeats the agent's input."""
     purpose = credreq_mod.validate_purpose(spec.get("purpose"))
@@ -858,7 +870,9 @@ def validate_open(cfg, spec, allowed_hosts):
         raise ValueError(f"hosts must be 1 to {MAX_HOSTS} plain host names, each optionally with :port (--host)")
     parsed = [parse_host_entry(h) for h in hosts]
     hosts = sorted({h if p is None else f"{h}:{p}" for h, p in parsed})
-    if any(h not in allowed_hosts for h, _ in parsed):
+    def ok(h, p):       # a bare manifest host means ports 80 and 443; host:port means exactly that port
+        return allowed(allowed_hosts, h, p) if p is not None else (allowed(allowed_hosts, h, 80) or allowed(allowed_hosts, h, 443))
+    if any(h not in destguard.host_parts(allowed_hosts) or not ok(h, p) or refused(h) for h, p in parsed):
         raise PermissionError("a session host is outside this credential's allowed hosts: a session can "
                               "only narrow what the credential allows (see `asb list`)")
     methods = spec.get("methods")
@@ -1135,7 +1149,8 @@ class SessionsMixin:
         if not sc.get("allowed_hosts"):
             raise PermissionError("this credential has no allowed hosts, so it is not an http credential; "
                                   "a session works only with http credentials")
-        out = validate_open(self.sessions_cfg, spec, sc["allowed_hosts"])
+        out = validate_open(self.sessions_cfg, spec, self.allowed_entries(names[0]), self.dest_guard.port_ok,
+                            self.dest_guard.host_refused)
         spec.clear()
         spec.update(out)
 
@@ -1164,7 +1179,13 @@ class SessionsMixin:
         sc = self.cfg["secrets"].get(req.names[0])
         if sc is None or sc.get("ssh") or not sc.get("allowed_hosts"):
             raise SessionOpenError("the credential is no longer available for http")
-        if any(parse_host_entry(h)[0] not in sc["allowed_hosts"] for h in sp["hosts"]):
+        if any(parse_host_entry(h)[0] not in destguard.host_parts(sc["allowed_hosts"])
+               or self.dest_guard.host_refused(parse_host_entry(h)[0])
+               or not (self.dest_guard.port_ok(self.allowed_entries(req.names[0]), parse_host_entry(h)[0],
+                                               parse_host_entry(h)[1] or 80)
+                       or (parse_host_entry(h)[1] is None
+                           and self.dest_guard.port_ok(self.allowed_entries(req.names[0]), parse_host_entry(h)[0], 443)))
+               for h in sp["hosts"]):
             raise SessionOpenError("a host is no longer allowed for this credential")
         self.sweep_sessions()
         with self._sess_lock:
@@ -1291,7 +1312,8 @@ class SessionsMixin:
         with s.lock:
             have = frozenset(s.captures)
         sc_now = None if self._internal_hit([s.cred]) else self.cfg["secrets"].get(s.cred)
-        problem = scope_problem(s, sc_now, names, method, spec, have)   # no lock held
+        problem = scope_problem(s, None if sc_now is None else {**sc_now, "allowed_hosts": self.allowed_entries(s.cred)},
+                                names, method, spec, have, self.dest_guard.port_ok)   # no lock held
         if problem is None:
             with self._sess_lock:                       # charge the call: re-check life and cap atomically
                 s2, state = self._sess_lookup(sid, cid, self.sessions_clock())
@@ -1346,7 +1368,8 @@ class SessionsMixin:
             elif isinstance(e, BackendError):
                 err = "release failed (credential store)"
             else:
-                err = "upstream call failed (" + coarse_class(e) + ")"
+                err = "upstream call failed (" + ("connection" if coarse_class(e) == "destination not allowed"
+                                                  else coarse_class(e)) + ")"
             self._finish(req, "failed", error=err, via="session")
             return req
         req.call_spec = None
@@ -1368,8 +1391,9 @@ class SessionsMixin:
         s, t0 = req.session, clock_mod.now()
         sc = self.cfg["secrets"].get(req.names[0]) or {}
         try:
-            out, info = run_http(s, req.call_spec, env, self._tls_policy(req.names), set(sc.get("allowed_hosts") or []),
-                                 broker_mod._opener_for, lambda: self.sessions_clock(), req.sess_state)
+            out, info = run_http(s, req.call_spec, {**env, **{f"\x00m{i}": v for i, v in enumerate(self.dest_guard.mask_values)}}, self._tls_policy(req.names), set(sc.get("allowed_hosts") or []),
+                                 lambda tls: broker_mod._opener_for(tls, self.dest_guard, self._dest_entries(req.names)),
+                                 lambda: self.sessions_clock(), req.sess_state)
             with s.lock:                            # last look: nothing survives a revoke, close or the deadline
                 _alive(s, self.sessions_clock)
         except SessionError:
@@ -1377,12 +1401,14 @@ class SessionsMixin:
         except Exception as e:  # noqa: BLE001 -- class only, never the exception's text
             with s.lock:                            # revoked, closed or past the deadline: say so (exit 7), not a timeout
                 _alive(s, self.sessions_clock)
-            cls = coarse_class(e)
-            self.audit("http_failed", req, error=cls, session=s.pid)
+            real = coarse_class(e)
+            cls = "connection" if real == "destination not allowed" else real    # the agent never learns a guard refusal
+            self.audit("http_failed", req, error=cls, reason_class=real, session=s.pid)
             err = OSError("upstream call failed (" + cls + ")")
             err.public = "upstream call failed (" + cls + ")"
             raise err from None
-        self.audit("http_executed", req, upstream_status=out["status"], response_bytes=len(out["body"]),
+        over = info.pop("_over_budget", False)
+        self.audit("http_executed", req, masked_over_budget=over, upstream_status=out["status"], response_bytes=len(out["body"]),
                    duration_ms=int((clock_mod.now() - t0) * 1000), session=s.pid)
         left = max(0, int(s.expires - self.sessions_clock()))
         return {"http": out, "session": {**info, "calls_left": max(0, s.max_calls - s.calls), "expires_in": left}}

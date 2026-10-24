@@ -12,8 +12,8 @@ import signal
 import threading
 
 from .backends import BackendConfigError, registry
-from .broker import Broker, parse_extra_origins, serve
-from . import clients, sessions, credreq, grants, notify, plans, presence, proposals, request_details, risk, riskmodel
+from .broker import Broker, parse_extra_origins, parse_trusted_proxies, serve
+from . import destguard, clients, sessions, credreq, grants, notify, plans, presence, proposals, request_details, risk, riskmodel
 
 
 def _read(path):
@@ -44,6 +44,12 @@ def main():
         ap.error("no settings: set BROKER_CONFIG or pass --config")
     try:
         parse_extra_origins(cfg.get("approve_extra_origins"))
+    except ValueError as e:
+        raise SystemExit(f"config error: {e}") from None
+    try:
+        parse_trusted_proxies(cfg)
+        parse_trusted_proxies(cfg, "approval_trusted_proxies")
+        destguard.DestGuard.from_config(cfg)    # destination_deny_cidrs, own_ports: fail at startup, naming the field
     except ValueError as e:
         raise SystemExit(f"config error: {e}") from None
     risk.parse_auto_approve_max(cfg.get("risk"), "risk")    # fail at startup, naming the field
@@ -80,8 +86,8 @@ def main():
                     background_load=True, push=push)
     bind = os.environ.get("BIND", "0.0.0.0")
     serve(broker,
-          (bind, int(cfg.get("client_port", 8800))),
-          (bind, int(cfg.get("approval_port", 8801))),
+          (bind, int(cfg.get("client_port") or 8800)),
+          (bind, int(cfg.get("approval_port") or 8801)),
           _read(cfg["client_key_file"]))
     print("secret-broker listening", flush=True)
     def _stop(*a):

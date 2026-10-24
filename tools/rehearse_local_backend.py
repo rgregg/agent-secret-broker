@@ -296,7 +296,12 @@ class Broker:
         env = {"PATH": os.environ["PATH"], "HOME": str(self.rh.home), "PYTHONPATH": str(REPO),
                "PYTHONUSERBASE": site.getuserbase(), "BIND": "127.0.0.1", "PYTHONUNBUFFERED": "1", **self.env}
         log = open(self.logf, "ab")
-        self.proc = subprocess.Popen([sys.executable, "-m", "secret_broker", "--config", str(self.cfg_path)],
+        # The rehearsal's stubs and its "phone" live on 127.0.0.1, which the production destination guard and
+        # approval-listener trust refuse. The only way to relax that is the Python-API test switch (there is no
+        # config key), so the throwaway broker is started through this two-line launcher instead of -m.
+        launcher = ("from secret_broker import destguard; destguard.allow_loopback_for_tests(); "
+                    "from secret_broker.__main__ import main; main()")
+        self.proc = subprocess.Popen([sys.executable, "-c", launcher, "--config", str(self.cfg_path)],
                                      env=env, stdout=log, stderr=log, cwd=str(self.rh.root))
         self.rh.pids.add(self.proc.pid)
         if wait:

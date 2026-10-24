@@ -10,6 +10,8 @@ import urllib.parse
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import test_e2e as t  # noqa: E402  (module import only: its tests are not re-collected)
 
+from secret_broker import destguard as _destguard  # noqa: E402
+_destguard.allow_loopback_for_tests()   # test stubs live on 127.0.0.1; no config key does this
 from secret_broker import broker as broker_mod  # noqa: E402
 from secret_broker import webpush  # noqa: E402
 from secret_broker.notify import NotifyError  # noqa: E402
@@ -312,7 +314,7 @@ class Listener(t.Dashboard):
     def ev(self, body, user="alice", hdr=None, raw=None):
         import urllib.request
         h = {"X-authentik-username": user, "Content-Type": "application/json",
-             "X-Requested-With": "asb"}
+             "X-Requested-With": "asb", "Origin": self.broker.cfg["approve_base_url"].rstrip("/")}
         h.update(hdr or {})
         h = {k: v for k, v in h.items() if v is not None}
         data = raw if raw is not None else json.dumps(body).encode()
@@ -504,7 +506,7 @@ class PushDecide(t.Dashboard):
     def pd(self, body, user="alice", hdr=None, raw=None):
         import urllib.request
         h = {"X-authentik-username": user, "Content-Type": "application/json",
-             "X-Requested-With": "asb"}
+             "X-Requested-With": "asb", "Origin": self.broker.cfg["approve_base_url"].rstrip("/")}
         h.update(hdr or {})
         h = {k: v for k, v in h.items() if v is not None}
         data = raw if raw is not None else json.dumps(body).encode()

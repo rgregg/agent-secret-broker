@@ -12,6 +12,8 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from secret_broker import destguard as _destguard  # noqa: E402
+_destguard.allow_loopback_for_tests()   # test stubs live on 127.0.0.1; no config key does this
 from secret_broker import audit as audit_mod  # noqa: E402
 from secret_broker import risk as risk_mod  # noqa: E402
 from secret_broker.backends import BwServeBackend  # noqa: E402
@@ -113,6 +115,10 @@ class Harness(unittest.TestCase):
         self.c, self.a = serve(self.broker, ("127.0.0.1", 0), ("127.0.0.1", 0), KEY)
         self.base = f"http://127.0.0.1:{self.c.server_address[1]}"
         self.abase = f"http://127.0.0.1:{self.a.server_address[1]}"
+        # name resolution must not depend on the machine running the tests (CI resolves `localhost` to ::1 first,
+        # and the stubs listen on 127.0.0.1 only): `localhost` is 127.0.0.1 here
+        real_resolver = self.broker.dest_guard._resolver
+        self.broker.dest_guard._resolver = lambda h, p: ["127.0.0.1"] if h.lower() == "localhost" else real_resolver(h, p)
 
     def tweak(self, cfg):
         """Subclass hook to adjust the broker config before it starts."""
@@ -696,16 +702,19 @@ class AuditTrail(Harness):
         self.decision = None
         self.create_env()
         nonce = next(iter(self.broker._by_id.values())).nonce
+        import ipaddress
+        self.broker._approval_proxies = [ipaddress.ip_network("127.0.0.1/32")]    # approval_trusted_proxies
         hdr = {"X-authentik-username": "alice", "X-Forwarded-For": "203.0.113.9, 198.51.100.1"}
         status, _ = req(self.abase + f"/a/{nonce}", headers=hdr)
         self.assertEqual(status, 200)
         v = self.events("approval_viewed")[0]
-        self.assertEqual((v["user"], v["client_ip"], v["found"]), ("alice", "203.0.113.9", True))
+        # the walk takes the rightmost untrusted hop, never the (spoofable) leftmost value
+        self.assertEqual((v["user"], v["client_ip"], v["found"]), ("alice", "198.51.100.1", True))
         data = urllib.parse.urlencode({"decision": "approve"}).encode()
         urllib.request.urlopen(urllib.request.Request(
             self.abase + f"/a/{nonce}", data=data, headers=hdr, method="POST"), timeout=10).read()
         next(iter(self.broker._by_id.values())).done.wait(10)
-        self.assertEqual(self.events("approved")[0]["approver_ip"], "203.0.113.9")
+        self.assertEqual(self.events("approved")[0]["approver_ip"], "198.51.100.1")
         self.assertNotIn(nonce, open(self.audit).read())
 
     def test_chain_continues_across_restart(self):
@@ -1812,7 +1821,7 @@ class TlsPinnedWrong(TlsModes):
     def test_wrong_fingerprint_is_refused(self):
         r = self.go()
         self.assertEqual(r["status"], "failed")
-        self.assertIn("pinned fingerprint", " ".join(e.get("error", "") for e in self.events("failed")))
+        self.assertIn("release failed: tls", " ".join(e.get("error", "") for e in self.events("failed")))   # a label, never the library's text
 
 
 class TlsNoVerifyPrivate(TlsModes):
@@ -2207,7 +2216,7 @@ class Dashboard(Harness):
 
     def cev(self, body, user="alice", headers=None, raw=None):
         h = {"X-authentik-username": user, "Content-Type": "application/json",
-             "X-Requested-With": "asb"}
+             "X-Requested-With": "asb", "Origin": self.broker.cfg["approve_base_url"].rstrip("/"),}
         if headers is not None:
             h = {k: v for k, v in {**h, **headers}.items() if v is not None}
         data = raw if raw is not None else json.dumps(body).encode()
@@ -2331,14 +2340,14 @@ class Dashboard(Harness):
         self.assertNotIn("data-body", body)
 
     def test_lists_pending_without_exposing_the_nonce(self):
-        rid = self.ask("/<img src=x onerror=alert(1)>")
+        rid = self.ask("/<img/src=x/onerror=alert(1)>")      # (a space in a URL is refused at creation)
         code, body = self.get()
         self.assertEqual(code, 200)
         self.assertIn("svc", body)
         self.assertIn("name=csrf", body)
         self.assertIn(f"data-id='{rid}'", body)
         self.assertNotIn(self.broker._by_id[rid].nonce, body)         # ids, never the capability URL
-        self.assertNotIn("<img src=x", body)                          # escaped
+        self.assertNotIn("<img/src=x", body)                          # escaped
         self.assertIn("script-src 'nonce-", urllib.request.urlopen(urllib.request.Request(
             self.abase + "/", headers={"X-authentik-username": "alice"})).headers["Content-Security-Policy"])
 

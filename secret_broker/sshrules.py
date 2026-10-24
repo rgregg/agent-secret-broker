@@ -34,6 +34,7 @@ import threading
 import time
 
 from . import clients as clients_mod
+from . import errclass
 from . import sshkey
 from .backends import BackendError
 
@@ -537,8 +538,8 @@ class SshRulesMixin:
         extra = dict(rule_id=rule["id"], decision_source="rule")
         try:
             result = self._release(req)
-        except (BackendError, OSError, ValueError) as e:
-            self._finish(req, "failed", error=f"release failed: {e}", via="policy", **extra)
+        except Exception as e:  # noqa: BLE001 -- the request must always settle; a fixed label only
+            self._finish(req, "failed", error=errclass.release_text(e), via="policy", **extra)
         else:
             self._finish(req, "approved", result=result, via="policy", **extra)
         return True

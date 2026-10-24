@@ -181,7 +181,7 @@ Config: `"sessions": {"enabled": true, "default_ttl_s": 900, "max_ttl_s": 3600, 
 
 All messages are fixed text. No exception text appears in any agent-visible output, audit record,
 log, history row or page: only class names and coarse categories (`timeout`, `connection`, `tls`,
-`dns`, `invalid_request`, `other`).
+`dns`, `invalid request`, `other`).
 
 ## Audit events
 
@@ -255,7 +255,7 @@ same lock-protected read that fetches the capture values (no check-use gap); `se
 
 **No free oracle on a secret.** Length and character checks on the url and headers run on the agent's template (neutral placeholders) before the call is charged.
 Once the credential is substituted the call is charged whatever happens, and every failure that depends on its content (a space, a line break, non-ASCII) gets
-one generic `invalid_request` error, so probing a credential costs calls and tells nothing beyond the generic class. A call may use at most 100 placeholders in
+one generic `invalid request` error, so probing a credential costs calls and tells nothing beyond the generic class. A call may use at most 100 placeholders in
 total (url, headers and body together); exceeding it is a metered refusal.
 
 **Deadline during upstream trouble.** The call timeout is min(30 s, time to deadline) and the body read is bounded by the same deadline (slow-drip upstreams cannot

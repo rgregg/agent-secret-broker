@@ -40,8 +40,8 @@ def parse(text):
     if is_json(text):
         try:
             obj = json.loads(text)
-        except ValueError as e:
-            raise StructuredError(f"field is not valid JSON: {e}") from None
+        except ValueError:      # the parser's text can quote the document: say only that it is not JSON
+            raise StructuredError("field is not valid JSON") from None
         if not isinstance(obj, dict):
             raise StructuredError("field JSON must be an object")
         return {str(k): v if isinstance(v, str) else json.dumps(v) for k, v in obj.items()}

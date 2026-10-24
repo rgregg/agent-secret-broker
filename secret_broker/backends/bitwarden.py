@@ -13,6 +13,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from .. import destguard
+
 from .. import sshkey
 from .base import (CAP_ADOPTS, CAP_CREATE_LOGIN, CAP_EDIT_ITEM, CAP_EXPORT_ITEMS, CAP_ON_EVENT,
                    CAP_SET_META, CAP_WARM, LOGIN, META_FIELD, NOTE, RESERVED_FIELDS, SSH_KEY,
@@ -549,7 +551,7 @@ class BwServeBackend(BwBackend):
         r = urllib.request.Request(f"http://127.0.0.1:{self._port}{path}", data=data, method=method,
                                    headers={"Content-Type": "application/json"})
         try:
-            with urllib.request.urlopen(r, timeout=timeout) as resp:
+            with destguard.operator_urlopen(r, timeout=timeout) as resp:
                 raw = resp.read()
         except urllib.error.HTTPError as e:
             raw = e.read()

@@ -15,6 +15,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import test_e2e as t  # noqa: E402
 import test_grants as tg  # noqa: E402
 from test_client_rules import ClientMixin, Legacy  # noqa: E402
+from secret_broker import destguard as _destguard  # noqa: E402
+_destguard.allow_loopback_for_tests()   # test stubs live on 127.0.0.1; no config key does this
 from secret_broker import clients as clients_mod  # noqa: E402
 from secret_broker.broker import Broker  # noqa: E402
 from secret_broker.notify import FakeNotifier  # noqa: E402

@@ -33,6 +33,8 @@ import time
 import urllib.error
 import urllib.request
 
+from . import destguard
+
 
 class NotifyError(Exception):
     pass
@@ -241,7 +243,7 @@ def send_to(transports, n):
             t.send(n.for_transport(t))
             ok += 1
         except (NotifyError, OSError) as e:
-            errors.append(f"{type(getattr(t, 'wrapped', t)).__name__}: {e}")
+            errors.append(f"{type(getattr(t, 'wrapped', t)).__name__}: {type(e).__name__}")
     if not ok:
         raise NotifyError("; ".join(errors) or "no transports configured")
 
@@ -265,7 +267,7 @@ class TickerNotifier:
             data=json.dumps(body).encode() if body is not None else None,
             headers={"Authorization": f"Bearer {self._token}", "Content-Type": "application/json"},
         )
-        with urllib.request.urlopen(req, timeout=self._timeout) as r:
+        with destguard.operator_urlopen(req, timeout=self._timeout) as r:
             return json.load(r)
 
     def action_list(self, n):
@@ -326,7 +328,7 @@ class TelegramNotifier:
             f"{self._base}/{method}", data=json.dumps(body).encode(),
             headers={"Content-Type": "application/json"})
         try:
-            with urllib.request.urlopen(req, timeout=self._timeout) as r:
+            with destguard.operator_urlopen(req, timeout=self._timeout) as r:
                 out = json.load(r)
         except urllib.error.HTTPError as e:
             try:
@@ -368,7 +370,7 @@ class MultiNotifier:
                 t.send(n.for_transport(t))
                 ok += 1
             except (NotifyError, OSError) as e:
-                errors.append(f"{type(getattr(t, 'wrapped', t)).__name__}: {e}")
+                errors.append(f"{type(getattr(t, 'wrapped', t)).__name__}: {type(e).__name__}")
         if not ok:
             raise NotifyError("; ".join(errors) or "no transports configured")
 

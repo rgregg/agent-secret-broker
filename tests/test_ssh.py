@@ -14,6 +14,8 @@ from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
 
 sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from secret_broker import destguard as _destguard  # noqa: E402
+_destguard.allow_loopback_for_tests()   # test stubs live on 127.0.0.1; no config key does this
 from secret_broker import sshkey  # noqa: E402
 from test_e2e import KEY, Harness  # noqa: E402
 

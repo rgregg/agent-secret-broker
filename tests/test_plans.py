@@ -15,6 +15,8 @@ import threading
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from secret_broker import destguard as _destguard  # noqa: E402
+_destguard.allow_loopback_for_tests()   # test stubs live on 127.0.0.1; no config key does this
 from secret_broker import audit_api  # noqa: E402
 from secret_broker import clock as clock_mod  # noqa: E402
 from secret_broker import plans as P  # noqa: E402

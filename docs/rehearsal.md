@@ -44,7 +44,9 @@ it created (`asb-reh-*`). The image `asb-rehearsal:local` is left as a build cac
 ## What it stands up
 
 - **The real broker**: `python -m secret_broker --config <file>` with a `local` backend,
-  `approval_trusted_peers` 127.0.0.1, identity header `X-authentik-username`.
+  `approval_trusted_peers` 127.0.0.1, identity header `X-authentik-username`. It is started
+  through a two-line launcher that calls `destguard.allow_loopback_for_tests()` (the stubs and the
+  rehearsal's "phone" are on loopback, which production refuses; no config key can do this).
 - **A stub upstream** that echoes request headers and body (so http mode and
   substitution can be asserted without the internet).
 - **A stub model and notification endpoint**: an OpenRouter-style `/chat/completions`

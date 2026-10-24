@@ -15,6 +15,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from plan_base import (BODY_CANARY, DESC_CANARY, DOC_CANARY, KEY, LEDGER_VALUE, NOPLAN_VALUE,  # noqa: E402
                        PBase, Stub, SVC_VALUE, TASK_CANARY)
+from secret_broker import destguard as _destguard  # noqa: E402
+_destguard.allow_loopback_for_tests()   # test stubs live on 127.0.0.1; no config key does this
 from secret_broker import audit_api  # noqa: E402
 from secret_broker.backends import BackendError  # noqa: E402
 from secret_broker.broker import Broker, serve  # noqa: E402
@@ -914,9 +916,9 @@ class BeforeSend(PBase):
         seen = []
         real = bmod._exchange
 
-        def spy(req, values, tls, strip_cookies=False, timeout=30):
+        def spy(req, values, tls, strip_cookies=False, timeout=30, **kw):
             seen.append(timeout)
-            return real(req, values, tls, strip_cookies=strip_cookies, timeout=timeout)
+            return real(req, values, tls, strip_cookies=strip_cookies, timeout=timeout, **kw)
         with mock.patch.object(bmod, "_exchange", spy):
             self.call(self.pid, body=self.ok_note())                            # an hour left: the usual 30 s
             self.tick(3600 - 12)
