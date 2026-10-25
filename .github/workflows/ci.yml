@@ -43,7 +43,9 @@ jobs:
 
   image:
     needs: test
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    # main and v* tags publish on push; any branch can be built on demand with
+    # `gh workflow run ci.yml --ref BRANCH` (tags: sha-<short> and the branch name, no release tag)
+    if: (github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))) || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -63,6 +65,7 @@ jobs:
           tags: |
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
             type=sha
+            type=ref,event=branch,enable=${{ github.event_name == 'workflow_dispatch' }}
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
       - id: built
