@@ -5,6 +5,7 @@ operator-client proxy handling.
 
 Every secret, address and name here is fake; every server is a loopback stub or an in-process fake.
 """
+import _fast  # noqa: F401  (test-only: prompt server shutdown, fake-clock helpers)
 import base64
 import email.message
 import io

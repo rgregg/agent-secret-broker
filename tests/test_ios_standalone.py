@@ -1,5 +1,6 @@
 """iOS home-screen app: safe-area header, head meta tags, manifest and icon (issue #11), and
 signed-out handling, manual reload and automatic recovery in the page scripts (issue #12)."""
+import _fast  # noqa: F401  (test-only: prompt server shutdown, fake-clock helpers)
 import json
 import os
 import re

@@ -5,6 +5,7 @@ enrolled clients through the real endpoint) in front of a local stub UniFi-like 
 127.0.0.1. Every secret, cookie and token here is an obviously fake canary. The real UniFi API is
 never contacted.
 """
+import _fast  # noqa: F401  (test-only: prompt server shutdown, fake-clock helpers)
 import io
 import json
 import os
@@ -1149,6 +1150,8 @@ class Approval(SBase):
     def test_an_unanswered_open_expires_and_creates_nothing(self):
         r = self.ask()
         self.advance(self.broker.cfg.get("ttl_seconds", 120) + 5)
+        with self.broker._lock:
+            self.broker._expire_locked()                # the pass a poll runs; also wakes a long-poll
         self.assertEqual(self.result(r["id"])["status"], "expired")
         self.assertEqual(self.broker._sess, {})
 
@@ -1909,60 +1912,7 @@ class EnvSession(CliBase):
 
 
 # ------------------------------------------------------------------------- review round 3
-class RawUpstream:
-    """A raw-socket upstream that records exactly what arrives on the wire: per connection the request
-    line, headers, the body as framed by Content-Length, and any bytes left over (a pipelined second request)."""
-
-    def __init__(self):
-        import socket
-        self.sock = socket.socket()
-        self.sock.bind(("127.0.0.1", 0))
-        self.sock.listen(8)
-        self.port = self.sock.getsockname()[1]
-        self.conns = []
-        threading.Thread(target=self._serve, daemon=True).start()
-
-    def _serve(self):
-        while True:
-            try:
-                c, _ = self.sock.accept()
-            except OSError:
-                return
-            threading.Thread(target=self._one, args=(c,), daemon=True).start()
-
-    def _one(self, c):
-        c.settimeout(1.0)
-        buf = b""
-        try:
-            while b"\r\n\r\n" not in buf:
-                d = c.recv(65536)
-                if not d:
-                    break
-                buf += d
-            head, _, rest = buf.partition(b"\r\n\r\n")
-            lines = head.decode("latin-1").split("\r\n")
-            hdrs = {k.lower(): v.strip() for k, _, v in (ln.partition(":") for ln in lines[1:])}
-            n = int(hdrs.get("content-length", "0") or 0)
-            while len(rest) < n:
-                d = c.recv(65536)
-                if not d:
-                    break
-                rest += d
-            body, extra = rest[:n], rest[n:]
-            try:                       # wait briefly for pipelined bytes
-                more = c.recv(65536)
-                extra += more
-            except OSError:
-                pass
-            self.conns.append({"line": lines[0], "headers": hdrs, "body": body, "extra": extra})
-            c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
-        except OSError:
-            pass
-        finally:
-            c.close()
-
-    def close(self):
-        self.sock.close()
+RawUpstream = _fast.RawUpstream      # the shared raw-socket upstream (tests/_fast.py)
 
 
 class Review3(SBase):
@@ -1984,7 +1934,6 @@ class Review3(SBase):
                     {"Content-Length": "4", "Content-Type": "text/plain"}):
             code, r = self.rcall(sid, headers=hdr, body=smuggle)
             self.assertEqual((code, r["code"]), (403, "session_refused"), hdr)
-        time.sleep(0.3)
         self.assertEqual(self.raw_up.conns, [])
         self.assertEqual(self.sess(sid).calls, 0)
 
@@ -2056,7 +2005,6 @@ class Review3(SBase):
         for hdr in good:
             code, r = self.rcall(sid, headers=hdr, body="x")
             self.assertEqual(r.get("http", {}).get("status"), 200, (hdr, r))
-        time.sleep(0.3)
         self.assertEqual(len(self.raw_up.conns), len(good))
         self.assertTrue(all(c["extra"] == b"" for c in self.raw_up.conns))
 
@@ -2304,7 +2252,6 @@ class Unicode(Review3):
             for path, hdr, body in cases:
                 code, r = self.call(sid, "POST", path, headers=hdr, body=body)
                 self.assertEqual((code, r.get("code")), (403, "session_refused"), (path, hdr, body))
-        time.sleep(0.2)
         self.assertEqual(self.st["seen"], [])
         self.assertEqual(self.sess(sid).calls, 0)
 
@@ -2321,7 +2268,6 @@ class Unicode(Review3):
             self.assertEqual(code, 403, raw)
         code, text = post(b"\xff\xfe harmless binary \x00\x01")
         self.assertEqual(code, 202, text)                       # binary without the word is allowed
-        time.sleep(0.3)
         self.assertEqual(len(self.raw_up.conns), 1)
 
 

@@ -1,5 +1,6 @@
 """Progressive description and rating: the card is drawn at summary_timeout with the plain line and
 swaps in the model's answer when it arrives; a late rating is shown but never decides anything."""
+import _fast  # noqa: F401  (test-only: prompt server shutdown, fake-clock helpers)
 import json
 import os
 import sys
@@ -126,7 +127,8 @@ class Late(E.Harness):
 
     def test_late_reply_for_a_settled_request_only_reaches_history(self):
         rid = self.make()
-        self.until(lambda: self.status(rid) == "expired", "request did not expire", secs=8)
+        _fast.expire(self.broker, rid)                      # its ttl passes
+        self.assertEqual(self.status(rid), "expired")
         before = (self.req_obj(rid).status, self.req_obj(rid).risk, len(self.records()))
         self.release_rating.set()
         self.release_text.set()

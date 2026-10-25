@@ -5,6 +5,7 @@ by itself, a recording stub upstream on a loopback port), per-client credentials
 the real endpoint, plans submitted and approved through the real endpoints, and a fake clock that
 moves both the wall clock and the monotonic clock. Every secret and value here is fake.
 """
+import _fast  # noqa: F401  (test-only: prompt server shutdown, fake-clock helpers)
 import contextlib
 import json
 import os

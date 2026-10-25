@@ -3,6 +3,7 @@ startup warnings, separate approval proxies, /64 keying, CSRF cookie lifetime.
 
 Every secret here is fake.
 """
+import _fast  # noqa: F401  (test-only: prompt server shutdown, fake-clock helpers)
 import base64
 import ipaddress
 import json

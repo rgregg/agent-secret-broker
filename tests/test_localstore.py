@@ -1,3 +1,4 @@
+import _fast  # noqa: F401  (test-only: prompt server shutdown, fake-clock helpers)
 import base64
 import json
 import os
@@ -545,15 +546,24 @@ class Events(Base):
 
 
 class IdleLock(Base):
+    """The idle timer is driven by a fake monotonic clock: a long real timer never fires, `lapse` moves the
+    clock and runs the callback the timer would run."""
+
+    def setUp(self):
+        super().setUp()
+        self.mono = _fast.patch_mono(self, ls)
+
+    def lapse(self, b, seconds):
+        self.mono.advance(seconds)
+        b._store._idle_drop()
+
     def test_idle_drops_state_and_next_use_redecrypts(self):
         self.init()
-        b = self.backend(idle=0.2)
+        b = self.backend(idle=300)
         b.put("A", "notes", VAL, create=True)
         store = b._store
         self.assertIsNotNone(store._doc)
-        deadline = time.time() + 5
-        while store._doc is not None and time.time() < deadline:
-            time.sleep(0.05)
+        self.lapse(b, 301)
         self.assertIsNone(store._doc)
         self.assertIsNone(store._dek)
         self.assertIn("store_locked", self.names())
@@ -563,20 +573,20 @@ class IdleLock(Base):
 
     def test_locked_store_cannot_be_read_when_key_gone(self):
         self.init()
-        b = self.backend(idle=0.2)
+        b = self.backend(idle=300)
         b.put("A", "notes", VAL, create=True)
-        while b._store._doc is not None:
-            time.sleep(0.05)
+        self.lapse(b, 301)
+        self.assertIsNone(b._store._doc)
         os.unlink(self.keyfile)
         with self.assertRaises(StoreError):
             b.get("A", "notes")
 
     def test_use_extends_the_window(self):
         self.init()
-        b = self.backend(idle=0.6)
+        b = self.backend(idle=300)
         b.put("A", "notes", VAL, create=True)
         for _ in range(4):
-            time.sleep(0.25)
+            self.lapse(b, 200)                  # each gap is shorter than the window, the total is not
             b.get("A", "notes")
         self.assertIsNotNone(b._store._doc)
         b.close()

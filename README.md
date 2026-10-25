@@ -88,7 +88,11 @@ remove them. Details in [docs/reference.md](docs/reference.md#threat-model-hones
 ## Development
 
     pip install -r requirements.txt
-    python3 -m unittest discover -s tests
+    python3 tests/run_tests.py            # parallel (a few minutes on a laptop); CI runs it as 4 shards
+    python3 -m unittest discover -s tests # the same tests, one process
+
+Tests never sleep for a timeout: time-bounded behavior (request ttls, idle locks, expiry) is driven with
+fake clocks or by expiring the request directly (`tests/_fast.py`).
 
 Python 3.12. Runtime dependency: `pywebpush` (pinned in `requirements.txt`). The
 CLI (`client/asb`) has no dependencies.

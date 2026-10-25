@@ -1,4 +1,5 @@
 """The Policies-page editor for an SSH key's ssh_hosts policy."""
+import _fast  # noqa: F401  (test-only: prompt server shutdown, fake-clock helpers)
 import base64
 import json
 import os

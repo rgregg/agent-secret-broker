@@ -8,6 +8,7 @@ string appears NOWHERE the agent, a log, a page or a notification could see it.
 
 Every secret here is fake; every server is a loopback stub or an in-process broker.
 """
+import _fast  # noqa: F401  (test-only: prompt server shutdown, fake-clock helpers)
 import contextlib
 import http.client
 import io

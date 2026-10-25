@@ -4,6 +4,7 @@ Every test runs the CLI with a temporary HOME and a temporary working directory,
 empty PATH directory (so no real agent binary is detected) and no CODEX_HOME or
 COPILOT_HOME. Nothing here touches a real agent file or the real client.json.
 """
+import _fast  # noqa: F401  (test-only: prompt server shutdown, fake-clock helpers)
 import os
 import re
 import stat

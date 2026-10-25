@@ -1,5 +1,6 @@
 """Home Assistant actionable-notification hook: ticker action payloads,
 POST /v1/hooks/ha/decide on the client listener, channel `ha`."""
+import _fast  # noqa: F401  (test-only: prompt server shutdown, fake-clock helpers)
 import json
 import os
 import sys

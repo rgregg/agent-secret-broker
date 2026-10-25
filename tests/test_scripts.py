@@ -1,5 +1,6 @@
 """Script contents for env-mode requests: client detection, integrity, broker
 validation, the card, audit, scrubbing and the classifier / description input."""
+import _fast  # noqa: F401  (test-only: prompt server shutdown, fake-clock helpers)
 import hashlib
 import importlib.machinery
 import importlib.util

@@ -1,6 +1,7 @@
 """Applying a guidance proposal against a rate-limited vault: serialized spaced writes, retry
 with backoff, failure classes for the approver only, the Retry action, and `asb guidance
 status`. The clock and sleep are fakes (see test_guidance_proposals.Base)."""
+import _fast  # noqa: F401  (test-only: prompt server shutdown, fake-clock helpers)
 import http.server
 import json
 import os
@@ -110,7 +111,7 @@ class Apply(g.Base):
         status, _ = self.decide(rid, "approve", apply=(0, 1, 2))
         self.assertEqual(status, 200)
         self.assertLess(time.time() - t0, 5)
-        time.sleep(0.3)
+        self.assertTrue(self.sleeping.wait(10))          # the apply is parked in its first backoff sleep
         req = self.broker._by_id[rid]
         self.assertEqual(req.status, "deciding")
         self.assertEqual(self.api("GET", f"/v1/requests/{rid}?wait=0")[1] and
@@ -326,7 +327,7 @@ class Retry(g.Base):
         self.broker._gwrite_last = None
         self.broker._jitter = lambda a, b: 0.0
         self.assertEqual(self.broker.retry_proposal(rid, "alice", "dashboard")[0], 202)
-        time.sleep(0.2)
+        self.assertTrue(self.sleeping.wait(10))          # the first retry is running (parked on the gate)
         self.assertEqual(self.broker.retry_proposal(rid, "alice", "dashboard")[0], 409)
         self.assertEqual(self.broker.retry_count(rid), 0)       # no button while one runs
         self.gate.set()

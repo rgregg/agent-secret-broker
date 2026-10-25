@@ -1,4 +1,5 @@
 """approve_extra_origins: the approval site may be reached under more than one origin."""
+import _fast  # noqa: F401  (test-only: prompt server shutdown, fake-clock helpers)
 import os
 import subprocess
 import sys

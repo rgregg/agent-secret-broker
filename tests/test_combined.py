@@ -1,4 +1,5 @@
 """Script contents + per-credential guidance + komodo rubric/floor, composed."""
+import _fast  # noqa: F401  (test-only: prompt server shutdown, fake-clock helpers)
 import json
 import os
 import sys

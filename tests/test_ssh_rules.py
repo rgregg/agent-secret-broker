@@ -1,6 +1,7 @@
 """Standing per-host SSH rules (GitHub issue #10): a rule is credential + verified
 host key fingerprint + account. Creation from the approval card, matching,
 refusal ordering, the Policies tab, expiry, audit and hiding."""
+import _fast  # noqa: F401  (test-only: prompt server shutdown, fake-clock helpers)
 import base64
 import json
 import os
