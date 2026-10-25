@@ -6,7 +6,7 @@ macOS. This rig runs the real thing:
     throwaway broker (here)  --real web push via FCM-->  stock Chrome on a Mac  --real macOS banner-->  a real click
                                                           \--> what the worker saw (diag log, getNotifications, new tabs)
 
-It found why clicking the approval notification did nothing in Chrome on macOS (see `docs` below) and proves
+It found why clicking the approval notification did nothing in Chrome on macOS (see "Findings" below) and proves
 the fix. It is **not** part of the CI suite (it needs a Mac); `python tests/run_tests.py` never touches it.
 
 ## One command
