@@ -3802,12 +3802,12 @@ def sanitize_client_event(obj):
             val = _ce_str(obj[key], n)
             if val is not None:
                 out[key] = val
-    for key in ("clients", "ms", "queued"):
+    for key in ("clients", "ms", "queued", "seen"):
         if key in obj:
             val = _ce_int(obj[key])
             if val is not None:
                 out[key] = val
-    for key in ("ok", "visible"):
+    for key in ("ok", "visible", "persist"):
         if isinstance(obj.get(key), bool):
             out[key] = obj[key]
     if isinstance(obj.get("client_paths"), list):
@@ -3960,7 +3960,9 @@ _DASH_JS = r'''
       +'stays open in a tab or window.':'Notifications only arrive while this page is open.';}
   function why(t){var e=document.getElementById('notify-why');if(e)e.textContent=t;}
   function fire(title,body,tag){
-    try{var n=new Notification(title,{body:body,tag:tag,requireInteraction:true});
+    // not on Chrome/Edge for macOS: see PERSIST in the service worker
+    var ua=navigator.userAgent||'',persist=!(/Macintosh/.test(ua)&&/Chrome\//.test(ua));
+    try{var n=new Notification(title,{body:body,tag:tag,requireInteraction:persist});
       n.onclick=function(){try{window.focus();}catch(x){}poll();n.close();};return true;}
     catch(e){why('The browser refused to show a notification ('+e.name+'). '
       +'Some mobile browsers need an installed web app for this.');return false;}}
@@ -4208,11 +4210,18 @@ _DASH_JS = _KEEP_JS + _DASH_JS + proposals_mod.JS_INIT
 
 # Single source of truth for the worker version: rendered into the worker, the
 # X-SW-Version header on /sw.js, and the Settings page ("expected" version).
-SW_VERSION = "8"
+SW_VERSION = "9"
 
 _SERVICE_WORKER = r"""
 var SW_VERSION='__SW_VERSION__';
 var Q=[],T0={};
+// Chrome (and Edge) on macOS hand requireInteraction notifications to a separate
+// "alerts" helper process; clicks on those never reached this worker, and Chrome
+// did not count them as shown (it added its own "updated in the background"
+// notice). Plain notifications go through Chrome itself and click normally, so
+// there we skip requireInteraction; the macOS alert style decides how long they stay.
+var UA=String((self.navigator&&self.navigator.userAgent)||'');
+var PERSIST=!(/Macintosh/.test(UA)&&/Chrome\//.test(UA));
 function tell(m){return self.clients.matchAll({type:'window',includeUncontrolled:true}).then(function(cs){
   cs.forEach(function(c){try{c.postMessage(m);}catch(x){}});return cs;});}
 // Report a step to the broker audit log. Never throws and never rejects; a
@@ -4281,10 +4290,15 @@ self.addEventListener('push',function(e){
   var mx=(self.Notification&&typeof Notification.maxActions==='number')?Notification.maxActions:2;
   acts=acts.slice(0,Math.max(mx,0));
   var r2=self.registration.showNotification(d.title||'Approval needed',{
-    body:d.body||'A secret was requested',tag:tag,requireInteraction:true,
+    body:d.body||'A secret was requested',tag:tag,requireInteraction:PERSIST,
     data:data,actions:acts,renotify:true,
-    timestamp:t0}).then(function(){return rep('show',{ok:true,tag:tag,ms:Date.now()-t0,
-      note:acts.map(function(a){return a.action;}).join(',')});},
+    timestamp:t0}).then(function(){
+      // seen: how many notifications under this tag the browser says are on display
+      // right after showing; 0 means it lost track of this one (clicks will not arrive).
+      return self.registration.getNotifications({tag:tag}).then(function(ns){return ns.length;},
+        function(){return -1;}).then(function(seen){
+        return rep('show',{ok:true,tag:tag,ms:Date.now()-t0,seen:seen,persist:PERSIST,
+          note:acts.map(function(a){return a.action;}).join(',')});});},
     function(err){return rep('show',{ok:false,tag:tag,err:em(err),ms:Date.now()-t0});});
   e.waitUntil(Promise.all([r1,r2]));});
 self.addEventListener('notificationclose',function(e){
@@ -4348,7 +4362,7 @@ self.addEventListener('notificationclick',function(e){
             ns.forEach(function(n){try{n.close();}catch(x){}});res();},function(){res();});
         },4000);});},function(){});
     }
-    o.requireInteraction=true;
+    o.requireInteraction=PERSIST;
     return self.registration.showNotification(text,o).catch(function(){});
   }
   function decideFlow(){
