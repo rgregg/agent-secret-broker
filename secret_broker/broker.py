@@ -4034,6 +4034,34 @@ _DASH_JS = r'''
     function on(m){var d=m.data;if(d&&d.type==='version'&&d.id===id)fin(String(d.v));}
     navigator.serviceWorker.addEventListener('message',on);
     try{w.postMessage({type:'version',id:id});}catch(x){fin(undefined);}});}
+  // Chrome only re-fetches /sw.js on its own at navigations (and at most daily on push);
+  // an update that fails (e.g. SSO redirect on the script fetch) leaves the old worker
+  // running silently. So every page load asks explicitly and records the outcome.
+  var swupdres='not run';
+  function swautoupdate(){
+    if(!('serviceWorker' in navigator))return;
+    navigator.serviceWorker.getRegistration('/').then(function(reg){
+      if(!reg){swupdres='no registration';return;}
+      return reg.update().then(function(){swupdres='ok at '+new Date().toLocaleTimeString()
+        +(reg.installing||reg.waiting?' (newer worker found)':' (no change)');
+        report('sw_update_check',{ok:true,note:reg.installing||reg.waiting?'newer':'same'});
+        swt('sw-upd',swupdres);},function(e){
+        swupdres='FAILED: '+String(e&&e.message||e).slice(0,80);
+        report('sw_update_check',{ok:false,err:String(e&&e.message||e).slice(0,100)});
+        swt('sw-upd',swupdres);});
+    }).catch(function(){});}
+  // The worker keeps its last 10 steps locally; ask it and show them (kinds and outcomes only).
+  function swlog(w){
+    if(!w){swt('sw-log','none');return;}
+    var t=setTimeout(function(){fin(null);},2000),done=false;
+    function fin(rows){if(done)return;done=true;clearTimeout(t);
+      navigator.serviceWorker.removeEventListener('message',on);
+      swt('sw-log',rows===null?'worker did not answer (older than v11)':!rows.length?'nothing recorded yet':
+        rows.map(function(r){return new Date(r.t).toLocaleTimeString()+' '+r.k
+          +(r.ok===false?' FAIL':'')+(r.n?' ('+r.n+')':'');}).join('; '));}
+    function on(m){var d=m.data;if(d&&d.type==='diaglog'&&d.id==='sw-log')fin(d.rows||[]);}
+    navigator.serviceWorker.addEventListener('message',on);
+    try{w.postMessage({type:'diag',id:'sw-log'});}catch(x){fin(null);}}
   function swpath(u){try{return new URL(u).pathname;}catch(x){return String(u||'');}}
   function swstatus(cls,text,note){var s=document.getElementById('sw-status');
     if(s){s.className='pill '+cls;s.textContent=text;}swt('sw-note',note||'');}
@@ -4064,6 +4092,7 @@ _DASH_JS = r'''
       var wk=reg.waiting||reg.installing;
       swt('sw-reg',reg.scope?swpath(reg.scope)+', '+(reg.active?reg.active.state:wk?wk.state:'none')
         +', '+swpath((reg.active||wk||{}).scriptURL):'none');
+      swt('sw-upd',swupdres);swlog(reg.active);
       reg.pushManager.getSubscription().then(function(sub){
         swt('sw-sub',sub?'present':'absent');},function(){swt('sw-sub','absent');});
       return Promise.all([swask(reg.active,'active'),swask(wk,'waiting')]).then(function(r){
@@ -4194,13 +4223,13 @@ _DASH_JS = r'''
           if(n){flash.textContent=n.textContent;flash.hidden=!n.textContent;}
           last=null;return poll();})
         .catch(function(){last=null;poll();});});});}
-  seen=cards?ids(cards):{};nshow();pshow();
+  seen=cards?ids(cards):{};nshow();pshow();swautoupdate();
   bind();secs();title();if(cards){setInterval(secs,1000);setInterval(poll,3000);}
   document.addEventListener('visibilitychange',function(){
     report('visibility',{visible:!document.hidden,state:document.visibilityState},5000);
     if(!document.hidden)poll();});
   if('serviceWorker' in navigator)navigator.serviceWorker.addEventListener('message',function(m){
-    if(m.data&&m.data.type&&m.data.type!=='version')report('sw_message',{note:String(m.data.type),v:String(m.data.v||'')},2000);
+    if(m.data&&m.data.type&&m.data.type!=='version'&&m.data.type!=='diaglog')report('sw_message',{note:String(m.data.type),v:String(m.data.v||'')},2000);
     if(m.data&&m.data.type==='poll'){report('poll_requested',{},2000);poll();}
     if(m.data&&m.data.type==='diag')why('Service worker v'+m.data.v+': '+m.data.what+' at '
       +new Date().toLocaleTimeString()+'.');});
@@ -4210,7 +4239,7 @@ _DASH_JS = _KEEP_JS + _DASH_JS + proposals_mod.JS_INIT
 
 # Single source of truth for the worker version: rendered into the worker, the
 # X-SW-Version header on /sw.js, and the Settings page ("expected" version).
-SW_VERSION = "10"
+SW_VERSION = "11"
 
 _SERVICE_WORKER = r"""
 var SW_VERSION='__SW_VERSION__';
@@ -4224,6 +4253,44 @@ var UA=String((self.navigator&&self.navigator.userAgent)||'');
 var PERSIST=!(/Macintosh/.test(UA)&&/Chrome\//.test(UA));
 function tell(m){return self.clients.matchAll({type:'window',includeUncontrolled:true}).then(function(cs){
   cs.forEach(function(c){try{c.postMessage(m);}catch(x){}});return cs;});}
+// Local diagnostic ring (IndexedDB, last 10 steps: kind, ok, short note/error,
+// never request text) so the Settings page can show what this browser did
+// without server access. Never rejects.
+function dlog(b){
+  try{
+    if(typeof indexedDB==='undefined')return Promise.resolve();
+    return new Promise(function(res){
+      try{
+        var rq=indexedDB.open('asb-diag',1);
+        rq.onupgradeneeded=function(){try{rq.result.createObjectStore('l',{autoIncrement:true});}catch(x){}};
+        rq.onerror=function(){res();};rq.onblocked=function(){res();};
+        rq.onsuccess=function(){try{
+          var db=rq.result,tx=db.transaction('l','readwrite'),st=tx.objectStore('l');
+          st.add({t:Date.now(),k:String(b.kind||''),ok:b.ok,
+            n:String(b.note||b.err||b.state||'').slice(0,40)});
+          var i=0,cu=st.openCursor(null,'prev');
+          cu.onsuccess=function(){var c=cu.result;if(!c)return;i++;if(i>10)c.delete();c.continue();};
+          tx.oncomplete=tx.onerror=tx.onabort=function(){try{db.close();}catch(x){}res();};
+        }catch(x){res();}};
+      }catch(x){res();}});
+  }catch(e){return Promise.resolve();}
+}
+function dread(){
+  try{
+    if(typeof indexedDB==='undefined')return Promise.resolve([]);
+    return new Promise(function(res){
+      try{
+        var rq=indexedDB.open('asb-diag',1),out=[];
+        rq.onupgradeneeded=function(){try{rq.result.createObjectStore('l',{autoIncrement:true});}catch(x){}};
+        rq.onerror=function(){res(out);};rq.onblocked=function(){res(out);};
+        rq.onsuccess=function(){try{
+          var db=rq.result,tx=db.transaction('l','readonly'),cu=tx.objectStore('l').openCursor();
+          cu.onsuccess=function(){var c=cu.result;if(c){out.push(c.value);c.continue();}};
+          tx.oncomplete=tx.onerror=tx.onabort=function(){try{db.close();}catch(x){}res(out.slice(-10));};
+        }catch(x){res(out);}};
+      }catch(x){res([]);}});
+  }catch(e){return Promise.resolve([]);}
+}
 // Report a step to the broker audit log. Never throws and never rejects; a
 // failed beacon (expired SSO session, network) is queued and retried next time.
 function rep(kind,x){
@@ -4232,13 +4299,13 @@ function rep(kind,x){
     var batch=Q.splice(0,Q.length);
     if(batch.length)b.queued=batch.length;
     batch.push(b);
-    return Promise.all(batch.map(function(o){
+    return Promise.all([dlog(b)].concat(batch.map(function(o){
       return fetch('/push/event',{method:'POST',credentials:'same-origin',keepalive:true,
         redirect:'manual',headers:{'Content-Type':'application/json','X-Requested-With':'asb'},
         body:JSON.stringify(o)}).then(function(r){
         if(r.status!==204&&r.status!==200)throw new Error('http '+r.status);
       }).catch(function(){if(Q.length<20)Q.push(o);});
-    })).catch(function(){});
+    }))).catch(function(){});
   }catch(e){return Promise.resolve();}
 }
 function em(e){return String(e&&(e.name||'')+(e&&e.message?': '+e.message:'')||e).slice(0,120);}
@@ -4281,7 +4348,7 @@ function resolvedPush(d){
   var p=self.registration.getNotifications({tag:tag}).then(function(old){return old.length;},
     function(){return 0;}).then(function(had){
     return self.registration.showNotification(title,{body:'',tag:tag,
-      renotify:false,silent:true,requireInteraction:false,data:{url:'/',resolved:true}}).then(function(){
+      renotify:false,silent:!CHROMIUM,requireInteraction:false,data:{url:'/',resolved:true}}).then(function(){
       if(CHROMIUM)return sweepResolved(tag);
       return new Promise(function(res){setTimeout(res,1000);}).then(closeAll);
     }).then(function(){
@@ -4344,8 +4411,21 @@ self.addEventListener('notificationclick',function(e){
   tell({type:'diag',what:'notification clicked',v:SW_VERSION});
   var shown=T0[tag];
   function step(name,ok,err){return rep(name,{ok:ok,tag:tag,err:err?em(err):undefined,ms:Date.now()-t0});}
-  // Robust chain: focus an open dashboard window, navigating it to "/" first if it
-  // is elsewhere; on any failure or no window, open one. Every step is reported.
+  // Focus an open dashboard window, else open one. Chrome only lets openWindow and
+  // focus run shortly after the click (user activation), so they go FIRST; every
+  // network report happens afterwards (earlier versions awaited a beacon round trip
+  // before openWindow and Chrome refused it, so a closed-browser click opened nothing).
+  var HOME='/';try{HOME=self.location.origin+'/';}catch(x){}
+  function openNew(info,why){
+    var op;try{op=self.clients.openWindow(HOME);}catch(err){op=Promise.reject(err);}
+    return op.then(function(w){
+      return rep('click_openwindow',{ok:true,tag:tag,note:(why||'')+(w?' window':' null'),ms:Date.now()-t0}).then(function(){
+        return rep('click_outcome',{ok:true,tag:tag,state:'opened',ms:Date.now()-t0});});
+    },function(err){
+      return rep('click_openwindow',{ok:false,tag:tag,err:em(err),note:why||'',ms:Date.now()-t0}).then(function(){
+        return rep('click_outcome',{ok:false,tag:tag,state:'failed',ms:Date.now()-t0});});
+    });
+  }
   function openApp(){return self.clients.matchAll({type:'window',includeUncontrolled:true}).then(function(cs){
     var paths=cs.slice(0,5).map(function(c){try{return new URL(c.url).pathname;}catch(x){return '?';}});
     var info={tag:tag,action:action,clients:cs.length,client_paths:paths};
@@ -4355,32 +4435,21 @@ self.addEventListener('notificationclick',function(e){
       if(!('focus' in cs[i]))continue;
       var p='';try{p=new URL(cs[i].url).pathname;}catch(x){}
       if(!pick||p==='/')pick=cs[i];}
-    return rep('notificationclick',info).then(function(){
-      if(!pick)return null;
-      var pp='';try{pp=new URL(pick.url).pathname;}catch(x){}
-      var nav=Promise.resolve(pick);
-      if(pp!=='/'&&'navigate' in pick){
-        nav=pick.navigate('/').then(function(c){
-          return step('click_navigate',true).then(function(){return c||pick;});},
-          function(err){return step('click_navigate',false,err).then(function(){return pick;});});}
-      return nav.then(function(c){
-        return (c||pick).focus().then(function(f){
-          try{(f||c||pick).postMessage({type:'poll'});}catch(x){}
-          return step('click_focus',true).then(function(){return f||c||pick;});});
-      }).catch(function(err){
-        return step('click_focus',false,err).then(function(){throw err;});});
+    if(!pick)return openNew(info,'none open').then(function(){return rep('notificationclick',info);});
+    var pp='';try{pp=new URL(pick.url).pathname;}catch(x){}
+    var fp;try{fp=pick.focus();}catch(err){fp=Promise.reject(err);}
+    return fp.then(function(f){
+      try{(f||pick).postMessage({type:'poll'});}catch(x){}
+      var nav=(pp!=='/'&&'navigate' in pick)?pick.navigate('/').then(function(){
+        return step('click_navigate',true);},function(err){return step('click_navigate',false,err);}):null;
+      return Promise.all([nav,step('click_focus',true),rep('notificationclick',info)]).then(function(){
+        return rep('click_outcome',{ok:true,tag:tag,state:'focused',ms:Date.now()-t0});});
+    },function(err){
+      return openNew(info,'focus failed').then(function(){
+        return Promise.all([step('click_focus',false,err),rep('notificationclick',info)]);});
     });
   }).catch(function(err){
-    return null;
-  }).then(function(done){
-    if(done)return rep('click_outcome',{ok:true,tag:tag,state:'focused',ms:Date.now()-t0});
-    return self.clients.openWindow('/').then(function(w){
-      return step('click_openwindow',true).then(function(){
-        return rep('click_outcome',{ok:true,tag:tag,state:'opened',ms:Date.now()-t0});});
-    },function(err){
-      return step('click_openwindow',false,err).then(function(){
-        return rep('click_outcome',{ok:false,tag:tag,state:'failed',ms:Date.now()-t0});});
-    });
+    return openNew({tag:tag},'matchAll failed');
   }).catch(function(){});}
   // Approve / Deny straight from the notification: one POST with the single-use
   // token from the payload; the reply is a short follow-up notification.
@@ -4424,7 +4493,11 @@ self.addEventListener('message',function(e){
   if(d.type==='version'){
     var m={type:'version',v:SW_VERSION,id:d.id};
     try{if(e.source)e.source.postMessage(m);else tell(m);}catch(x){}
-  }else if(d.type==='skip'){e.waitUntil(self.skipWaiting());}});
+  }else if(d.type==='skip'){e.waitUntil(self.skipWaiting());
+  }else if(d.type==='diag'){
+    e.waitUntil(dread().then(function(rows){
+      var m={type:'diaglog',v:SW_VERSION,id:d.id,rows:rows};
+      try{if(e.source)e.source.postMessage(m);else tell(m);}catch(x){}}));}});
 """
 _SERVICE_WORKER = _SERVICE_WORKER.replace("__SW_VERSION__", SW_VERSION)
 
@@ -5807,6 +5880,8 @@ def approval_handler(broker):
                 + row("sw-controlled", "This tab is controlled by the worker")
                 + row("sw-reg", "Registration") + row("sw-sub", "Push subscription")
                 + row("sw-caches", "Caches")
+                + row("sw-upd", "Last update check of the worker script")
+                + row("sw-log", "Recent worker events on this browser (newest last)")
                 + "<div class=srow><div class=t>"
                 "<button id=sw-update class=btn type=button hidden>Update worker now</button> "
                 "<button id=sw-clear class=btn type=button hidden>Clear caches</button> "
