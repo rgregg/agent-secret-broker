@@ -142,37 +142,6 @@ _EMAIL_RE = re.compile(r"\S+@\S+\.\S+")
 _HTML_RE = re.compile(r"<[^>]*>|&[a-z#0-9]+;", re.I)
 _MD_LINK_RE = re.compile(r"\[[^\]]*\]\([^)]*\)")
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+(?=\S)")
-# Write-class action gerunds. A description of a MUTATING request must START
-# with one of these (first word, or a leading "logging in"/"signing in"). Explicit
-# forms only: stems such as open, sent, arm, block, sync, pull, merge, cancel are
-# nouns or adjectives too. One constant, edit here.
-WRITE_VERBS = (
-    "creating", "adding", "updating", "changing", "deleting", "removing", "modifying", "writing",
-    "sending", "posting", "pushing", "restarting", "stopping", "starting", "triggering",
-    "deploying", "submitting", "uploading", "revoking", "rotating", "replacing", "overwriting",
-    "dropping", "killing", "executing", "running", "installing", "disabling", "enabling",
-    "rebooting", "resetting", "purging", "clearing", "moving", "renaming", "signing", "unlocking",
-    "locking", "destroying", "wiping", "formatting", "refunding", "charging", "transferring",
-    "issuing", "generating", "storing", "saving", "editing", "turning", "switching", "opening",
-    "closing", "disarming", "arming", "merging", "publishing", "applying", "blocking",
-    "unblocking", "reloading", "syncing", "cancelling", "canceling", "pruning", "rolling",
-    "pulling", "building", "logging in", "restoring", "pausing", "resuming", "scaling", "setting",
-    "granting", "assigning", "inviting", "registering", "enrolling", "paying", "pairing",
-    "committing", "tagging", "archiving", "importing", "emptying",
-    # added after a probe of realistic model replies (tools/describe_probe.py): plain action
-    # verbs that were rejected as a first word although they plainly change something
-    "authenticating", "requesting", "adjusting", "muting", "unmuting", "joining", "leaving",
-    "connecting", "disconnecting", "waking", "linking", "unlinking", "attaching", "detaching",
-    "mounting", "unmounting", "sharing", "unsharing", "subscribing", "unsubscribing", "cloning",
-    "copying", "duplicating", "provisioning", "powering", "activating", "deactivating",
-    "dismissing", "acknowledging", "marking", "labeling", "labelling", "snoozing", "silencing",
-    "booking", "ordering", "purchasing", "buying", "claiming", "extending", "renewing",
-    "refreshing", "increasing", "decreasing", "raising", "lowering", "dimming", "brightening",
-    "toggling", "playing", "recording", "notifying", "linking", "signing in", "accepting",
-    "rejecting", "withdrawing", "depositing", "scheduling", "rescheduling", "mapping", "binding",
-    "forwarding", "redirecting", "sending", "re-sending", "resending", "retrying",
-)
-_WRITE_FIRST = re.compile(r"^(?:" + "|".join(WRITE_VERBS) + r")\b", re.I)
 # Read gerunds: never allowed anywhere in the description of a mutating request.
 READ_GERUNDS = ("retrieving", "fetching", "listing", "reading", "checking", "querying", "viewing",
                 "getting", "looking", "searching", "inspecting", "showing", "downloading")
@@ -387,14 +356,11 @@ def is_mutating(mode, spec, read_endpoints=()):
 
 def consistency_rule(text, mode, spec, read_endpoints=()):
     """None when the text fits the hard facts, else the NAME of the rule it broke:
-    "first_word" (a mutating request must start with a write verb), "read_word" (a read
-    gerund in the description of a mutating request) or "minimizing"."""
+    "read_word" (a read gerund in the description of a mutating request) or "minimizing"."""
     if text.lower().rstrip(".") in CANNED:
         return None
     if not is_mutating(mode, spec, read_endpoints):
         return None
-    if not _WRITE_FIRST.search(text.strip()):
-        return "first_word"
     if _READ_GERUND_RE.search(text):
         return "read_word"
     if _MINIMIZING_RE.search(text):
@@ -405,8 +371,7 @@ def consistency_rule(text, mode, spec, read_endpoints=()):
 def consistent_with(text, mode, spec, read_endpoints=()):
     """Best-effort check against hard facts (false means reject).
 
-    A mutating request (see is_mutating) needs a description with a write-class
-    verb gerund (WRITE_VERBS) as its first word, no read gerund (READ_GERUNDS) anywhere, and no minimizing/negating language (MINIMIZING). A
+    A mutating request (see is_mutating) needs a description with no read gerund (READ_GERUNDS) anywhere, and no minimizing/negating language (MINIMIZING). A
     non-mutating request is only checked for minimizing claims being absent where
     they would be misleading (not checked: GET descriptions are accepted as is)."""
     return consistency_rule(text, mode, spec, read_endpoints) is None
@@ -449,8 +414,6 @@ RETRY_HINTS = {
     "technical_ip": "your previous reply contained a network address. Use everyday words only.",
     "technical_status": "your previous reply contained a number. Write no numbers.",
     "technical_host": "your previous reply contained a web address. Name only the service in everyday words.",
-    "first_word": "your previous reply did not start with a verb for the change being made. Start with one "
-                  "(Adding, Updating, Deleting, Sending, Running, Logging in to).",
     "read_word": "your previous reply described a change as reading or checking. Say what is changed.",
     "minimizing": "your previous reply played down the change. State plainly what is done.",
     "forbidden_word": "your previous reply used a banned word. Avoid every word on the banned list.",

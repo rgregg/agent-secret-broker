@@ -2177,28 +2177,28 @@ class HistoryPage(Harness):
         class Plain:
             def analyze(self, mode, names, spec):
                 return {"summary": "auto: GET 127.0.0.1/x", "risk": "low", "summary_source": "deterministic",
-                        "summary_reason": "rejected", "summary_rule": "first_word"}
+                        "summary_reason": "rejected", "summary_rule": "read_word"}
         self.broker.summarizer = Plain()
         rid, _ = self.call()
         for frag in (True, False):
             _, d = self.detail(rid, frag=frag)
-            self.assertIn("check: first_word", d)
+            self.assertIn("check: read_word", d)
             self.assertIn("the AI reply failed a safety or consistency check", d)
         # the aggregated numbers: names and counts only
         code, body = self.api("GET", "/v1/status")
-        for leak in ("descriptions", "first_word", "rejected", "by_reason", "by_rule"):
+        for leak in ("descriptions", "read_word", "rejected", "by_reason", "by_rule"):
             self.assertNotIn(leak, body)           # agent-readable: no counters, no reason classes
         code, page = req(self.abase + "/settings", headers={"X-authentik-username": "alice"})
         self.assertEqual(code, 200)
         self.assertIn("0 written by the AI model, 1 plain auto lines", page)
         self.assertIn("rejected 1", page)
-        self.assertIn("first_word 1", page)
+        self.assertIn("read_word 1", page)
         code, _ = req(self.abase + "/settings", headers={"Authorization": "Bearer " + KEY})
         self.assertNotEqual(code, 200)
         # the agent's audit view never carries the reason, the rule or the assessment
         code, body = self.api("GET", f"/v1/audit?request={rid}")
         self.assertEqual(code, 200)
-        for leak in ("first_word", "summary_reason", "summary_rule", "assessed", "check:"):
+        for leak in ("read_word", "summary_reason", "summary_rule", "assessed", "check:"):
             self.assertNotIn(leak, body)
 
     def test_detail_unknown_malformed_and_pending(self):
