@@ -290,6 +290,14 @@ class Listener(t.Dashboard):
                        "keepalive", "Q.length<20"):
             self.assertIn(needle, js)
 
+    def test_worker_keeps_a_local_diagnostic_log_and_page_shows_it(self):
+        js = broker_mod._SERVICE_WORKER
+        for needle in ("indexedDB.open('asb-diag'", "d.type==='diag'", "type:'diaglog'"):
+            self.assertIn(needle, js)
+        code, body = self.get("/settings")
+        for needle in ("id=sw-log", "id=sw-upd", "swautoupdate", "reg.update()", "diaglog"):
+            self.assertIn(needle, body)
+
     def test_settings_shows_service_worker_status_block(self):
         code, body = self.get("/settings")
         self.assertEqual(code, 200)
@@ -678,8 +686,8 @@ class PushDecide(t.Dashboard):
         import urllib.request
         js = urllib.request.urlopen(urllib.request.Request(
             self.abase + "/sw.js", headers={"X-authentik-username": "alice"})).read().decode()
-        self.assertEqual(broker_mod.SW_VERSION, "10")
-        self.assertIn("SW_VERSION='10'", js)
+        self.assertEqual(broker_mod.SW_VERSION, "11")
+        self.assertIn("SW_VERSION='11'", js)
         for needle in ("/push/decide", "X-Requested-With", "credentials:'same-origin'",
                        "redirect:'manual'", "action_click", "action_decide",
                        "Could not '+verb+' - tap to review", "'Approved'", "'Denied'",
@@ -1119,15 +1127,93 @@ new Function(src).call(global);
         self.assertEqual(r.returncode, 0, r.stderr)
         return json.loads(r.stdout.strip().splitlines()[-1])
 
+    MAC_CHROME = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36")
+    MAC_SAFARI = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
+                  "(KHTML, like Gecko) Version/27.0 Safari/605.1.15")
+    CLICK_HARNESS = r"""
+const fs=require('fs');
+const src=fs.readFileSync(process.argv[2],'utf8');
+const mode=process.argv[3];
+const listeners={}, order=[], shownOpts=[];
+global.setTimeout=(f)=>setImmediate(f);
+const win={url:'https://b.example/settings',focus(){order.push('focus');return mode==='focusfail'?Promise.reject(new Error('nofocus')):Promise.resolve(this);},
+  navigate(u){order.push('navigate '+u);return Promise.resolve(this);},postMessage(){}};
+global.self={addEventListener:(n,f)=>{listeners[n]=f;},
+  registration:{showNotification:(t,o)=>{shownOpts.push({t,o});return Promise.resolve();},getNotifications:()=>Promise.resolve([])},
+  clients:{matchAll:()=>Promise.resolve(mode==='nowin'||mode==='openreject'?[]:[win]),claim:()=>Promise.resolve(),
+    openWindow:(u)=>{order.push('openWindow '+u);return mode==='openreject'?Promise.reject(new Error('NotAllowedError')):Promise.resolve({});}},
+  skipWaiting:()=>Promise.resolve(),navigator:{userAgent:process.env.UA||''}};
+global.Notification={maxActions:2};
+global.fetch=(u,o)=>{order.push('fetch '+u+' '+(o&&o.body?JSON.parse(o.body).kind||'':''));return Promise.resolve({status:204});};
+new Function(src).call(global);
+(async()=>{
+  let p=null;
+  if(mode==='resolved'){
+    listeners.push({data:{json:()=>({type:'resolved',tag:'t',status:'denied',name:'svc'})},waitUntil:(x)=>{p=x;}});
+  }else{
+    listeners.notificationclick({action:'',notification:{tag:'t',data:{url:'/'},close(){}},waitUntil:(x)=>{p=x;}});
+  }
+  await p;
+  console.log(JSON.stringify({order,shownOpts}));
+})();
+"""
+
+    def run_click(self, mode, ua=""):
+        import subprocess
+        import shutil
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is not installed")
+        d = tempfile.mkdtemp()
+        with open(os.path.join(d, "sw.js"), "w") as f:
+            f.write(broker_mod._SERVICE_WORKER)
+        with open(os.path.join(d, "h.js"), "w") as f:
+            f.write(self.CLICK_HARNESS)
+        r = subprocess.run([node, os.path.join(d, "h.js"), os.path.join(d, "sw.js"), mode],
+                           capture_output=True, text=True, timeout=30, env={**os.environ, "UA": ua})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.loads(r.stdout.strip().splitlines()[-1])
+
+    def test_click_with_no_window_opens_one_before_any_network_report(self):
+        # Chrome rejects openWindow once the click's user activation lapses (~1 s), so it
+        # must not wait behind a beacon round trip
+        out = self.run_click("nowin", ua=self.MAC_CHROME)["order"]
+        self.assertEqual(out[0], "openWindow /")
+        self.assertTrue(any(o.startswith("fetch /push/event click_outcome") for o in out), out)
+
+    def test_click_with_a_window_focuses_before_any_network_report(self):
+        out = self.run_click("win", ua=self.MAC_CHROME)["order"]
+        self.assertEqual(out[0], "focus")
+        self.assertNotIn("openWindow /", out)
+        self.assertEqual(out[1], "navigate /")
+
+    def test_click_falls_back_to_open_window_when_focus_fails(self):
+        out = self.run_click("focusfail")["order"]
+        self.assertEqual(out[0], "focus")
+        self.assertEqual(out[1], "openWindow /")
+
+    def test_click_reports_a_rejected_open_window(self):
+        out = self.run_click("openreject")["order"]
+        self.assertEqual(out[0], "openWindow /")
+        self.assertTrue(any(o.startswith("fetch /push/event click_openwindow") for o in out), out)
+
+    def test_resolved_notice_is_audible_on_chromium_and_silent_elsewhere(self):
+        # Chrome may not count a silent notification as the one the push owed the user
+        (n,) = self.run_click("resolved", ua=self.MAC_CHROME)["shownOpts"]
+        self.assertFalse(n["o"]["silent"])
+        (n,) = self.run_click("resolved", ua=self.MAC_SAFARI)["shownOpts"]
+        self.assertTrue(n["o"]["silent"])
+
     def test_version_bumped_and_old_version_gone(self):
-        self.assertEqual(broker_mod.SW_VERSION, "10")
-        self.assertIn("SW_VERSION='10'", broker_mod._SERVICE_WORKER)
+        self.assertEqual(broker_mod.SW_VERSION, "11")
+        self.assertIn("SW_VERSION='11'", broker_mod._SERVICE_WORKER)
         self.assertNotIn("SW_VERSION='9'", broker_mod._SERVICE_WORKER)
 
     def test_source_has_replace_then_close_logic(self):
         js = broker_mod._SERVICE_WORKER
         for needle in ("d.type==='resolved'", "getNotifications({tag:tag})", "renotify:false",
-                       "silent:true", "setTimeout(res,1000)", "n.close()",
+                       "silent:!CHROMIUM", "setTimeout(res,1000)", "n.close()",
                        "e.waitUntil(resolvedPush(d))"):
             self.assertIn(needle, js)
         for needle in ("notificationclose", "notificationclick", "/push/decide", "action_decide"):
