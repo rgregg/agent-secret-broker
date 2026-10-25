@@ -4268,7 +4268,7 @@ function dlog(b){
         rq.onsuccess=function(){try{
           var db=rq.result,tx=db.transaction('l','readwrite'),st=tx.objectStore('l');
           st.add({t:Date.now(),k:String(b.kind||''),ok:b.ok,
-            n:String(b.note||b.err||b.state||'').slice(0,40)});
+            n:(String(b.note||b.err||b.state||'')+(b.seen!=null?' seen='+b.seen:'')+(b.clients!=null?' win='+b.clients:'')).slice(0,60)});
           var i=0,cu=st.openCursor(null,'prev');
           cu.onsuccess=function(){var c=cu.result;if(!c)return;i++;if(i>10)c.delete();c.continue();};
           tx.oncomplete=tx.onerror=tx.onabort=function(){try{db.close();}catch(x){}res();};
@@ -4430,6 +4430,8 @@ function onClick(e){
   function openNew(info,why){
     dlog({kind:'click_open_call',note:(why||'').slice(0,20)});
     var op;try{op=self.clients.openWindow(HOME);}catch(err){op=Promise.reject(err);}
+    var tm=setTimeout(function(){dlog({kind:'click_open_pending',note:'openWindow unsettled 3s'});},3000);
+    op=op.then(function(w){clearTimeout(tm);return w;},function(err){clearTimeout(tm);throw err;});
     return op.then(function(w){
       return rep('click_openwindow',{ok:true,tag:tag,note:(why||'')+(w?' window':' null'),ms:Date.now()-t0}).then(function(){
         return rep('click_outcome',{ok:true,tag:tag,state:'opened',ms:Date.now()-t0});});
