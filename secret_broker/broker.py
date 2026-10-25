@@ -194,6 +194,11 @@ class Request:
         self.summary = None       # advisory, unverified
         self.summary_model = None  # model that wrote the summary (None: unknown)
         self.summary_source = None  # "model", "deterministic" or None
+        self.summary_reason = None  # why a deterministic line was used (a class), human views only
+        self.summary_rule = None    # the check that rejected the reply (a fixed word), human views only
+        self.summary_pending = False  # the model description is still being written (display only)
+        self.late_rating = None     # a rating that arrived after the verdict was fixed: display only
+        self.late_seq = 0           # bumps when a late description or rating arrives (card refresh)
         self.risk = None          # {"level","model","reasons"}
         self.always = None        # outcome of an "always allow" click, if any
         self.ssh_rule = None      # outcome of an "Always: this host" click: created|exists|refused|...
@@ -232,6 +237,8 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         self._cfg_lock = threading.Lock()
         self.summarizer = summarizer
         self._kp_seen = set()           # summary key credentials seen in the catalog (see _summary_key_read)
+        self._desc_lock = threading.Lock()
+        self._desc_counts, self._desc_reasons, self._desc_rules = {}, {}, {}
         self.backend = backend
         self.notifier = notifier            # property: adapts legacy transports
         self.action_policy = notify_mod.parse_action_policy(
@@ -748,6 +755,63 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             cls = backend_base.error_class(e)
             raise keyprovider_mod.KeyUnavailable(
                 cls if cls in keyprovider_mod.REASONS else "other") from None
+    def _description_arrived(self, req, fut):
+        """The model description finished after the card was first drawn (or hit the hard ceiling).
+        Display only: touches the summary fields of this request and writes one audit event; a
+        request that is already settled keeps its status and only its history row changes."""
+        try:
+            d = fut.result()
+        except Exception:  # noqa: BLE001
+            d = {"source": "deterministic", "reason": "error", "rule": None}
+        with self._lock:
+            req.summary_pending = False
+            if d.get("source") == "model" and d.get("text"):
+                req.summary, req.summary_source = d["text"], "model"
+                req.summary_model, req.summary_reason, req.summary_rule = d.get("model"), None, None
+            else:
+                req.summary_source = "deterministic"
+                req.summary_reason, req.summary_rule = d.get("reason") or "error", d.get("rule")
+            req.late_seq += 1
+        self._count_description(req)
+        self.audit("description_updated", req, summary_source=req.summary_source,
+                   summary_reason=req.summary_reason, summary_rule=req.summary_rule)
+
+    def _rating_arrived(self, req, fut):
+        """A rating that came after the verdict was fixed. It is shown ("rated later") and audited;
+        nothing reads it for approval, auto-approval, grants or limits."""
+        try:
+            level = fut.result()[0]
+        except Exception:  # noqa: BLE001
+            return
+        if level not in ("low", "medium", "high"):
+            return
+        with self._lock:
+            req.late_rating = level
+            req.late_seq += 1
+        self.audit("rated_late", req, late_level=level)
+
+    def _description_stats(self):
+        """Since start: how many request descriptions came from the model and how many fell
+        back to the plain "auto:" line, by reason class and by rejecting check. Names and
+        counts only; never any text."""
+        with self._desc_lock:
+            return {"model": self._desc_counts.get("model", 0),
+                    "deterministic": self._desc_counts.get("deterministic", 0),
+                    "by_reason": dict(sorted(self._desc_reasons.items())),
+                    "by_rule": dict(sorted(self._desc_rules.items()))}
+
+    def _count_description(self, req):
+        """Count how each description was produced (counts of fixed class names only)."""
+        src = req.summary_source
+        if src not in ("model", "deterministic"):
+            return
+        with self._desc_lock:
+            self._desc_counts[src] = self._desc_counts.get(src, 0) + 1
+            if src == "deterministic":
+                for table, key in ((self._desc_reasons, req.summary_reason or "none"),
+                                   (self._desc_rules, req.summary_rule)):
+                    if key:
+                        table[key] = table.get(key, 0) + 1
 
     def status(self):
         """Deploy-verification summary for GET /v1/status. Counts and type names
@@ -1392,8 +1456,18 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         req.summary, req.risk = a["summary"], {k: a[k] for k in ("level", "model", "reasons")}
         req.summary_model = a.get("summary_model") if a.get("summary_source") != "deterministic" else None
         req.summary_source = a.get("summary_source")
+        req.summary_reason, req.summary_rule = a.get("summary_reason"), a.get("summary_rule")
+        req.summary_pending = bool(a.get("summary_pending"))
+        if not req.summary_pending:
+            self._count_description(req)
         self.audit("assessed", req, model=a["model"], reasons=a["reasons"],
-                   summary_source=a.get("summary_source"), summary_reason=a.get("summary_reason"))
+                   summary_source=a.get("summary_source"), summary_reason=a.get("summary_reason"),
+                   summary_rule=a.get("summary_rule"))
+        # late answers (display only): never read by the decision below, which is taken now
+        if a.get("summary_late") is not None:
+            a["summary_late"].add_done_callback(lambda f, r=req: self._description_arrived(r, f))
+        if a.get("rating_late") is not None:
+            a["rating_late"].add_done_callback(lambda f, r=req: self._rating_arrived(r, f))
         cid = req.client["id"]
         never = self.client_never_auto(cid)
         if not never and self._ssh_rule_claim(req):   # standing per-host rule: explicit policy, any risk limit
@@ -3547,6 +3621,7 @@ small,.muted{color:var(--muted)}
 .info{display:inline-grid;place-items:center;box-sizing:border-box;width:1.05rem;height:1.05rem;min-width:0;min-height:0;flex:none;padding:0;margin:0 .15rem;border:1px solid var(--muted);border-radius:50%;background:none;color:var(--muted);font:italic 700 .7rem/1 Georgia,serif;cursor:help;position:relative;vertical-align:baseline}
 .info:hover::after,.info:focus::after{content:attr(data-tip);position:absolute;left:0;top:1.5rem;z-index:30;width:max-content;max-width:min(16rem,70vw);padding:.4rem .6rem;border:1px solid var(--line);border-radius:.4rem;background:var(--card);color:var(--fg);font:normal .8rem/1.3 system-ui,sans-serif;text-align:left;box-shadow:0 4px 14px #0003}
 p,td,li{overflow-wrap:anywhere}
+.sumtxt{overflow-wrap:anywhere;word-break:break-word;line-height:1.4}
 .pill{display:inline-block;padding:0 .55rem;border-radius:99px;font-size:.75rem;font-weight:600;line-height:1.1rem;
 white-space:nowrap}
 .pill.ok{background:var(--okbg);color:var(--okfg)}.pill.warn{background:var(--wbg);color:var(--wfg)}
@@ -4047,6 +4122,7 @@ _DASH_JS = r'''
           cards.innerHTML=c.innerHTML;asbReopen(cards,wasopen);asbRecheck(cards,wasck);asbGSync(cards);bind();
           track(ids(c));}
         if(hl&&nl&&seq===hseq&&nl.innerHTML!==hl.innerHTML)hl.innerHTML=nl.innerHTML;
+        refreshdetail();
         off.hidden=true;secs();title();})
       .catch(function(){if(!A.out)off.hidden=false;});}
   function hload(){
@@ -4062,7 +4138,7 @@ _DASH_JS = r'''
   // Detail pop-over: the server renders (and escapes) the fragment; it is the
   // only thing put into the dialog, and the dialog sits outside the polled areas.
   var dlg=document.getElementById('hdlg'), dbody=document.getElementById('hbody'),
-      dseq=0, dfor=null, dopener=null;
+      dseq=0, dfor=null, dopener=null, dtxt=null;
   function opendetail(btn){
     var id=btn.getAttribute('data-id');
     if(!dlg||!dlg.showModal){location.href='/request/'+encodeURIComponent(id);return;}
@@ -4074,10 +4150,18 @@ _DASH_JS = r'''
         return r.text().then(function(t){return {s:r.status,t:t};});})
       .then(function(o){if(n!==dseq)return;
         if(o.s===-1)dbody.textContent='Your session expired. Close this and sign in again.';
-        else if(o.s===200)dbody.innerHTML=o.t;
+        else if(o.s===200){dbody.innerHTML=o.t;dtxt=o.t;}
         else dbody.textContent=o.s===409?'This request is still waiting; decide it from its card.'
           :'This request is not in the history.';})
       .catch(function(){if(n===dseq)dbody.textContent='Could not load the details.';});}
+  // a description or rating that arrives while the pop-over is open replaces its text in place
+  function refreshdetail(){
+    if(!dlg||!dlg.open||!dfor||dtxt===null)return;
+    var n=dseq,id=dfor;
+    fetch('/request/'+encodeURIComponent(id)+'?fragment=1',{credentials:'same-origin',cache:'no-store',redirect:'manual'})
+      .then(function(r){return r.status===200?r.text():null;})
+      .then(function(t){if(t===null||n!==dseq||id!==dfor||t===dtxt)return;dbody.innerHTML=t;dtxt=t;})
+      .catch(function(){});}
   if(dlg){
     dlg.addEventListener('click',function(e){if(e.target===dlg)dlg.close();});
     var dc=document.getElementById('hclose');if(dc)dc.addEventListener('click',function(){dlg.close();});
@@ -4429,11 +4513,37 @@ def _describe(req):
             "command shown is what it <em>said</em> it would run.")
 
 
-def _info_icon(model, source=None):
+_REASON_TEXT = {
+    "rejected": "the AI reply failed a safety or consistency check",
+    "timeout": "the AI model took too long",
+    "error": "the AI model call failed",
+    "rate_limited": "too many descriptions were being written at once",
+    "empty": "the AI model returned nothing (its token budget may have run out)",
+    "truncated": "the AI reply was cut off",
+    "not_sent": "SSH signing data is never sent to a model",
+    "disabled": "AI descriptions are switched off",
+    "pending": "the AI description is still being written; this line is replaced when it arrives",
+}
+
+
+def _reason_note(reason, rule):
+    """Human-view note naming why a plain line was used. Fixed class and rule names only,
+    never the rejected text; callers show it on the dashboard and history, never to agents."""
+    word = re.compile(r"^[a-z_]{1,32}$")
+    if not isinstance(reason, str) or not word.match(reason):
+        return ""
+    note = f" Reason: {_REASON_TEXT.get(reason, reason)} ({reason}"
+    if isinstance(rule, str) and word.match(rule):
+        note += f", check: {rule}"
+    return note + ")."
+
+
+def _info_icon(model, source=None, reason=None, rule=None):
     """The (i) icon whose tooltip says which model wrote a description (or that
-    a plain line was built from the request details, with no model involved)."""
+    a plain line was built from the request details, with no model involved, and why)."""
     if source == "deterministic":
-        tip = html.escape("Built from the request details; no AI model was used.")
+        tip = html.escape("Built from the request details; no AI model was used."
+                          + _reason_note(reason, rule))
     else:
         tip = html.escape(f"Generated by {model or 'an AI model'} based on the request.")
     # data-tip drives the CSS tooltip (hover, focus, tap); no title attribute, or the
@@ -4450,8 +4560,14 @@ def _risk_html(req):
            + html.escape("; ".join(req.risk["reasons"]) if req.risk else "") + "</small></div>")
     if req.summary:
         out += (f"<p>{'Summary' if req.summary_source == 'deterministic' else 'AI summary'} "
-                f"{_info_icon(req.summary_model, req.summary_source)}:<br>"
-                f"<i>{html.escape(req.summary)}</i></p>")
+                f"{_info_icon(req.summary_model, req.summary_source, req.summary_reason, req.summary_rule)}:<br>"
+                f"<i class=sumtxt>{html.escape(req.summary)}</i>"
+                + (" <small class=muted>(model description pending)</small>" if req.summary_pending else "")
+                + "</p>")
+    if req.late_rating:
+        out += ("<p><small class=muted>The rating model later said "
+                f"{html.escape(req.late_rating.upper())} (rated later). The request is still handled as "
+                f"{html.escape(req.risk['level'].upper())}.</small></p>")
     return out
 
 
@@ -4734,12 +4850,14 @@ def _detail_html(r, evs, retained=""):
     add("Source (claimed by the client, unverified)", r["source"])
     add("Peer", r["peer"])
     if r["summary"]:
-        add("Summary", f"{e(r['summary'])} {_info_icon(r.get('summary_model'), r.get('summary_source'))}", True)
+        add("Summary", f"<span class=sumtxt>{e(r['summary'])}</span> {_info_icon(r.get('summary_model'), r.get('summary_source'), r.get('summary_reason'), r.get('summary_rule'))}", True)
     if r["risk"]:
         reasons = "; ".join(r["risk_reasons"] or [])
         add("Risk", f"<span class='risk {e(r['risk'])}'><b>{e(r['risk'].upper())}</b></span> "
             + e(reasons) + (f" <small class=muted>(model verdict: {e(str(r['risk_model']))})</small>"
-                            if r["risk_model"] else ""), True)
+                            if r["risk_model"] else "")
+            + (f" <small class=muted>(rated later: {e(r['late_rating'].upper())}; it did not change how the "
+               "request was handled)</small>" if r.get("late_rating") else ""), True)
     add("Outcome", f"<span class='pill {kind}'>{e(label)}</span>"
         + (f" {e(r['error'])}" if r["error"] else ""), True)
     if r["via"] == "policy" and r.get("rule_id"):
@@ -5261,7 +5379,7 @@ def approval_handler(broker):
                     f"{_approve_actions(broker, r)}</form></article>")
             # the card must refresh when its assessment arrives, not only when requests come and go
             version = hashlib.sha256(
-                "|".join([f"{r.id}:{1 if r.risk else 0}" for r in reqs]
+                "|".join([f"{r.id}:{1 if r.risk else 0}:{r.late_seq}:{1 if r.summary_pending else 0}" for r in reqs]
                          + [f"enroll:{e['id']}" for e in enrolls]).encode()).hexdigest()[:16]
             inner = ("".join(cards) if cards else
                      "<div class='card empty'>Nothing is waiting for approval.</div>")
@@ -5605,7 +5723,8 @@ def approval_handler(broker):
                   "(plans); a plan lasts at most until its deadline and ends on a restart.</small></div></div>"
                   "<div class=srow><div class=t><b>Standing approvals</b><small class=muted>"
                   f"{html.escape(grants_mod.describe(broker.grants_cfg, broker.auto_approve_max()))}. "
-                  "Durations are set in the broker config (timed_grants).</small></div></div></section>"
+                  "Durations are set in the broker config (timed_grants).</small></div></div>"
+                  + self._description_row() + "</section>"
                   "<section class=card><h2>This browser</h2>"
                   "<div class=srow><div class=t><b>Notifications while this page is open</b>"
                   "<small id=notify-state class=muted></small></div>"
@@ -5616,6 +5735,17 @@ def approval_handler(broker):
                   "<button id=notify-test class=btn type=button hidden>Send a test notification"
                   "</button></div>" + self._sw_block() + "</section>" + devices,
                   script=_DASH_JS, tab="settings", user=user)
+
+        def _description_row(self):
+            """Approver-only: how request descriptions were produced since start, by reason class and
+            by rejecting check (fixed names and counts; never any text). Not part of /v1/status or any
+            agent view, so an agent cannot use it to tune replies against the checks."""
+            ds = broker._description_stats()
+            fmt = lambda t: ", ".join(f"{html.escape(k)} {v}" for k, v in t.items()) or "none"
+            return ("<div class=srow><div class=t><b>Request descriptions since start</b><small class=muted>"
+                    f"{ds['model']} written by the AI model, {ds['deterministic']} plain auto lines. "
+                    f"Reasons: {fmt(ds['by_reason'])}. Checks that rejected a reply: {fmt(ds['by_rule'])}."
+                    "</small></div></div>")
 
         def _sw_block(self):
             # Filled in by _DASH_JS; the expected version comes from the same constant /sw.js serves

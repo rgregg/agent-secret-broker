@@ -166,14 +166,15 @@ Safety measures:
   path without query string, header names, a body or command excerpt of
   `max_content_chars`), inside a data block with a random per-call boundary.
   Never secret values, header values, query strings or key material.
-- The prompt asks for one 3-12 word action phrase in plain language and
-  forbids opinions and approvals; a request that speaks to the reviewer is
+- The prompt asks for 1 or 2 plain sentences (roughly 15 to 40 words): the first names the
+  action, what it acts on and the service, the optional second says in everyday words what the
+  script or call is for. It forbids opinions and approvals; a request that speaks to the reviewer is
   described as "Request contains text addressed to the reviewer".
 - Every reply is sanitized in code (`description.sanitize`): single line, ASCII
   only (control, bidi and zero-width characters are rejected), no markdown,
   HTML, URLs, emails, code, paths, hostnames, IPs, status codes, HTTP verbs or
   API jargon, no shouted tokens, no quote of the prompt, no safety or approval
-  language (`FORBIDDEN_PHRASES` and `FORBIDDEN_STEMS`: approv*, deny, authoris/z*, permit*, allow*), capped at 160 characters.
+  language (`FORBIDDEN_PHRASES` and `FORBIDDEN_STEMS`: approv*, deny, authoris/z*, permit*, allow*), at most 2 sentences and at most 320 characters (`MAX_LEN`; a longer reply is rejected, never cut).
 - Consistency (best effort): for a mutating request (POST/PUT/PATCH/DELETE other
   than a clean POST to an allowlisted read endpoint; a write-looking command, a store request or ssh signing) the description must START with a write-class gerund
   (`WRITE_VERBS`: Deleting, Opening, Syncing ...), contain no read gerund
@@ -190,14 +191,82 @@ Safety measures:
   technical `auto:` line unless allowlisted.
 - Any rejection, timeout, error or rate cap replaces the description with the
   deterministic `auto:` line. The audit `assessed` event records
-  `summary_source` (`model` or `deterministic`) and `summary_reason`
-  (`rejected`, `timeout`, `error`, `rate_limited`), never the rejected text.
+  `summary_source` (`model` or `deterministic`), `summary_reason`
+  (`rejected`, `timeout`, `error`, `rate_limited`, `empty`, `truncated`, `not_sent`, `disabled`) and,
+  for a rejected reply, `summary_rule` (the fixed name of the check: `forbidden_word`, `sentences`,
+  `first_word`, `technical_host`, `technical_http_verb`, `technical_jargon`, `technical_path`,
+  `technical_ip`, `technical_status`, `prompt_echo`, ...), never the rejected text. The `assessed` event is hidden from the agent audit
+  view. The approver sees the class in the (i) tooltip, the details pop-over and the Settings page
+  (counts since start); `/v1/status` and `asb status` carry no description counters.
 - Bounds: `summary_timeout` (4 s), `summary_concurrency` (4),
   `summary_max_per_minute` (30), responses capped at 16 KB. The key is never
   logged.
 - Endpoint: descriptions go to `summary_base_url` (default OpenRouter). If
   `base_url` is custom and `summary_base_url` is not set, descriptions are
   disabled (startup warning) instead of using the default endpoint.
+
+## What the sanitizer allows, and why
+
+A live comparison (35 shapes, three models) fell back on 43% of requests, mostly on the technical
+syntax check, so the validator was the main cause of `auto:` lines, not the models. Changes, each
+with a test that the dangerous variants are still rejected:
+
+- The words API, request and response are allowed: ordinary English, no markup or instruction.
+  Endpoint, payload, JSON, URL, HTTP, header, curl and the like are still refused.
+- A host name is allowed only if it is the request's own host (taken from the request, not from the
+  reply), and an HTTP method name only if it is the request's own method. Any other host, a path, an
+  address, a link, `www.`, a status code or number in the 100-599 range is still refused.
+- The prompt-copy check needs 6 copied words (it was 5, which flagged ordinary phrases).
+- The prompt now tells the model not to write URLs, domain names, paths, methods or numbers, and
+  lists the banned words, so most replies never reach the check.
+- Reasoning: `description.REASONING_BY_PREFIX` sets the `reasoning` field per model family. Default
+  `{"effort": "minimal"}` (unchanged for every model except the one listed); `google/gemini-2.5-flash-lite`
+  gets `{"effort": "none"}` because "minimal" left it spending its 400-token budget on hidden
+  reasoning. A 400 reply from the provider is retried once without the field.
+
+### Fail-soft repair and one retry
+
+Instead of discarding a description for a host name, address or path, `description.repair` swaps
+it for wording that is plainly not the real target ("another service", "another server", "another
+resource"). Only those fixed phrases are inserted. Numbers (status codes, quantities), HTTP method
+names and technical terms are never rewritten or dropped: the text is refused instead, because
+changing them could change what it claims. After repair EVERY check runs again on the text that
+would be shown (markup, banned words, sentences, technical syntax, shouting, prompt copy, length),
+and the consistency check (write verb first, no read or minimizing words) runs on it too; any
+failure rejects the description. The request's own host and method are left as written.
+
+A reply refused for a reason a rewrite can fix (`RETRY_HINTS`: technical_*, first_word, read_word,
+minimizing, forbidden_word, sentences, too_long, prompt_echo, shouting) gets ONE retry with a
+fixed-wording correction added to the system prompt. The rejected text is never sent back. The
+retry counts against the same per-minute cap and concurrency; its outcome is final, and the audit
+still records one reason class and rule. Disable with `Describer(retry=False)`.
+
+## Late descriptions and late ratings
+
+The card is drawn after at most `summary_timeout` (description) and `timeout` (rating) seconds, as
+before: a description that is not ready is replaced by the plain `auto:` line marked "model
+description pending", and a rating that is not ready counts as no verdict, so the request is
+treated as HIGH. The two model calls are NOT cancelled then. They run off the request thread (a
+shared pool, still bounded by `summary_concurrency` and `summary_max_per_minute` for descriptions)
+until `summary_hard_timeout` (default 30 s, max 120).
+
+- Description: when the reply arrives and passes `sanitize` and `consistent_with`, it replaces
+  the plain line in the pending card, the history row and the open details pop-over (the dashboard
+  poll redraws a card when its `late_seq` changes, and keeps open sections, ticked boxes and typed
+  text as it does for an arriving assessment). If the reply is rejected, or the ceiling passes, the
+  plain line becomes final and the reason class (`rejected` + rule, `timeout`, `error`, ...) is
+  recorded. Either way exactly one `description_updated` audit event is written. A reply for a
+  request that is already approved, denied or expired changes only its history row.
+- Rating: the decision is taken when the card is first drawn (including auto-approval, grants and
+  `auto_approve_max`) and is never revisited. A rating that arrives later is stored separately
+  (`late_rating`), audited as `rated_late` and shown as "rated later: LOW; it did not change how
+  the request was handled". It is never written to `req.risk`, which is the only value the gate
+  reads, so a late rating can neither auto-approve a request nor lower an approval requirement.
+- Notifications are unchanged: they carry the text the request had when it was sent (names plus
+  the plain line when no description was ready) and are never delayed. `description_updated` and
+  `rated_late` are hidden from the agent audit view.
+- Slot use: a slow call holds a description slot until it finishes, so a slow provider can make
+  later descriptions wait up to 3 s for a slot and then fall back with `rate_limited`.
 
 ## Deterministic rules
 

@@ -21,9 +21,11 @@ from . import keyprovider
 from . import scripts as scripts_mod
 from . import sshkey
 
+MAX_SUMMARY = 320     # characters of a displayed summary (1 or 2 sentences)
+
 SYSTEM = (
     "You label API requests for a human approver. Reply with ONLY a JSON "
-    'object: {"summary": "<=12 words saying what the request does", '
+    'object: {"summary": "1 or 2 plain sentences (about 15 to 40 words) saying what the request does and on which service", '
     '"risk": "low|medium|high"}. Risk rubric: low = read-only, no side '
     "effects; medium = reversible changes or exposes data; high = destructive, "
     "irreversible, changes credentials or permissions, could exfiltrate "
@@ -85,7 +87,7 @@ class OpenRouterSummarizer:
                 {"role": "system", "content": SYSTEM + ("\n\n" + extra if extra else "")},
                 {"role": "user", "content": describe(mode, names, spec, self._max, self._send)},
             ],
-            "max_tokens": 200,
+            "max_tokens": 400,
             "temperature": 0,
             "reasoning": {"effort": "minimal"},
         }
@@ -110,7 +112,7 @@ class OpenRouterSummarizer:
                 risk = str(obj.get("risk") or "").lower()
             except (json.JSONDecodeError, AttributeError):
                 pass
-        summary = " ".join(summary.split())[:100] or None
+        summary = " ".join(summary.split())[:MAX_SUMMARY] or None
         return {"summary": summary, "risk": risk if risk in ("low", "medium", "high") else None,
                 "summary_model": self._model}
 
