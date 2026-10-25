@@ -4210,7 +4210,7 @@ _DASH_JS = _KEEP_JS + _DASH_JS + proposals_mod.JS_INIT
 
 # Single source of truth for the worker version: rendered into the worker, the
 # X-SW-Version header on /sw.js, and the Settings page ("expected" version).
-SW_VERSION = "9"
+SW_VERSION = "10"
 
 _SERVICE_WORKER = r"""
 var SW_VERSION='__SW_VERSION__';
@@ -4247,10 +4247,28 @@ self.addEventListener('install',function(e){
 self.addEventListener('activate',function(e){
   e.waitUntil(self.clients.claim().then(function(){return rep('sw_activate');},
     function(){return rep('sw_activate',{ok:false});}));});
+// Chromium (Chrome, Edge, Android): after a push event settles it checks that a
+// notification is still on display; one shown and closed inside the event counts
+// as nothing shown and Chrome adds its own "updated in the background" banner.
+// iOS/Safari workers carry no "Chrome/" in their UA and keep show-then-close.
+var CHROMIUM=/Chrome\/|Edg\//.test(UA);
+// Last resort so a push never settles with nothing on display.
+function minimalShow(tag,title){
+  return self.registration.showNotification(title||'Approval needed',{
+    body:title?'':'A secret was requested',tag:tag,data:{url:'/'}}).then(function(){return true;},
+    function(){return false;});
+}
+// Chromium leaves the brief "Approved: x" notice up (it replaces the approval
+// notification under the same tag); sweep earlier notices out on the next push.
+function sweepResolved(except){
+  return self.registration.getNotifications().then(function(ns){
+    ns.forEach(function(n){try{if(n.data&&n.data.resolved&&n.tag!==except)n.close();}catch(x){}});
+  },function(){}).catch(function(){});
+}
 // A settled request: replace the notification under its tag with a brief,
-// silent, button-less one and close it. Every push must show something
-// (userVisibleOnly; iOS revokes subscriptions that do not), so even with no
-// old notification to clear we show then close.
+// silent, button-less one. Every push must show something (userVisibleOnly; iOS
+// revokes subscriptions that do not). On Chromium that notice stays up (see
+// CHROMIUM); elsewhere it is closed after a second.
 function resolvedPush(d){
   var tag=String(d.tag||'secret-resolved').slice(0,64),t0=Date.now();
   var words={approved:'Approved',denied:'Denied',expired:'Expired',failed:'Failed',released:'Released'};
@@ -4259,22 +4277,29 @@ function resolvedPush(d){
   delete T0[tag];
   function closeAll(){return self.registration.getNotifications({tag:tag}).then(function(ns){
     ns.forEach(function(n){try{n.close();}catch(x){}});return ns.length;},function(){return 0;});}
+  var title=word+(name?': '+name:'');
   var p=self.registration.getNotifications({tag:tag}).then(function(old){return old.length;},
     function(){return 0;}).then(function(had){
-    return self.registration.showNotification(word+(name?': '+name:''),{body:'',tag:tag,
-      renotify:false,silent:true,requireInteraction:false,data:{url:'/'}}).then(function(){
-      return new Promise(function(res){setTimeout(res,1000);});
-    }).then(closeAll).then(function(){
-      return rep('resolved',{ok:true,tag:tag,note:String(d.status||'').slice(0,12)+(had?'':' none'),
+    return self.registration.showNotification(title,{body:'',tag:tag,
+      renotify:false,silent:true,requireInteraction:false,data:{url:'/',resolved:true}}).then(function(){
+      if(CHROMIUM)return sweepResolved(tag);
+      return new Promise(function(res){setTimeout(res,1000);}).then(closeAll);
+    }).then(function(){
+      return rep('resolved',{ok:true,tag:tag,note:String(d.status||'').slice(0,12)+(had?'':' none')+(CHROMIUM?' kept':''),
         ms:Date.now()-t0});
-    },function(err){return rep('resolved',{ok:false,tag:tag,err:em(err),ms:Date.now()-t0});});
+    },function(err){
+      return minimalShow(tag,title).then(function(ok){
+        return rep('resolved',{ok:false,tag:tag,err:em(err),note:ok?'fallback':'nofallback',ms:Date.now()-t0});});});
   });
   return p.catch(function(){});
 }
 self.addEventListener('push',function(e){
   var d={},parsed=true;try{d=e.data.json();}catch(x){parsed=false;}
-  if(parsed&&d&&d.type==='resolved'){e.waitUntil(resolvedPush(d));return;}
-  var tag=d.tag||'secret-request',t0=Date.now();T0[tag]=t0;
+  if(!d||typeof d!=='object'){d={};parsed=false;}
+  var tag='secret-request';
+  try{
+  if(parsed&&d.type==='resolved'){e.waitUntil(resolvedPush(d));return;}
+  tag=String(d.tag||'secret-request');var t0=Date.now();T0[tag]=t0;
   tell({type:'diag',what:'push received',v:SW_VERSION});
   var r1=rep('push',{ok:parsed,tag:tag});
   // Buttons: only what the payload lists (Deny, Approve), then Review, capped to
@@ -4299,8 +4324,14 @@ self.addEventListener('push',function(e){
         function(){return -1;}).then(function(seen){
         return rep('show',{ok:true,tag:tag,ms:Date.now()-t0,seen:seen,persist:PERSIST,
           note:acts.map(function(a){return a.action;}).join(',')});});},
-    function(err){return rep('show',{ok:false,tag:tag,err:em(err),ms:Date.now()-t0});});
-  e.waitUntil(Promise.all([r1,r2]));});
+    function(err){
+      // e.g. unsupported option: still show a plain one rather than let Chrome add its own
+      return minimalShow(tag).then(function(ok){
+        return rep('show',{ok:false,tag:tag,err:em(err),note:ok?'fallback':'nofallback',ms:Date.now()-t0});});});
+  e.waitUntil(Promise.all([r1,r2,CHROMIUM?sweepResolved(tag):null]));
+  }catch(err){
+    e.waitUntil(minimalShow(tag).then(function(){return rep('show',{ok:false,tag:tag,err:em(err),note:'fallback'});}));
+  }});
 self.addEventListener('notificationclose',function(e){
   var tag=(e.notification&&e.notification.tag)||'';
   e.waitUntil(rep('notificationclose',{tag:tag,note:'dismissed'}));});
