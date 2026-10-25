@@ -678,8 +678,8 @@ class PushDecide(t.Dashboard):
         import urllib.request
         js = urllib.request.urlopen(urllib.request.Request(
             self.abase + "/sw.js", headers={"X-authentik-username": "alice"})).read().decode()
-        self.assertEqual(broker_mod.SW_VERSION, "9")
-        self.assertIn("SW_VERSION='9'", js)
+        self.assertEqual(broker_mod.SW_VERSION, "10")
+        self.assertIn("SW_VERSION='10'", js)
         for needle in ("/push/decide", "X-Requested-With", "credentials:'same-origin'",
                        "redirect:'manual'", "action_click", "action_decide",
                        "Could not '+verb+' - tap to review", "'Approved'", "'Denied'",
@@ -786,6 +786,97 @@ new Function(src).call(global);
         self.assertEqual(ev, {"kind": "show", "seen": 0, "persist": False})
         ev = broker_mod.sanitize_client_event({"kind": "show", "seen": "1", "persist": "no"})
         self.assertEqual(ev, {"kind": "show"})
+
+    PUSH_HARNESS = r"""
+const fs=require('fs');
+const src=fs.readFileSync(process.argv[2],'utf8');
+const payload=JSON.parse(process.argv[3]);
+const mode=process.argv[4]||'';
+const listeners={}; let live=[]; const log=[];
+global.setTimeout=(f)=>setImmediate(f);
+const reg={
+  showNotification:(t,o)=>{
+    if(mode==='reject-full'&&o&&o.actions)return Promise.reject(new TypeError('actions unsupported'));
+    if(mode==='reject-all')return Promise.reject(new Error('boom'));
+    live=live.filter(n=>!o.tag||n.tag!==o.tag);
+    live.push({title:t,tag:o.tag,data:o.data,close(){live=live.filter(x=>x!==this);}});
+    return Promise.resolve();},
+  getNotifications:(f)=>Promise.resolve(live.filter(n=>!f||!f.tag||n.tag===f.tag))};
+global.self={addEventListener:(n,f)=>{listeners[n]=f;},registration:reg,
+  clients:{matchAll:()=>Promise.resolve([]),claim:()=>Promise.resolve()},
+  skipWaiting:()=>Promise.resolve(),navigator:{userAgent:process.env.UA||''}};
+global.Notification={maxActions:2};
+global.fetch=()=>Promise.resolve({status:204});
+new Function(src).call(global);
+(async()=>{
+  // a stale approval notification already on display
+  live.push({title:'Secret request',tag:'secret-abc',data:{url:'/'},close(){live=live.filter(x=>x!==this);}});
+  if(process.env.OLD_RESOLVED)live.push({title:'Denied: old',tag:'secret-old',data:{resolved:true},
+    close(){live=live.filter(x=>x!==this);}});
+  let p=null,threw=null;
+  const data=mode==='nodata'?null:{json:()=>{if(mode==='badjson')throw new SyntaxError('x');return payload;}};
+  try{listeners.push({data,waitUntil:(x)=>{p=x;}});}catch(e){threw=String(e);}
+  await p;
+  console.log(JSON.stringify({threw,live:live.map(n=>n.title),waited:p!==null}));
+})();
+"""
+
+    def run_push(self, payload, ua="", mode="", old_resolved=False):
+        import subprocess
+        import shutil
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is not installed")
+        d = tempfile.mkdtemp()
+        with open(os.path.join(d, "sw.js"), "w") as f:
+            f.write(broker_mod._SERVICE_WORKER)
+        with open(os.path.join(d, "h.js"), "w") as f:
+            f.write(self.PUSH_HARNESS)
+        env = {**os.environ, "UA": ua}
+        if old_resolved:
+            env["OLD_RESOLVED"] = "1"
+        r = subprocess.run([node, os.path.join(d, "h.js"), os.path.join(d, "sw.js"),
+                            json.dumps(payload), mode], capture_output=True, text=True, timeout=30, env=env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.loads(r.stdout.strip().splitlines()[-1])
+
+    RESOLVED = {"type": "resolved", "tag": "secret-abc", "status": "denied", "name": "svc"}
+    REQUEST = {"title": "Secret request [LOW]", "body": "svc", "tag": "secret-new",
+               "actions": ["deny", "approve"], "rid": "R", "token": "T"}
+    IOS_SAFARI = ("Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 "
+                  "(KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1")
+
+    def test_resolved_push_on_chromium_leaves_a_notification_on_display(self):
+        # Chrome adds its own "updated in the background" banner if nothing is visible
+        # once the push event settles; so the replacement notice must not be closed
+        for ua in (self.MAC_CHROME, self.WIN_CHROME):
+            out = self.run_push(self.RESOLVED, ua=ua)
+            self.assertEqual(out["live"], ["Denied: svc"], ua)
+
+    def test_resolved_push_elsewhere_still_clears_the_stale_notification(self):
+        for ua in (self.MAC_SAFARI, self.IOS_SAFARI, ""):
+            out = self.run_push(self.RESOLVED, ua=ua)
+            self.assertEqual(out["live"], [], ua)
+
+    def test_chromium_request_push_sweeps_earlier_resolved_notices(self):
+        out = self.run_push(self.REQUEST, ua=self.MAC_CHROME, old_resolved=True)
+        self.assertIn("Secret request [LOW]", out["live"])
+        self.assertNotIn("Denied: old", out["live"])
+
+    def test_push_always_ends_with_something_on_display(self):
+        for mode, payload in (("badjson", self.REQUEST), ("nodata", self.REQUEST),
+                              ("reject-full", self.REQUEST), ("", None), ("", "null")):
+            for ua in (self.MAC_CHROME, self.MAC_SAFARI):
+                out = self.run_push(payload, ua=ua, mode=mode)
+                self.assertIsNone(out["threw"], (mode, payload))
+                self.assertTrue(out["waited"], (mode, payload))
+                self.assertTrue(any(t in ("Approval needed", "Secret request [LOW]") for t in out["live"]),
+                                (mode, payload, out))
+
+    def test_resolved_push_falls_back_when_the_full_notice_is_rejected(self):
+        out = self.run_push(self.RESOLVED, ua=self.MAC_CHROME, mode="reject-all")
+        self.assertIsNone(out["threw"])
+        self.assertTrue(out["waited"])
 
     def test_worker_approve_success_shows_short_names_only_followup(self):
         out = self.run_worker("ok", "approve")
@@ -1029,9 +1120,9 @@ new Function(src).call(global);
         return json.loads(r.stdout.strip().splitlines()[-1])
 
     def test_version_bumped_and_old_version_gone(self):
-        self.assertEqual(broker_mod.SW_VERSION, "9")
-        self.assertIn("SW_VERSION='9'", broker_mod._SERVICE_WORKER)
-        self.assertNotIn("SW_VERSION='8'", broker_mod._SERVICE_WORKER)
+        self.assertEqual(broker_mod.SW_VERSION, "10")
+        self.assertIn("SW_VERSION='10'", broker_mod._SERVICE_WORKER)
+        self.assertNotIn("SW_VERSION='9'", broker_mod._SERVICE_WORKER)
 
     def test_source_has_replace_then_close_logic(self):
         js = broker_mod._SERVICE_WORKER
