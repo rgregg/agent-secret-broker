@@ -556,8 +556,7 @@ class Canary(Base):
     decision = "approve"
 
     def raw_audit(self):
-        with open(self.audit) as f:
-            return f.read()
+        return _fast.read_audit_text(self.audit)
 
     def test_canaries_only_on_approver_surfaces(self):
         body = json.dumps({"canary": BODYC})

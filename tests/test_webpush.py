@@ -517,8 +517,7 @@ class PushDecide(t.Dashboard):
             return e.code, e.read().decode()
 
     def audit_text(self):
-        with open(self.audit) as f:
-            return f.read()
+        return _fast.read_audit_text(self.audit)
 
     def test_payload_has_actions_rid_and_token_but_no_details(self):
         rid = self.ask("/path-with-detail?token=SEKRIT")

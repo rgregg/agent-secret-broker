@@ -665,6 +665,7 @@ class MidFlight(PBase):
         while time.time() < end and self.plan_view(pid)["inflight"] < 1:
             time.sleep(0.02)
         self.assertEqual(self.plan_view(pid)["inflight"], 1)
+        _fast.wait_until(lambda: Stub.seen, 10, "the call to reach the upstream")   # truly in flight, on the wire
         rid = [e for e in self.events("requested") if e.get("mode") == "http"][-1]["id"]
         action()
         Stub.gate.set()

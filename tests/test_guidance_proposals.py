@@ -135,8 +135,7 @@ class Base(t.Harness):
         return self.broker.cfg["secrets"][name].get("guidance")
 
     def all_text(self):
-        with open(self.audit) as f:
-            return f.read()
+        return _fast.read_audit_text(self.audit)
 
 
 HIDDEN = {

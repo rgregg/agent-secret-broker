@@ -339,8 +339,7 @@ class Secrecy(t.Harness):
             self.assertNotIn("GUIDE-CANARY", body, path)
         # the whole audit log may name the secret and carry hashes at most when it changes
         self.assertTrue(self.broker.set_guidance("svc", CANARY + " v2", "alice"))
-        with open(self.audit) as f:
-            raw = f.read()
+        raw = _fast.read_audit_text(self.audit)
         self.assertNotIn("GUIDE-CANARY", raw)
         out = [audit_api.redact(json.loads(line)) for line in raw.splitlines()]
         self.assertNotIn("GUIDE-CANARY", json.dumps(out))
@@ -407,8 +406,7 @@ class Editor(t.Harness):
         self.assertEqual(e["old_sha256"], hashlib.sha256(old.encode()).hexdigest()[:12])
         self.assertEqual(e["new_sha256"], hashlib.sha256(want.encode()).hexdigest()[:12])
         self.assertIn("peer", e)
-        with open(self.audit) as f:
-            raw = f.read()
+        raw = _fast.read_audit_text(self.audit)
         self.assertNotIn("DestroyStack", raw)
         self.assertNotIn("GUIDE-CANARY", raw)
 

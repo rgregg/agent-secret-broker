@@ -132,8 +132,7 @@ class CBase(tg.Base):
         return {"secret": secret, "hash": h, "name": name, **{"id": json.loads(st[1])["client_id"]}}
 
     def audit_text(self):
-        with open(self.audit) as f:
-            return f.read()
+        return _fast.read_audit_text(self.audit)
 
     def tearDown(self):
         super().tearDown()
@@ -774,7 +773,7 @@ class Persistence(CBase):
         self.assertEqual(b2.clients.submit("x", "0" * 64, "a@b", "1.2.3.4")[0], 503)
         self.assertEqual(b2.clients.authenticate(KEY, KEY)[1], "ok")         # the legacy key still works
         self.assertEqual(open(path).read(), junk)                            # never overwritten
-        ev = [json.loads(line) for line in open(self.audit) if "clients_file_corrupt" in line]
+        ev = [r for r in _fast.read_jsonl(self.audit) if r["event"] == "clients_file_corrupt"]
         self.assertEqual(len(ev), 1)
         self.assertNotIn("nope", json.dumps(ev))
 

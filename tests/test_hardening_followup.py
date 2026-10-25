@@ -286,7 +286,7 @@ class CollapsedRefusals(ts.SBase):
         self.assertNotIn("destination", agent)
 
     def audit_events(self):
-        return [json.loads(line) for line in open(self.audit) if line.strip()]
+        return _fast.read_jsonl(self.audit)
 
 
 class CollapsedPlanRefusals(pb.PBase):
@@ -612,7 +612,7 @@ class PerClientLimits(tc.CBase):
         self.assertEqual(codes, [202, 202, 429])
 
     def records_of(self, name):
-        return [json.loads(line) for line in open(self.audit) if line.strip() and json.loads(line)["event"] == name]
+        return [r for r in _fast.read_jsonl(self.audit) if r["event"] == name]
 
 
 class PerClientLimitsOff(tc.CBase):
