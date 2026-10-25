@@ -4,6 +4,7 @@ The safety properties: a proposal is always HIGH by code with no model call, can
 auto-approved or decided from a notification button, shows its text only on the approval
 card, applies only the entries the human ticked, and leaves no text in any other surface.
 """
+import _fast  # noqa: F401  (test-only: prompt server shutdown, fake-clock helpers)
 import hashlib
 import html
 import json
@@ -13,6 +14,7 @@ import select
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import urllib.error
@@ -79,6 +81,7 @@ class Base(t.Harness):
         self.broker.summarizer = self.stub
         # a fake clock: sleeps (write spacing, retry backoff) cost no real time
         self.now, self.sleeps, self.gate = 1000.0, [], None
+        self.sleeping = threading.Event()               # set when a backoff sleep starts (it blocks on `gate`)
         self.broker._mono = lambda: self.now
         self.broker._sleep = self._fsleep
         self.broker._jitter = lambda a, b: 0.0
@@ -86,6 +89,7 @@ class Base(t.Harness):
     # -- helpers ---------------------------------------------------------
     def _fsleep(self, d):
         if self.gate is not None:
+            self.sleeping.set()
             self.gate.wait(10)
         self.sleeps.append(d)
         self.now += d
@@ -797,7 +801,7 @@ class Expiry(Base):
     def test_expiry_applies_nothing(self):
         rid = self.one(CANARY)
         req = self.broker._by_id[rid]
-        req.expires = time.time() - 1
+        _fast.expire(self.broker, rid)
         got = self.result(rid)
         self.assertEqual(got, {"status": "expired", "error": None,
                                "guidance": {"applied": [], "denied": ["alpha"], "failed": []}})
@@ -961,7 +965,7 @@ class Cli(Base):
 
     def test_expired_exit_5(self):
         def expire(rid):
-            self.broker._by_id[rid].expires = time.time() - 1
+            _fast.expire(self.broker, rid)
         rc, out, err, rid = self.run_propose(["-"], stdin=json.dumps([{"name": "alpha", "text": "x"}]),
                                              decide=expire)
         self.assertEqual(rc, 5, err)

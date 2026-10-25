@@ -1,4 +1,5 @@
 """Time-boxed grants: "Approve for N minutes"."""
+import _fast  # noqa: F401  (test-only: prompt server shutdown, fake-clock helpers)
 import base64
 import json
 import re

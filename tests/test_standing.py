@@ -1,4 +1,5 @@
 """Standing approvals: 'Always' and time-boxed grants as one feature."""
+import _fast  # noqa: F401  (test-only: prompt server shutdown, fake-clock helpers)
 import json
 import os
 import sys

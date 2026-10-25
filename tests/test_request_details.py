@@ -1,5 +1,6 @@
 """Request details: headers and body on the approval card and page, masking, the
 retained history copy (separate store), retention, caps, config and leak checks."""
+import _fast  # noqa: F401  (test-only: prompt server shutdown, fake-clock helpers)
 import base64
 import json
 import os

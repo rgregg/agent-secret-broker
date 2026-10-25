@@ -1,4 +1,5 @@
 """The broker's own summary key stays unusable through plans and sessions too."""
+import _fast  # noqa: F401  (test-only: prompt server shutdown, fake-clock helpers)
 import json
 import os
 import sys

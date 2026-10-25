@@ -1,4 +1,5 @@
 """The ip_literal_any_port migration flag: human-managed catalog entries only."""
+import _fast  # noqa: F401  (test-only: prompt server shutdown, fake-clock helpers)
 import json
 import os
 import sys

@@ -2,6 +2,7 @@
 observation log, partial secrets at the read boundary, host:port entries, effective addresses in planflow,
 TAB in session URLs.
 """
+import _fast  # noqa: F401  (test-only: prompt server shutdown, fake-clock helpers)
 import ipaddress
 import json
 import os

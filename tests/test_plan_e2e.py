@@ -1,6 +1,7 @@
 """Plan mode end to end: a real broker, a local stub upstream, per-client credentials, the approval
 site driven like the human's browser, and the real `asb` CLI. Every secret and value here is fake.
 """
+import _fast  # noqa: F401  (test-only: prompt server shutdown, fake-clock helpers)
 import json
 import os
 import re
@@ -710,56 +711,8 @@ class MidFlight(PBase):
         self.assertIn(self.broker._by_id[rid].status, ("approved", "released"))      # exhausted is not ended
 
 
-class RawStub:
-    """An upstream on a raw socket: records every byte of every connection, answers once the headers and
-    the declared body are in, then keeps listening briefly for a second (pipelined) request."""
-
-    def __init__(self):
-        import socket
-        self.sock = socket.socket()
-        self.sock.bind(("127.0.0.1", 0))
-        self.sock.listen(8)
-        self.port = self.sock.getsockname()[1]
-        self.conns = []
-        self.lock = threading.Lock()
-        threading.Thread(target=self.run, daemon=True).start()
-
-    def run(self):
-        import socket
-        while True:
-            try:
-                c, _ = self.sock.accept()
-            except OSError:
-                return
-            threading.Thread(target=self.one, args=(c,), daemon=True).start()
-
-    def one(self, c):
-        import socket
-        buf = b""
-        c.settimeout(0.5)
-        answered = False
-        try:
-            while True:
-                d = c.recv(65536)
-                if not d:
-                    break
-                buf += d
-                if not answered and b"\r\n\r\n" in buf:
-                    answered = True
-                    c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
-        except (socket.timeout, OSError):
-            pass
-        with self.lock:
-            self.conns.append(buf)
-        c.close()
-
-    def settled(self):
-        time.sleep(1.2)
-        with self.lock:
-            return list(self.conns)
-
-    def close(self):
-        self.sock.close()
+def RawStub():
+    return _fast.RawUpstream(wait_body=False)      # shared raw-socket upstream (tests/_fast.py)
 
 
 class Wire(PBase):
@@ -796,7 +749,7 @@ class Wire(PBase):
         pid = self.approve(self.manifest(rules=[self.rrule()]))
         body = json.dumps(self.ok_note())
         for hdr in ({}, {"Content-Length": str(len(body))}):
-            self.raw_up.conns.clear()
+            self.raw_up.clear()
             code, r = self.rcall(pid, raw_body=body, headers=hdr)
             self.assertEqual((code, r["http"]["status"]), (202, 200))
             conns = self.raw_up.settled()
@@ -818,7 +771,7 @@ class Wire(PBase):
         line, hd, got = self.split(conns[0])
         self.assertEqual((int(hd["content-length"]), got), (len(smuggle.encode()), smuggle.encode()))
         # and with a short declared length the call never leaves the broker
-        self.raw_up.conns.clear()
+        self.raw_up.clear()
         code, r = self.rcall(pid, raw_body=smuggle, headers={"Content-Length": "8"})
         self.assertEqual((code, r["why"]), (403, "headers"))
         self.assertEqual(self.raw_up.settled(), [])

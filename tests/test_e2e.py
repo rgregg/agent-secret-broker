@@ -1,3 +1,4 @@
+import _fast  # noqa: F401  (test-only: prompt server shutdown, fake-clock helpers)
 import json
 import os
 import subprocess
@@ -228,7 +229,11 @@ class Expiry(Harness):
 
     def test_expires(self):
         _, body = self.create_env()
-        _, b = self.api("GET", f"/v1/requests/{json.loads(body)['id']}?wait=3")
+        rid = json.loads(body)["id"]
+        req = self.broker._by_id[rid]
+        self.assertAlmostEqual(req.expires - req.created, 1, delta=0.5)      # the ttl is one second
+        _fast.expire(self.broker, rid)                                       # ...and it has passed
+        _, b = self.api("GET", f"/v1/requests/{rid}?wait=3")
         self.assertEqual(json.loads(b)["status"], "expired")
         self.assertEqual(len(self.events("expired")), 1)
 
@@ -1164,11 +1169,18 @@ class BwBackendParsing(unittest.TestCase):
 
 
 class SlowBackend(FileBackend):
+    """A vault read that blocks until the test opens `gate` (so a release can be held mid-flight); `entered`
+    is set when a read has started."""
     reads = 0
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.gate, self.entered = threading.Event(), threading.Event()
 
     def get(self, item, field):
         SlowBackend.reads += 1
-        time.sleep(0.6)
+        self.entered.set()
+        self.gate.wait(10)
         return super().get(item, field)
 
 
@@ -1178,7 +1190,8 @@ class DoubleSubmit(Harness):
     def setUp(self):
         super().setUp()
         SlowBackend.reads = 0
-        self.broker.backend = SlowBackend(os.path.join(os.path.dirname(self.audit), "vault.json"))
+        self.broker.backend = self.slow = SlowBackend(os.path.join(os.path.dirname(self.audit), "vault.json"))
+        self.addCleanup(self.slow.gate.set)
 
     def test_concurrent_approvals_release_once(self):
         self.create_env()
@@ -1194,9 +1207,14 @@ class DoubleSubmit(Harness):
                 codes.append(r.status)
             except urllib.error.HTTPError as e:
                 codes.append(e.code)
-        ts = [threading.Thread(target=post) for _ in range(2)]
-        [t.start() for t in ts]
-        [t.join() for t in ts]
+        first = threading.Thread(target=post)
+        first.start()
+        self.assertTrue(self.slow.entered.wait(10))        # the first release is inside the vault read...
+        second = threading.Thread(target=post)
+        second.start()                                     # ...when the second approval arrives
+        second.join()
+        self.slow.gate.set()
+        first.join()
         self.assertEqual(sorted(codes), [200, 404])
         next(iter(self.broker._by_id.values())).done.wait(10)
         self.assertEqual(SlowBackend.reads, 1)
@@ -1211,7 +1229,8 @@ class AsyncApproval(Harness):
     def setUp(self):
         super().setUp()
         SlowBackend.reads = 0
-        self.broker.backend = SlowBackend(os.path.join(os.path.dirname(self.audit), "vault.json"))
+        self.broker.backend = self.slow = SlowBackend(os.path.join(os.path.dirname(self.audit), "vault.json"))
+        self.addCleanup(self.slow.gate.set)
 
     def test_page_answers_before_release_finishes(self):
         _, body = self.create_env()
@@ -1223,11 +1242,12 @@ class AsyncApproval(Harness):
             method="POST"), timeout=10)
         page, took = r.read().decode(), time.time() - t0
         self.assertIn("Approved", page)
-        self.assertLess(took, 0.4)                       # backend sleeps 0.6s per read
+        self.assertFalse(self.slow.gate.is_set())        # the page answered while the vault read is still blocked
         # the decision is on record immediately; the release outcome is not yet
         self.assertEqual(self.events("decided")[0]["decision"], "approve")
         self.assertEqual(self.events("approved"), [])
         self.assertEqual([s for _, s in getattr(self.notifier, "resolutions", [])], ["approved"])
+        self.slow.gate.set()                             # let the release finish
         _, b = self.api("GET", f"/v1/requests/{json.loads(body)['id']}?wait=5")
         self.assertEqual(json.loads(b)["env"], {"SVC_TOKEN": SECRET})
         self.assertEqual(len(self.events("approved")), 1)
@@ -1299,7 +1319,15 @@ esac
 
 
 class BwIdleLogout(BwBackendWarm):
-    """Session is kept for idle_timeout after last use, then logged out."""
+    """Session is kept for idle_timeout after last use, then logged out.
+
+    The idle timer is driven by a fake monotonic clock: `idle` is armed with a long real timer that never
+    fires, `lapse` moves the clock and runs the callback the timer would run."""
+
+    def setUp(self):
+        super().setUp()
+        from secret_broker.backends import bitwarden as bw_mod
+        self.mono = _fast.patch_mono(self, bw_mod)
 
     def backend(self, idle):
         b = BwBackend("https://v.example", self.pw, bw=self.bw, idle_timeout=idle)
@@ -1308,31 +1336,38 @@ class BwIdleLogout(BwBackendWarm):
         b.on_event = lambda name, **kw: self.events.append(name)
         return b
 
+    def lapse(self, b, seconds):
+        self.mono.advance(seconds)
+        if b._idle_timeout:
+            b._idle_logout()                              # what the timer calls when it fires
+
     def test_logs_out_after_idle_then_recovers(self):
-        b = self.backend(0.4)
+        b = self.backend(300)
         self.assertEqual(b.get("T", "notes"), "v")
         self.assertNotIn("logout", self.calls())
-        time.sleep(1.0)
+        self.lapse(b, 301)
         self.assertEqual(self.calls().count("logout"), 1)
         self.assertEqual(self.events, ["backend_closed"])
         self.assertEqual(b.get("T", "notes"), "v")        # transparently logs in again
         self.assertEqual(self.calls().count("login"), 2)
 
     def test_use_extends_the_window(self):
-        b = self.backend(0.8)
+        b = self.backend(300)
         b.get("T", "notes")
-        time.sleep(0.5)
-        b.get("T", "notes")                               # re-arms the timer
-        time.sleep(0.5)                                   # 1.0s since first use, 0.5s since last
+        self.lapse(b, 200)                                # not yet idle for 300 s
         self.assertNotIn("logout", self.calls())
-        time.sleep(0.8)
+        b.get("T", "notes")                               # re-arms the timer
+        self.lapse(b, 200)                                # 400 s since first use, 200 s since last
+        self.assertNotIn("logout", self.calls())
+        self.lapse(b, 101)                                # 301 s since the last use
         self.assertEqual(self.calls().count("logout"), 1)
 
     def test_idle_timeout_zero_disables_logout(self):
         b = self.backend(0)
         b.get("T", "notes")
-        time.sleep(0.4)
+        self.lapse(b, 100000)
         self.assertNotIn("logout", self.calls())
+        self.assertIsNone(b._timer)
 
     # inherited warm/resync tests don't depend on idle behaviour
     test_warm_then_get_does_not_unlock_or_resync = None
@@ -1375,7 +1410,7 @@ class Prewarm(Harness):
     def test_prewarm_can_be_disabled(self):
         self.stub.capabilities = frozenset()      # a backend that does not declare "warm"
         self.create_env()
-        time.sleep(0.3)
+        _fast.quiesce(self.broker)                # any warm-up thread has run by now
         self.assertEqual(self.stub.count, 0)
 
 
@@ -1502,8 +1537,22 @@ class AlwaysAllow(Harness):
         self.assertEqual(r[0], 403)
 
 
-FAKE_BW = r"""#!/usr/bin/env python3
-import base64, json, os, sys
+FAKE_BW = r"""#!/bin/sh
+# A fake `bw`. It is started for every vault call, so interpreter start-up is the cost: commands that need no
+# state are answered by the shell, and the rest run the Python below (started with -I -S, base64 imported lazily).
+case "$1" in
+  config|sync|lock|logout) exit 0;;
+  unlock) echo SESSION; exit 0;;
+  status)
+    if [ -f "$FAKE_BW_STATE" ] && grep -q '"in": true' "$FAKE_BW_STATE"; then
+      echo '{"status": "locked"}'
+    else
+      echo '{"status": "unauthenticated"}'
+    fi
+    exit 0;;
+esac
+PY=$(cat <<'PYEOF'
+import json, os, sys
 S = os.environ["FAKE_BW_STATE"]
 def load():
     return json.load(open(S)) if os.path.exists(S) else {"items": [], "in": False, "n": 0}
@@ -1521,6 +1570,7 @@ elif cmd in ("config", "sync", "lock", "logout"):
 elif cmd == "unlock":
     print("SESSION")
 elif cmd == "encode":
+    import base64
     print(base64.b64encode(sys.stdin.read().encode()).decode())
 elif cmd == "list" and a[1] == "organizations":
     print(json.dumps(d.get("orgs", [{"id": "org1", "name": "Org"}])))
@@ -1536,6 +1586,7 @@ elif cmd == "get":
         print("More than one result was found.", file=sys.stderr); sys.exit(1)
     print(json.dumps(hits[0]))
 elif cmd in ("create", "edit"):
+    import base64
     obj = json.loads(base64.b64decode(sys.stdin.read().strip()))
     if cmd == "create":
         d["n"] += 1; obj["id"] = f"id{d['n']}"; d["items"].append(obj)
@@ -1597,6 +1648,9 @@ elif cmd == "serve":
         def do_PUT(self): self.route("PUT")
         def do_DELETE(self): self.route("DELETE")
     HTTPServer(("127.0.0.1", port), H).serve_forever()
+PYEOF
+)
+exec python3 -I -S -c "$PY" "$@"
 """
 
 
@@ -1604,6 +1658,8 @@ class BwBackendWrites(unittest.TestCase):
     backend_class = BwBackend
 
     def setUp(self):
+        from secret_broker.backends import bitwarden as bw_mod
+        _fast.patch_mono(self, bw_mod)       # start-up polling inside the backend does not sleep for real
         d = tempfile.mkdtemp()
         self.state = os.path.join(d, "state.json")
         self.bw = os.path.join(d, "bw")
@@ -1882,6 +1938,8 @@ class HistoryPage(Harness):
             "mode": "http", "names": ["svc"], "method": "GET", "url": url,
             "headers": {"Authorization": "Bearer {{SVC_TOKEN}}"}, **extra})
         rid = json.loads(body)["id"]
+        if decision is None:
+            _fast.expire(self.broker, rid)              # nobody answers: the 1 s ttl passes
         _, b = self.api("GET", f"/v1/requests/{rid}?wait={wait}")
         return rid, json.loads(b)
 
@@ -2554,7 +2612,7 @@ class BwServeWrites(BwBackendWrites):
 
     def test_refuses_a_port_it_does_not_own(self):
         self.b._owns_port = lambda: False
-        self.b._startup_timeout = 1.5
+        self.b._startup_timeout = 0.3        # the port is never ours: give up quickly
         with self.assertRaises(BackendError):
             self.b.put("A", "notes", "a", create=True)
         self.assertIsNone(self.b._proc)

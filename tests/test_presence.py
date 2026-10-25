@@ -1,4 +1,5 @@
 """Approver presence: heartbeat endpoint, hold/release of phone notifications."""
+import _fast  # noqa: F401  (test-only: prompt server shutdown, fake-clock helpers)
 import json
 import os
 import shutil
@@ -308,13 +309,16 @@ class Hold(Base):
         self.assertEqual(self.beat({"v": True}), 204)    # still answers
 
     def test_agent_create_does_not_wait_on_held_sends(self):
-        slow = FakeNotifier(type_name="telegram", on_send=lambda u: time.sleep(0.5))
+        gate = threading.Event()                         # the slow transport's send blocks until the test opens it
+        self.addCleanup(gate.set)
+        slow = FakeNotifier(type_name="telegram", on_send=lambda u: gate.wait(10))
         self.install([self.tick, slow])
         self.here()
         t0 = time.time()
         self.ask()
-        self.assertLess(time.time() - t0, 0.45)          # the slow transport was held
-        self.assertEqual(len(slow.sent), 0)
+        self.assertLess(time.time() - t0, 5)             # create returned while the send was still blocked
+        self.assertFalse(gate.is_set())
+        self.assertEqual(len(slow.sent), 0)              # the slow transport was held
 
 
 class Release(Base):
@@ -390,7 +394,7 @@ class Release(Base):
         code, _, _ = self.decide(rid, "approve")
         self.assertEqual(code, 303)
         self.assertEqual(self.broker._by_id[rid].done.wait(5), True)
-        time.sleep(0.2)
+        _fast.quiesce(self.broker)
         self.assertNotIn(rid, self.broker._held)
         (d,) = self.ev("notify_dropped")
         self.assertEqual((d["id"], d["outcome"]), (rid, "approved"))
@@ -403,7 +407,7 @@ class Release(Base):
     def test_denied_while_held(self):
         rid = self.held()
         self.decide(rid, "deny")
-        time.sleep(0.2)
+        _fast.quiesce(self.broker)
         self.assertEqual(self.ev("notify_dropped")[0]["outcome"], "denied")
         self.assertEqual([len(x.resolutions) for x in (self.tick, self.tele, self.wp)], [0, 0, 0])
 
@@ -421,7 +425,7 @@ class Release(Base):
         rid = self.ask()
         self.assertEqual(self.counts(), [0, 1, 1])
         self.decide(rid, "deny")
-        time.sleep(0.3)
+        _fast.quiesce(self.broker)
         self.assertEqual([len(x.resolutions) for x in (self.tick, self.tele, self.wp)], [0, 1, 1])
 
     def test_resolved_flows_after_release(self):
@@ -429,7 +433,7 @@ class Release(Base):
         self.clock.t += 30
         self.broker.presence_tick()
         self.decide(rid, "deny")
-        time.sleep(0.3)
+        _fast.quiesce(self.broker)
         self.assertEqual([len(x.resolutions) for x in (self.tick, self.tele, self.wp)], [1, 1, 1])
 
     def test_one_failing_transport_does_not_block_others(self):
@@ -515,7 +519,9 @@ class AsyncDispatch(Base):
         return code, json.loads(body), time.time() - t0
 
     def test_create_latency_does_not_depend_on_presence(self):
-        slow = [Slow(0.5, type_name="ticker"), Slow(0.5, type_name="telegram")]
+        gate = threading.Event()                                   # every send blocks until the test opens the gate
+        self.addCleanup(gate.set)
+        slow = [Slow(gate=gate, type_name="ticker"), Slow(gate=gate, type_name="telegram")]
         self.install(slow)
         lat = {}
         lat["absent"] = self.raw_create()[2]                       # sent at once, slowly
@@ -526,7 +532,9 @@ class AsyncDispatch(Base):
         self.broker.presence_cfg["transports"] = []
         lat["unheld"] = self.raw_create()[2]
         for k, v in lat.items():
-            self.assertLess(v, 0.3, k)
+            self.assertLess(v, 5, k)                               # returned long before the 10 s the sends block
+        self.assertFalse(gate.is_set())
+        gate.set()
         self.assertTrue(self.broker.flush_notifications(10))
         self.assertEqual([len(x.sent) for x in slow], [2, 3])      # absent, partial(tele), unheld
 
@@ -565,7 +573,7 @@ class AsyncDispatch(Base):
         self.assertTrue(slow.started.wait(5))
         self.decide(rid, "deny")
         self.assertEqual(self.broker._by_id[rid].status, "denied")
-        time.sleep(0.2)
+        _fast.quiesce()                                            # nothing may be mid-flight but the held send
         self.assertEqual(slow.resolutions, [])                     # send still in flight
         gate.set()
         self.assertTrue(self.broker.flush_notifications(10))
@@ -595,7 +603,7 @@ class AsyncDispatch(Base):
         rid = self.raw_create()[1]["id"]
         self.assertEqual(len(jobs), 1)
         self.decide(rid, "deny")
-        time.sleep(0.2)
+        _fast.quiesce(self.broker)
         jobs[0]()
         self.assertEqual(self.counts(), [0, 0, 0])
         self.assertEqual([len(x.resolutions) for x in (self.tick, self.tele, self.wp)], [0, 0, 0])
@@ -616,7 +624,9 @@ class AsyncDispatch(Base):
         self.assertEqual(log, [("sent", "telegram"), ("resolved", "denied")])
 
     def test_concurrent_requests(self):
-        slow = [Slow(0.3, type_name="ticker")]
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+        slow = [Slow(gate=gate, type_name="ticker")]
         self.install(slow)
         out = []
         ts = [threading.Thread(target=lambda: out.append(self.raw_create())) for _ in range(6)]
@@ -625,8 +635,10 @@ class AsyncDispatch(Base):
             x.start()
         for x in ts:
             x.join(10)
-        self.assertLess(time.time() - t0, 0.3)
+        self.assertLess(time.time() - t0, 5)                     # all six returned while every send is blocked
+        self.assertFalse(gate.is_set())
         self.assertEqual(len({o[1]["id"] for o in out}), 6)
+        gate.set()
         self.assertTrue(self.broker.flush_notifications(10))
         self.assertEqual(len(slow[0].sent), 6)
         self.assertEqual(len(self.ev("notified")), 6)
@@ -683,7 +695,7 @@ class Visibility(Base):
         self.clock.t += 30
         self.broker.presence_tick()
         self.decide(rid, "deny")
-        time.sleep(0.5)
+        _fast.quiesce(self.broker)
         body = self.get(f"/request/{rid}?fragment=1")[1]
         self.assertIn("notify_held", body)
         self.assertIn("notify_released", body)
@@ -710,7 +722,7 @@ class Visibility(Base):
         self.broker.presence_tick()
         sweep()
         self.decide(rid, "deny")
-        time.sleep(0.3)
+        _fast.quiesce(self.broker)
         sweep()
         for s in surfaces:
             low = s.lower()

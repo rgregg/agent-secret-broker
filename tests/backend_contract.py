@@ -23,6 +23,7 @@ Hooks (all optional, each has a safe default):
 
 Values in tests are obviously fake. Run with:  python -m unittest tests.test_backends
 """
+import _fast  # noqa: F401  (test-only: prompt server shutdown, fake-clock helpers)
 import json
 import threading
 import time
@@ -733,15 +734,22 @@ class BackendContract:
         self.assertEqual(sorted(r["item"] for r in self.b.catalog()), ["Added", "Shared"])
 
     # == 13. idle lock ====================================================================================
+    IDLE = 0.3          # idle_timeout the idle test asks for; fake-clock backends override it (see lapse)
+
+    def lapse(self, b, seconds):
+        """Let `seconds` of idle time pass for `b` and run its idle expiry. Default: really wait (a backend
+        that can be driven by a fake clock overrides this)."""
+        time.sleep(seconds)
+
     def test_the_backend_works_again_after_its_idle_timeout(self):
         if not self.supports_idle:
             self.skipTest("no idle lock")
-        b = self.make(idle_timeout=0.3)
+        b = self.make(idle_timeout=self.IDLE)
         self.addCleanup(b.close)
         b.put("Idle", "notes", "v", create=True, meta={"a": 1})
-        time.sleep(0.9)                                   # locked / logged out by now
+        self.lapse(b, 0.9)                                # locked / logged out by now
         self.assertEqual(b.get("Idle", "notes"), "v")
-        time.sleep(0.9)
+        self.lapse(b, 0.9)
         self.assertEqual(self.row("Idle", b)["meta"], {"a": 1})
         b.put("Idle", "notes", "v2")
         self.assertEqual(b.get("Idle", "notes"), "v2")

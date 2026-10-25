@@ -1,8 +1,11 @@
 """Security-review regressions for per-client credentials: audit scoping, the revoke race and
 durable (or fail-closed) revocation."""
+import _fast  # noqa: F401  (test-only: prompt server shutdown, fake-clock helpers)
 import builtins
 import json
 import os
+import queue
+import signal
 import subprocess
 import sys
 import threading
@@ -74,16 +77,31 @@ class AuditScope(ClientMixin, tg.Base):
     def test_asb_audit_cli_is_scoped_too(self):
         env = {"PATH": os.environ["PATH"], "HOME": self.dir if hasattr(self, "dir") else "/tmp",
                "SECRET_BROKER_URL": self.base, "SECRET_BROKER_KEY": self.ca.secret}
+        needles = ["bravo", self.cb.id, self.rb, "shared key"]
         for args in (["audit", "--json"], ["audit", "--request", self.rb, "--json"],
-                     ["audit", "--event", "requested"], ["audit", "--tail", "--json"]):
-            p = subprocess.Popen([t.CLI, *args], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            try:
-                out, err = p.communicate(timeout=4)
-            except subprocess.TimeoutExpired:
-                p.kill()
-                out, err = p.communicate()
-            for needle in ("bravo", self.cb.id, self.rb, "shared key"):
-                self.assertNotIn(needle, out + err, args)
+                     ["audit", "--event", "requested"]):
+            p = subprocess.run([t.CLI, *args], env=env, capture_output=True, text=True, timeout=30)
+            for needle in needles:
+                self.assertNotIn(needle, p.stdout + p.stderr, args)
+        # `--tail` never ends by itself: read its first batch, then make new events for BOTH clients and wait
+        # until A's own new request shows up (so the follow-up polling has run) before stopping it
+        p = subprocess.Popen([*_fast.FAST_CLI, "audit", "--tail", "--json"], env=env, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, text=True)
+        lines = queue.Queue()
+        threading.Thread(target=lambda: [lines.put(ln) for ln in p.stdout], daemon=True).start()
+        out = [lines.get(timeout=30)]                           # the first batch has begun
+        rb2 = self.http_as(self.cb, path="/b2")
+        ra2 = self.http_as(self.ca, path="/a2")
+        try:
+            while ra2 not in out[-1]:
+                out.append(lines.get(timeout=30))
+        finally:
+            p.send_signal(signal.SIGINT)
+            err = p.communicate(timeout=30)[1]
+            p.stdout.close()
+        text = "".join(out) + err
+        for needle in needles + [rb2]:
+            self.assertNotIn(needle, text, "--tail")
 
     def test_the_legacy_key_keeps_its_view_but_is_told_no_client_names(self):
         out, text = self.audit_as(Legacy)
@@ -115,9 +133,9 @@ class RevokeRace(ClientMixin, tg.Base):
             ths = [threading.Thread(target=hammer) for _ in range(4)]
             for th in ths:
                 th.start()
-            time.sleep(0.15)
+            _fast.wait_until(lambda: len(rids) >= 3, what="creates running")
             self.broker.revoke_client(c.id, "alice")
-            time.sleep(0.15)
+            _fast.wait_until(lambda: errs, what="a create refused after the revoke")
             stop.set()
             for th in ths:
                 th.join()

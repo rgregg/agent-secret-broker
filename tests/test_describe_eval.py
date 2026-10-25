@@ -1,3 +1,4 @@
+import _fast  # noqa: F401  (test-only: prompt server shutdown, fake-clock helpers)
 import io
 import json
 import os

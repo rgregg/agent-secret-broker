@@ -1,4 +1,5 @@
 """GET /v1/audit and /v1/audit/verify (redacted audit view for the agent) and `asb audit`."""
+import _fast  # noqa: F401  (test-only: prompt server shutdown, fake-clock helpers)
 import hashlib
 import json
 import os
@@ -600,7 +601,7 @@ class Cli(ApiBase):
     def test_tail_prints_recent_then_new_events(self):
         self.run_env()
         env = dict(os.environ, SECRET_BROKER_URL=self.base, SECRET_BROKER_KEY=t.KEY)
-        proc = subprocess.Popen([sys.executable, "-I", t.CLI, "audit", "--tail", "--json",
+        proc = subprocess.Popen([*_fast.FAST_CLI[:1], "-I", *_fast.FAST_CLI[1:], "audit", "--tail", "--json",
                                  "--event", "requested"], env=env, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, text=True)
         try:

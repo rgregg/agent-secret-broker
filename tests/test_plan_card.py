@@ -2,6 +2,7 @@
 
 Driven like the human's browser against a throwaway broker (tests/plan_base.py). Every value is fake.
 """
+import _fast  # noqa: F401  (test-only: prompt server shutdown, fake-clock helpers)
 import json
 import os
 import re

@@ -1,4 +1,5 @@
 """summary.api_key_secret: the OpenRouter key read from the broker's own vault."""
+import _fast  # noqa: F401  (test-only: prompt server shutdown, fake-clock helpers)
 import json
 import logging
 import os
