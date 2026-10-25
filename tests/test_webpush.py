@@ -679,8 +679,8 @@ class PushDecide(t.Dashboard):
         import urllib.request
         js = urllib.request.urlopen(urllib.request.Request(
             self.abase + "/sw.js", headers={"X-authentik-username": "alice"})).read().decode()
-        self.assertEqual(broker_mod.SW_VERSION, "8")
-        self.assertIn("SW_VERSION='8'", js)
+        self.assertEqual(broker_mod.SW_VERSION, "9")
+        self.assertIn("SW_VERSION='9'", js)
         for needle in ("/push/decide", "X-Requested-With", "credentials:'same-origin'",
                        "redirect:'manual'", "action_click", "action_decide",
                        "Could not '+verb+' - tap to review", "'Approved'", "'Denied'",
@@ -699,6 +699,7 @@ const reg={showNotification:(t,o)=>{shown.push({t,o});return Promise.resolve();}
 global.self={addEventListener:(n,f)=>{listeners[n]=f;},registration:reg,
   clients:{matchAll:()=>Promise.resolve([]),claim:()=>Promise.resolve(),openWindow:(u)=>{fetches.push('open '+u);return Promise.resolve({});}},
   skipWaiting:()=>Promise.resolve(),Notification:{maxActions:2}};
+if(process.env.UA)global.self.navigator={userAgent:process.env.UA};
 global.Notification={maxActions:+(process.env.MAXA||2)};
 global.fetch=(u,o)=>{
   fetches.push(u+' '+(o&&o.body||''));
@@ -719,12 +720,13 @@ new Function(src).call(global);
   listeners.notificationclick({action,notification:{tag:'secret-abc',data:first.o.data,close(){}},waitUntil:(x)=>{p=x;}});
   await p;
   await new Promise(r=>setTimeout(r,10));
-  console.log(JSON.stringify({first:{actions:first.o.actions.map(a=>a.action),data:first.o.data},shown,
+  console.log(JSON.stringify({first:{actions:first.o.actions.map(a=>a.action),data:first.o.data,
+    persist:first.o.requireInteraction},shown,
     fetches,closed:closed.length}));
 })();
 """
 
-    def run_worker(self, scenario, action, maxa=2):
+    def run_worker(self, scenario, action, maxa=2, ua=""):
         import subprocess
         import shutil
         node = shutil.which("node")
@@ -739,7 +741,7 @@ new Function(src).call(global);
         self.assertEqual(chk.returncode, 0, chk.stderr)
         r = subprocess.run([node, os.path.join(d, "h.js"), os.path.join(d, "sw.js"), scenario, action],
                            capture_output=True, text=True, timeout=30,
-                           env={**os.environ, "MAXA": str(maxa)})
+                           env={**os.environ, "MAXA": str(maxa), "UA": ua})
         self.assertEqual(r.returncode, 0, r.stderr)
         return json.loads(r.stdout.strip().splitlines()[-1])
 
@@ -757,6 +759,34 @@ new Function(src).call(global);
         self.assertEqual(out1["first"]["actions"], ["deny"])
         out3 = self.run_worker("ok", "open", maxa=3)
         self.assertEqual(out3["first"]["actions"], ["deny", "approve", "open"])
+
+    MAC_CHROME = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36")
+    MAC_SAFARI = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
+                  "(KHTML, like Gecko) Version/27.0 Safari/605.1.15")
+    WIN_CHROME = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36")
+
+    def test_worker_not_persistent_on_mac_chrome_only(self):
+        # Chrome on macOS routes requireInteraction to its alerts helper, whose clicks were lost
+        self.assertFalse(self.run_worker("ok", "open", ua=self.MAC_CHROME)["first"]["persist"])
+        for ua in (self.MAC_SAFARI, self.WIN_CHROME, ""):
+            self.assertTrue(self.run_worker("ok", "open", ua=ua)["first"]["persist"], ua)
+
+    def test_worker_failed_decide_followup_not_persistent_on_mac_chrome(self):
+        out = self.run_worker("net", "approve", ua=self.MAC_CHROME)
+        (n,) = out["shown"]
+        self.assertFalse(n["o"]["requireInteraction"])
+        out = self.run_worker("net", "approve")
+        (n,) = out["shown"]
+        self.assertTrue(n["o"]["requireInteraction"])
+
+    def test_sanitizer_keeps_seen_and_persist(self):
+        ev = broker_mod.sanitize_client_event({"kind": "show", "seen": 0, "persist": False,
+                                               "junk": "x"})
+        self.assertEqual(ev, {"kind": "show", "seen": 0, "persist": False})
+        ev = broker_mod.sanitize_client_event({"kind": "show", "seen": "1", "persist": "no"})
+        self.assertEqual(ev, {"kind": "show"})
 
     def test_worker_approve_success_shows_short_names_only_followup(self):
         out = self.run_worker("ok", "approve")
@@ -1000,9 +1030,9 @@ new Function(src).call(global);
         return json.loads(r.stdout.strip().splitlines()[-1])
 
     def test_version_bumped_and_old_version_gone(self):
-        self.assertEqual(broker_mod.SW_VERSION, "8")
-        self.assertIn("SW_VERSION='8'", broker_mod._SERVICE_WORKER)
-        self.assertNotIn("SW_VERSION='7'", broker_mod._SERVICE_WORKER)
+        self.assertEqual(broker_mod.SW_VERSION, "9")
+        self.assertIn("SW_VERSION='9'", broker_mod._SERVICE_WORKER)
+        self.assertNotIn("SW_VERSION='8'", broker_mod._SERVICE_WORKER)
 
     def test_source_has_replace_then_close_logic(self):
         js = broker_mod._SERVICE_WORKER
