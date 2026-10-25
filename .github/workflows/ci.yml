@@ -11,15 +11,35 @@ permissions:
   contents: read
 
 jobs:
-  test:
+  # The suite is split into balanced shards that run in parallel (tests/run_tests.py, which also runs
+  # several test processes at once inside each shard). Shards run to completion even if one fails.
+  shard:
+    name: tests (shard ${{ matrix.shard }}/4)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
       - run: pip install -r requirements.txt
-      - run: python -m unittest discover -s tests -v
+      - run: python tests/run_tests.py --shard ${{ matrix.shard }}/4
+
+  # The single check to require in branch protection: it keeps the name "test" and is green only when
+  # every shard is.
+  test:
+    needs: shard
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          test "${{ needs.shard.result }}" = "success" || { echo "tests: ${{ needs.shard.result }}"; exit 1; }
 
   image:
     needs: test

@@ -1,3 +1,4 @@
+import _fast  # noqa: F401  (test-only: prompt server shutdown, fake-clock helpers)
 import json
 import os
 import sys
@@ -385,7 +386,7 @@ class Describe(unittest.TestCase):
             self.assertEqual([r["reason"] for r in rs], [None, None, "rate_limited"])
             t[0] = 61
             self.assertIsNone(d.describe("http", ["x"], dict(HTTP_GET))["reason"])
-        d = self.d(concurrency=1)
+        d = self.d(concurrency=1, timeout=0.05)      # a burst waits `timeout` (at most 3 s) for a free slot
         d._sem.acquire()
         self.assertEqual(d.describe("http", ["x"], dict(HTTP_GET))["reason"], "rate_limited")
 

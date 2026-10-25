@@ -1,6 +1,7 @@
 """Hardening tests for the encrypted local store, beyond tests/test_localstore.py:
 permissions, wrap identity binding, crash safety at every write step, key material
 and values never in logs, errors or audit events."""
+import _fast  # noqa: F401  (test-only: prompt server shutdown, fake-clock helpers)
 import base64
 import glob
 import json
@@ -247,11 +248,12 @@ class NoLeaks(Base):
         self.assertNotIn(RAW, repr(ls.Key(RAW)))
 
     def test_audit_events_carry_only_names_counts_and_reasons(self):
-        b = self.make({"items": {}}, idle=0.2)
+        mono = _fast.patch_mono(self, ls)
+        b = self.make({"items": {}}, idle=300)
         b.put("A", "notes", VAL, create=True)
         b.get("A", "notes")
-        import time
-        time.sleep(0.5)
+        mono.advance(301)
+        b._store._idle_drop()                  # the idle timer fires
         with open(self.path, "ab"):
             pass
         os.utime(self.path, None)

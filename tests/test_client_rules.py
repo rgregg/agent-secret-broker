@@ -6,6 +6,7 @@ applies to client B; a rule for any client applies to all. Ceilings (`auto_appro
 `auto_modes`) have global defaults and per-client overrides. Rules saved before this existed are
 global, so nothing changes on upgrade. Revoking a client removes its own rules.
 """
+import _fast  # noqa: F401  (test-only: prompt server shutdown, fake-clock helpers)
 import base64
 import json
 import os

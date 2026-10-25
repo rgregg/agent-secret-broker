@@ -1,6 +1,7 @@
 """env-mode (run-with-secret) requests are auto-approved under the same rules as web
 requests: approval allow + model risk <= risk.auto_approve_max; script text that is
 not visible always prompts."""
+import _fast  # noqa: F401  (test-only: prompt server shutdown, fake-clock helpers)
 import json
 import os
 import sys

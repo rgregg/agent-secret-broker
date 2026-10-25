@@ -1,4 +1,5 @@
 """SSH host identity composed with grants, guidance, the audit API, env scripts and the card."""
+import _fast  # noqa: F401  (test-only: prompt server shutdown, fake-clock helpers)
 import base64
 import json
 import os

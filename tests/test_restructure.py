@@ -1,3 +1,4 @@
+import _fast  # noqa: F401  (test-only: prompt server shutdown, fake-clock helpers)
 import unittest
 
 from secret_broker import restructure

@@ -16,6 +16,7 @@ approval listener), and the listener believed the identity header from ANY peer.
 Every address, name and secret here is fake. Servers are loopback stubs; DNS and connections are
 injected, so nothing real is resolved or contacted.
 """
+import _fast  # noqa: F401  (test-only: prompt server shutdown, fake-clock helpers)
 import json
 import os
 import socket

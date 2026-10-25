@@ -1,6 +1,7 @@
 """Runs the backend conformance suite (tests/backend_contract.py) against every
 bundled backend: MemoryBackend, FileBackend, LocalBackend (file and env key
 sources), and BwBackend / BwServeBackend against the fake `bw` of test_e2e."""
+import _fast  # noqa: F401  (test-only: prompt server shutdown, fake-clock helpers)
 import base64
 import json
 import os
@@ -15,6 +16,7 @@ from secret_broker.backends import (BwBackend, BwServeBackend, FileBackend, Item
                                     MemoryBackend)
 from secret_broker.backends import localstore as ls  # noqa: E402
 from test_e2e import FAKE_BW  # noqa: E402
+from secret_broker.backends import bitwarden as bw_mod  # noqa: E402
 
 
 def _variant(name):
@@ -52,8 +54,15 @@ class LocalFileKeyContract(BackendContract, unittest.TestCase):
     persistent = True
     supports_idle = True
     PASS = "correct horse battery staple (fake)"
+    IDLE = 300          # real timer never fires; `lapse` moves a fake clock and runs the expiry instead
+
+    def lapse(self, b, seconds):
+        self._mono.advance(seconds)
+        b._store._idle_drop()                               # what the idle timer calls
 
     def make(self, idle_timeout=None, **kw):
+        if not hasattr(self, "_mono"):
+            self._mono = _fast.patch_mono(self, ls)
         d = tempfile.mkdtemp()
         self.path = os.path.join(d, "store.enc")
         self.keyfile = os.path.join(d, "key")
@@ -80,6 +89,8 @@ class LocalEnvKeyContract(LocalFileKeyContract):
     RAW = base64.b64encode(bytes(range(32))).decode()
 
     def make(self, idle_timeout=None, **kw):
+        if not hasattr(self, "_mono"):
+            self._mono = _fast.patch_mono(self, ls)
         os.environ["ASB_CONTRACT_KEY"] = self.RAW
         self.addCleanup(os.environ.pop, "ASB_CONTRACT_KEY", None)
         d = tempfile.mkdtemp()
@@ -98,8 +109,15 @@ class BwContract(BackendContract, unittest.TestCase):
     persistent = True
     supports_idle = True
     ci_lookup = False               # the CLI's `bw get item NAME` is not an exact, case-folded match
+    IDLE = 300          # real timer never fires; `lapse` moves a fake clock and runs the expiry instead
+
+    def lapse(self, b, seconds):
+        self._mono.advance(seconds)
+        b._idle_logout()                                    # what the idle timer calls
 
     def make(self, idle_timeout=None, **kw):
+        if not hasattr(self, "_mono"):
+            self._mono = _fast.patch_mono(self, bw_mod)
         d = tempfile.mkdtemp()
         self.state = os.path.join(d, "state.json")
         self.bw = os.path.join(d, "bw")

@@ -1,5 +1,6 @@
 """Notification pipeline (one Notification, per-transport actions), the legacy
 transport adapter, and the single decision entry Broker.decide_via."""
+import _fast  # noqa: F401  (test-only: prompt server shutdown, fake-clock helpers)
 import os
 import sys
 import time

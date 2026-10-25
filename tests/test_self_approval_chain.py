@@ -8,6 +8,7 @@ on a tree without the fixes):
 
 Every value is fake; the broker is in-process and the only server is the broker's own listener.
 """
+import _fast  # noqa: F401  (test-only: prompt server shutdown, fake-clock helpers)
 import json
 import os
 import sys

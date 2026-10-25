@@ -1,8 +1,10 @@
+import _fast  # noqa: F401  (test-only: prompt server shutdown, fake-clock helpers)
 import base64
 import json
 import os
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import urllib.parse
@@ -419,10 +421,7 @@ class Listener(t.Dashboard):
         self.store.add("alice", EP, P256DH, AUTH)
         self.broker.notifier = webpush.WebPushNotifier(self.store)
         self.ask("/path-with-detail?token=SEKRIT")
-        end = time.time() + 5
-        while not self.sender.calls and time.time() < end:
-            time.sleep(0.1)
-        self.assertTrue(self.sender.calls)
+        _fast.wait_until(lambda: self.sender.calls, 5, "the push to be sent")
         data = json.loads(self.sender.calls[0]["data"])
         self.assertEqual(sorted(data), ["actions", "body", "rid", "tag", "title", "token"])
         self.assertEqual(data["body"], "svc")
@@ -823,18 +822,14 @@ class ResolvedPush(t.Dashboard):
         return [json.loads(c["data"]) for c in self.sender.calls]
 
     def wait_notified(self):
-        end = time.time() + 5
-        while len(self.sender.calls) < 2 and time.time() < end:
-            time.sleep(0.05)
-        self.assertGreaterEqual(len(self.sender.calls), 2)
+        _fast.wait_until(lambda: len(self.sender.calls) >= 2, 5, "both subscriptions to be pushed")
 
     def resolved_calls(self, want=0):
-        end = time.time() + 5
         def cur():
             return [c for c in self.sender.calls if json.loads(c["data"]).get("type") == "resolved"]
-        while want and len(cur()) < want and time.time() < end:
-            time.sleep(0.05)
-        time.sleep(0.4)             # let any (wrong) extra push arrive
+        if want:
+            _fast.wait_until(lambda: len(cur()) >= want, 5, "the resolved pushes")
+        _fast.quiesce(self.broker)  # every send in flight has finished: any (wrong) extra push has arrived
         return cur()
 
     def check_one_per_sub(self, status, rid):
@@ -933,14 +928,17 @@ class ResolvedPush(t.Dashboard):
         self.store._send = sender
         self.assertEqual(self.decide(rid, "approve")[0], 303)
         self.assertEqual(self.result(rid)["status"], "approved")
-        time.sleep(0.4)
+        _fast.quiesce(self.broker)
         with open(self.audit) as f:
             self.assertNotIn("SEKRIT", f.read())
 
     def test_slow_transport_does_not_block_the_settle_path(self):
+        gate = threading.Event()                          # the resolved push blocks until the test opens the gate
+        self.addCleanup(gate.set)
+
         def sender(sub, data, *a):
             if json.loads(data).get("type") == "resolved":
-                time.sleep(3)
+                gate.wait(10)
         rid = self.ask()
         self.wait_notified()
         self.store._send = sender

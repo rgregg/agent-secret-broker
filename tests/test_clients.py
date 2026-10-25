@@ -4,6 +4,7 @@ A throwaway broker per test (the shared test_grants.Base harness: a fake phone t
 by itself, a stub upstream, an SSH key, a second credential). Clients are enrolled through the real
 endpoint and approved on the real approval listener. Every secret and value here is fake.
 """
+import _fast  # noqa: F401  (test-only: prompt server shutdown, fake-clock helpers)
 import contextlib
 import hashlib
 import importlib.machinery
@@ -868,11 +869,11 @@ class CliEnroll(CBase):
         self.cfgdir = os.path.join(self.home, ".config", "secret-broker")
         self.cfgfile = os.path.join(self.cfgdir, "client.json")
 
-    def run_cli(self, *args, human=None, timeout=60, env_extra=None, snapshot_ps=False):
+    def run_cli(self, *args, human=None, timeout=60, env_extra=None, snapshot_ps=False, on_request=None):
         env = {"PATH": os.environ["PATH"], "HOME": self.home, "USER": "bob"}
         env.update(env_extra or {})
-        p = subprocess.Popen([CLI, *args], env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                             stderr=subprocess.PIPE, text=True)
+        p = subprocess.Popen([*_fast.FAST_CLI, *args], env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, text=True)           # the real client, poll sleeps capped
         ps = ""
         if human is not None:
             end = time.time() + 20
@@ -883,6 +884,9 @@ class CliEnroll(CBase):
             pend = self.broker.clients.pending()
             if pend:
                 human(pend[0])
+        if on_request is not None:              # a request the client made is waiting for a human
+            _fast.wait_until(self.broker.pending, 20, "the client's request to be pending")
+            on_request(self.broker.pending()[0].id)
         try:
             out, err = p.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
@@ -940,7 +944,10 @@ class CliEnroll(CBase):
 
     def test_expired_exit_5(self):
         self.broker.clients.cfg["enrollment"]["ttl_s"] = 2
-        rc, out, err, _ = self.run_cli("enroll", "--name", "box", "--url", self.base)
+        skew = [0]
+        self.broker.clients.clock = lambda: time.time() + skew[0]
+        rc, out, err, _ = self.run_cli("enroll", "--name", "box", "--url", self.base,
+                                       human=lambda e: skew.__setitem__(0, 10))      # the 2 s ttl passes
         self.assertEqual(rc, 5, err)
         self.assertIn("expired", err)
         self.assertFalse(os.path.exists(self.cfgfile))
@@ -1027,7 +1034,8 @@ class CliEnroll(CBase):
             h = clients_mod.hash_secret(secret)
             rc, o2, e2, ps2 = self.run_cli("http", "svc", "GET", f"http://127.0.0.1:{self.up.server_address[1]}/x",
                                            "-H", "Authorization: Bearer {{SVC_TOKEN}}",
-                                           human=None, timeout=3)
+                                           on_request=lambda rid: self.broker.decide_via(
+                                               "dashboard", rid, "deny", "alice"))
             self.post("/clients/rename", {"id": cid, "name": "leaky2"})
             self.as_client("asbc1_wrongwrong", "GET", "/v1/status")
             self.post("/clients/revoke", {"id": cid})

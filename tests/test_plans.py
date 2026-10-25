@@ -5,6 +5,7 @@ the in-memory PlanStore (binding, deadlines, uses, rate, in-flight, concurrency,
 No broker and no network: the matcher is a pure function and the store takes injected clocks.
 Every value here is fake.
 """
+import _fast  # noqa: F401  (test-only: prompt server shutdown, fake-clock helpers)
 import base64
 import copy
 import json

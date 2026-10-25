@@ -8,6 +8,7 @@ submits a complete valid form, and the value appears in no output channel at all
 
 Every value here is obviously fake.
 """
+import _fast  # noqa: F401  (test-only: prompt server shutdown, fake-clock helpers)
 import json
 import os
 import re
@@ -444,7 +445,7 @@ class DenyExpire(H):
         self.broker.credreq_cfg = dict(self.broker.credreq_cfg, ttl_s=1)
         r = self.ask()
         self.assertLessEqual(r["expires_in"], 1)
-        time.sleep(1.4)
+        _fast.expire(self.broker, r["id"])                  # the 1 s ttl has passed
         self.assertEqual(self.result(r["id"])["status"], "expired")
         self.assertEqual(self.get(f"/credential/{r['id']}")[0], 404)
         status, _, hdr = self.submit(r["id"])
@@ -710,11 +711,13 @@ class DoubleSubmit(H):
     def test_concurrent_submits_store_exactly_once(self):
         r = self.ask()
         real = self.broker.backend.put
-        calls = []
+        calls, entered, gate = [], threading.Event(), threading.Event()
+        self.addCleanup(gate.set)
 
         def counting(*a, **kw):
             calls.append(a[0])
-            time.sleep(0.2)
+            entered.set()
+            gate.wait(10)                               # hold the one winning store open while the others race it
             return real(*a, **kw)
         out = []
         with mock.patch.object(self.broker.backend, "put", counting):
@@ -722,6 +725,9 @@ class DoubleSubmit(H):
                 r["id"], token=f"{TOK}-{i}")[0])) for i in range(4)]
             for th in ths:
                 th.start()
+            self.assertTrue(entered.wait(10))
+            _fast.wait_until(lambda: len(out) == 3, what="the three losing submits to be refused")
+            gate.set()
             for th in ths:
                 th.join(20)
         self.assertEqual(sorted(out).count(200), 1, out)
@@ -1008,7 +1014,8 @@ class CliFlow(H):
     def test_expired_exit_5(self):
         self.broker.credreq_cfg = dict(self.broker.credreq_cfg, ttl_s=1)
         rc, out, err = self.run_cli("request-credential", "clinew", "--kind", "token", "--for", PURPOSE,
-                                    "--host", "a.example.com", timeout=60)
+                                    "--host", "a.example.com", timeout=60,
+                                    human=lambda rid: _fast.expire(self.broker, rid))    # the 1 s ttl passes
         self.assertEqual(rc, 5, err)
         self.assertIn("expired", err)
 

@@ -1,4 +1,5 @@
 """Per-credential risk guidance: metadata, prompts, secrecy, editor, eval harness."""
+import _fast  # noqa: F401  (test-only: prompt server shutdown, fake-clock helpers)
 import hashlib
 import io
 import json

@@ -1,5 +1,6 @@
 """Server identity for SSH signatures: claimed destination, session-bind
 verification, known_hosts names and the allowed_hosts policy."""
+import _fast  # noqa: F401  (test-only: prompt server shutdown, fake-clock helpers)
 import base64
 import importlib.machinery
 import importlib.util
@@ -371,8 +372,7 @@ class Verified(HostBase):
         code, body = self.sign(login(SID_A), [self.host.bind(SID_A)], claimed="web.example.com:22")
         rid = json.loads(body)["id"]
         self.api("GET", f"/v1/requests/{rid}?wait=5")
-        import time
-        time.sleep(0.5)
+        _fast.quiesce(self.broker)
         _, page = req(self.abase + f"/request/{rid}?fragment=1", headers={"X-authentik-username": "alice"})
         self.assertIn(self.host.fp, page)
         self.assertIn("known as web.example.com", page)
