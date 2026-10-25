@@ -79,8 +79,7 @@ class Base(unittest.TestCase):
         self.backend.put("OR", "notes", value, create=create, meta=meta if create else None)
 
     def records(self):
-        with open(self.audit) as f:
-            return [json.loads(x) for x in f if x.strip()]
+        return _fast.read_jsonl(self.audit)
 
     def analyze(self, prime=True):
         """prime: let the background key read finish first (the first request after the TTL

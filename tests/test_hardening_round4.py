@@ -271,7 +271,7 @@ class PlanUsesTheEffectiveAddress(pb.PBase):
         code, text, _ = self.raw("POST", "/v1/plans", {"manifest": self.manifest(), "source": "bob@build-box"},
                                  {"X-Client-Key": self.cs, "X-Forwarded-For": "6.6.6.6, 198.51.100.7"})
         self.assertEqual(code, 202, text)
-        rec = [json.loads(line) for line in open(self.audit) if line.strip()]
+        rec = _fast.read_jsonl(self.audit)
         req = [r for r in rec if r["event"] == "requested" and r.get("mode") == "plan"][-1]
         self.assertEqual(req["peer"], "198.51.100.7")
 

@@ -681,8 +681,7 @@ class UnlockableStoreAtStartup(Base):
         return e2e.req(self.base + path, method, body, {"X-Client-Key": e2e.KEY, "Content-Type": "application/json"})
 
     def audit_events(self):
-        with open(self.audit) as f:
-            return [json.loads(line) for line in f if line.strip()]
+        return _fast.read_jsonl(self.audit)
 
     def check(self, background_load):
         self.start(background_load)

@@ -148,8 +148,7 @@ class Plans(pb.PBase):
         self.assertTrue(self.broker.grant_eligibility(req)[0])
 
     def records(self):
-        with open(self.audit) as f:
-            return [json.loads(x) for x in f if x.strip()]
+        return _fast.read_jsonl(self.audit)
 
 
 class Sessions(ts.SBase):
@@ -163,8 +162,7 @@ class Sessions(ts.SBase):
         self.sent0 = len(self.notifier.sent)
 
     def records(self):
-        with open(self.audit) as f:
-            return [json.loads(x) for x in f if x.strip()]
+        return _fast.read_jsonl(self.audit)
 
     def test_open_refused_like_an_unknown_credential(self):
         code, text = self.as_client(ts.KEY, "POST", "/v1/requests", {

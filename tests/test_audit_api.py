@@ -472,8 +472,7 @@ class Api(ApiBase):
         self.assertEqual((r["ok"], r["first_bad_seq"]), (True, None))
         self.assertEqual(r["events"], len(self.records()))
         self.assertEqual(self.get("x=1", path="/v1/audit/verify")[0], 400)
-        with open(self.audit) as f:
-            lines = f.read().splitlines()
+        lines = _fast.read_audit_text(self.audit).splitlines()
         i = next(n for n, l in enumerate(lines) if '"event": "approved"' in l)
         lines[i] = lines[i].replace('"approved"', '"denied"')
         with open(self.audit, "w") as f:
@@ -578,8 +577,7 @@ class Cli(ApiBase):
         p = self.asb("audit", "verify")
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertIn("hash chain intact", p.stdout)
-        with open(self.audit) as f:
-            lines = f.read().splitlines()
+        lines = _fast.read_audit_text(self.audit).splitlines()
         lines[2] = lines[2].replace('"requested"', '"rewritten"')
         with open(self.audit, "w") as f:
             f.write("\n".join(lines) + "\n")

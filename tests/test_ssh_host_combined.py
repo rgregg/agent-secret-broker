@@ -65,6 +65,7 @@ class Combined(Base):
     def test_audit_api_shows_only_the_whitelisted_host_fields(self):
         body = self.sign_to(HOST)
         self.assertEqual(self.approve(json.loads(body)["id"], "approve"), 303)
+        _fast.quiesce(self.broker)                            # the signing runs after the approval returns
         self.sign_to(OTHER)                                   # refused by allowed_hosts
         _, out = self.api("GET", "/v1/audit?limit=200")
         evs = json.loads(out)["events"]

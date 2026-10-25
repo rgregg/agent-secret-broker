@@ -122,8 +122,7 @@ class H(unittest.TestCase):
 
     # -- helpers ----------------------------------------------------------
     def records(self):
-        with open(self.audit) as f:
-            return [json.loads(line) for line in f if line.strip()]
+        return _fast.read_jsonl(self.audit)
 
     def events(self, name):
         return [r for r in self.records() if r["event"] == name]

@@ -210,3 +210,20 @@ def quiesce(*brokers, timeout=10.0):
         for t in live:
             t.join(max(0.0, end - _time.monotonic()))
         assert _time.monotonic() < end, f"background threads still running: {[t.name for t in live]}"
+
+
+def read_audit_text(path):
+    """The audit log's text, read only when it ends on a complete line. The broker appends each record with one
+    write() from a handler thread, so a read that races it can see a half-written last line; wait (microseconds,
+    never a fixed sleep) until the file ends with a newline."""
+    def whole():
+        with open(path, "rb") as f:
+            data = f.read()
+        return data if (not data or data.endswith(b"\n")) else None
+    box = []
+    wait_until(lambda: box.append(whole()) or box[-1] is not None, 5, "a complete audit line")
+    return box[-1].decode()
+
+
+def read_jsonl(path):
+    return [__import__("json").loads(x) for x in read_audit_text(path).splitlines() if x.strip()]

@@ -130,8 +130,7 @@ class Harness(unittest.TestCase):
             s.server_close()
 
     def records(self):
-        with open(self.audit) as f:
-            return [json.loads(line) for line in f if line.strip()]
+        return _fast.read_jsonl(self.audit)
 
     def events(self, name):
         return [r for r in self.records() if r["event"] == name]
@@ -601,8 +600,7 @@ class CatalogFromVault(unittest.TestCase):
             "Garbage": {"notes": "x", "broker": "not json"},
             "Good": {"notes": "x", "broker": self.meta()}})
         self.assertEqual(sorted(b.cfg["secrets"]), ["good"])
-        with open(audit) as f:
-            ev = [json.loads(line) for line in f if '"catalog_loaded"' in line][0]
+        ev = [r for r in _fast.read_jsonl(audit) if r["event"] == "catalog_loaded"][0]
         self.assertEqual(len(ev["invalid"]), 4)
 
     def test_no_hosts_means_env_only_never_http(self):
@@ -967,8 +965,7 @@ class AutoApproveConfig(unittest.TestCase):
         self.assertIn("risk.auto_approve_max", str(cm.exception))
         b, d = self._broker({"auto_approve_max": "medium", "escalate_auto_at": "high"})
         self.assertEqual(b.auto_approve_max(), "medium")
-        with open(os.path.join(d, "audit.jsonl")) as f:
-            warns = [json.loads(line) for line in f if '"config_warning"' in line]
+        warns = [r for r in _fast.read_jsonl(os.path.join(d, "audit.jsonl")) if r["event"] == "config_warning"]
         self.assertEqual(len(warns), 1)
         self.assertEqual(self._broker({"escalate_auto_at": "high"})[0].auto_approve_max(), "medium")
         self.assertEqual(self._broker(None)[0].auto_approve_max(), "low")
