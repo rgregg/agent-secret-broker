@@ -686,8 +686,8 @@ class PushDecide(t.Dashboard):
         import urllib.request
         js = urllib.request.urlopen(urllib.request.Request(
             self.abase + "/sw.js", headers={"X-authentik-username": "alice"})).read().decode()
-        self.assertEqual(broker_mod.SW_VERSION, "12")
-        self.assertIn("SW_VERSION='12'", js)
+        self.assertEqual(broker_mod.SW_VERSION, "13")
+        self.assertIn("SW_VERSION='13'", js)
         for needle in ("/push/decide", "X-Requested-With", "credentials:'same-origin'",
                        "redirect:'manual'", "action_click", "action_decide",
                        "Could not '+verb+' - tap to review", "'Approved'", "'Denied'",
@@ -1135,7 +1135,7 @@ new Function(src).call(global);
 const fs=require('fs');
 const src=fs.readFileSync(process.argv[2],'utf8');
 const mode=process.argv[3];
-const listeners={}, order=[], shownOpts=[], rows=[];
+const listeners={}, order=[], shownOpts=[], rows=[]; let opened=false;
 global.indexedDB={open(){const rq={};setImmediate(()=>{
   const st={add(v){rows.push(v);order.push('diag '+v.k);},openCursor(){const c={};setImmediate(()=>c.onsuccess&&c.onsuccess());return c;}};
   const tx={objectStore:()=>st};
@@ -1146,8 +1146,8 @@ const win={url:'https://b.example/settings',focus(){order.push('focus');return m
   navigate(u){order.push('navigate '+u);return Promise.resolve(this);},postMessage(){}};
 global.self={addEventListener:(n,f)=>{listeners[n]=f;},
   registration:{showNotification:(t,o)=>{shownOpts.push({t,o});return Promise.resolve();},getNotifications:()=>Promise.resolve([])},
-  clients:{matchAll:()=>{if(mode==='matchthrow')throw new Error('boom');return Promise.resolve(mode==='nowin'||mode==='openreject'?[]:[win]);},claim:()=>Promise.resolve(),
-    openWindow:(u)=>{order.push('openWindow '+u);return mode==='openreject'?Promise.reject(new Error('NotAllowedError')):Promise.resolve({});}},
+  clients:{matchAll:()=>{if(mode==='matchthrow')throw new Error('boom');return Promise.resolve(mode==='openok'?(opened?[{url:'https://b.example/'}]:[]):mode==='nowin'||mode==='openreject'||mode==='opennull'?[]:[win]);},claim:()=>Promise.resolve(),
+    openWindow:(u)=>{order.push('openWindow '+u);opened=true;return mode==='openreject'?Promise.reject(new Error('NotAllowedError')):Promise.resolve(mode==='opennull'?null:{url:u,focused:true,visibilityState:'visible'});}},
   skipWaiting:()=>Promise.resolve(),navigator:{userAgent:process.env.UA||''}};
 global.Notification={maxActions:2};
 global.fetch=(u,o)=>{order.push('fetch '+u+' '+(o&&o.body?JSON.parse(o.body).kind||'':''));return Promise.resolve({status:204});};
@@ -1182,6 +1182,19 @@ new Function(src).call(global);
                            capture_output=True, text=True, timeout=30, env={**os.environ, "UA": ua})
         self.assertEqual(r.returncode, 0, r.stderr)
         return json.loads(r.stdout.strip().splitlines()[-1])
+
+    def test_open_window_is_verified_and_retried_then_tap_notice(self):
+        # openWindow resolving (or a null) is not proof a tab exists: verify, retry once, then notify
+        out = self.run_click("opennull", ua=self.MAC_CHROME)
+        opens = [o for o in out["order"] if o.startswith("openWindow")]
+        self.assertEqual(opens, ["openWindow /", "openWindow /?from=push"])
+        self.assertEqual([n["t"] for n in out["shownOpts"]], ["Tap to open the broker"])
+
+    def test_open_window_verified_once_a_window_exists(self):
+        out = self.run_click("openok", ua=self.MAC_CHROME)
+        self.assertEqual([o for o in out["order"] if o.startswith("openWindow")], ["openWindow /"])
+        self.assertEqual(out["shownOpts"], [])
+        self.assertIn("click_window", [r["k"] for r in out["rows"]])
 
     def test_click_writes_local_diag_rows(self):
         out = self.run_click("nowin", ua=self.MAC_CHROME)["order"]
@@ -1236,8 +1249,8 @@ new Function(src).call(global);
         self.assertTrue(n["o"]["silent"])
 
     def test_version_bumped_and_old_version_gone(self):
-        self.assertEqual(broker_mod.SW_VERSION, "12")
-        self.assertIn("SW_VERSION='12'", broker_mod._SERVICE_WORKER)
+        self.assertEqual(broker_mod.SW_VERSION, "13")
+        self.assertIn("SW_VERSION='13'", broker_mod._SERVICE_WORKER)
         self.assertNotIn("SW_VERSION='9'", broker_mod._SERVICE_WORKER)
 
     def test_source_has_replace_then_close_logic(self):
