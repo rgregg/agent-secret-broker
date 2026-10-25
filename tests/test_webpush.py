@@ -686,8 +686,8 @@ class PushDecide(t.Dashboard):
         import urllib.request
         js = urllib.request.urlopen(urllib.request.Request(
             self.abase + "/sw.js", headers={"X-authentik-username": "alice"})).read().decode()
-        self.assertEqual(broker_mod.SW_VERSION, "11")
-        self.assertIn("SW_VERSION='11'", js)
+        self.assertEqual(broker_mod.SW_VERSION, "12")
+        self.assertIn("SW_VERSION='12'", js)
         for needle in ("/push/decide", "X-Requested-With", "credentials:'same-origin'",
                        "redirect:'manual'", "action_click", "action_decide",
                        "Could not '+verb+' - tap to review", "'Approved'", "'Denied'",
@@ -1135,13 +1135,18 @@ new Function(src).call(global);
 const fs=require('fs');
 const src=fs.readFileSync(process.argv[2],'utf8');
 const mode=process.argv[3];
-const listeners={}, order=[], shownOpts=[];
+const listeners={}, order=[], shownOpts=[], rows=[];
+global.indexedDB={open(){const rq={};setImmediate(()=>{
+  const st={add(v){rows.push(v);order.push('diag '+v.k);},openCursor(){const c={};setImmediate(()=>c.onsuccess&&c.onsuccess());return c;}};
+  const tx={objectStore:()=>st};
+  rq.result={createObjectStore(){},transaction:()=>{setImmediate(()=>setImmediate(()=>tx.oncomplete&&tx.oncomplete()));return tx;},close(){}};
+  rq.onsuccess&&rq.onsuccess();});return rq;}};
 global.setTimeout=(f)=>setImmediate(f);
 const win={url:'https://b.example/settings',focus(){order.push('focus');return mode==='focusfail'?Promise.reject(new Error('nofocus')):Promise.resolve(this);},
   navigate(u){order.push('navigate '+u);return Promise.resolve(this);},postMessage(){}};
 global.self={addEventListener:(n,f)=>{listeners[n]=f;},
   registration:{showNotification:(t,o)=>{shownOpts.push({t,o});return Promise.resolve();},getNotifications:()=>Promise.resolve([])},
-  clients:{matchAll:()=>Promise.resolve(mode==='nowin'||mode==='openreject'?[]:[win]),claim:()=>Promise.resolve(),
+  clients:{matchAll:()=>{if(mode==='matchthrow')throw new Error('boom');return Promise.resolve(mode==='nowin'||mode==='openreject'?[]:[win]);},claim:()=>Promise.resolve(),
     openWindow:(u)=>{order.push('openWindow '+u);return mode==='openreject'?Promise.reject(new Error('NotAllowedError')):Promise.resolve({});}},
   skipWaiting:()=>Promise.resolve(),navigator:{userAgent:process.env.UA||''}};
 global.Notification={maxActions:2};
@@ -1151,15 +1156,18 @@ new Function(src).call(global);
   let p=null;
   if(mode==='resolved'){
     listeners.push({data:{json:()=>({type:'resolved',tag:'t',status:'denied',name:'svc'})},waitUntil:(x)=>{p=x;}});
+  }else if(mode==='close'){
+    listeners.notificationclose({notification:{tag:'t'},waitUntil:(x)=>{p=x;}});
   }else{
     listeners.notificationclick({action:'',notification:{tag:'t',data:{url:'/'},close(){}},waitUntil:(x)=>{p=x;}});
   }
   await p;
-  console.log(JSON.stringify({order,shownOpts}));
+  await new Promise(r=>setTimeout(r,5));
+  console.log(JSON.stringify({order,shownOpts,rows}));
 })();
 """
 
-    def run_click(self, mode, ua=""):
+    def run_click(self, mode, ua="", full=False):
         import subprocess
         import shutil
         node = shutil.which("node")
@@ -1174,6 +1182,28 @@ new Function(src).call(global);
                            capture_output=True, text=True, timeout=30, env={**os.environ, "UA": ua})
         self.assertEqual(r.returncode, 0, r.stderr)
         return json.loads(r.stdout.strip().splitlines()[-1])
+
+    def test_click_writes_local_diag_rows(self):
+        out = self.run_click("nowin", ua=self.MAC_CHROME)["order"]
+        # the write is async (IndexedDB) so it lands after the synchronous openWindow call;
+        # what matters is that the click row exists even if openWindow never settles
+        self.assertIn("diag click_event", out)
+        self.assertIn("diag click_open_call", out)
+
+    def test_close_event_is_logged_locally(self):
+        out = self.run_click("close", ua=self.MAC_CHROME)
+        self.assertIn("close_event", [r["k"] for r in out["rows"]])
+        self.assertIn("notificationclose", [r["k"] for r in out["rows"]])
+
+    def test_click_exception_is_logged_and_still_opens_a_window(self):
+        out = self.run_click("matchthrow", ua=self.MAC_CHROME)
+        ks = [r["k"] for r in out["rows"]]
+        self.assertIn("click_exception", ks)
+        self.assertIn("openWindow /", out["order"])
+
+    def test_notification_data_url_is_set(self):
+        js = broker_mod._SERVICE_WORKER
+        self.assertIn("var data={url:HOME_URL()", js)
 
     def test_click_with_no_window_opens_one_before_any_network_report(self):
         # Chrome rejects openWindow once the click's user activation lapses (~1 s), so it
@@ -1206,8 +1236,8 @@ new Function(src).call(global);
         self.assertTrue(n["o"]["silent"])
 
     def test_version_bumped_and_old_version_gone(self):
-        self.assertEqual(broker_mod.SW_VERSION, "11")
-        self.assertIn("SW_VERSION='11'", broker_mod._SERVICE_WORKER)
+        self.assertEqual(broker_mod.SW_VERSION, "12")
+        self.assertIn("SW_VERSION='12'", broker_mod._SERVICE_WORKER)
         self.assertNotIn("SW_VERSION='9'", broker_mod._SERVICE_WORKER)
 
     def test_source_has_replace_then_close_logic(self):

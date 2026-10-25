@@ -4239,7 +4239,7 @@ _DASH_JS = _KEEP_JS + _DASH_JS + proposals_mod.JS_INIT
 
 # Single source of truth for the worker version: rendered into the worker, the
 # X-SW-Version header on /sw.js, and the Settings page ("expected" version).
-SW_VERSION = "11"
+SW_VERSION = "12"
 
 _SERVICE_WORKER = r"""
 var SW_VERSION='__SW_VERSION__';
@@ -4251,6 +4251,7 @@ var Q=[],T0={};
 // there we skip requireInteraction; the macOS alert style decides how long they stay.
 var UA=String((self.navigator&&self.navigator.userAgent)||'');
 var PERSIST=!(/Macintosh/.test(UA)&&/Chrome\//.test(UA));
+function HOME_URL(){try{return self.location.origin+'/';}catch(x){return '/';}}
 function tell(m){return self.clients.matchAll({type:'window',includeUncontrolled:true}).then(function(cs){
   cs.forEach(function(c){try{c.postMessage(m);}catch(x){}});return cs;});}
 // Local diagnostic ring (IndexedDB, last 10 steps: kind, ok, short note/error,
@@ -4371,7 +4372,7 @@ self.addEventListener('push',function(e){
   var r1=rep('push',{ok:parsed,tag:tag});
   // Buttons: only what the payload lists (Deny, Approve), then Review, capped to
   // what this browser/platform allows. The notification body click always opens.
-  var data={url:'/',names:String(d.body||'').slice(0,200)};
+  var data={url:HOME_URL(),names:String(d.body||'').slice(0,200)};
   var acts=[];
   if(d.token&&d.rid&&Array.isArray(d.actions)){
     data.rid=String(d.rid);data.token=String(d.token);
@@ -4400,11 +4401,21 @@ self.addEventListener('push',function(e){
     e.waitUntil(minimalShow(tag).then(function(){return rep('show',{ok:false,tag:tag,err:em(err),note:'fallback'});}));
   }});
 self.addEventListener('notificationclose',function(e){
-  var tag=(e.notification&&e.notification.tag)||'';
-  e.waitUntil(rep('notificationclose',{tag:tag,note:'dismissed'}));});
+  var early=dlog({kind:'close_event',note:'raw'});
+  var tag='';try{tag=(e.notification&&e.notification.tag)||'';}catch(x){}
+  try{e.waitUntil(early);e.waitUntil(rep('notificationclose',{tag:tag,note:'dismissed'}));}catch(x){}});
 self.addEventListener('pushsubscriptionchange',function(e){
   e.waitUntil(rep('pushsubscriptionchange'));});
+// The very first thing a click does is write a local diagnostic row (before close(),
+// tell() or matchAll), and any exception is logged and answered with a plain
+// openWindow, so the Settings log shows whether Chrome delivered the click at all.
 self.addEventListener('notificationclick',function(e){
+  var early=dlog({kind:'click_event',note:'action='+String(e.action||'-').slice(0,12)});
+  try{e.waitUntil(early);onClick(e);}catch(err){
+    var hm='/';try{hm=self.location.origin+'/';}catch(x){}
+    try{e.waitUntil(Promise.all([rep('click_exception',{ok:false,err:em(err)}),
+      self.clients.openWindow(hm).catch(function(){})]));}catch(x){}}});
+function onClick(e){
   var tag=(e.notification&&e.notification.tag)||'',action=e.action||'',t0=Date.now();
   var nd=(e.notification&&e.notification.data)||{};
   try{e.notification.close();}catch(x){}
@@ -4417,6 +4428,7 @@ self.addEventListener('notificationclick',function(e){
   // before openWindow and Chrome refused it, so a closed-browser click opened nothing).
   var HOME='/';try{HOME=self.location.origin+'/';}catch(x){}
   function openNew(info,why){
+    dlog({kind:'click_open_call',note:(why||'').slice(0,20)});
     var op;try{op=self.clients.openWindow(HOME);}catch(err){op=Promise.reject(err);}
     return op.then(function(w){
       return rep('click_openwindow',{ok:true,tag:tag,note:(why||'')+(w?' window':' null'),ms:Date.now()-t0}).then(function(){
@@ -4485,7 +4497,7 @@ self.addEventListener('notificationclick',function(e){
       }).catch(function(){});
   }
   if(action==='approve'||action==='deny')e.waitUntil(decideFlow());
-  else e.waitUntil(openApp());});
+  else e.waitUntil(openApp());}
 // Settings page probes: {type:'version'} is answered with the running version
 // (echoing the caller's id); {type:'skip'} lets a waiting worker take over now.
 self.addEventListener('message',function(e){
