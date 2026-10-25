@@ -387,7 +387,7 @@ def has_blind_spot(scripts):
 # Fails closed: only a short list of plainly read-only commands, in a plain shell
 # script, with no redirection to files, no substitution and no tricks, counts. A
 # curl/wget counts only as a plain GET of one literal https URL. Anything unusual
-# or unparseable is "not read-only", which makes the description need a write verb.
+# or unparseable is "not read-only", which makes the description subject to the write-request checks.
 _SHELL_SHEBANG = re.compile(r"^#!\s*(?:/usr/bin/env\s+(?:-S\s+)?)?\S*?(?:ba|z|da|k)?sh\b")
 READ_CMDS = frozenset((
     "cat", "ls", "head", "tail", "grep", "egrep", "fgrep", "wc", "stat", "date", "uname", "uptime", "df",

@@ -23,7 +23,7 @@ written to the report. Each live run makes one call per model per corpus case (a
 
 ## What it reports
 
-Per model: fallback rate and count by reason class and rejecting check (`rejected/first_word`,
+Per model: fallback rate and count by reason class and rejecting check (`rejected/read_word`,
 `timeout`, `empty`, ...), latency p50, p95 and max, prompt and completion tokens, estimated cost
 (from the `usage.cost` the provider returns; "n/a" when absent), words and sentences per shown
 description (average and maximum). Then a side-by-side table of the produced texts per case for human

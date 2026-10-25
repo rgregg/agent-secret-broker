@@ -94,7 +94,7 @@ raise the rating one level.
 
 For the description, the model sees the first 1000 characters of each script and
 may describe the script's job ("Running a backup script"). All sanitizer rules
-stay. An env request with scripts counts as mutating (a write verb is required)
+stay. An env request with scripts counts as mutating (no read words allowed in its description)
 unless every script is certainly read-only. That check fails closed: the script
 must be complete (not cut off) and a plain shell script made only of a short list of
 read-only commands (`cat`, `ls`, `head`, `tail`, `grep` without `-f`, `wc`, `stat`,
@@ -176,8 +176,7 @@ Safety measures:
   API jargon, no shouted tokens, no quote of the prompt, no safety or approval
   language (`FORBIDDEN_PHRASES` and `FORBIDDEN_STEMS`: approv*, deny, authoris/z*, permit*, allow*), at most 2 sentences and at most 320 characters (`MAX_LEN`; a longer reply is rejected, never cut).
 - Consistency (best effort): for a mutating request (POST/PUT/PATCH/DELETE other
-  than a clean POST to an allowlisted read endpoint; a write-looking command, a store request or ssh signing) the description must START with a write-class gerund
-  (`WRITE_VERBS`: Deleting, Opening, Syncing ...), contain no read gerund
+  than a clean POST to an allowlisted read endpoint; a write-looking command, a store request or ssh signing) the description must contain no read gerund
   (`READ_GERUNDS`: retrieving, listing, checking ...) anywhere, and no minimizing language (`MINIMIZING`: nothing, without, no
   change, only, just, merely, read-only, does not ...). Read requests are not
   checked.
@@ -194,7 +193,7 @@ Safety measures:
   `summary_source` (`model` or `deterministic`), `summary_reason`
   (`rejected`, `timeout`, `error`, `rate_limited`, `empty`, `truncated`, `not_sent`, `disabled`) and,
   for a rejected reply, `summary_rule` (the fixed name of the check: `forbidden_word`, `sentences`,
-  `first_word`, `technical_host`, `technical_http_verb`, `technical_jargon`, `technical_path`,
+  `technical_host`, `technical_http_verb`, `technical_jargon`, `technical_path`,
   `technical_ip`, `technical_status`, `prompt_echo`, ...), never the rejected text. The `assessed` event is hidden from the agent audit
   view. The approver sees the class in the (i) tooltip, the details pop-over and the Settings page
   (counts since start); `/v1/status` and `asb status` carry no description counters.
@@ -232,10 +231,10 @@ resource"). Only those fixed phrases are inserted. Numbers (status codes, quanti
 names and technical terms are never rewritten or dropped: the text is refused instead, because
 changing them could change what it claims. After repair EVERY check runs again on the text that
 would be shown (markup, banned words, sentences, technical syntax, shouting, prompt copy, length),
-and the consistency check (write verb first, no read or minimizing words) runs on it too; any
+and the consistency check (no read or minimizing words) runs on it too; any
 failure rejects the description. The request's own host and method are left as written.
 
-A reply refused for a reason a rewrite can fix (`RETRY_HINTS`: technical_*, first_word, read_word,
+A reply refused for a reason a rewrite can fix (`RETRY_HINTS`: technical_*, read_word,
 minimizing, forbidden_word, sentences, too_long, prompt_echo, shouting) gets ONE retry with a
 fixed-wording correction added to the system prompt. The rejected text is never sent back. The
 retry counts against the same per-minute cap and concurrency; its outcome is final, and the audit

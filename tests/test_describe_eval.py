@@ -53,7 +53,7 @@ class DescribeEval(unittest.TestCase):
         finally:
             srv.shutdown()
         self.assertEqual([(r["reason"], r["rule"]) for r in rows],
-                         [("rejected", "forbidden_word"), ("rejected", "first_word"), ("empty", None)])
+                         [("rejected", "forbidden_word"), ("rejected", "read_word"), ("empty", None)])
 
     def test_report_and_cli_never_print_the_key(self):
         buf = io.StringIO()
@@ -80,7 +80,7 @@ class DescribeEval(unittest.TestCase):
             srv.shutdown()
         got = {r["id"]: (r["reason"], r["rule"]) for r in rows if r["kind"] == "fallback"}
         self.assertEqual(got, {"graphql": ("rejected", "technical_jargon"),
-                               "search-post": ("rejected", "first_word"),
+                               "search-post": ("rejected", "read_word"),
                                "delete-vm": ("rejected", "technical_status"),
                                "env-curl-ua": ("rejected", "technical_http_verb")})
 
