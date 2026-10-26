@@ -1047,6 +1047,8 @@ class SessionsMixin:
     def _sweeper_tick(self):
         """One sweep. A failure is logged by class name only (at most once a minute) and sweeping carries on."""
         try:
+            if self._sess:      # while a session exists keep the catalog fresh, so a vault change reaches it (http and ws)
+                self._refresh_if(self.CATALOG_TTL, wait=False)
             self.sweep_sessions()
         except Exception as e:  # noqa: BLE001 -- never let the sweeper die; never log the text
             now = time.monotonic()
@@ -1140,10 +1142,12 @@ class SessionsMixin:
                     for s in self._sess.values()]
         return sorted(rows, key=lambda r: r["left_s"])
 
-    def session_counts(self, cid):
+    def session_counts(self, cid, kind=None):
+        """(this client's open sessions of `kind` (all kinds when None), all open sessions)."""
         self.sweep_sessions()               # an overdue session must not count against the caps
         with self._sess_lock:
-            return sum(s.cid == cid for s in self._sess.values()), len(self._sess)
+            return (sum(s.cid == cid and (kind is None or getattr(s, "kind", "http") == kind)
+                        for s in self._sess.values()), len(self._sess))
 
     # -- opening ---------------------------------------------------------------------
     def _validate_session(self, names, spec, client):
@@ -1216,7 +1220,7 @@ class SessionsMixin:
             raise SessionOpenError("a host is no longer allowed for this credential")
         self.sweep_sessions()
         with self._sess_lock:
-            mine = sum(s.cid == cid for s in self._sess.values())
+            mine = sum(s.cid == cid and getattr(s, "kind", "http") == "http" for s in self._sess.values())
             if mine >= self.sessions_cfg["max_per_client"] or len(self._sess) >= MAX_TOTAL:
                 raise SessionOpenError("too many open sessions")
             sid = secrets.token_urlsafe(24)
@@ -1465,6 +1469,9 @@ class SessionsMixin:
             s, state = self._sess_lookup(sid, cid, now)
             if s is None:
                 return state, None
+            if getattr(s, "kind", "http") == "ws" and not self._ws_scope_ok(s):    # same as every other use
+                self._sess_end_locked(s, "revoked", now, actor="scope_recheck")
+                return "revoked", None
             info = {"expires_in": max(0, int(s.expires - now)), "calls_left": max(0, s.max_calls - s.calls),
                     "calls": s.calls, "max_calls": s.max_calls, "hosts": list(s.hosts),
                     "methods": list(s.methods), "names": [s.cred]}

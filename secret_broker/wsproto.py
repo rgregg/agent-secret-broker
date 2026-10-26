@@ -81,7 +81,11 @@ class Transport:
         if self.closed:
             raise OSError("closed")
         try:
-            if not (self.is_ssl and self.sock.pending()):
+            pending = False
+            if self.is_ssl:
+                with self.lock:                     # (the TLS object is not safe for SSL_pending beside an SSL_write)
+                    pending = bool(self.sock.pending())
+            if not pending:
                 p = select.poll()                   # (not select(): a descriptor number above 1023 would break it)
                 p.register(self.sock, select.POLLIN)
                 if not p.poll(int(wait * 1000)):
@@ -220,6 +224,8 @@ class Conn:
         self.send_timeout, self.clock = send_timeout, clock
         self.frames_in = self.bytes_in = 0
         self.frame_started = None
+        self.msg_started = None         # when the first fragment of the message being assembled arrived
+        self._last_start = None
         self.sent_close = False
 
     # -- reading ------------------------------------------------------------------
@@ -249,7 +255,7 @@ class Conn:
         connection (WsError). Once a frame has started it is read to the end."""
         if not self._fill(1, stop):
             return None
-        self.frame_started = self.clock()
+        self.frame_started = self._last_start = self.clock()
         try:
             if not self._fill(2, lambda: stop(True)):
                 raise WsError(TIMEOUT)
@@ -291,6 +297,12 @@ class Conn:
     def read_message(self, stop):
         """The next complete message: ("text", str) | ("binary", length) | ("close", code) | None (stopped while idle).
         Pings are answered here; pongs are dropped. Raises WsError (fixed label, `.code` = close code to send)."""
+        try:
+            return self._read_message(stop)
+        finally:
+            self.msg_started = None
+
+    def _read_message(self, stop):
         kind, parts, size, frags = None, [], 0, 0
         while True:
             fr = self.read_frame(stop)
@@ -321,6 +333,8 @@ class Conn:
             elif kind is None:
                 raise WsError(PROTOCOL, 1002)           # a continuation with nothing to continue
             frags += 1
+            if frags == 1 and not fin:
+                self.msg_started = self._last_start
             size += len(payload)
             if frags > MAX_FRAGMENTS:
                 raise WsError(LIMIT, 1008)

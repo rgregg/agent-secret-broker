@@ -1425,12 +1425,15 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                     err = "too many pending requests"
                 if mode == "session":
                     cid_ = (client or clients_mod.ClientStore.LEGACY_VIEW)["id"]
-                    mine, total = self.session_counts(cid_)
-                    waiting = sum(r.status == "pending" and r.mode == "session" and r.client["id"] == cid_
-                                  for r in self._by_id.values())
-                    if waiting >= sessions_mod.MAX_PENDING_PER_CLIENT:
+                    kind = spec.get("kind") or "http"
+                    mine, total = self.session_counts(cid_, kind)       # each kind against its own cap
+                    pend = [r for r in self._by_id.values()
+                            if r.status == "pending" and r.mode == "session" and r.client["id"] == cid_]
+                    waiting = sum((r.spec.get("kind") or "http") == kind for r in pend)
+                    cap = (self.ws_cfg if kind == "ws" else self.sessions_cfg)["max_per_client"]
+                    if len(pend) >= sessions_mod.MAX_PENDING_PER_CLIENT:
                         err = "too many pending session requests"
-                    elif mine + waiting >= self.sessions_cfg["max_per_client"] or total >= sessions_mod.MAX_TOTAL:
+                    elif mine + waiting >= cap or total >= sessions_mod.MAX_TOTAL:
                         err = "too many open sessions"
                 if mode == "credential":
                     open_cr = [r for r in self._by_id.values() if r.status == "pending" and r.mode == "credential"]

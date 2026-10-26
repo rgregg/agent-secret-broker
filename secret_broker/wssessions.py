@@ -311,6 +311,12 @@ def matches(spec, text):
     return sub(spec, got)
 
 
+def _reserved_clash(cred_query, target):
+    """Does the agent's query use a parameter name the credential owns (decoded, + as space, case-folded)?"""
+    reserved = {_qkey(k) for k in cred_query}
+    return bool(reserved) and any(_qkey(part.partition("=")[0]) in reserved for part in target.partition("?")[2].split("&"))
+
+
 def _qkey(k):
     """A query parameter name as a server may read it: percent-decoded, plus as space, case-folded."""
     return urllib.parse.unquote_plus(k).strip().lower()
@@ -410,10 +416,66 @@ def parse_url(url):
         raise ValueError(msg)
     if ";" in u.query:                      # some servers read ; as a parameter separator: no way to smuggle one in
         raise ValueError(msg)
+    for part in (u.path, u.query):          # a % must start a real escape ...
+        if re.search(r"%(?![0-9A-Fa-f]{2})", part):
+            raise ValueError(msg)
+    try:                                    # ... and the query must decode to plain ASCII text (no replacement characters)
+        dq = urllib.parse.unquote_plus(u.query, errors="strict")
+    except UnicodeDecodeError:
+        raise ValueError(msg) from None
+    if not all(" " <= c < "\x7f" for c in dq):
+        raise ValueError(msg)
     target = (u.path or "/") + (("?" + u.query) if u.query else "")
     if not _TARGET_RE.match(target):
         raise ValueError(msg)
     return u.scheme, host, port or (443 if u.scheme == "wss" else 80), target
+
+
+MAX_DENY_DEPTH = 16
+
+
+def deny_verdict(text, deny):
+    """None when an outgoing frame may go; else the refusal class. FAIL CLOSED: with a deny list set, a frame must
+    parse as strict JSON by Python's rules (no duplicate keys, no NaN/Infinity, nested at most 16 deep, no lone
+    surrogate, no BOM), because a frame the server's parser reads differently from ours must not slip past. The
+    `type` of the top-level object, or of every object in a top-level array, must be text and not denied, and as a
+    backstop no denied name may appear anywhere in the frame, raw or after decoding (case-insensitively)."""
+    def pairs(items):
+        d = {}
+        for k, v in items:
+            if k in d:
+                raise ValueError("duplicate key")
+            d[k] = v
+        return d
+
+    def const(name):
+        raise ValueError("not strict JSON")
+    try:
+        obj = json.loads(text, object_pairs_hook=pairs, parse_constant=const)
+    except (ValueError, RecursionError):
+        return "not_json"
+    stack = [(obj, 1)]
+    while stack:                                    # depth and lone surrogates, without recursion
+        v, depth = stack.pop()
+        if depth > MAX_DENY_DEPTH:
+            return "not_json"
+        if isinstance(v, str):
+            if any("\ud800" <= c <= "\udfff" for c in v):
+                return "not_json"
+        elif isinstance(v, list):
+            stack += [(x, depth + 1) for x in v]
+        elif isinstance(v, dict):
+            for k, x in v.items():
+                stack += [(k, depth + 1), (x, depth + 1)]
+    items = obj if isinstance(obj, list) else [obj]
+    for item in items:
+        if isinstance(item, dict) and "type" in item:
+            if not isinstance(item["type"], str) or item["type"] in deny:
+                return "denied_type"
+    hay = (text + "\n" + json.dumps(obj, ensure_ascii=False)).lower()
+    if any(d.lower() in hay for d in deny):
+        return "denied_type"
+    return None
 
 
 def target_audit(sp):
@@ -477,6 +539,9 @@ class WsSession(S.Session):
 
     def _stopped(self, mid=False):
         if self.dead or self.finished is not None:
+            return True
+        ms = self.conn.msg_started      # a fragmented message must finish too, however its pieces are spaced
+        if ms is not None and self.clock() - ms >= FRAME_DEADLINE_S:
             return True
         if mid:                         # a frame that has started must finish: enforced here, not only by the sweeper
             fs = self.conn.frame_started
@@ -542,14 +607,29 @@ class WsSession(S.Session):
     def stream_mask(self, text):
         """Mask a message in the context of the ones before it, or None when all of it is held back. A server can
         split a secret across messages, so the end of the text that could still become the start of a secret (a
-        proper prefix, 4+ characters, of any spelling) is HELD in `self.hold` and joined to the next message; it is
-        flushed as a mask at the end of the connection. Sound for any number of pieces; costs only that a message
-        that ends in the first 4+ characters of a secret waits for the next one (and, in that case, the two are
-        delivered as one)."""
+        proper prefix, 1 or more characters, of any spelling) is HELD in `self.hold` and joined to the next message; it is
+        flushed as a mask at the end of the connection. Sound for any number of pieces and any split point; costs
+        only that a message ending in something that starts a secret waits for the next one (and, in that case,
+        the two are delivered as one). A whole JSON document is never held. Residual: a hostile server that
+        splits a secret across separate frames INSIDE structured JSON values cannot be fully masked."""
         raw = self.hold + text
-        k = self.masker.tail_prefix_len(raw)
-        if self.masker_lc.forms and len(raw) == len(raw.lower()):
-            k = max(k, self.masker_lc.tail_prefix_len(raw.lower()))
+        if raw[:1] in ("{", "[", "\""):
+            try:
+                json.loads(raw)
+                complete = True
+            except (ValueError, RecursionError):
+                complete = False
+            if complete:                        # a whole JSON document ends in a delimiter: nothing can still be coming
+                self.hold = ""
+                return self._mask_message(raw)
+        # only what follows the last complete secret can be the start of another
+        spans = self.masker._spans(raw) or []
+        start = max((en for _, en in spans), default=0)
+        low = raw[start:].lower()
+        part = raw[start:]
+        k = self.masker.tail_prefix_len(part, 1)
+        if self.masker_lc.forms and len(low) == len(part):
+            k = max(k, self.masker_lc.tail_prefix_len(low, 1))
         self.hold = raw[len(raw) - k:] if k else ""
         emit = raw[:len(raw) - k] if k else raw
         if k and not emit:
@@ -568,6 +648,8 @@ class WsSession(S.Session):
                         return
                 msg = conn.read_message(self._stopped)
                 if msg is None:
+                    if not self.dead and self.finished is None:      # stopped by the message deadline
+                        self._finish(wsproto.TIMEOUT)
                     return
                 if msg[0] == "close":
                     try:
@@ -649,8 +731,8 @@ class WsSession(S.Session):
                 if not self.queue or now - (self.finished_at or now) >= DRAIN_GRACE_S:
                     return "peer_closed" if self.finished == wsproto.CLOSED else "ws_error"
                 return None
-            fs = self.conn.frame_started
-            if fs is not None and now - fs >= FRAME_DEADLINE_S:
+            fs, ms = self.conn.frame_started, self.conn.msg_started
+            if any(x is not None and now - x >= FRAME_DEADLINE_S for x in (fs, ms)):
                 return "ws_error"
             if now - self.last_activity >= self.caps["idle_s"]:
                 return "idle"
@@ -747,8 +829,7 @@ class WsMixin:
                 or not self.dest_guard.port_ok(entries, host, port)):
             raise PermissionError("that host or port is outside this credential's allowed hosts "
                                   "(see `asb list`)")
-        reserved = {_qkey(k) for k in sc["_ws"]["query"]}
-        if reserved and any(_qkey(part.partition("=")[0]) in reserved for part in target.partition("?")[2].split("&")):
+        if _reserved_clash(sc["_ws"]["query"], target):
             raise ValueError("a query parameter in that url is set by the credential")
         ttl = spec.get("ttl_s", cfg["default_ttl_s"])
         if not S._int(ttl) or ttl < S.TTL_FLOOR:
@@ -766,7 +847,7 @@ class WsMixin:
                      "hosts": [hostport(host, port)], "methods": [], "ttl_s": ttl, "max_calls": frames,
                      "purpose": "", "max_bytes": cfg["max_bytes"], "max_frame_bytes": cfg["max_frame_bytes"],
                      "idle_s": cfg["idle_s"], "signin": signin_summary(sc["_ws"]),
-                     "deny_n": len(sc["_ws"]["deny_send"])})
+                     "deny_n": len(sc["_ws"]["deny_send"]), "sig": self._ws_sig(sc)})
 
     def _ws_count(self, cid):
         self.sweep_sessions()
@@ -777,19 +858,17 @@ class WsMixin:
     def _ws_open(self, req, who):
         """Connect, authenticate, register. Returns the result handed to the agent once. A failure is
         a SessionOpenError with a fixed text; the request settles as failed."""
-        sp, cid, now = req.spec, req.client["id"], self.sessions_clock()
+        sp, cid = req.spec, req.client["id"]
         ttl, frames = sp["final"]
         name = req.names[0]
+        self._refresh_if(self.CATALOG_TTL)                  # a vault change since the card was shown is seen now
         if not self.clients.is_active(cid):
             raise S.SessionOpenError("this client was revoked")
-        sc = self.cfg["secrets"].get(name)
-        if sc is None or sc.get("ssh") or not sc.get("allowed_hosts") or sc.get("_ws") is None or self._internal_hit([name]):
-            raise S.SessionOpenError("the credential is no longer available for WebSocket sessions")
         host, port = sp["host"], sp["port"]
-        entries = self.allowed_entries(name)
-        if (host not in destguard.host_parts(sc["allowed_hosts"]) or self.dest_guard.host_refused(host)
-                or not self.dest_guard.port_ok(entries, host, port)):
-            raise S.SessionOpenError("the host is no longer allowed for this credential")
+        problem = self._ws_scope_problem(name, host, port, cid, sp.get("sig"), sp["target"])
+        if problem:
+            raise S.SessionOpenError(problem)
+        sc = self.cfg["secrets"][name]
         if self._ws_count(cid) >= self.ws_cfg["max_per_client"]:
             raise S.SessionOpenError("too many open sessions")
         env = self._read_env(req)                           # audited secret_read; the values stay in this function
@@ -837,16 +916,20 @@ class WsMixin:
                               client_name=req.client["name"], host=host[:S.MAX_HOST_LOG], _event="ws_session_refused")
             raise S.SessionOpenError("could not connect (" + label + ")") from None
         with self._sess_lock:
+            # the handshake took a while and ran without a lock: look again, now, right before the session exists
+            problem = self._ws_scope_problem(name, host, port, cid, sp.get("sig"), sp["target"])
             mine = sum(isinstance(s, WsSession) and s.cid == cid for s in self._sess.values())
-            if mine >= cfg["max_per_client"] or len(self._sess) >= S.MAX_TOTAL:
+            if problem or mine >= cfg["max_per_client"] or len(self._sess) >= S.MAX_TOTAL:
                 conn.t.close()
-                raise S.SessionOpenError("too many open sessions")
+                raise S.SessionOpenError(problem or "too many open sessions")
+            now = self.sessions_clock()                      # the clock starts when the session is usable
             sid = secrets.token_urlsafe(24)
             while any(s.pid == sid[:8] for s in self._sess.values()):
                 sid = secrets.token_urlsafe(24)
             s = WsSession(sid, sid[:8], req.client, name, hostport(host, port), ttl, caps, now, who.get("approver"),
                           lambda: self.sessions_clock(), conn,
                           list(env.values()) + list(self.dest_guard.mask_values), wsc["deny_send"])
+            s.sig = sp.get("sig")
             self._sess[self._skey(sid)] = s
         s.start()
         self.audit("ws_session_opened", req, session=s.pid, host=hostport(host, port), ttl_s=ttl, max_frames=frames,
@@ -859,18 +942,39 @@ class WsMixin:
                             "max_frame_bytes": caps["max_frame"], "idle_s": caps["idle_s"]}}
 
     # -- using ------------------------------------------------------------------------
+    @staticmethod
+    def _ws_sig(sc):
+        """A fingerprint of everything about a credential that shapes a WebSocket session (its variables, TLS policy and ws
+        setting; never a value). A session is bound to the one it was approved with."""
+        blob = json.dumps({"vars": sc.get("vars"), "tls": sc.get("_tls"), "ws": sc.get("_ws")}, sort_keys=True,
+                          default=list)
+        return hashlib.sha256(blob.encode()).hexdigest()
+
+    def _ws_scope_problem(self, name, host, port, cid, sig, target=None):
+        """None when the credential still allows this session as approved; else a fixed reason. Used at open (twice) and
+        on every use. Takes no session lock."""
+        try:
+            sc = self.cfg["secrets"].get(name)
+            if (sc is None or self._internal_hit([name]) or sc.get("ssh") or not sc.get("allowed_hosts")
+                    or sc.get("_ws") is None or not self.clients.is_active(cid)):
+                return "the credential is no longer available for WebSocket sessions"
+            if sig is not None and self._ws_sig(sc) != sig:
+                return "the credential changed since the session was approved"
+            if not (host in destguard.host_parts(sc["allowed_hosts"]) and not self.dest_guard.host_refused(host)
+                    and self.dest_guard.port_ok(self.allowed_entries(name), host, port)):
+                return "the host is no longer allowed for this credential"
+            if target is not None and _reserved_clash(sc["_ws"]["query"], target):
+                return "a query parameter is set by the credential"
+            return None
+        except Exception:  # noqa: BLE001 -- fail closed
+            return "the credential is no longer available for WebSocket sessions"
+
     def _ws_scope_ok(self, s):
         """Is this session still inside what its credential allows NOW? The same checks as at open, repeated on every
         use and by the sweeper (so a narrowed, removed or retyped credential ends the session). Takes no session lock."""
         try:
-            sc = self.cfg["secrets"].get(s.cred)
-            if (sc is None or self._internal_hit([s.cred]) or sc.get("ssh") or not sc.get("allowed_hosts")
-                    or sc.get("_ws") is None or not self.clients.is_active(s.cid)):
-                return False
             host, _, port = s.hosts[0].rpartition(":")
-            port = int(port)
-            return (host in destguard.host_parts(sc["allowed_hosts"]) and not self.dest_guard.host_refused(host)
-                    and self.dest_guard.port_ok(self.allowed_entries(s.cred), host, port))
+            return self._ws_scope_problem(s.cred, host, int(port), s.cid, getattr(s, "sig", None)) is None
         except Exception:  # noqa: BLE001 -- fail closed
             return False
 
@@ -918,15 +1022,12 @@ class WsMixin:
         if len(data) > s.caps["max_frame"]:
             self._refuse(client, s, "frame_size", f"a frame is limited to {s.caps['max_frame'] // 1024} KB",
                          _event="ws_session_refused")
-        if s.deny_send and text[:1] in ("{", "[", " ", "\t", "\r", "\n"):
-            try:
-                obj = json.loads(text)
-            except (ValueError, RecursionError):
-                obj = None
-            for item in (obj if isinstance(obj, list) else [obj]):
-                if isinstance(item, dict) and isinstance(item.get("type"), str) and item["type"] in s.deny_send:
-                    self._refuse(client, s, "denied_type", "that message type is blocked for this credential",
-                                 _event="ws_session_refused")
+        if s.deny_send:
+            why = deny_verdict(text, s.deny_send)
+            if why:
+                self._refuse(client, s, why, "that message is blocked for this credential"
+                             if why == "denied_type" else "this credential accepts only JSON frames",
+                             _event="ws_session_refused")
         with s.lock:
             if s.dead:
                 raise S.SessionError(*S.ENDED[s.end_reason if s.end_reason in S.ENDED else "unknown"])
@@ -979,6 +1080,8 @@ class WsMixin:
         finally:
             with s.lock:
                 s.recv_inflight -= 1
+        if out is not None and not self.clients.is_active(client["id"]):
+            raise S.SessionError(*S.ENDED["unknown"])        # revoked while it waited: nothing is handed over
         if out is None or s.dead:
             with self._sess_lock:
                 _, state = self._sess_lookup(sid, client["id"], self.sessions_clock())

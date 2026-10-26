@@ -231,6 +231,8 @@ class WsStub:
             c.send_frame(1, b"ab", fin=False)
             c.send_frame(9, b"mid")             # a ping may sit between fragments
             c.send_frame(0, b"cd", fin=True)
+        elif t == "FRAGSTALL":
+            c.send_frame(1, b"ab", fin=False)               # the first piece of a message that never finishes
         elif t == "PING":
             c.send_frame(9, b"hi")
         elif t.startswith("ECHO:"):
@@ -243,7 +245,7 @@ class WsStub:
             c.send_frame(1, b"x" * int(t[4:]))
         elif t.startswith("FLOOD:"):
             for i in range(int(t[6:])):
-                c.send_text(f"f{i}")
+                c.send_text(json.dumps(f"f{i}"))
         elif t == "STALL":
             c.send(b"\x81\x7e\x00")              # half of a 16-bit length header, then nothing
         elif t == "DROP":

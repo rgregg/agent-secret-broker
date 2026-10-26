@@ -2460,12 +2460,20 @@ agent learns only `connection` for a refusal.
 values in their usual encodings), and additionally: a JSON frame is parsed and every decoded string and key masked (so mixed
 `\uXXXX` escapes are seen through; the frame is re-serialised only when something was masked), matching is also done
 case-insensitively, and a partly percent-encoded spelling is masked. **Across messages** the broker holds back the end of a
-message that could still turn into the start of a secret (a proper prefix of 4 or more characters of any spelling) and joins it to
+message that could still turn into the start of a secret (a proper prefix, one character or more, of any spelling) and joins it to
 the next message, so a secret split over any number of messages is masked; the held text is flushed as a mask when the
-connection ends. The cost: a message ending in the first 4+ characters of a secret waits for the next one and is delivered
-together with it. A server that transforms the secret in some other way (rot13, its own encoding) still defeats it, as for http. The URL, headers and sign-in messages exist only in memory and on the wire: they are in no
+connection ends. The cost: a plain-text message ending in a character that starts some spelling of a secret waits for the next one and is delivered
+together with it (a complete JSON document is never held, so JSON protocols such as Home Assistant's are unaffected). Residual: a hostile server that splits the
+secret across separate frames inside structured JSON values cannot be fully masked (the same class as a server that transforms it). A server that transforms the secret in some other way (rot13, its own encoding) still defeats it, as for http. The URL, headers and sign-in messages exist only in memory and on the wire: they are in no
 response, log, audit record or card; the failure text to the agent is a fixed class (`could not connect (connection | tls |
 dns | timeout | handshake refused | frame too large)`), never exception or server text.
+
+**Catalog freshness and binding.** While any session exists the sweeper re-reads the vault catalog at most once a minute (shared by HTTP and WebSocket
+sessions), so a credential disabled, narrowed or stripped of its `ws` setting in the vault ends an idle session within about a minute. A WebSocket session is bound
+to a fingerprint of its credential's variables, TLS policy and `ws` setting taken when the card was made: a change before the open refuses it, a change after ends
+the session (as revoked). The client and the scope are checked again under the session lock right before the session is created (the handshake runs unlocked),
+and status reads go through the same check. Open sessions are counted per kind against their own caps (`sessions.max_per_client` for http,
+`ws_sessions.max_per_client` for WebSocket, pending requests included), with the global limit of 20 across both.
 
 **Ending.** The deadline is fixed (never extended). A session also ends on `asb ws close`, on revoke (Clients tab) or client
 revocation (the socket is closed at once, best effort close frame), after `idle_s` without a data frame in either direction,
@@ -2484,8 +2492,11 @@ it by the card. **That includes commands that create new credentials on the serv
 `auth/long_lived_access_token` and `auth/sign_path`, for example): what the server returns is a new secret the masker has
 never seen, and it outlives the session and its revocation. The card says so. The operator can block message types per
 credential with `ws.deny_send` (a list of exact JSON `type` values; matching outgoing frames are refused with a fixed error,
-non-JSON frames pass); the `home-assistant` preset blocks those two by default and `"deny_send": []` clears that. This is a
-blocklist for known dangerous commands, not a filter: everything else is relayed. A prompt-injected agent can spend the
+non-JSON frames are refused too, so a credential with `deny_send` set accepts JSON frames only); the `home-assistant` preset blocks those two by default and `"deny_send": []` clears that. This is a
+blocklist for known dangerous commands, not a filter: everything else is relayed. It fails closed: with a deny list set, a frame must parse as strict JSON
+(no duplicate keys, no NaN/Infinity, nesting at most 16, no lone surrogate, no BOM), the `type` of the object (or of each object in a top-level array)
+must be text and not denied, and no denied name may appear anywhere in the frame (raw or decoded, any case), so a parser difference with the server cannot
+smuggle one through. A prompt-injected agent can spend the
 session but cannot extend it, reach another host, read the configured token from a frame, or turn a refusal into a prompt. A hostile server can send frames up to the caps, pause the reader only by flow control,
 and hold a slow frame for 30 s; it cannot make the broker dial elsewhere (no redirects, one pinned connection).
 

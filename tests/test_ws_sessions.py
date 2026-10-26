@@ -41,7 +41,10 @@ class WsBase(SBase):
             cfg["ws_sessions"] = self.ws_cfg
         cfg["_vault"]["Ha"] = {"token": TOKEN}
         cfg["secrets"]["ha"] = {"vars": {"HA_TOKEN": {"item": "Ha", "field": "token"}},
-                                "allowed_hosts": list(self.ha_hosts), "ws": {"handshake": "home-assistant"}}
+                                "allowed_hosts": list(self.ha_hosts), "ws": {"handshake": "home-assistant", "deny_send": []}}
+        cfg["_vault"]["Hadeny"] = {"token": TOKEN}
+        cfg["secrets"]["hadeny"] = {"vars": {"HADENY_TOKEN": {"item": "Hadeny", "field": "token"}},
+                                    "allowed_hosts": ["127.0.0.1"], "ws": {"handshake": "home-assistant"}}
         cfg["_vault"]["Plainws"] = {"token": "PLAINWS-TOKEN-CANARY"}
         cfg["secrets"]["plainws"] = {"vars": {"PLAINWS_TOKEN": {"item": "Plainws", "field": "token"}},
                                      "allowed_hosts": ["127.0.0.1"], "ws": {}}
@@ -462,7 +465,7 @@ class Relay(WsBase):
         first = self.wrecv(sid, wait=5, mx=2)[1]
         self.assertEqual(len(first["frames"]), 2)
         rest = self.frames_until(sid, 3)
-        self.assertEqual([f["data"] for f in first["frames"] + rest], [f"f{i}" for i in range(5)])
+        self.assertEqual([f["data"] for f in first["frames"] + rest], [json.dumps(f"f{i}") for i in range(5)])
 
     def test_the_secret_is_masked_in_every_frame_returned(self):
         sid = self.wopen()
@@ -511,7 +514,7 @@ class Relay(WsBase):
             seen += [f["data"] for f in r["frames"]]
             if r["closed"]:
                 break
-        self.assertEqual(seen, ["f0", "f1"])
+        self.assertEqual(seen, [json.dumps("f0"), json.dumps("f1")])
         self.assertEqual(r["close_reason"], "closed")
         code, r = self.wrecv(sid)
         self.assertEqual((code, r["code"]), (410, "session_expired"))
@@ -584,7 +587,7 @@ class Limits(WsBase):
             got += r.get("frames", [])
             if code != 200 or r["closed"]:
                 break
-        self.assertEqual([f["data"] for f in got], [f"f{i}" for i in range(6 + W.IN_FRAMES_SLACK - 2)])
+        self.assertEqual([f["data"] for f in got], [json.dumps(f"f{i}") for i in range(6 + W.IN_FRAMES_SLACK - 2)])
         self.assertEqual(r["close_reason"], "limit reached")
         self.assertTrue(self.stub.eof[0].wait(5))
         self.assertIn((8, (1008).to_bytes(2, "big")), self.stub.received)
@@ -628,7 +631,7 @@ class Limits(WsBase):
             self.assertEqual(code, 200, r)
             got += [f["data"] for f in r["frames"]]
             flags.append(r["truncated"])
-        self.assertEqual(got, [f"f{i}" for i in range(10)])           # nothing dropped, order kept
+        self.assertEqual(got, [json.dumps(f"f{i}") for i in range(10)])           # nothing dropped, order kept
         self.assertTrue(flags[0])                                      # and the agent was told
         self.assertLessEqual(max(len(f) for f in [got]), 10)
 
@@ -1563,7 +1566,7 @@ def raw_post(t, path, obj, key=KEY):
 
 class DenySend(WsBase):
     def test_the_home_assistant_preset_blocks_token_minting_by_default(self):
-        sid = self.wopen()
+        sid = self.wopen(cred="hadeny")
         for t in ("auth/long_lived_access_token", "auth/sign_path"):
             code, text = self.wsend(sid, json.dumps({"id": 5, "type": t, "client_name": "x"}))
             self.assertEqual((code, json.loads(text)["code"]), (403, "session_refused"), t)
@@ -1572,10 +1575,34 @@ class DenySend(WsBase):
         self.assertEqual(code, 403)
         self.assertEqual(self.stub.received, [])
         self.assertEqual(self.events("ws_session_refused")[0]["reason_class"], "denied_type")
-        for ok in ('{"id": 6, "type": "get_states"}', "not json at all", '{"type": 5}', '{"no": "type"}',
-                   '{"type": "auth/long_lived_access_token_x"}'):
+        for ok in ('{"id": 6, "type": "get_states"}', '{"no": "type"}', '[1, "a", {"type": "ping"}]', '{"id": 1, "type": "auth"}'):
             self.assertEqual(self.wsend(sid, ok)[0], 200, ok)
-        self.assertEqual(len(self.stub.wait_frames(5)), 5)
+        self.assertEqual(len(self.stub.wait_frames(4)), 4)
+
+    def test_it_fails_closed_on_anything_the_servers_parser_might_read_differently(self):
+        sid = self.wopen(cred="hadeny")
+        deep = "[" * 20 + "]" * 20
+        evil = ["not json at all", "", "   ", '\ufeff{"type": "auth/sign_path"}',                  # not JSON / BOM
+                '{"type": "auth/sign_path", "type": "ping"}', '{"type": "ping", "type": "auth/sign_path"}',   # duplicate keys
+                '{"type": NaN}', '{"id": Infinity, "type": "ping"}', '{"id": -Infinity}',             # constants
+                '{"type": "ping", "x": ' + deep + '}',                                              # nesting
+                '{"type": "ping", "x": "\\ud800"}',                                                  # a lone surrogate
+                '{"type": 5}', '{"type": ["auth/sign_path"]}', '{"type": null}',                    # a type that is not text
+                '{"type": "auth\\/sign_path"}', '{"type": "auth\\u002fsign_path"}',                 # escaped spellings
+                '{"type": "AUTH/SIGN_PATH"}', '{"id": 1, "payload": "auth/sign_path"}',              # backstop
+                '[{"type": "ping"}, {"type": "auth/long_lived_access_token"}]', '{"id": ' + "9" * 5000 + '}',
+                '{"type": "ping"} trailing', '{"type": "ping"}{"type": "auth/sign_path"}']
+        for frame in evil:
+            code, text = self.wsend(sid, frame)
+            self.assertEqual((code, json.loads(text)["code"]), (403, "session_refused"), frame[:60])
+        self.assertEqual(self.stub.received, [])
+        reasons = {e["reason_class"] for e in self.events("ws_session_refused")}
+        self.assertEqual(reasons, {"denied_type", "not_json"})
+        self.assertEqual(self.wsend(sid, '{"id": 1, "type": "ping"}')[0], 200)
+
+    def test_a_credential_without_a_deny_list_still_relays_plain_text(self):
+        sid = self.wopen()
+        self.assertEqual(self.wsend(sid, "not json at all")[0], 200)
 
     def test_empty_list_clears_the_default_and_a_list_replaces_it(self):
         for name, ws, sent, expect in (
@@ -1599,7 +1626,7 @@ class DenySend(WsBase):
                 W.parse_cred_config({"deny_send": bad}, ["T"])
 
     def test_the_card_warns_about_minting_and_shows_the_block_count(self):
-        self.wask()
+        self.wask(cred="hadeny")
         page = self.get("/")[1]
         self.assertIn("create NEW credentials", page)
         self.assertIn("outlives this session", page)
@@ -1628,6 +1655,27 @@ class Masking(WsBase):
         for piece in ("x HA-TOK", "EN-CANA", "RY-31337 y"):
             self.wsend(sid, "ECHO:" + piece)
         blob = "".join(f["data"] for f in self.frames_until(sid, 1))
+        self.assertEqual(blob, "x *** y")
+
+    def test_a_secret_split_at_any_point_is_masked(self):
+        for cut in (1, 2, 3, 4, 7, 15, 20):
+            sid = self.wopen(url=self.wurl(stub=self.mkstub()))
+            self.wsend(sid, "ECHO:x " + TOKEN[:cut])
+            self.wsend(sid, "ECHO:" + TOKEN[cut:] + " y")
+            blob = "".join(f["data"] for f in self.frames_until(sid, 2 if False else 1))
+            code, r = self.wrecv(sid, wait=0.3)
+            blob += "".join(f["data"] for f in r["frames"])
+            self.assertEqual(blob, "x *** y", cut)
+            self.as_client(KEY, "POST", "/v1/requests", {"mode": "session_close", "session": sid})
+
+    def test_a_three_way_split_with_short_pieces(self):
+        sid = self.wopen()
+        for piece in ("x H", "A", "-TOKEN-CANARY-3", "1337 y"):
+            self.wsend(sid, "ECHO:" + piece)
+        blob = ""
+        end = time.time() + 5
+        while "y" not in blob and time.time() < end:
+            blob += "".join(f["data"] for f in self.wrecv(sid, wait=1)[1]["frames"])
         self.assertEqual(blob, "x *** y")
 
     def test_a_held_prefix_is_flushed_as_a_mask_when_the_connection_ends(self):
@@ -1834,3 +1882,209 @@ class CliText(ts.CliBase, WsBase):
         self.assertEqual(out, "ok [31mRED evilxy\n".replace("[31m", "[31m"))
         self.assertNotIn("\x1b", out)
         self.assertNotIn("\u202e", out)
+
+
+# ------------------------------------------------------------------------------- second review round
+class Round2(SignIn):
+    def vault_change(self, item, fn):
+        """Change a credential the way an operator does: in the vault, not in memory."""
+        rec = self.broker.backend._data[item]
+        meta = json.loads(rec["broker"])
+        fn(meta)
+        rec["broker"] = json.dumps(meta)
+        self.broker._catalog_at = 0
+
+    def tick(self):
+        self.broker._sweeper_tick()
+
+    # 1. stale catalog
+    def test_a_vault_change_ends_an_idle_session_after_one_sweep_with_no_other_request(self):
+        sid = self.wopen()
+        self.vault_change("Ha", lambda m: m.pop("ws"))
+        self.tick()
+        self.assertTrue(self.stub.eof[0].wait(5))
+        self.assertEqual(self.events("ws_session_closed")[0].get("revoked_by"), "scope_recheck")
+
+    def test_narrowing_allowed_hosts_in_the_vault_ends_it_too(self):
+        self.wopen()
+        self.vault_change("Ha", lambda m: m.update(allowed_hosts=["other.example.com"]))
+        self.tick()
+        self.assertTrue(self.stub.eof[0].wait(5))
+
+    def test_the_same_sweeper_refreshes_for_http_sessions(self):
+        sid = self.open()
+        self.vault_change("Unifi", lambda m: m.update(allowed_hosts=["other.example.com"]))
+        self.tick()
+        code, r = self.call(sid, "GET", "/")
+        self.assertEqual((code, r.get("code")), (403, "session_refused"))
+
+    def test_a_catalog_that_is_still_fresh_is_not_reread(self):
+        self.wopen()
+        with mock.patch.object(self.broker, "refresh_catalog") as m:
+            self.broker._catalog_at = time.time()
+            self.tick()
+        m.assert_not_called()
+
+    # 2. the client is revoked while the handshake is in flight
+    def test_revoking_the_client_during_the_handshake_means_no_session(self):
+        a = self.new_client("alice-box")
+        gate = threading.Event()
+
+        def h(c, st):
+            gate.wait(10)
+            st.default(c)
+        st = self.mkstub(handler=h)
+        r = self.wask(key=a["secret"], url=self.wurl(stub=st))
+        th = threading.Thread(target=lambda: self.approve(r["id"]))
+        th.start()
+        self.assertTrue(st.connected.wait(10))
+        self.post("/clients/revoke", {"id": a["id"]})
+        gate.set()
+        th.join(15)
+        self.assertEqual(self.broker._by_id[r["id"]].status, "failed")
+        self.assertEqual(len(self.broker._sess), 0)
+        self.assertTrue(st.eof[0].wait(5))
+
+    def test_recv_woken_after_a_client_revoke_hands_nothing_over(self):
+        a = self.new_client("alice-box")
+        sid = self.wopen(key=a["secret"])
+        self.broker.clients.revoke(a["id"], "alice")
+        client = {"id": a["id"], "name": "alice-box", "legacy": False}
+        with self.assertRaises(S.SessionError):
+            self.broker.ws_recv(sid, client, 0)
+
+    # 3. the credential changed between the card and the open, or after
+    def test_a_credential_changed_between_the_card_and_the_open_is_not_opened(self):
+        r = self.wask()
+        self.broker.cfg["secrets"]["ha"]["_ws"] = {**self.broker.cfg["secrets"]["ha"]["_ws"], "origin": "https://x.example.com"}
+        self.approve(r["id"])
+        self.assertEqual(self.result(r["id"])["error"],
+                         "session not opened: the credential changed since the session was approved")
+        self.assertEqual(self.stub.requests, [])
+
+    def test_vars_or_tls_changing_after_the_open_ends_the_session(self):
+        for change in (lambda sc: sc.update(vars={"HA_TOKEN": {"item": "Plainws", "field": "token"}}),
+                       lambda sc: sc.update(_tls={"fingerprint": None, "verify": False}),
+                       lambda sc: sc["_ws"].update(deny_send=["x"])):
+            st = self.mkstub()
+            sid = self.wopen(url=self.wurl(stub=st))
+            saved = json.loads(json.dumps(self.broker.cfg["secrets"]["ha"], default=list))
+            change(self.broker.cfg["secrets"]["ha"])
+            self.assertEqual(self.wsend(sid, "x")[0], 410)
+            self.assertTrue(st.eof[0].wait(5))
+            self.broker.cfg["secrets"]["ha"].update(saved)
+            self.broker.cfg["secrets"]["ha"]["_ws"] = saved["_ws"]
+            self.broker.cfg["secrets"]["ha"]["_tls"] = saved.get("_tls", {})
+
+    def test_a_reload_with_the_same_content_keeps_the_session(self):
+        sid = self.wopen()
+        self.broker._catalog_at = 0
+        self.tick()
+        self.assertEqual(self.wsend(sid, "still")[0], 200)
+
+    # 4. query smuggling
+    def test_hostile_queries_are_refused(self):
+        st = self.mkstub(auth=False)
+        for q in ("%ffaccess_token=x", "ACCESS_TOKEN=x", "a=1;access_token=x", "a=%zz", "a=%", "a=%4", "a=%00",
+                  "a=%0a", "a=%e2%82%ac", "a=%c3%28", "a=\x7f", "%61ccess_token=x"):
+            code, text = self.as_client(KEY, "POST", "/v1/requests", {"mode": "session", "kind": "ws", "names": ["qcred"],
+                                                                      "url": self.wurl("/ws?" + q, stub=st)})
+            self.assertIn(code, (400, 403), q)
+        for ok in ("a=1", "a=%20b", "a=b+c", "x=%41%42"):
+            self.assertEqual(W.parse_url("ws://example.com/ws?" + ok)[3], "/ws?" + ok)
+        self.wask(cred="qcred", url=self.wurl("/ws?a=%20b", stub=st))
+
+    def test_a_malformed_escape_in_the_path_is_refused(self):
+        for bad in ("ws://example.com/a%zz", "ws://example.com/a%"):
+            with self.assertRaises(ValueError):
+                W.parse_url(bad)
+
+    # 5. the TLS object is never asked about pending data beside a write
+    def test_pending_is_read_under_the_transport_lock(self):
+        import ssl
+        sock = mock.Mock(spec=ssl.SSLSocket)
+        t = wsproto.Transport(sock)
+        seen = []
+        sock.pending.side_effect = lambda: seen.append(t.lock.locked()) or 1
+        sock.recv.return_value = b"x"
+        self.assertEqual(t.recv(10), b"x")
+        self.assertEqual(seen, [True])
+
+    # 6. a fragmented message has a deadline of its own
+    def test_a_message_that_stalls_between_fragments_is_cut_off(self):
+        self.broker.ws_cfg = W.parse_config({**self.broker.ws_cfg, "idle_s": 3600})
+        sid = self.wopen()
+        s = self.sess()
+        self.wsend(sid, "FRAGSTALL")
+        end = time.time() + 10
+        while s.conn.msg_started is None and time.time() < end:
+            time.sleep(0.005)
+        self.assertIsNotNone(s.conn.msg_started)
+        self.assertIsNone(s.conn.frame_started)                  # the frame itself finished
+        self.advance(W.FRAME_DEADLINE_S - 1)
+        self.broker.sweep_sessions()
+        self.assertFalse(s.dead)
+        self.advance(2)
+        with s.cond:
+            self.assertTrue(s.cond.wait_for(lambda: s.finished is not None, 10))     # the reader itself, no sweeper
+        self.assertEqual(s.finished, wsproto.TIMEOUT)
+
+    def test_the_sweeper_also_sees_a_stalled_message(self):
+        self.broker.ws_cfg = W.parse_config({**self.broker.ws_cfg, "idle_s": 3600})
+        sid = self.wopen()
+        s = self.sess()
+        s.conn.msg_started = self.broker.sessions_clock()
+        self.advance(W.FRAME_DEADLINE_S + 1)
+        self.assertIsNotNone(s.sweep_reason(self.broker.sessions_clock()))
+
+    # 7. each kind against its own cap
+    def test_each_kind_has_its_own_cap(self):
+        self.broker.sessions_cfg = S.parse_config({"max_per_client": 1})
+        self.broker.ws_cfg = W.parse_config({"max_per_client": 3})
+        self.wopen()
+        self.wopen(url=self.wurl(stub=self.mkstub()))
+        self.wopen(url=self.wurl(stub=self.mkstub()))
+        self.wask(expect=403, url=self.wurl(stub=self.mkstub()))             # a fourth websocket session
+        self.open()                                                           # an http session: its own cap of 1
+        self.ask(expect=403)
+
+    def test_http_sessions_do_not_eat_the_websocket_cap(self):
+        self.broker.sessions_cfg = S.parse_config({"max_per_client": 3})
+        self.broker.ws_cfg = W.parse_config({"max_per_client": 1})
+        self.open()
+        self.open()
+        self.wopen()
+        self.wask(expect=403)
+
+    def test_pending_requests_count_per_kind(self):
+        self.broker.ws_cfg = W.parse_config({"max_per_client": 1})
+        self.wask()
+        self.wask(expect=403)                                                 # one pending websocket request is the cap
+        self.ask()                                                            # an http request is not held up by it
+
+    # 8. status goes through the same checks
+    def test_status_of_an_out_of_scope_session_is_the_fixed_answer(self):
+        sid = self.wopen()
+        self.assertEqual(self.as_client(KEY, "GET", "/v1/sessions/" + sid)[0], 200)
+        self.broker.cfg["secrets"]["ha"]["allowed_hosts"] = []
+        code, text = self.as_client(KEY, "GET", "/v1/sessions/" + sid)
+        self.assertEqual((code, json.loads(text)["code"]), (410, "session_expired"))
+        self.assertTrue(self.stub.eof[0].wait(5))
+
+    def test_status_of_a_session_whose_credential_became_internal(self):
+        sid = self.wopen()
+        with mock.patch.object(self.broker, "_internal_hit", lambda names: "x"):
+            code, text = self.as_client(KEY, "GET", "/v1/sessions/" + sid)
+        self.assertEqual(code, 410)
+
+    # after the deadline nothing is relayed
+    def test_nothing_is_relayed_after_the_deadline(self):
+        sid = self.wopen(ttl_s=60)
+        self.wsend(sid, "a")
+        s = self.sess()
+        with s.cond:
+            s.cond.wait_for(lambda: len(s.queue) == 1, 10)
+        self.advance(61)
+        self.assertEqual(self.wrecv(sid, wait=0)[0], 410)
+        self.assertEqual(self.wsend(sid, "b")[0], 410)
+        self.assertEqual([o for o, _ in self.stub.received if o == 1], [b"a"] and [1])
