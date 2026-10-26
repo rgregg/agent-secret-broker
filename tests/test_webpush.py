@@ -686,8 +686,8 @@ class PushDecide(t.Dashboard):
         import urllib.request
         js = urllib.request.urlopen(urllib.request.Request(
             self.abase + "/sw.js", headers={"X-authentik-username": "alice"})).read().decode()
-        self.assertEqual(broker_mod.SW_VERSION, "13")
-        self.assertIn("SW_VERSION='13'", js)
+        self.assertEqual(broker_mod.SW_VERSION, "14")
+        self.assertIn("SW_VERSION='14'", js)
         for needle in ("/push/decide", "X-Requested-With", "credentials:'same-origin'",
                        "redirect:'manual'", "action_click", "action_decide",
                        "Could not '+verb+' - tap to review", "'Approved'", "'Denied'",
@@ -800,16 +800,17 @@ const fs=require('fs');
 const src=fs.readFileSync(process.argv[2],'utf8');
 const payload=JSON.parse(process.argv[3]);
 const mode=process.argv[4]||'';
-const listeners={}; let live=[]; const log=[];
+const listeners={}; let live=[]; const log=[]; const calls=[];
 global.setTimeout=(f)=>setImmediate(f);
 const reg={
   showNotification:(t,o)=>{
+    calls.push('show');
     if(mode==='reject-full'&&o&&o.actions)return Promise.reject(new TypeError('actions unsupported'));
     if(mode==='reject-all')return Promise.reject(new Error('boom'));
     live=live.filter(n=>!o.tag||n.tag!==o.tag);
     live.push({title:t,tag:o.tag,data:o.data,close(){live=live.filter(x=>x!==this);}});
     return Promise.resolve();},
-  getNotifications:(f)=>Promise.resolve(live.filter(n=>!f||!f.tag||n.tag===f.tag))};
+  getNotifications:(f)=>{calls.push('get');return Promise.resolve(live.filter(n=>!f||!f.tag||n.tag===f.tag));}};
 global.self={addEventListener:(n,f)=>{listeners[n]=f;},registration:reg,
   clients:{matchAll:()=>Promise.resolve([]),claim:()=>Promise.resolve()},
   skipWaiting:()=>Promise.resolve(),navigator:{userAgent:process.env.UA||''}};
@@ -825,7 +826,7 @@ new Function(src).call(global);
   const data=mode==='nodata'?null:{json:()=>{if(mode==='badjson')throw new SyntaxError('x');return payload;}};
   try{listeners.push({data,waitUntil:(x)=>{p=x;}});}catch(e){threw=String(e);}
   await p;
-  console.log(JSON.stringify({threw,live:live.map(n=>n.title),waited:p!==null}));
+  console.log(JSON.stringify({threw,live:live.map(n=>n.title),waited:p!==null,calls}));
 })();
 """
 
@@ -870,6 +871,22 @@ new Function(src).call(global);
         out = self.run_push(self.REQUEST, ua=self.MAC_CHROME, old_resolved=True)
         self.assertIn("Secret request [LOW]", out["live"])
         self.assertNotIn("Denied: old", out["live"])
+
+    def test_chromium_push_never_reads_the_displayed_list_once_it_has_shown(self):
+        # Real Chrome 156 on macOS 27 (tools/e2e_push): getNotifications() right after (or alongside)
+        # showNotification() makes Chrome drop the notification, so a click never reaches the worker.
+        # Reads (the sweep of old "Approved" notices) must all come BEFORE the first show.
+        for ua in (self.MAC_CHROME, self.WIN_CHROME):
+            for payload in (self.REQUEST, self.RESOLVED):
+                out = self.run_push(payload, ua=ua, old_resolved=True)
+                calls = out["calls"]
+                self.assertIn("show", calls, (ua, payload))
+                self.assertNotIn("get", calls[calls.index("show"):], (ua, payload, calls))
+
+    def test_request_push_shows_first_only_after_the_sweep_finished(self):
+        # the sweep must be sequenced before the show, not run next to it
+        out = self.run_push(self.REQUEST, ua=self.MAC_CHROME, old_resolved=True)
+        self.assertEqual(out["calls"][:2], ["get", "show"])
 
     def test_push_always_ends_with_something_on_display(self):
         for mode, payload in (("badjson", self.REQUEST), ("nodata", self.REQUEST),
@@ -1249,8 +1266,8 @@ new Function(src).call(global);
         self.assertTrue(n["o"]["silent"])
 
     def test_version_bumped_and_old_version_gone(self):
-        self.assertEqual(broker_mod.SW_VERSION, "13")
-        self.assertIn("SW_VERSION='13'", broker_mod._SERVICE_WORKER)
+        self.assertEqual(broker_mod.SW_VERSION, "14")
+        self.assertIn("SW_VERSION='14'", broker_mod._SERVICE_WORKER)
         self.assertNotIn("SW_VERSION='9'", broker_mod._SERVICE_WORKER)
 
     def test_source_has_replace_then_close_logic(self):

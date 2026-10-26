@@ -4239,7 +4239,7 @@ _DASH_JS = _KEEP_JS + _DASH_JS + proposals_mod.JS_INIT
 
 # Single source of truth for the worker version: rendered into the worker, the
 # X-SW-Version header on /sw.js, and the Settings page ("expected" version).
-SW_VERSION = "13"
+SW_VERSION = "14"
 
 _SERVICE_WORKER = r"""
 var SW_VERSION='__SW_VERSION__';
@@ -4326,8 +4326,14 @@ function minimalShow(tag,title){
     body:title?'':'A secret was requested',tag:tag,data:{url:'/'}}).then(function(){return true;},
     function(){return false;});
 }
+// NEVER read the displayed list (getNotifications) right after showNotification on Chromium.
+// Measured on real Chrome 156 / macOS 27 (tools/e2e_push): a getNotifications() issued within a few
+// seconds of showNotification() returns nothing for the notification just shown AND makes Chrome drop
+// it, so a later click is delivered to Chrome but never reaches this worker (no notificationclick,
+// so no tab opens). The same call a few seconds later is harmless. So reads happen BEFORE a show,
+// never after it and never alongside it.
 // Chromium leaves the brief "Approved: x" notice up (it replaces the approval
-// notification under the same tag); sweep earlier notices out on the next push.
+// notification under the same tag); sweep earlier notices out BEFORE showing the next one.
 function sweepResolved(except){
   return self.registration.getNotifications().then(function(ns){
     ns.forEach(function(n){try{if(n.data&&n.data.resolved&&n.tag!==except)n.close();}catch(x){}});
@@ -4346,11 +4352,12 @@ function resolvedPush(d){
   function closeAll(){return self.registration.getNotifications({tag:tag}).then(function(ns){
     ns.forEach(function(n){try{n.close();}catch(x){}});return ns.length;},function(){return 0;});}
   var title=word+(name?': '+name:'');
-  var p=self.registration.getNotifications({tag:tag}).then(function(old){return old.length;},
-    function(){return 0;}).then(function(had){
+  var pre=CHROMIUM?sweepResolved(tag):Promise.resolve();
+  var p=pre.then(function(){return self.registration.getNotifications({tag:tag}).then(function(old){return old.length;},
+    function(){return 0;});}).then(function(had){
     return self.registration.showNotification(title,{body:'',tag:tag,
       renotify:false,silent:!CHROMIUM,requireInteraction:false,data:{url:'/',resolved:true}}).then(function(){
-      if(CHROMIUM)return sweepResolved(tag);
+      if(CHROMIUM)return;
       return new Promise(function(res){setTimeout(res,1000);}).then(closeAll);
     }).then(function(){
       return rep('resolved',{ok:true,tag:tag,note:String(d.status||'').slice(0,12)+(had?'':' none')+(CHROMIUM?' kept':''),
@@ -4382,21 +4389,20 @@ self.addEventListener('push',function(e){
   acts.push({action:'open',title:'Review'});
   var mx=(self.Notification&&typeof Notification.maxActions==='number')?Notification.maxActions:2;
   acts=acts.slice(0,Math.max(mx,0));
-  var r2=self.registration.showNotification(d.title||'Approval needed',{
+  // Chromium: clear earlier "Approved: x" notices first (a read), then show; nothing reads the
+  // displayed list after the show (see sweepResolved).
+  var pre=CHROMIUM?sweepResolved(tag):Promise.resolve();
+  var r2=pre.then(function(){return self.registration.showNotification(d.title||'Approval needed',{
     body:d.body||'A secret was requested',tag:tag,requireInteraction:PERSIST,
     data:data,actions:acts,renotify:true,
-    timestamp:t0}).then(function(){
-      // seen: how many notifications under this tag the browser says are on display
-      // right after showing; 0 means it lost track of this one (clicks will not arrive).
-      return self.registration.getNotifications({tag:tag}).then(function(ns){return ns.length;},
-        function(){return -1;}).then(function(seen){
-        return rep('show',{ok:true,tag:tag,ms:Date.now()-t0,seen:seen,persist:PERSIST,
-          note:acts.map(function(a){return a.action;}).join(',')});});},
+    timestamp:t0});}).then(function(){
+      return rep('show',{ok:true,tag:tag,ms:Date.now()-t0,persist:PERSIST,
+        note:acts.map(function(a){return a.action;}).join(',')});},
     function(err){
       // e.g. unsupported option: still show a plain one rather than let Chrome add its own
       return minimalShow(tag).then(function(ok){
         return rep('show',{ok:false,tag:tag,err:em(err),note:ok?'fallback':'nofallback',ms:Date.now()-t0});});});
-  e.waitUntil(Promise.all([r1,r2,CHROMIUM?sweepResolved(tag):null]));
+  e.waitUntil(Promise.all([r1,r2]));
   }catch(err){
     e.waitUntil(minimalShow(tag).then(function(){return rep('show',{ok:false,tag:tag,err:em(err),note:'fallback'});}));
   }});
