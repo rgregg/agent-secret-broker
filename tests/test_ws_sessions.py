@@ -1567,7 +1567,7 @@ def raw_post(t, path, obj, key=KEY):
 class DenySend(WsBase):
     def test_the_home_assistant_preset_blocks_token_minting_by_default(self):
         sid = self.wopen(cred="hadeny")
-        for t in ("auth/long_lived_access_token", "auth/sign_path"):
+        for t in W.PRESET_DENY["home-assistant"]:
             code, text = self.wsend(sid, json.dumps({"id": 5, "type": t, "client_name": "x"}))
             self.assertEqual((code, json.loads(text)["code"]), (403, "session_refused"), t)
             self.assertNotIn(t, text)                               # fixed text: the type is not echoed
@@ -1617,7 +1617,12 @@ class DenySend(WsBase):
 
     def test_config_parse(self):
         self.assertEqual(W.parse_cred_config({"handshake": "home-assistant"}, ["T"])["deny_send"],
-                         ["auth/long_lived_access_token", "auth/sign_path"])
+                         W.PRESET_DENY["home-assistant"])
+        for t in ("auth/long_lived_access_token", "auth/sign_path", "auth/delete_refresh_token", "config/auth/create",
+                  "config/auth/update", "config/auth/delete", "config/auth_provider/homeassistant/create",
+                  "config/auth_provider/homeassistant/admin_change_password",
+                  "config/auth_provider/homeassistant/delete", "supervisor/api"):
+            self.assertIn(t, W.PRESET_DENY["home-assistant"])
         self.assertEqual(W.parse_cred_config({"handshake": "home-assistant", "deny_send": []}, ["T"])["deny_send"], [])
         self.assertEqual(W.parse_cred_config({}, ["T"])["deny_send"], [])
         self.assertEqual(W.parse_cred_config({"handshake": {"send": "x"}}, ["T"])["deny_send"], [])
@@ -1630,7 +1635,7 @@ class DenySend(WsBase):
         page = self.get("/")[1]
         self.assertIn("create NEW credentials", page)
         self.assertIn("outlives this session", page)
-        self.assertIn("Message types blocked by the operator: 2", page)
+        self.assertIn("Message types blocked by the operator: 10", page)
 
 
 class Masking(WsBase):
@@ -1895,6 +1900,12 @@ class Round2(SignIn):
         self.broker._catalog_at = 0
 
     def tick(self):
+        """One sweeper tick; the catalog refresh runs in its own thread, so wait for it, then sweep again."""
+        self.broker._sweep_refresh_next = 0
+        self.broker._sweeper_tick()
+        th = getattr(self.broker, "_sweep_refresh_thread", None)
+        if th is not None:
+            th.join(10)
         self.broker._sweeper_tick()
 
     # 1. stale catalog
@@ -2088,3 +2099,69 @@ class Round2(SignIn):
         self.assertEqual(self.wrecv(sid, wait=0)[0], 410)
         self.assertEqual(self.wsend(sid, "b")[0], 410)
         self.assertEqual([o for o, _ in self.stub.received if o == 1], [b"a"] and [1])
+
+
+class Round3(WsBase):
+    def test_json_aware_masking_ignores_leading_whitespace_and_a_bom(self):
+        sid = self.wopen()
+        for lead in ("", " ", "\n", "\t", "\r\n  ", "\ufeff", "\ufeff \n"):
+            self.wsend(sid, "ECHO:" + lead + '{"v":"\\u0048A-TOKEN-C\\u0041NARY-31337","k":1}')
+            out = self.frames_until(sid, 1)[0]["data"]
+            self.assertNotIn("TOKEN", out, repr(lead))
+            self.assertEqual(json.loads(out.lstrip("\ufeff")), {"v": "***", "k": 1}, repr(lead))
+
+    def test_a_secret_split_around_a_json_document_with_leading_space(self):
+        sid = self.wopen()
+        self.wsend(sid, 'ECHO: \n{"v":"HA-TOK')
+        self.wsend(sid, 'ECHO:EN-CANARY-31337"}')
+        blob = ""
+        end = time.time() + 5
+        while "}" not in blob and time.time() < end:
+            blob += "".join(f["data"] for f in self.wrecv(sid, wait=1)[1]["frames"])
+        self.assertNotIn("TOKEN", blob)
+        self.assertIn("***", blob)
+
+    def test_a_deeply_nested_body_is_a_fixed_400(self):
+        sid = self.wopen()
+        for path in ("/v1/ws/send", "/v1/ws/recv", "/v1/requests"):
+            code, text, _ = self.raw("POST", path, data=b"[" * 100000,
+                                     headers={"X-Client-Key": KEY, "Content-Type": "application/json"})
+            self.assertEqual(code, 400, path)
+            self.assertNotIn("Traceback", text)
+            self.assertNotIn("recursion", text)
+        self.assertEqual(self.wsend(sid, "still fine")[0], 200)
+
+    def test_a_slow_vault_does_not_hold_up_the_sweeper(self):
+        sid = self.wopen(ttl_s=60)
+        gate = threading.Event()
+        entered = threading.Event()
+
+        def slow():
+            entered.set()
+            gate.wait(20)
+        self.broker._catalog_at = 0
+        self.broker._sweep_refresh_next = 0
+        with mock.patch.object(self.broker, "refresh_catalog", slow):
+            t0 = time.monotonic()
+            self.broker._sweeper_tick()
+            self.assertTrue(entered.wait(5))
+            self.assertLess(time.monotonic() - t0, 2)                   # it did not wait for the vault
+            self.advance(61)
+            self.broker._sweeper_tick()                                 # expiry is still swept on time, refresh still stuck
+            self.assertTrue(self.stub.eof[0].wait(5))
+            self.assertEqual(self.events("ws_session_closed")[0]["reason"], "expired")
+            gate.set()
+            self.broker._sweep_refresh_thread.join(10)
+
+    def test_a_failed_refresh_backs_off(self):
+        self.wopen()
+        calls = []
+        self.broker._catalog_at = 0
+        self.broker._sweep_refresh_next = 0
+        with mock.patch.object(self.broker, "refresh_catalog", lambda: calls.append(1) or (_ for _ in ()).throw(OSError("x"))):
+            self.broker._sweeper_tick()
+            self.broker._sweep_refresh_thread.join(10)
+            self.broker._catalog_at = 0
+            self.broker._sweeper_tick()
+            self.broker._sweeper_tick()
+        self.assertEqual(len(calls), 1)                                  # one attempt per backoff period

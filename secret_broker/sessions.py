@@ -1048,7 +1048,7 @@ class SessionsMixin:
         """One sweep. A failure is logged by class name only (at most once a minute) and sweeping carries on."""
         try:
             if self._sess:      # while a session exists keep the catalog fresh, so a vault change reaches it (http and ws)
-                self._refresh_if(self.CATALOG_TTL, wait=False)
+                self._sweep_refresh()
             self.sweep_sessions()
         except Exception as e:  # noqa: BLE001 -- never let the sweeper die; never log the text
             now = time.monotonic()
@@ -1058,6 +1058,20 @@ class SessionsMixin:
                     self.log("session_sweep_error", error_class=type(e).__name__)
                 except Exception:  # noqa: BLE001
                     pass
+
+    SWEEP_REFRESH_BACKOFF_S = 30.0
+
+    def _sweep_refresh(self):
+        """Refresh the catalog in a thread of its own so a slow vault never delays an expiry, idle or frame-deadline
+        sweep; at most one at a time and one attempt per SWEEP_REFRESH_BACKOFF_S whatever the outcome."""
+        now = time.monotonic()
+        th = getattr(self, "_sweep_refresh_thread", None)
+        if (th is not None and th.is_alive()) or now < getattr(self, "_sweep_refresh_next", 0.0):
+            return
+        self._sweep_refresh_next = now + self.SWEEP_REFRESH_BACKOFF_S
+        self._sweep_refresh_thread = threading.Thread(
+            target=lambda: self._refresh_if(self.CATALOG_TTL, wait=False), daemon=True, name="sessions-refresh")
+        self._sweep_refresh_thread.start()
 
     @staticmethod
     def _skey(sid):

@@ -2464,7 +2464,10 @@ message that could still turn into the start of a secret (a proper prefix, one c
 the next message, so a secret split over any number of messages is masked; the held text is flushed as a mask when the
 connection ends. The cost: a plain-text message ending in a character that starts some spelling of a secret waits for the next one and is delivered
 together with it (a complete JSON document is never held, so JSON protocols such as Home Assistant's are unaffected). Residual: a hostile server that splits the
-secret across separate frames inside structured JSON values cannot be fully masked (the same class as a server that transforms it). A server that transforms the secret in some other way (rot13, its own encoding) still defeats it, as for http. The URL, headers and sign-in messages exist only in memory and on the wire: they are in no
+secret across separate frames inside structured JSON values cannot be fully masked, nor one that splits it across frames while also mixing spellings
+(for example a partly percent-encoded or partly `\\u`-escaped secret cut mid-escape): the cross-message guarantee is for a secret split in ONE spelling (the
+raw value or any of the forms the masker knows), same class as a server that transforms it. The hold can also replace a held tail with `***` when the
+connection ends, even if it was not a secret. A server that transforms the secret in some other way (rot13, its own encoding) still defeats it, as for http. The URL, headers and sign-in messages exist only in memory and on the wire: they are in no
 response, log, audit record or card; the failure text to the agent is a fixed class (`could not connect (connection | tls |
 dns | timeout | handshake refused | frame too large)`), never exception or server text.
 
@@ -2492,7 +2495,9 @@ it by the card. **That includes commands that create new credentials on the serv
 `auth/long_lived_access_token` and `auth/sign_path`, for example): what the server returns is a new secret the masker has
 never seen, and it outlives the session and its revocation. The card says so. The operator can block message types per
 credential with `ws.deny_send` (a list of exact JSON `type` values; matching outgoing frames are refused with a fixed error,
-non-JSON frames are refused too, so a credential with `deny_send` set accepts JSON frames only); the `home-assistant` preset blocks those two by default and `"deny_send": []` clears that. This is a
+non-JSON frames are refused too, so a credential with `deny_send` set accepts JSON frames only); the `home-assistant` preset blocks the known credential and user-management commands by default (`auth/long_lived_access_token`, `auth/sign_path`,
+`auth/delete_refresh_token`, `config/auth/create|update|delete`, `config/auth_provider/homeassistant/create|admin_change_password|delete`, `supervisor/api`)
+and `"deny_send": []` clears that. The list is a guardrail, not a complete list. This is a
 blocklist for known dangerous commands, not a filter: everything else is relayed. It fails closed: with a deny list set, a frame must parse as strict JSON
 (no duplicate keys, no NaN/Infinity, nesting at most 16, no lone surrogate, no BOM), the `type` of the object (or of each object in a top-level array)
 must be text and not denied, and no denied name may appear anywhere in the frame (raw or decoded, any case), so a parser difference with the server cannot

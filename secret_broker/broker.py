@@ -5206,7 +5206,7 @@ def client_handler(broker, client_key):
                              {"Retry-After": "60"})
             try:
                 body = json.loads(self.rfile.read(n).decode("utf-8"))
-            except (ValueError, UnicodeDecodeError):
+            except (ValueError, UnicodeDecodeError, RecursionError):
                 body = None
             code, out = broker.enroll_submit(body, peer)
             _json(self, code, out)
@@ -5248,7 +5248,7 @@ def client_handler(broker, client_key):
                 return _json(self, 413 if n > 2048 else 400, {"ok": False})
             try:
                 body = json.loads(self.rfile.read(n).decode("utf-8"))
-            except (ValueError, UnicodeDecodeError):
+            except (ValueError, UnicodeDecodeError, RecursionError):
                 body = None
             ok_id = lambda v, mx: isinstance(v, str) and re.fullmatch(  # noqa: E731
                 r"[A-Za-z0-9_-]{1,%d}" % mx, v) is not None
@@ -5350,6 +5350,8 @@ def client_handler(broker, client_key):
                                     peer=self._ip, client=self.client)
             except sessions_mod.SessionError as e:
                 return _json(self, e.http, {"error": str(e), "code": e.code})
+            except RecursionError:                      # a absurdly nested body: a fixed answer, no traceback
+                return _json(self, 400, {"error": "bad request"})
             except (ValueError, KeyError, TypeError, json.JSONDecodeError) as e:
                 if not str(e) or not isinstance(e, ValueError) or isinstance(e, json.JSONDecodeError):
                     broker.log("bad_request", peer=self._ip, error=httpcheck.clip(e),
@@ -5385,7 +5387,7 @@ def client_handler(broker, client_key):
                     out = broker.ws_recv(body.get("session"), self.client, wait, mx)
             except sessions_mod.SessionError as e:
                 return _json(self, e.http, {"error": str(e), "code": e.code})
-            except (ValueError, KeyError, TypeError, UnicodeError, ArithmeticError, json.JSONDecodeError):
+            except (ValueError, KeyError, TypeError, UnicodeError, ArithmeticError, RecursionError, json.JSONDecodeError):
                 return _json(self, 400, {"error": "bad request"})     # fixed: the agent's text is never echoed
             except PermissionError as e:
                 return _json(self, 403, {"error": httpcheck.clip(e)})
@@ -6308,7 +6310,7 @@ def approval_handler(broker):
                 return self._json(413, {"ok": False})
             try:
                 body = json.loads(self.rfile.read(n).decode("utf-8"))
-            except (ValueError, UnicodeDecodeError):
+            except (ValueError, UnicodeDecodeError, RecursionError):
                 body = None
             tab = body.get("tab", "") if isinstance(body, dict) else None
             if (not isinstance(body, dict) or not isinstance(body.get("v"), bool)
@@ -6341,7 +6343,7 @@ def approval_handler(broker):
                 return self._json(413, {"ok": False})
             try:
                 body = json.loads(self.rfile.read(n).decode("utf-8"))
-            except (ValueError, UnicodeDecodeError):
+            except (ValueError, UnicodeDecodeError, RecursionError):
                 body = None
             if (not isinstance(body, dict) or body.get("decision") not in ("approve", "deny")
                     or not isinstance(body.get("token"), str) or not body["token"]

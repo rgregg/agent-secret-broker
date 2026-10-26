@@ -72,7 +72,12 @@ _TARGET_RE = re.compile(r"^/[A-Za-z0-9\-._~!$&'()*+,;=:@/?%]{0,2040}\Z")
 _ORIGIN_RE = re.compile(r"^https?://[A-Za-z0-9.-]{1,253}(:[0-9]{1,5})?\Z")
 _PROTO_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,64}\Z")
 HANDSHAKE_KEYS = ("wait", "send", "expect")
-PRESET_DENY = {"home-assistant": ["auth/long_lived_access_token", "auth/sign_path"]}   # minting commands
+# A guardrail, not a complete list: the known commands that mint credentials or manage users and tokens.
+PRESET_DENY = {"home-assistant": [
+    "auth/long_lived_access_token", "auth/sign_path", "auth/delete_refresh_token",
+    "config/auth/create", "config/auth/update", "config/auth/delete",
+    "config/auth_provider/homeassistant/create", "config/auth_provider/homeassistant/admin_change_password",
+    "config/auth_provider/homeassistant/delete", "supervisor/api"]}
 MAX_STEPS = 8
 STEP_TIMEOUT_DEFAULT, STEP_TIMEOUT_MAX = 10.0, 30.0
 STEP_BYTES_DEFAULT, STEP_BYTES_MAX = 65536, 1 << 20
@@ -235,9 +240,9 @@ def parse_cred_config(raw, var_names):
         "query": {"access_token": "{{VAR}}"}   added to the upgrade URL's query, URL-encoded by the broker
         "headers": {"Authorization": "Bearer {{VAR}}"}   Authorization, Sec-WebSocket-Protocol and Origin only
         "origin": "https://app.example.com", "subprotocols": ["graphql-ws"]
-        "deny_send": ["auth/long_lived_access_token"]   outgoing text frames whose JSON `type` is listed are refused
-            (non-JSON frames pass). The home-assistant preset blocks the token-minting commands by default;
-            `"deny_send": []` clears that.
+        "deny_send": ["auth/long_lived_access_token"]   outgoing text frames whose JSON `type` is listed are refused;
+            with a list set, frames must be strict JSON (anything else is refused: fail closed). The home-assistant
+            preset blocks credential and user-management commands by default; `"deny_send": []` clears that.
     The broker owns Host, Upgrade, Connection and every Sec-WebSocket-Key/Version/Extensions header: they are
     never settable. `{{VAR}}` is the credential's only variable (with several, name one: `{{MY_TOKEN}}`)."""
     if not isinstance(raw, dict):
@@ -431,6 +436,13 @@ def parse_url(url):
     return u.scheme, host, port or (443 if u.scheme == "wss" else 80), target
 
 
+_JSON_LEAD = " \t\r\n\ufeff"      # whitespace and a BOM may precede a JSON document: it is still one
+
+
+def _jsonish(text):
+    return text.lstrip(_JSON_LEAD)[:1] in ("{", "[", "\"")
+
+
 MAX_DENY_DEPTH = 16
 
 
@@ -580,7 +592,7 @@ class WsSession(S.Session):
         """Mask one text message. A JSON object or array is parsed and every decoded string and key masked (this sees
         through mixed \\uXXXX escapes); when that changed anything the masked structure is re-serialised, else the
         text is kept exactly as the server sent it. The textual masker runs over the result in every case."""
-        if text[:1] in ("{", "["):
+        if _jsonish(text):
             try:
                 changed = []
 
@@ -597,7 +609,7 @@ class WsSession(S.Session):
                     if isinstance(v, dict):
                         return {walk(k, depth + 1): walk(x, depth + 1) for k, x in v.items()}
                     return v
-                obj = walk(json.loads(text))
+                obj = walk(json.loads(text.lstrip(_JSON_LEAD)))
                 if changed:
                     return self._mask_one(json.dumps(obj, ensure_ascii=False))
             except (ValueError, RecursionError):
@@ -613,9 +625,9 @@ class WsSession(S.Session):
         the two are delivered as one). A whole JSON document is never held. Residual: a hostile server that
         splits a secret across separate frames INSIDE structured JSON values cannot be fully masked."""
         raw = self.hold + text
-        if raw[:1] in ("{", "[", "\""):
+        if _jsonish(raw):
             try:
-                json.loads(raw)
+                json.loads(raw.lstrip(_JSON_LEAD))
                 complete = True
             except (ValueError, RecursionError):
                 complete = False
