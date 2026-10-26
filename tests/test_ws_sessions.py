@@ -2165,3 +2165,47 @@ class Round3(WsBase):
             self.broker._sweeper_tick()
             self.broker._sweeper_tick()
         self.assertEqual(len(calls), 1)                                  # one attempt per backoff period
+
+
+class RefreshBackoff(WsBase):
+    def test_a_fresh_catalog_starts_nothing_and_arms_nothing(self):
+        self.wopen()
+        self.broker._catalog_at = time.time()
+        self.broker._sweep_refresh_thread = None
+        self.broker._sweep_refresh_next = 0
+        with mock.patch.object(self.broker, "refresh_catalog") as m:
+            self.broker._sweeper_tick()
+        m.assert_not_called()
+        self.assertIsNone(self.broker._sweep_refresh_thread)
+        self.assertEqual(self.broker._sweep_refresh_next, 0)
+
+    def test_a_stale_catalog_is_refreshed_on_the_next_tick_and_sessions_rechecked_by_the_thread(self):
+        sid = self.wopen()
+        rec = self.broker.backend._data["Ha"]
+        meta = json.loads(rec["broker"])
+        meta.pop("ws")
+        rec["broker"] = json.dumps(meta)
+        self.broker._catalog_at = 0
+        self.broker._sweep_refresh_next = 0
+        self.broker._sweeper_tick()                       # ONE tick: the refresh thread re-checks the sessions itself
+        self.broker._sweep_refresh_thread.join(10)
+        self.assertTrue(self.stub.eof[0].wait(5))
+        self.assertEqual(len(self.broker._sess), 0)
+        self.assertEqual(self.broker._sweep_refresh_next, 0)             # a success arms no backoff
+
+    def test_a_failure_backs_off(self):
+        self.wopen()
+        calls = []
+        self.broker._catalog_at = 0
+        self.broker._sweep_refresh_next = 0
+
+        def boom():
+            calls.append(1)
+            raise OSError("x")
+        with mock.patch.object(self.broker, "refresh_catalog", boom):
+            self.broker._sweeper_tick()
+            self.broker._sweep_refresh_thread.join(10)
+            self.assertGreater(self.broker._sweep_refresh_next, time.monotonic())
+            self.broker._sweeper_tick()
+            self.broker._sweeper_tick()
+        self.assertEqual(len(calls), 1)

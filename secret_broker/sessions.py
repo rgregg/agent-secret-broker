@@ -1063,14 +1063,23 @@ class SessionsMixin:
 
     def _sweep_refresh(self):
         """Refresh the catalog in a thread of its own so a slow vault never delays an expiry, idle or frame-deadline
-        sweep; at most one at a time and one attempt per SWEEP_REFRESH_BACKOFF_S whatever the outcome."""
-        now = time.monotonic()
+        sweep. Nothing is started while the catalog is younger than its TTL (and nothing is armed: the next real
+        refresh is not delayed). One refresh at a time; after a FAILED attempt the next one waits
+        SWEEP_REFRESH_BACKOFF_S. When a refresh changes the catalog the sessions are re-checked at once."""
         th = getattr(self, "_sweep_refresh_thread", None)
-        if (th is not None and th.is_alive()) or now < getattr(self, "_sweep_refresh_next", 0.0):
+        if (th is not None and th.is_alive()) or time.time() - self._catalog_at <= self.CATALOG_TTL:
             return
-        self._sweep_refresh_next = now + self.SWEEP_REFRESH_BACKOFF_S
-        self._sweep_refresh_thread = threading.Thread(
-            target=lambda: self._refresh_if(self.CATALOG_TTL, wait=False), daemon=True, name="sessions-refresh")
+        if time.monotonic() < getattr(self, "_sweep_refresh_next", 0.0):
+            return
+
+        def run():
+            before = self._catalog_at
+            self._refresh_if(self.CATALOG_TTL, wait=False)
+            if self._catalog_at == before and time.time() - before > self.CATALOG_TTL:
+                self._sweep_refresh_next = time.monotonic() + self.SWEEP_REFRESH_BACKOFF_S    # it did not happen: back off
+            else:
+                self.sweep_sessions()               # the catalog changed under the sessions: check them now
+        self._sweep_refresh_thread = threading.Thread(target=run, daemon=True, name="sessions-refresh")
         self._sweep_refresh_thread.start()
 
     @staticmethod
