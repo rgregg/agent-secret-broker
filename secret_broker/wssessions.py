@@ -936,7 +936,7 @@ class WsMixin:
 
     def _init_ws(self, config):
         self.ws_cfg = parse_config(config.get("ws_sessions"))
-        self._ws_profiles_dir = wsprofiles.parse_dir_config(config)
+        self._ws_profiles_dir = wsprofiles.parse_dir_config(config, audit_path=self._audit._path)
         self.ws_profiles = wsprofiles.build_registry(self._ws_profiles_dir)
         self._ws_profiles_sig = None
         self._ws_profiles_lock = threading.Lock()
@@ -960,7 +960,6 @@ class WsMixin:
                 self.log("ws_profile_invalid", profile=n[:wsprofiles.MAX_NAME], source=reg.status(n)[1])
             for n in reg.overridden():
                 self.log("ws_profile_override", profile=n, winner="admin", replaced="built-in")
-            self.log("ws_profiles_loaded", builtin=sorted(reg.builtin), admin=sorted(reg.admin))
         return reg
 
     @staticmethod

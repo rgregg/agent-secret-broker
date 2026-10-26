@@ -64,13 +64,17 @@ def strict_loads(text):
         return d
 
     def const(name):
-        raise ValueError("not strict JSON")
-    if not isinstance(text, str) or text.startswith("﻿"):
-        raise ValueError("not strict JSON")
+        raise ValueError("NaN and Infinity are not allowed")
+    if not isinstance(text, str):
+        raise ValueError("invalid JSON")
+    if text.startswith("\ufeff"):
+        raise ValueError("a byte order mark is not allowed")
     try:
         obj = json.loads(text, object_pairs_hook=pairs, parse_constant=const)
-    except (ValueError, RecursionError):
-        raise ValueError("not strict JSON") from None
+    except json.JSONDecodeError:
+        raise ValueError("invalid JSON") from None
+    except RecursionError:
+        raise ValueError("nested too deeply") from None
     stack = [(obj, 1)]
     while stack:
         v, depth = stack.pop()
@@ -78,7 +82,7 @@ def strict_loads(text):
             raise ValueError("nested too deeply")
         if isinstance(v, str):
             if any("\ud800" <= c <= "\udfff" for c in v):
-                raise ValueError("not strict JSON")
+                raise ValueError("a lone surrogate is not allowed")
         elif isinstance(v, list):
             stack += [(x, depth + 1) for x in v]
         elif isinstance(v, dict):
@@ -188,8 +192,11 @@ def rule_matches(rule, item):
 def rule_groups(rule):
     """The backstop for a rule: lower-cased alternative strings, one group per string field of the match (a list is
     any-of). If EVERY group has a member somewhere in the frame text the rule is treated as hit, whatever the
-    structure says (a parser that reads the frame differently must not slip past)."""
+    structure says (a parser that reads the frame differently must not slip past). A rule with a number or true/false
+    anywhere in its match has NO backstop (None): the structural match, which compares those by their text form
+    (1, 1.0, "1"), decides alone, so such a rule cannot over-block every frame that merely contains its strings."""
     groups = []
+    structural_only = []
 
     def walk(m):
         for v in m.values():
@@ -197,12 +204,16 @@ def rule_groups(rule):
                 walk(v)
             elif isinstance(v, list):
                 alts = [x.lower() for x in v if isinstance(x, str)]
-                if alts:
+                if len(alts) != len(v):
+                    structural_only.append(1)
+                elif alts:
                     groups.append(alts)
             elif isinstance(v, str):
                 groups.append([v.lower()])
+            else:
+                structural_only.append(1)
     walk(rule["match"])
-    return groups
+    return None if structural_only else groups
 
 
 def rule_backstop(rule, hay):
@@ -461,7 +472,7 @@ def builtin_registry():
 
 
 # ---------------------------------------------------------------- config
-def parse_dir_config(cfg, field="ws_profiles_dir"):
+def parse_dir_config(cfg, field="ws_profiles_dir", audit_path=None):
     """The profiles directory for a config dict: `ws_profiles_dir`, else `ws-profiles/` next to the audit log, else
     None (built-ins only). ValueError names the field."""
     raw = (cfg or {}).get("ws_profiles_dir")
@@ -469,7 +480,7 @@ def parse_dir_config(cfg, field="ws_profiles_dir"):
         if not isinstance(raw, str) or not raw or len(raw) > 4096 or "\x00" in raw:
             raise ValueError(f"{field} must be a directory path")
         return raw
-    audit = (cfg or {}).get("audit_log")
+    audit = (cfg or {}).get("audit_log") or audit_path
     if isinstance(audit, str) and audit:
         return os.path.join(os.path.dirname(os.path.abspath(audit)), DEFAULT_DIR_NAME)
     return None
