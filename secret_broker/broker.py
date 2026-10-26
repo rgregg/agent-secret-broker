@@ -4239,7 +4239,7 @@ _DASH_JS = _KEEP_JS + _DASH_JS + proposals_mod.JS_INIT
 
 # Single source of truth for the worker version: rendered into the worker, the
 # X-SW-Version header on /sw.js, and the Settings page ("expected" version).
-SW_VERSION = "11"
+SW_VERSION = "13"
 
 _SERVICE_WORKER = r"""
 var SW_VERSION='__SW_VERSION__';
@@ -4251,6 +4251,7 @@ var Q=[],T0={};
 // there we skip requireInteraction; the macOS alert style decides how long they stay.
 var UA=String((self.navigator&&self.navigator.userAgent)||'');
 var PERSIST=!(/Macintosh/.test(UA)&&/Chrome\//.test(UA));
+function HOME_URL(){try{return self.location.origin+'/';}catch(x){return '/';}}
 function tell(m){return self.clients.matchAll({type:'window',includeUncontrolled:true}).then(function(cs){
   cs.forEach(function(c){try{c.postMessage(m);}catch(x){}});return cs;});}
 // Local diagnostic ring (IndexedDB, last 10 steps: kind, ok, short note/error,
@@ -4267,7 +4268,7 @@ function dlog(b){
         rq.onsuccess=function(){try{
           var db=rq.result,tx=db.transaction('l','readwrite'),st=tx.objectStore('l');
           st.add({t:Date.now(),k:String(b.kind||''),ok:b.ok,
-            n:String(b.note||b.err||b.state||'').slice(0,40)});
+            n:(String(b.note||b.err||b.state||'')+(b.seen!=null?' seen='+b.seen:'')+(b.clients!=null?' win='+b.clients:'')).slice(0,60)});
           var i=0,cu=st.openCursor(null,'prev');
           cu.onsuccess=function(){var c=cu.result;if(!c)return;i++;if(i>10)c.delete();c.continue();};
           tx.oncomplete=tx.onerror=tx.onabort=function(){try{db.close();}catch(x){}res();};
@@ -4371,7 +4372,7 @@ self.addEventListener('push',function(e){
   var r1=rep('push',{ok:parsed,tag:tag});
   // Buttons: only what the payload lists (Deny, Approve), then Review, capped to
   // what this browser/platform allows. The notification body click always opens.
-  var data={url:'/',names:String(d.body||'').slice(0,200)};
+  var data={url:HOME_URL(),names:String(d.body||'').slice(0,200)};
   var acts=[];
   if(d.token&&d.rid&&Array.isArray(d.actions)){
     data.rid=String(d.rid);data.token=String(d.token);
@@ -4400,11 +4401,21 @@ self.addEventListener('push',function(e){
     e.waitUntil(minimalShow(tag).then(function(){return rep('show',{ok:false,tag:tag,err:em(err),note:'fallback'});}));
   }});
 self.addEventListener('notificationclose',function(e){
-  var tag=(e.notification&&e.notification.tag)||'';
-  e.waitUntil(rep('notificationclose',{tag:tag,note:'dismissed'}));});
+  var early=dlog({kind:'close_event',note:'raw'});
+  var tag='';try{tag=(e.notification&&e.notification.tag)||'';}catch(x){}
+  try{e.waitUntil(early);e.waitUntil(rep('notificationclose',{tag:tag,note:'dismissed'}));}catch(x){}});
 self.addEventListener('pushsubscriptionchange',function(e){
   e.waitUntil(rep('pushsubscriptionchange'));});
+// The very first thing a click does is write a local diagnostic row (before close(),
+// tell() or matchAll), and any exception is logged and answered with a plain
+// openWindow, so the Settings log shows whether Chrome delivered the click at all.
 self.addEventListener('notificationclick',function(e){
+  var early=dlog({kind:'click_event',note:'action='+String(e.action||'-').slice(0,12)});
+  try{e.waitUntil(early);onClick(e);}catch(err){
+    var hm='/';try{hm=self.location.origin+'/';}catch(x){}
+    try{e.waitUntil(Promise.all([rep('click_exception',{ok:false,err:em(err)}),
+      self.clients.openWindow(hm).catch(function(){})]));}catch(x){}}});
+function onClick(e){
   var tag=(e.notification&&e.notification.tag)||'',action=e.action||'',t0=Date.now();
   var nd=(e.notification&&e.notification.data)||{};
   try{e.notification.close();}catch(x){}
@@ -4416,14 +4427,51 @@ self.addEventListener('notificationclick',function(e){
   // network report happens afterwards (earlier versions awaited a beacon round trip
   // before openWindow and Chrome refused it, so a closed-browser click opened nothing).
   var HOME='/';try{HOME=self.location.origin+'/';}catch(x){}
+  var ORIGIN='';try{ORIGIN=new URL(HOME).origin;}catch(x){}
+  // Where a click lands: the notification's own absolute same-origin url, else home.
+  function target(retry){
+    var u=HOME;
+    try{var du=nd.url;if(du&&ORIGIN&&new URL(du).origin===ORIGIN)u=du;}catch(x){}
+    return retry?u+(u.indexOf('?')<0?'?':'&')+'from=push':u;}
+  function pth(u){try{return new URL(u).pathname;}catch(x){return '?';}}
+  // How many windows of ours exist now (origin+path only in the log).
+  function countWins(label,w){
+    var d=w?(pth(w.url)+' foc='+w.focused+' vis='+w.visibilityState):'null';
+    dlog({kind:'click_window',note:label+' '+d});
+    return self.clients.matchAll({type:'window',includeUncontrolled:true}).then(function(cs){
+      var mine=cs.filter(function(c){try{return !ORIGIN||new URL(c.url).origin===ORIGIN;}catch(x){return false;}});
+      return rep('click_verify',{ok:mine.length>0,tag:tag,clients:mine.length,
+        note:label+' '+mine.slice(0,3).map(function(c){return pth(c.url);}).join(',')}).then(function(){return mine.length;});
+    },function(){return -1;});}
+  function tapToOpen(){
+    return self.registration.showNotification('Tap to open the broker',{body:'',tag:tag+'-open',
+      renotify:true,requireInteraction:false,data:{url:target(false)}}).then(function(){
+      return rep('click_tap_notice',{ok:true,tag:tag});},function(err){
+      return rep('click_tap_notice',{ok:false,tag:tag,err:em(err)});});}
+  function openAttempt(retry,why){
+    dlog({kind:'click_open_call',note:((retry?'retry ':'')+(why||'')).slice(0,20)});
+    var op;try{op=self.clients.openWindow(target(retry));}catch(err){op=Promise.reject(err);}
+    var tm=setTimeout(function(){dlog({kind:'click_open_pending',note:'openWindow unsettled 3s'});},3000);
+    return op.then(function(w){clearTimeout(tm);return w;},function(err){clearTimeout(tm);throw err;});}
+  // openWindow resolving does not mean a tab is on screen (null when Chrome blocked it or
+  // opened it elsewhere), so verify, then retry once, then leave a tap-to-open notice.
   function openNew(info,why){
-    var op;try{op=self.clients.openWindow(HOME);}catch(err){op=Promise.reject(err);}
-    return op.then(function(w){
-      return rep('click_openwindow',{ok:true,tag:tag,note:(why||'')+(w?' window':' null'),ms:Date.now()-t0}).then(function(){
-        return rep('click_outcome',{ok:true,tag:tag,state:'opened',ms:Date.now()-t0});});
+    var first=openAttempt(false,why);
+    return first.then(function(w){
+      return rep('click_openwindow',{ok:!!w,tag:tag,note:(why||'')+(w?' window':' null'),ms:Date.now()-t0}).then(function(){
+        var fp=Promise.resolve();
+        if(w&&w.focused===false&&typeof w.focus==='function')fp=w.focus().then(function(){
+          return dlog({kind:'click_refocus',ok:true});},function(err){return dlog({kind:'click_refocus',ok:false,err:em(err)});});
+        return fp.then(function(){return countWins('first',w);});});
     },function(err){
-      return rep('click_openwindow',{ok:false,tag:tag,err:em(err),note:why||'',ms:Date.now()-t0}).then(function(){
-        return rep('click_outcome',{ok:false,tag:tag,state:'failed',ms:Date.now()-t0});});
+      return rep('click_openwindow',{ok:false,tag:tag,err:em(err),note:why||'',ms:Date.now()-t0}).then(function(){return 0;});
+    }).then(function(n){
+      if(n>0)return rep('click_outcome',{ok:true,tag:tag,state:'opened',ms:Date.now()-t0});
+      return openAttempt(true,why).then(function(w2){return countWins('retry',w2);},function(err){
+        return rep('click_openwindow',{ok:false,tag:tag,err:em(err),note:'retry',ms:Date.now()-t0}).then(function(){return 0;});
+      }).then(function(n2){
+        if(n2>0)return rep('click_outcome',{ok:true,tag:tag,state:'opened-retry',ms:Date.now()-t0});
+        return tapToOpen().then(function(){return rep('click_outcome',{ok:false,tag:tag,state:'failed',ms:Date.now()-t0});});});
     });
   }
   function openApp(){return self.clients.matchAll({type:'window',includeUncontrolled:true}).then(function(cs){
@@ -4485,7 +4533,7 @@ self.addEventListener('notificationclick',function(e){
       }).catch(function(){});
   }
   if(action==='approve'||action==='deny')e.waitUntil(decideFlow());
-  else e.waitUntil(openApp());});
+  else e.waitUntil(openApp());}
 // Settings page probes: {type:'version'} is answered with the running version
 // (echoing the caller's id); {type:'skip'} lets a waiting worker take over now.
 self.addEventListener('message',function(e){
