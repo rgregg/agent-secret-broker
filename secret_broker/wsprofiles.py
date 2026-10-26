@@ -158,7 +158,7 @@ def _parse_rules(raw):
 def _canon(v):
     """The text form a scalar is compared by: 1, 1.0, "1" are one value; true and "true" are one value. Deny rules
     compare this way on purpose (a server that coerces types must not be able to dodge a rule with 1.0 or "1").
-    Case still matters. None for anything that is not a scalar."""
+    Strings compare case-insensitively (a deny rule must not be dodged by case: servers may fold it); field names stay exact. None for anything that is not a scalar."""
     if isinstance(v, bool):
         return "true" if v else "false"
     if isinstance(v, int):
@@ -166,13 +166,16 @@ def _canon(v):
     if isinstance(v, float):
         return str(int(v)) if v == v and v not in (float("inf"), float("-inf")) and v.is_integer() else repr(v)
     if isinstance(v, str):
-        return v
+        return v.lower()
     return None
 
 
 def _match_value(spec, val, depth=0):
     if depth > MAX_MATCH_DEPTH + 1:
         return False
+    if isinstance(val, list):
+        # a list where the rule expects a scalar or an object is a shape a server may unpack: refuse it (deny rule)
+        return True if not isinstance(spec, dict) else any(_match_value(spec, x, depth + 1) for x in val)
     if isinstance(spec, dict):
         return isinstance(val, dict) and all(k in val and _match_value(s, val[k], depth + 1) for k, s in spec.items())
     got = _canon(val)
@@ -185,35 +188,27 @@ def _match_value(spec, val, depth=0):
 
 def rule_matches(rule, item):
     """Does one parsed JSON message (an object) match a rule? Every listed field must be present with an equal
-    value (a list is any-of; objects match as subsets; exact, case-sensitive; scalars by `_canon`)."""
+    value (a list is any-of; objects match as subsets; exact keys, case-insensitive values; scalars by `_canon`; a list where a scalar is expected counts as a match)."""
     return isinstance(item, dict) and _match_value(rule["match"], item)
 
 
 def rule_groups(rule):
-    """The backstop for a rule: lower-cased alternative strings, one group per string field of the match (a list is
-    any-of). If EVERY group has a member somewhere in the frame text the rule is treated as hit, whatever the
-    structure says (a parser that reads the frame differently must not slip past). A rule with a number or true/false
-    anywhere in its match has NO backstop (None): the structural match, which compares those by their text form
-    (1, 1.0, "1"), decides alone, so such a rule cannot over-block every frame that merely contains its strings."""
+    """The backstop for a rule: lower-cased alternative strings, one group per field of the match (a list is any-of;
+    a number or true/false contributes its text form, so a mixed rule keeps the backstop on its string fields). If EVERY
+    group has a member somewhere in the frame text the rule is treated as hit, whatever the structure says (a parser
+    that reads the frame differently must not slip past). The backstop is never dropped: a rule with a short number
+    in it can refuse more frames than it names, which is the safe direction for a deny rule."""
     groups = []
-    structural_only = []
 
     def walk(m):
         for v in m.values():
             if isinstance(v, dict):
                 walk(v)
-            elif isinstance(v, list):
-                alts = [x.lower() for x in v if isinstance(x, str)]
-                if len(alts) != len(v):
-                    structural_only.append(1)
-                elif alts:
-                    groups.append(alts)
-            elif isinstance(v, str):
-                groups.append([v.lower()])
             else:
-                structural_only.append(1)
+                alts = [_canon(x).lower() for x in (v if isinstance(v, list) else [v])]
+                groups.append(alts)
     walk(rule["match"])
-    return None if structural_only else groups
+    return groups
 
 
 def rule_backstop(rule, hay):

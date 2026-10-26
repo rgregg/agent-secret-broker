@@ -2457,7 +2457,7 @@ pull in a file from elsewhere); a world-writable or unreadable directory makes e
 **Rules.** `{"match": {...}, "action": "deny", "reason": "why"}`. `action` is `"deny"` (the only action; it may be left out) and
 `reason` is for the operator. `match` is an object of 1 to 8 fields, nested at most 3 deep. A frame (the top-level object, or each
 object of a top-level array) matches when every listed field is present with an equal value: a **list** is any-of, an object
-matches as a subset, there are no regular expressions, and strings compare exactly and case-sensitively. Values are text, whole
+matches as a subset, there are no regular expressions, field names are exact, and string values compare exactly but **case-insensitively** (servers may fold case). A list in the frame where the rule expects a single value counts as a match (refused), and an object rule matches if any object of such a list does. Values are text, whole
 numbers or `true`/`false`. Because a deny rule must not be dodged by a server that coerces types, scalars are compared by their
 text form: a rule value `1` matches the frame's `1`, `1.0`, `1e0` and `"1"`, and `true` matches `true` and `"true"` (but `1` never
 matches `true`). Rules on numbers and booleans are therefore best effort: prefer matching on text fields. Examples:
@@ -2472,8 +2472,8 @@ Then, for the object or each object of a top-level array, in this order: a `type
 a rule that matches: `rule_denied`; with `allow_send`, anything that is not an object with a text `type` in the list:
 `not_allowed`. **Deny wins**: a type in both `deny_send` and `allow_send` is refused. Two backstops catch a parser difference
 (case, escapes, wrong nesting): no denied type may appear anywhere in the frame (raw or decoded, any case); and a rule whose
-**every** string (its `type`, `domain`, ...) appears anywhere in the frame (raw or decoded, any case) counts as matched, as long as
-the rule has no number or `true`/`false` in it (a rule with one is judged by the structural match alone). The refusal answer to the
+**every** string (its `type`, `domain`, ...) appears anywhere in the frame (raw or decoded, any case) counts as matched, with a number or
+`true`/`false` in the rule contributing its text form (so a rule with a short number can refuse more frames than it names: the safe direction). The refusal answer to the
 agent is a fixed text; the audit log records the class (`denied_type`, `rule_denied`, `not_allowed`, `not_json`) and the profile
 name, never the frame, the rule or its reason. A refusal is not a prompt: it never reaches the server and cannot be approved.
 

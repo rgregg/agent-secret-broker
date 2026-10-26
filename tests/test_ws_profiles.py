@@ -509,28 +509,42 @@ class Verdict(unittest.TestCase):
     def test_type_confusion_in_rule_values(self):
         def rule(**m):
             return [{"match": m, "action": "deny", "reason": ""}]
-        r = rule(type="t", n=1)
-        for n in ("1", "1.0", '"1"', "1e0", "10e-1"):
-            self.assertEqual(W.deny_verdict('{"type": "t", "n": %s}' % n, frozenset(), None, r), "rule_denied", n)
-        for n in ("true", "2", "1.5", "null", "[1]", "{}", '"01"', '"1 "'):
-            self.assertIsNone(W.deny_verdict('{"type": "t", "n": %s}' % n, frozenset(), None, r), n)
-        rb = rule(type="t", b=True)
-        for b in ("true", '"true"'):
-            self.assertEqual(W.deny_verdict('{"type": "t", "b": %s}' % b, frozenset(), None, rb), "rule_denied", b)
-        for b in ("1", "false", '"True"', "null"):
-            self.assertIsNone(W.deny_verdict('{"type": "t", "b": %s}' % b, frozenset(), None, rb), b)
+        v = lambda text, r: W.deny_verdict(text, frozenset(), None, r)       # noqa: E731
+        r = rule(type="tt", n=7)
+        for n in ("7", "7.0", '"7"', "7e0", "70e-1", "[7]", "[8]", '["x"]'):
+            self.assertEqual(v('{"type": "tt", "n": %s}' % n, r), "rule_denied", n)      # a list where a scalar belongs: refused
+        for n in ("true", "8", "null", "{}", '"x"', "0"):
+            self.assertIsNone(v('{"type": "tt", "n": %s}' % n, r), n)
+        rb = rule(type="tt", b=True)
+        for b in ("true", '"true"', '"True"', '"TRUE"'):
+            self.assertEqual(v('{"type": "tt", "b": %s}' % b, rb), "rule_denied", b)
+        for b in ("1", "false", "null", "0"):
+            self.assertIsNone(v('{"type": "tt", "b": %s}' % b, rb), b)
         # a rule value of 1 must not match the boolean true (Python's True == 1)
-        self.assertIsNone(W.deny_verdict('{"type": "t", "n": true}', frozenset(), None, r))
-        # a list is any-of; a list in the FRAME does not match a scalar rule structurally (the backstop is what catches it)
-        rl = rule(type="t", d=["a", "b"])
-        self.assertEqual(W.deny_verdict('{"type": "t", "d": "b"}', frozenset(), None, rl), "rule_denied")
-        self.assertIsNone(W.deny_verdict('{"type": "t", "d": "c"}', frozenset(), None, rl))
-        self.assertEqual(W.deny_verdict('{"type": "t", "d": ["b"]}', frozenset(), None, rl), "rule_denied")   # backstop
+        self.assertIsNone(v('{"type": "tt", "n": true}', rule(type="tt", n=1)))
+        rl = rule(type="tt", d=["a", "b"])
+        self.assertEqual(v('{"type": "tt", "d": "B"}', rl), "rule_denied")
+        self.assertIsNone(v('{"type": "tt", "d": "c"}', rl))
+        self.assertEqual(v('{"type": "tt", "d": ["c"]}', rl), "rule_denied")           # list for scalar: refused
+        self.assertEqual(v('{"type": "tt", "o": {"d": ["c"]}}', rule(type="tt", o={"d": "x"})), "rule_denied")
+        self.assertEqual(v('{"type": "tt", "o": [{"d": "x"}]}', rule(type="tt", o={"d": "x"})), "rule_denied")   # objects in a list
+        self.assertIsNone(v('{"type": "tt", "o": [{"d": "y"}]}', rule(type="tt", o={"d": "x"})))
 
-    def test_matching_is_exact_and_case_sensitive_but_the_backstop_is_not(self):
+    def test_mixed_string_and_number_rules_keep_the_backstop(self):
+        r = [{"match": {"type": "call_service", "domain": "shell_command", "n": 5}, "action": "deny", "reason": ""}]
+        v = lambda text: W.deny_verdict(text, frozenset(), None, r)       # noqa: E731
+        for text in ('{"type": "call_service", "domain": "SHELL_COMMAND", "n": 5}',               # case variant
+                     '{"type": "call_service", "domain": "shell\\u005fcommand", "n": "5"}',           # escaped spelling
+                     '{"type": "call_service", "domain": ["shell_command"], "n": 5}',               # list for scalar
+                     '{"type": "call_service", "domain": {"x": "shell_command"}, "n": 5.0}',        # wrong shape, same strings
+                     '{"type": "CALL_SERVICE", "domain": " shell_command ", "n": 5e0}'):           # padding, case
+            self.assertEqual(v(text), "rule_denied", text)
+        self.assertIsNone(v('{"type": "call_service", "domain": "light", "n": 6}'))
+
+    def test_matching_is_exact_on_names_and_case_insensitive_on_values(self):
         r = [{"match": {"type": "t", "d": "x"}, "action": "deny", "reason": ""}]
         self.assertIsNone(W.deny_verdict('{"type": "t", "d": "y"}', frozenset(), None, r))
-        self.assertIsNone(W.deny_verdict('{"type": "t", "D": "y"}', frozenset(), None, r))
+        self.assertIsNone(W.deny_verdict('{"type": "t", "D": "y"}', frozenset(), None, r))          # field names are exact
         self.assertEqual(W.deny_verdict('{"type": "t", "d": "x"}', frozenset(), None, r), "rule_denied")
         # a server that lower-cases (Home Assistant does for domain and service) still hits the backstop
         self.assertEqual(W.deny_verdict('{"type": "T", "d": "X"}', frozenset(), None, r), "rule_denied")
@@ -576,8 +590,7 @@ class Verdict(unittest.TestCase):
     def test_rule_helpers(self):
         r = {"match": {"a": ["X", "Z"], "b": {"c": "y"}}, "action": "deny", "reason": ""}
         self.assertEqual(sorted(map(tuple, P.rule_groups(r))), [("x", "z"), ("y",)])
-        for m in ({"a": ["X", 2], "b": "y"}, {"a": "x", "d": 3}, {"a": "x", "b": {"c": True}}):
-            self.assertIsNone(P.rule_groups({"match": m}), m)       # a number or true/false: structural match only
+        self.assertEqual(P.rule_groups({"match": {"a": ["X", 2], "b": "y", "c": True}}), [["x", "2"], ["y"], ["true"]])
         self.assertTrue(P.rule_backstop(r, "..x..y.."))
         self.assertFalse(P.rule_backstop(r, "..x.."))
 

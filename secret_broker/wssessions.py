@@ -520,7 +520,7 @@ def deny_verdict(text, deny, allow=None, rules=()):
     differently from ours must not slip past. For the top-level object, or every object in a top-level array:
       * its `type`, if present, must be text, and not in `deny` (deny always wins);
       * no rule of `rules` may match it (fields present with equal values, lists are any-of, exact and
-        case-sensitive; see wsprofiles.rule_matches);
+        case-insensitive values, a list where a scalar is expected counts as a match; see wsprofiles.rule_matches);
       * with `allow` set, it must be an object whose `type` is text and in `allow`.
     As backstops, no denied type may appear anywhere in the frame (raw or decoded, any case), and a rule whose
     every string appears anywhere in the frame (raw or decoded, any case) counts as matched."""
