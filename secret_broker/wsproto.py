@@ -23,6 +23,7 @@ import base64
 import hashlib
 import hmac
 import os
+import re
 import select
 import socket
 import ssl
@@ -34,6 +35,9 @@ OP_CONT, OP_TEXT, OP_BIN, OP_CLOSE, OP_PING, OP_PONG = 0, 1, 2, 8, 9, 10
 HEAD_LIMIT = 16384              # response header block
 MAX_FRAGMENTS = 256             # wire frames in one data message
 POLL_S = 0.5
+_OWNED = frozenset(("host", "upgrade", "connection", "sec-websocket-key", "sec-websocket-version",
+                    "sec-websocket-extensions", "sec-websocket-accept", "sec-websocket-protocol", "origin",
+                    "content-length", "transfer-encoding", "cookie"))
 
 # fixed failure labels
 HANDSHAKE, PROTOCOL, TOO_LARGE, LIMIT, TIMEOUT, CONNECTION, CLOSED = (
@@ -120,11 +124,11 @@ def accept_key(key_b64):
     return base64.b64encode(hashlib.sha1(key_b64 + GUID).digest())
 
 
-def handshake(t, host_header, target, origin=None, subprotocols=(), deadline_s=10.0, egress=None):
+def handshake(t, host_header, target, origin=None, subprotocols=(), deadline_s=10.0, egress=None, extra_headers=()):
     """Perform the opening handshake on `t`. Returns (leftover bytes read past the header block, subprotocol or
     None). `target` and `host_header` are validated by the caller (printable ASCII, no CR/LF); they are
     checked again here and anything unusual raises WsError (fail closed)."""
-    for v in (host_header, target, origin or "", *subprotocols):
+    for v in (host_header, target, origin or "", *subprotocols, *[x for kv in extra_headers for x in kv]):
         if not isinstance(v, str) or not v.isascii() or any(c in v for c in "\r\n\x00") or any(ord(c) < 32 for c in v):
             raise WsError(HANDSHAKE)
     if not target.startswith("/") or " " in target:
@@ -136,6 +140,10 @@ def handshake(t, host_header, target, origin=None, subprotocols=(), deadline_s=1
         lines.append("Origin: " + origin)
     if subprotocols:
         lines.append("Sec-WebSocket-Protocol: " + ", ".join(subprotocols))
+    for k, v in extra_headers:
+        if not re.match(r"^[A-Za-z][A-Za-z0-9-]{0,63}\Z", k) or k.lower() in _OWNED or not v.strip():
+            raise WsError(HANDSHAKE)                # the broker owns these; config may not set them
+        lines.append(f"{k}: {v}")
     if egress:
         lines.append(f"{egress[0]}: {egress[1]}")
     try:

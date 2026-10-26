@@ -370,6 +370,8 @@ class Session:
     monotonic: `opened` and `expires` are readings of the session clock, never wall time (wall time is
     kept only for display and the audit log)."""
 
+    kind = "http"
+
     def __init__(self, sid, pid, client, cred, hosts, methods, ttl_s, max_calls, opened, purpose, approver,
                  clock):
         self.id, self.pid = sid, pid
@@ -1010,7 +1012,7 @@ def sessions_section(broker, csrf, now=None):
             f"<br><span class=idn>session {e(r['pid'])}</span></td>"
             f"<td data-label=Client>{e(r['client_name'])}<br><span class=idn>id {e(r['client_id'])}</span></td>"
             f"<td data-label=Hosts>{e('; '.join(host_label(h) for h in r['hosts']))}</td>"
-            f"<td data-label=Methods>{e(', '.join(r['methods']))}</td>"
+            f"<td data-label=Methods>{e('WebSocket' if r.get('kind') == 'ws' else ', '.join(r['methods']))}</td>"
             f"<td data-label='Time left'>{left}</td>"
             f"<td data-label=Calls>{r['calls']} / {r['max_calls']}</td>"
             "<td><form method=post action='/sessions/revoke' class=inline>"
@@ -1074,7 +1076,10 @@ class SessionsMixin:
                   "names": [s.cred]}
         if actor is not None:
             fields["revoked_by"] = actor
-        if reason == "ended":
+        if getattr(s, "kind", "http") == "ws":
+            fields.pop("unused", None)
+            self.log("ws_session_closed", reason=reason, **fields, **self._ws_end_fields(s), **extra)
+        elif reason == "ended":
             self.log("session_ended", reason="refusal_budget", **fields, **extra)
         else:
             self.log(f"session_{reason}", **fields, **extra)
@@ -1109,6 +1114,11 @@ class SessionsMixin:
                 if now >= s.expires:
                     self._sess_end_locked(s, "expired", now)
                     n += 1
+                elif getattr(s, "kind", "http") == "ws":
+                    r = s.sweep_reason(now)
+                    if r:
+                        self._sess_end_locked(s, r, now)
+                        n += 1
             for k in [k for k, t in self._sess_tomb.items() if now - t["t"] >= TOMBSTONE_S]:
                 del self._sess_tomb[k]
         return n
@@ -1121,7 +1131,8 @@ class SessionsMixin:
             rows = [{"pid": s.pid, "cred": s.cred, "client_id": s.cid, "client_name": s.cname,
                      "hosts": list(s.hosts), "methods": list(s.methods),
                      "expires_at": clock_mod.now() + max(0, s.expires - now),      # wall time, for display only
-                     "left_s": max(0, int(s.expires - now)), "calls": s.calls, "max_calls": s.max_calls}
+                     "left_s": max(0, int(s.expires - now)), "calls": s.calls, "max_calls": s.max_calls,
+                     "kind": getattr(s, "kind", "http")}
                     for s in self._sess.values()]
         return sorted(rows, key=lambda r: r["left_s"])
 
@@ -1133,6 +1144,12 @@ class SessionsMixin:
     # -- opening ---------------------------------------------------------------------
     def _validate_session(self, names, spec, client):
         """Validate an agent's open request and rewrite `spec` to what the card shows."""
+        kind = spec.get("kind")
+        if kind not in (None, "http", "ws"):
+            raise ValueError("bad session kind")
+        if kind == "ws":
+            return self._validate_ws_session(names, spec, client)
+        spec.pop("kind", None)
         if not self.sessions_cfg["enabled"]:
             raise PermissionError("http sessions are disabled")
         if len(names) != 1 or not isinstance(names[0], str):
@@ -1159,11 +1176,13 @@ class SessionsMixin:
         without any action button, decided only on the approval site."""
         from . import risk as risk_mod
         a = risk_mod.assess("session", req.names, {}, None)
+        if req.spec.get("kind") == "ws":
+            a = {**a, "reasons": ["a WebSocket session always needs a human to approve it; always high"]}
         req.risk = {k: a[k] for k in ("level", "model", "reasons")}
         self.audit("assessed", req, model=None, reasons=a["reasons"], summary_source=None, summary_reason=None)
         sp = req.spec
-        self.audit("session_requested", req, hosts=sp["hosts"], methods=sp["methods"], ttl_s=sp["ttl_s"],
-                   max_calls=sp["max_calls"])
+        self.audit("ws_session_requested" if sp.get("kind") == "ws" else "session_requested", req,
+                   hosts=sp["hosts"], methods=sp["methods"], ttl_s=sp["ttl_s"], max_calls=sp["max_calls"])
         try:
             self._push(req)
         except Exception:  # noqa: BLE001 -- the card is on the page whatever the transport does
@@ -1172,6 +1191,8 @@ class SessionsMixin:
 
     def _session_open(self, req, who):
         """The human approved: create the session. Returns the result handed to the agent once."""
+        if req.spec.get("kind") == "ws":
+            return self._ws_open(req, who)
         sp, cid, now = req.spec, req.client["id"], self.sessions_clock()
         ttl, calls = sp["final"]
         if not self.clients.is_active(cid):
@@ -1208,6 +1229,7 @@ class SessionsMixin:
         """Audit a refusal, coalesced: the first REFUSAL_LOG_PER_MIN per minute per session (or per client for an
         unknown id), then only a counter that rides on the next logged line (`suppressed`). The log cannot be flooded."""
         now = self.sessions_clock()
+        event = fields.pop("_event", "session_refused")
         with self._refusal_lock:
             st = self._refusal_log.get(key)
             carry = 0
@@ -1222,7 +1244,7 @@ class SessionsMixin:
                 return
         if carry:
             fields["suppressed"] = carry
-        self.log("session_refused", **fields)
+        self.log(event, **fields)
 
     def _meter_refusal(self, s):
         """A refusal that costs the caller nothing counts against the session's refusal budget; one more than
@@ -1307,6 +1329,12 @@ class SessionsMixin:
             state = state if active else "unknown"
             msg, code, http = ENDED[state]
             self._log_refusal("c:" + cid, session=None, reason_class=state, client_id=cid,
+                              client_name=client["name"], method=method[:16], host=shown)
+            raise SessionError(msg, code, http)
+        if getattr(s, "kind", "http") != "http":        # a WebSocket session's id is not an http session's
+            s, state = None, "unknown"
+            msg, code, http = ENDED["unknown"]
+            self._log_refusal("c:" + cid, session=None, reason_class="unknown", client_id=cid,
                               client_name=client["name"], method=method[:16], host=shown)
             raise SessionError(msg, code, http)
         with s.lock:
@@ -1431,9 +1459,13 @@ class SessionsMixin:
             s, state = self._sess_lookup(sid, cid, now)
             if s is None:
                 return state, None
-            return "ok", {"expires_in": max(0, int(s.expires - now)), "calls_left": max(0, s.max_calls - s.calls),
-                          "calls": s.calls, "max_calls": s.max_calls, "hosts": list(s.hosts),
-                          "methods": list(s.methods), "names": [s.cred]}
+            info = {"expires_in": max(0, int(s.expires - now)), "calls_left": max(0, s.max_calls - s.calls),
+                    "calls": s.calls, "max_calls": s.max_calls, "hosts": list(s.hosts),
+                    "methods": list(s.methods), "names": [s.cred]}
+            if getattr(s, "kind", "http") == "ws":     # counts only: never any frame content
+                info.update(kind="ws", frames_out=s.frames_out, bytes_out=s.bytes_out, frames_in=s.conn.frames_in,
+                            bytes_in=s.conn.bytes_in, queued=len(s.queue), connected=s.finished is None)
+            return "ok", info
 
     def revoke_session(self, pid, actor, peer=None, client_ip=None):
         """The human revokes one session (by its public prefix). True when it was active."""

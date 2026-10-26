@@ -95,6 +95,14 @@ WHITELIST = {
     "session_closed": {"session": ("session", _S), "calls": ("calls", _I)},
     "session_expired": {"session": ("session", _S), "calls": ("calls", _I)},
     "session_revoked": {"session": ("session", _S), "calls": ("calls", _I)},
+    # WebSocket sessions: counts and byte totals only, never frame contents
+    "ws_session_requested": {"names": ("names", _L), "ttl_s": ("ttl_s", _I), "max_calls": ("max_calls", _I)},
+    "ws_session_opened": {"session": ("session", _S), "ttl_s": ("ttl_s", _I), "max_frames": ("max_frames", _I)},
+    "ws_session_refused": {"session": ("session", _S), "reason": ("reason_class", _S),
+                           "suppressed": ("suppressed", _I)},
+    "ws_session_closed": {"session": ("session", _S), "reason": ("reason", _S), "frames_in": ("frames_in", _I),
+                          "frames_out": ("frames_out", _I), "bytes_in": ("bytes_in", _I),
+                          "bytes_out": ("bytes_out", _I)},
     "backend_ready": {"duration_ms": ("duration_ms", _I)},
     # plans (the agent's own, scoped by client id like every event). The agent sees that its plan
     # was issued, ended, revoked, used or missed: the plan id, the rule index, the uses left and a
