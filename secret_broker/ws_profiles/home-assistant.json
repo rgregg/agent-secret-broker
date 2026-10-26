@@ -1,0 +1,68 @@
+{
+  "name": "home-assistant",
+  "description": "Home Assistant WebSocket API: normal use with credential minting and code execution blocked.",
+  "handshake": {
+    "steps": [
+      {
+        "expect": {
+          "type": "auth_required"
+        }
+      },
+      {
+        "send": {
+          "type": "auth",
+          "access_token": "{{VAR}}"
+        }
+      },
+      {
+        "expect": {
+          "type": "auth_ok"
+        }
+      }
+    ]
+  },
+  "deny_send": [
+    "auth/long_lived_access_token",
+    "auth/sign_path",
+    "auth/delete_refresh_token",
+    "config/auth/create",
+    "config/auth/update",
+    "config/auth/delete",
+    "config/auth_provider/homeassistant/create",
+    "config/auth_provider/homeassistant/admin_change_password",
+    "config/auth_provider/homeassistant/delete",
+    "supervisor/api"
+  ],
+  "rules": [
+    {
+      "match": {
+        "type": "call_service",
+        "domain": [
+          "shell_command",
+          "python_script",
+          "hassio"
+        ]
+      },
+      "action": "deny",
+      "reason": "runs shell commands, Python or supervisor operations"
+    },
+    {
+      "match": {
+        "type": "call_service",
+        "domain": "homeassistant",
+        "service": [
+          "stop",
+          "restart"
+        ]
+      },
+      "action": "deny",
+      "reason": "stops or restarts Home Assistant"
+    }
+  ],
+  "card_text": "Home Assistant: normal use. Commands that mint credentials or manage users, and service calls that run shell commands or stop Home Assistant, are blocked.",
+  "risk_notes": [
+    "A guardrail, not a complete list: everything not blocked is relayed as the signed-in user.",
+    "execute_script, fire_event and automations can reach services these rules do not see; use home-assistant-readonly when the client only needs to look.",
+    "Frames must be strict JSON; anything else is refused."
+  ]
+}

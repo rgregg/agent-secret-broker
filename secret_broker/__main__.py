@@ -9,11 +9,12 @@ import argparse
 import json
 import os
 import signal
+import sys
 import threading
 
 from .backends import BackendConfigError, registry
 from .broker import Broker, parse_extra_origins, parse_trusted_proxies, serve
-from . import destguard, clients, sessions, credreq, grants, notify, plans, presence, proposals, request_details, risk, riskmodel
+from . import wsprofiles, destguard, clients, sessions, credreq, grants, notify, plans, presence, proposals, request_details, risk, riskmodel
 
 
 def _read(path):
@@ -36,6 +37,9 @@ def build_backend(cfg):
 
 
 def main():
+    if sys.argv[1:2] == ["ws-profile"]:          # admin tooling: stdlib, no network, never starts the broker
+        from .wsprofiles_cli import main as ws_profile_main
+        raise SystemExit(ws_profile_main(sys.argv[2:], load_settings))
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default=None)
     args = ap.parse_args()
@@ -60,6 +64,10 @@ def main():
     credreq.parse_config(cfg.get("credential_requests"))    # fail at startup, naming the field
     plans.parse_config(cfg.get("plans"))                    # fail at startup, naming the field
     sessions.parse_config(cfg.get("sessions"))              # fail at startup, naming the field
+    try:
+        wsprofiles.parse_dir_config(cfg)                    # ws_profiles_dir: fail at startup, naming the field
+    except ValueError as e:
+        raise SystemExit(f"config error: {e}") from None
     clients.parse_config(cfg)           # legacy_client_key, enrollment, clients: fail at startup, naming the field
     try:
         backend = build_backend(cfg)

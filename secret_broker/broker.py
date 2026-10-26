@@ -377,7 +377,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
     CATALOG_BG_TTL = 300        # discovery serves the cache and refreshes in the background
 
     @staticmethod
-    def _entry(item, meta):
+    def _entry(item, meta, profiles=None):
         """Validated in-memory secret entry from an item's broker metadata."""
         name = meta.get("name") or re.sub(r"[^a-z0-9_-]+", "-", item.lower()).strip("-")[:41]
         if not _NAME_RE.match(name or ""):
@@ -466,7 +466,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         if meta.get("ws") is not None:
             if ssh or not hosts:
                 raise ValueError("ws only applies to an http credential with allowed_hosts")
-            ws_cfg = ws_mod.parse_cred_config(meta["ws"], vars_)
+            ws_cfg = ws_mod.parse_cred_config(meta["ws"], vars_, profiles=profiles)
         entry = {**meta, "vars": vars_, "allowed_hosts": [h.lower() for h in hosts],
                  "_human": "created" not in meta,     # not made by a store / credential request
                  "approval": approval, "_item": item, "_meta": meta,
@@ -573,6 +573,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         """Rebuild the secret catalog from the vault's items. Raises if the vault
         cannot be read, leaving the previous catalog in place."""
         rows = self.backend.catalog()
+        profiles = self._reload_ws_profiles()       # profile files are re-read with every catalog refresh
         out, bad, owners, autos = {}, [], {}, []
         for row in rows:
             if row.get("auto") is not None:
@@ -583,7 +584,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             try:
                 if row["meta"] is None:
                     raise ValueError("broker metadata is not a JSON object")
-                name, entry = self._entry(row["item"], row["meta"])
+                name, entry = self._entry(row["item"], row["meta"], profiles=profiles)
                 self._guard_entry_hosts(name, entry)
                 out[name] = entry
                 owners.setdefault(name, []).append(row["item"])
@@ -602,7 +603,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         for row in autos:
             meta = self._auto_meta(row["item"], row["auto"])
             try:
-                name, entry = self._entry(row["item"], meta) if meta else (None, None)
+                name, entry = self._entry(row["item"], meta, profiles=profiles) if meta else (None, None)
                 if entry is not None:
                     self._guard_entry_hosts(name, entry)
             except ValueError as e:

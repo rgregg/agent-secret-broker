@@ -46,6 +46,7 @@ from . import httpcheck
 from . import masking
 from . import sessions as S
 from . import wsproto
+from . import wsprofiles
 
 DEFAULTS = {"enabled": True, "default_ttl_s": 900, "max_ttl_s": 3600, "max_frames": 1000, "max_bytes": 8 << 20,
             "max_frame_bytes": 1 << 20, "idle_s": 300, "max_per_client": 2,
@@ -72,12 +73,6 @@ _TARGET_RE = re.compile(r"^/[A-Za-z0-9\-._~!$&'()*+,;=:@/?%]{0,2040}\Z")
 _ORIGIN_RE = re.compile(r"^https?://[A-Za-z0-9.-]{1,253}(:[0-9]{1,5})?\Z")
 _PROTO_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,64}\Z")
 HANDSHAKE_KEYS = ("wait", "send", "expect")
-# A guardrail, not a complete list: the known commands that mint credentials or manage users and tokens.
-PRESET_DENY = {"home-assistant": [
-    "auth/long_lived_access_token", "auth/sign_path", "auth/delete_refresh_token",
-    "config/auth/create", "config/auth/update", "config/auth/delete",
-    "config/auth_provider/homeassistant/create", "config/auth_provider/homeassistant/admin_change_password",
-    "config/auth_provider/homeassistant/delete", "supervisor/api"]}
 MAX_STEPS = 8
 STEP_TIMEOUT_DEFAULT, STEP_TIMEOUT_MAX = 10.0, 30.0
 STEP_BYTES_DEFAULT, STEP_BYTES_MAX = 65536, 1 << 20
@@ -85,21 +80,19 @@ STEP_SKIP_MAX = 16
 HEADER_ALLOW = ("authorization", "sec-websocket-protocol", "origin")   # the only upgrade headers config may set
 _QKEY_RE = re.compile(r"^[A-Za-z0-9_.~-]{1,64}\Z")
 
-PRESETS = {
-    # Home Assistant: the server speaks first with auth_required, we answer with the token, it says auth_ok.
-    "home-assistant": [{"expect": {"type": "auth_required"}},
-                       {"send": {"type": "auth", "access_token": "{{VAR}}"}},
-                       {"expect": {"type": "auth_ok"}}],
-}
-
 REASON = "a WebSocket session always needs a human to approve it; always high"
-WARNING = ("The requesting agent asked for this session. If you approve, this client may send ANY text "
-           "frames it likes to the server below, authenticated with the stored credential, and read what "
-           "comes back, WITHOUT asking you again, until the time runs out or a cap is used. Nothing it "
-           "sends is filtered or reviewed, except message types the operator blocked for this credential. "
-           "Many servers let a signed-in client create NEW credentials (for example a long-lived access "
-           "token): anything it creates outlives this session, is not masked and is not revoked with it. The time limit is fixed from the moment you approve: it is never "
-           "extended or renewed. Revoke it any time on the Clients tab.")
+_W_HEAD = "The requesting agent asked for this session. If you approve, this client may send "
+_W_MID = (" to the server below, authenticated with the stored credential, and read what comes back, WITHOUT asking "
+          "you again, until the time runs out or a cap is used. ")
+_W_TAIL = ("Many servers let a signed-in client create NEW credentials (for example a long-lived access token): "
+           "anything it creates outlives this session, is not masked and is not revoked with it. The time limit is "
+           "fixed from the moment you approve: it is never extended or renewed. Revoke it any time on the Clients tab.")
+WARNING = (_W_HEAD + "ANY text frames it likes" + _W_MID
+           + "Nothing it sends is filtered or reviewed, except message types the operator blocked for this credential. "
+           + _W_TAIL)
+WARNING_RESTRICTED = (_W_HEAD + "text frames" + _W_MID
+                      + "Only the restrictions listed above are enforced (blocked or allowed message types, field "
+                      "rules); everything else it sends is relayed and not reviewed. " + _W_TAIL)
 
 # end reasons beyond sessions.ENDED's (registered below so the shared lookups keep working)
 S.ENDED.update({
@@ -164,14 +157,10 @@ def _check_placeholders(text, names):
 
 
 def _norm_steps(hs, names):
-    """The handshake setting -> a normalized list of steps. Three spellings: a preset name; {"steps": [...]};
+    """The handshake setting -> a normalized list of steps. Two spellings: {"steps": [...]};
     or the short {"wait": X, "send": Y, "expect": Z}. A step is {"send": Y} or {"expect": X, "timeout": s,
     "max_bytes": n, "skip": k} (`wait` is a synonym of `expect`)."""
-    if isinstance(hs, str):
-        if hs not in PRESETS:
-            raise ValueError("ws.handshake preset is not known (" + ", ".join(sorted(PRESETS)) + ")")
-        raw = PRESETS[hs]
-    elif isinstance(hs, dict) and set(hs) == {"steps"}:
+    if isinstance(hs, dict) and set(hs) == {"steps"}:
         raw = hs["steps"]
     elif isinstance(hs, dict) and hs and set(hs) <= set(HANDSHAKE_KEYS):
         raw = []
@@ -182,7 +171,7 @@ def _norm_steps(hs, names):
         if "expect" in hs:
             raw.append({"expect": hs["expect"]})
     else:
-        raise ValueError("ws.handshake must be a preset name, {\"steps\": [...]} or an object with wait, send, expect")
+        raise ValueError("ws.handshake must be a profile name, {\"steps\": [...]} or an object with wait, send, expect")
     if not isinstance(raw, list) or not 1 <= len(raw) <= MAX_STEPS:
         raise ValueError(f"ws.handshake has 1 to {MAX_STEPS} steps")
     try:
@@ -224,11 +213,31 @@ def _norm_steps(hs, names):
     return steps
 
 
-def parse_cred_config(raw, var_names):
+def _type_names(raw, field, hi, lo=0):
+    if (not isinstance(raw, list) or not lo <= len(raw) <= hi
+            or not all(isinstance(x, str) and 1 <= len(x) <= 128 for x in raw)):
+        raise ValueError(f"{field} is a list of {'at least %d, ' % lo if lo else ''}up to {hi} message type names")
+    return list(dict.fromkeys(raw))
+
+
+CRED_KEYS = ("handshake", "origin", "subprotocols", "query", "headers", "deny_send", "profile", "deny_send_extra",
+             "allow_send")
+
+
+def parse_cred_config(raw, var_names, profiles=None):
     """The credential's operator `ws` setting -> a normalized dict. ValueError (fixed text) on anything wrong,
     which makes the credential invalid in the catalog: it fails closed. A credential with no `ws` setting can
-    not open a WebSocket session at all. Never agent input. Options (all optional):
-        "handshake": a preset ("home-assistant"), {"steps": [...]} or {"wait": X, "send": Y, "expect": Z}.
+    not open a WebSocket session at all. Never agent input. `profiles` is the wsprofiles.Registry to resolve a
+    profile name in (default: the built-in profiles only). Options (all optional):
+        "profile": "home-assistant"   a named profile (built-in or the admin's own, see wsprofiles.py): it brings
+            the sign-in (handshake, query, headers, origin, subprotocols), the blocked message types, an optional
+            allow-list and field rules. `"handshake": "home-assistant"` (a text) is the older spelling of the same.
+            The credential may fill in a sign-in field the profile leaves out but not replace one it sets.
+        "deny_send_extra": ["x"]   more blocked types, added to the profile's
+        "allow_send": ["get_states"]   only these types may be sent: it can only NARROW the profile's list
+        "deny_send": []   the one explicit loosening: drops the profile's blocked types AND rules (not the allow-list).
+            With the older `"handshake": "NAME"` spelling a non-empty list REPLACES the profile's blocks, as it always did.
+        "handshake": {"steps": [...]} or {"wait": X, "send": Y, "expect": Z}
             send step:   {"send": JSON-or-text}      strings inside are filled ({{VAR}}); JSON is encoded
                          by the broker, so a value cannot break out of its string
             expect step: {"expect": X, "timeout": 10, "max_bytes": 65536, "skip": 0}
@@ -241,25 +250,77 @@ def parse_cred_config(raw, var_names):
         "headers": {"Authorization": "Bearer {{VAR}}"}   Authorization, Sec-WebSocket-Protocol and Origin only
         "origin": "https://app.example.com", "subprotocols": ["graphql-ws"]
         "deny_send": ["auth/long_lived_access_token"]   outgoing text frames whose JSON `type` is listed are refused;
-            with a list set, frames must be strict JSON (anything else is refused: fail closed). The home-assistant
-            preset blocks credential and user-management commands by default; `"deny_send": []` clears that.
+            with a list set, frames must be strict JSON (anything else is refused: fail closed).
     The broker owns Host, Upgrade, Connection and every Sec-WebSocket-Key/Version/Extensions header: they are
     never settable. `{{VAR}}` is the credential's only variable (with several, name one: `{{MY_TOKEN}}`)."""
     if not isinstance(raw, dict):
         raise ValueError("ws must be an object")
     for k in raw:
-        if k not in ("handshake", "origin", "subprotocols", "query", "headers", "deny_send"):
+        if k not in CRED_KEYS:
             raise ValueError(f"ws.{k} is not a known option")
+    hs = raw.get("handshake")
+    pname, legacy = raw.get("profile"), False
+    if isinstance(hs, str):
+        if pname is not None:
+            raise ValueError("ws.profile and a ws.handshake profile name are both set")
+        pname, legacy = hs, True
+    elif "profile" in raw and pname is None:
+        raise ValueError("ws.profile must be a profile name")
+    prof = None
+    if pname is not None:
+        try:
+            prof = (profiles if profiles is not None else wsprofiles.builtin_registry()).resolve(pname)
+        except ValueError as e:
+            if legacy and "is not known" in str(e):
+                raise ValueError("ws.handshake preset is not known") from None
+            raise
+    core = {}
+    for k in wsprofiles.SIGNIN_KEYS:
+        mine = None if (k == "handshake" and legacy) else raw.get(k)
+        theirs = prof[k] if prof and prof[k] not in (None, {}, []) else None
+        if mine is not None and theirs is not None:
+            raise ValueError(f"ws.{k} is set by profile {pname}: a credential can add a sign-in field the profile "
+                             "leaves out, not replace one")
+        if (mine if mine is not None else theirs) is not None:
+            core[k] = mine if mine is not None else theirs
+    out = _parse_signin(core, var_names)
+    deny = list(prof["deny_send"]) if prof else []
+    rules = [dict(r) for r in prof["rules"]] if prof else []
+    allow = list(prof["allow_send"]) if prof and prof["allow_send"] else None
+    overrides = []
+    if "deny_send" in raw:
+        ds = _type_names(raw["deny_send"], "ws.deny_send", 50)
+        if prof and not legacy and ds:
+            raise ValueError("with a profile, ws.deny_send can only be [] (clear); add blocks with ws.deny_send_extra")
+        if prof and (deny or rules):
+            overrides.append("deny_send_replaced" if ds else "deny_send_cleared")
+        deny, rules = ds, ([] if prof else rules)
+    if "deny_send_extra" in raw:
+        extra = _type_names(raw["deny_send_extra"], "ws.deny_send_extra", 50, lo=1)
+        deny = list(dict.fromkeys(deny + extra))
+        overrides.append("deny_send_extra")
+    if "allow_send" in raw:
+        al = _type_names(raw["allow_send"], "ws.allow_send", 100, lo=1)
+        if allow is not None and not set(al) <= set(allow):
+            raise ValueError("ws.allow_send can only narrow the profile's allow-list (it lists a type the profile does not allow)")
+        allow = al
+        overrides.append("allow_send")
+    out["deny_send"] = deny
+    if allow is not None:
+        out["allow_send"] = allow
+    if rules:
+        out["rules"] = rules
+    if prof:
+        out["profile"] = {"name": prof["name"], "source": prof["source"], "card_text": prof["card_text"],
+                          "overrides": overrides,
+                          "sha256": wsprofiles.content_hash({k: v for k, v in out.items() if k != "profile"})}
+    return out
+
+
+def _parse_signin(raw, var_names):
+    """handshake, query, headers, origin and subprotocols (the sign-in) -> the normalized dict (with empty deny_send)."""
     names = set(var_names)
     out = {"steps": None, "origin": None, "subprotocols": [], "query": {}, "headers": {}, "deny_send": []}
-    if "deny_send" in raw:
-        ds = raw["deny_send"]
-        if (not isinstance(ds, list) or len(ds) > 50
-                or not all(isinstance(x, str) and 1 <= len(x) <= 128 for x in ds)):
-            raise ValueError("ws.deny_send is a list of up to 50 message type names")
-        out["deny_send"] = list(dict.fromkeys(ds))
-    elif isinstance(raw.get("handshake"), str):
-        out["deny_send"] = list(PRESET_DENY.get(raw["handshake"], []))      # a preset's default; `deny_send: []` clears it
     if raw.get("handshake") is not None:
         out["steps"] = _norm_steps(raw["handshake"], names)
     q = raw.get("query")
@@ -444,14 +505,25 @@ def _jsonish(text):
 
 
 MAX_DENY_DEPTH = 16
+SEND_REFUSED = {"denied_type": "that message is blocked for this credential",
+                "rule_denied": "that message is blocked for this credential",
+                "not_allowed": "that message type is not allowed for this credential",
+                "not_json": "this credential accepts only JSON frames"}
 
 
-def deny_verdict(text, deny):
-    """None when an outgoing frame may go; else the refusal class. FAIL CLOSED: with a deny list set, a frame must
-    parse as strict JSON by Python's rules (no duplicate keys, no NaN/Infinity, nested at most 16 deep, no lone
-    surrogate, no BOM), because a frame the server's parser reads differently from ours must not slip past. The
-    `type` of the top-level object, or of every object in a top-level array, must be text and not denied, and as a
-    backstop no denied name may appear anywhere in the frame, raw or after decoding (case-insensitively)."""
+def deny_verdict(text, deny, allow=None, rules=()):
+    """None when an outgoing frame may go; else the refusal class: `not_json`, `denied_type`, `rule_denied` or
+    `not_allowed`. The ONE enforcement function for `deny_send`, `allow_send` and profile `rules`.
+
+    FAIL CLOSED: with anything set, a frame must parse as strict JSON by Python's rules (no duplicate keys, no
+    NaN/Infinity, nested at most 16 deep, no lone surrogate, no BOM), because a frame the server's parser reads
+    differently from ours must not slip past. For the top-level object, or every object in a top-level array:
+      * its `type`, if present, must be text, and not in `deny` (deny always wins);
+      * no rule of `rules` may match it (fields present with equal values, lists are any-of, exact and
+        case-insensitive values, a list where a scalar is expected counts as a match; see wsprofiles.rule_matches);
+      * with `allow` set, it must be an object whose `type` is text and in `allow`.
+    As backstops, no denied type may appear anywhere in the frame (raw or decoded, any case), and a rule whose
+    every string appears anywhere in the frame (raw or decoded, any case) counts as matched."""
     def pairs(items):
         d = {}
         for k, v in items:
@@ -484,9 +556,17 @@ def deny_verdict(text, deny):
         if isinstance(item, dict) and "type" in item:
             if not isinstance(item["type"], str) or item["type"] in deny:
                 return "denied_type"
-    hay = (text + "\n" + json.dumps(obj, ensure_ascii=False)).lower()
-    if any(d.lower() in hay for d in deny):
-        return "denied_type"
+    if deny or rules:
+        hay = (text + "\n" + json.dumps(obj, ensure_ascii=False)).lower()
+        if any(d.lower() in hay for d in deny):
+            return "denied_type"
+        for rule in rules:
+            if wsprofiles.rule_backstop(rule, hay) or any(wsprofiles.rule_matches(rule, it) for it in items):
+                return "rule_denied"
+    if allow is not None:
+        for item in items:
+            if not isinstance(item, dict) or not isinstance(item.get("type"), str) or item["type"] not in allow:
+                return "not_allowed"
     return None
 
 
@@ -494,7 +574,27 @@ def target_audit(sp):
     """What the human saw, for the operator-only audit events: the agent's path and query (clipped) and its hash.
     It holds nothing the credential adds (the secret is appended later, on the wire only)."""
     import hashlib as _h
-    return {"target_clip": sp["target"][:200], "target_sha256": _h.sha256(sp["target"].encode()).hexdigest()[:16]}
+    out = {"target_clip": sp["target"][:200], "target_sha256": _h.sha256(sp["target"].encode()).hexdigest()[:16]}
+    if sp.get("profile"):
+        out["profile"] = sp["profile"]
+    return out
+
+
+def limits_summary(wsc):
+    """What the card says about the outgoing-message limits: the profile's name, source and card text, and counts."""
+    prof = wsc.get("profile") or {}
+    return {"deny_n": len(wsc["deny_send"]), "rule_n": len(wsc.get("rules") or ()),
+            "allow_n": None if wsc.get("allow_send") is None else len(wsc["allow_send"]),
+            "profile": prof.get("name"), "profile_source": prof.get("source"),
+            "profile_text": prof.get("card_text"), "profile_overrides": list(prof.get("overrides") or ())}
+
+
+def limits_audit(wsc):
+    """Counts and the profile's identity (never rule or frame content) for the operator audit log."""
+    prof = wsc.get("profile") or {}
+    return {"deny_n": len(wsc["deny_send"]), "rule_n": len(wsc.get("rules") or ()),
+            "allow_n": None if wsc.get("allow_send") is None else len(wsc["allow_send"]),
+            "profile_source": prof.get("source"), "profile_sha256": (prof.get("sha256") or "")[:16] or None}
 
 
 def hostport(host, port):
@@ -509,13 +609,16 @@ class WsSession(S.Session):
 
     kind = "ws"
 
-    def __init__(self, sid, pid, client, cred, hp, ttl_s, caps, opened, approver, clock, conn, values, deny_send=()):
+    def __init__(self, sid, pid, client, cred, hp, ttl_s, caps, opened, approver, clock, conn, values, deny_send=(), allow_send=None, rules=()):
         super().__init__(sid, pid, client, cred, [hp], [], ttl_s, caps["max_frames"], opened, "", approver, clock)
         self.clock, self.caps, self.conn = clock, caps, conn
         self.masker = masking.get_masker(values)
         self.masker_lc = masking.get_masker([v.lower() for v in values if isinstance(v, str)])
         self.hold = ""                  # raw text held back: a possible start of a secret that continues in the next message
         self.deny_send = frozenset(deny_send)
+        self.allow_send = None if allow_send is None else frozenset(allow_send)
+        self.rules = tuple(rules)
+        self.profile = None             # the profile's name, for the audit log only
         self.recv_inflight = 0
         self.cond = threading.Condition(self.lock)
         self.queue, self.qbytes = deque(), 0
@@ -773,13 +876,42 @@ def describe_html(req):
             f"Server: {e(sp['scheme'])}://{e(sp['host'])}:{sp['port']}<br>"
             f"Path and query, as the agent wrote them (unverified): <code>{e(sp['target'])}</code><br>"
             f"Sign-in, set by the operator on this credential: {e(sp.get('signin', ''))}<br>"
-            f"Message types blocked by the operator: {sp.get('deny_n', 0)}<br>"
+            f"{limits_html(sp)}"
             f"Time limit: {e(S._fmt_ttl(sp['ttl_s']))} from the moment you approve (fixed, never extended)<br>"
             f"Caps: {sp['max_calls']} frames and {sp['max_bytes'] // 1024} KB in each direction, "
             f"one message at most {sp['max_frame_bytes'] // 1024} KB, closed after {sp['idle_s']} s idle<br>"
             "The broker signs in with the credential; the agent never sees it. Text the server sends back is "
             "masked if it contains the credential; binary frames are never shown to the agent.")
-    return what, WARNING
+    return what, warning_for(sp)
+
+
+def limits_html(sp):
+    """The card lines about what the operator restricts: the profile's name and its fixed sentence (escaped; it is
+    plain text from a file the operator controls, never markup), then the counts."""
+    e = html.escape
+    lines = []
+    if sp.get("profile"):
+        lines.append(f"Profile: <b>{e(str(sp['profile']))}</b> ({e(str(sp.get('profile_source') or ''))}): "
+                     f"{e(str(sp.get('profile_text') or ''))}<br>")
+        if sp.get("profile_overrides"):
+            lines.append("Changed for this credential by the operator: "
+                         + e(", ".join(str(x).replace("_", " ") for x in sp["profile_overrides"])) + "<br>")
+    bits = [f"Message types blocked by the operator: {int(sp.get('deny_n') or 0)}"]
+    if sp.get("rule_n"):
+        bits.append(f"{int(sp['rule_n'])} field rule(s)")
+    if sp.get("allow_n") is not None:
+        bits.append(f"allow-list: only {int(sp['allow_n'])} message type(s) may be sent")
+    lines.append("; ".join(bits) + "<br>")
+    return "".join(lines)
+
+
+def warning_for(sp):
+    """The approval card's warning. 'Nothing is filtered' is only said when it is true; with a profile that
+    restricts what may be sent, the card says that restrictions apply and that the rest is relayed unreviewed."""
+    restricted = bool(sp.get("deny_n") or sp.get("rule_n") or sp.get("allow_n") is not None)
+    if restricted:
+        return WARNING_RESTRICTED
+    return WARNING.replace(", except message types the operator blocked for this credential", "")
 
 
 def actions_html(broker, req):
@@ -804,7 +936,31 @@ class WsMixin:
 
     def _init_ws(self, config):
         self.ws_cfg = parse_config(config.get("ws_sessions"))
+        self._ws_profiles_dir = wsprofiles.parse_dir_config(config, audit_path=self._audit._path)
+        self.ws_profiles = wsprofiles.build_registry(self._ws_profiles_dir)
+        self._ws_profiles_sig = None
+        self._ws_profiles_lock = threading.Lock()
         self.ws_ssl_context = self._default_ws_ssl_context      # a test may replace it
+
+    def _reload_ws_profiles(self):
+        """Re-read the profile files (a catalog refresh calls this, so an edit is seen within the catalog TTL and a
+        session approved under the old file ends: the credential's signature covers the effective profile).
+        Logs `ws_profile_invalid` (name only), `ws_profile_dir_invalid` and `ws_profile_override` once per change."""
+        reg = wsprofiles.build_registry(self._ws_profiles_dir)
+        bad = reg.invalid_names()
+        sig = json.dumps([bad, reg.overridden(), reg.dir_error.label if reg.dir_error else None,
+                          sorted((n, wsprofiles.content_hash(p)[:16]) for n, p in reg.admin.items())])
+        with self._ws_profiles_lock:
+            self.ws_profiles = reg
+            changed, self._ws_profiles_sig = sig != self._ws_profiles_sig, sig
+        if changed:
+            if reg.dir_error is not None:
+                self.log("ws_profile_dir_invalid", reason=reg.dir_error.label)
+            for n in bad:
+                self.log("ws_profile_invalid", profile=n[:wsprofiles.MAX_NAME], source=reg.status(n)[1])
+            for n in reg.overridden():
+                self.log("ws_profile_override", profile=n, winner="admin", replaced="built-in")
+        return reg
 
     @staticmethod
     def _default_ws_ssl_context(tls):
@@ -859,7 +1015,7 @@ class WsMixin:
                      "hosts": [hostport(host, port)], "methods": [], "ttl_s": ttl, "max_calls": frames,
                      "purpose": "", "max_bytes": cfg["max_bytes"], "max_frame_bytes": cfg["max_frame_bytes"],
                      "idle_s": cfg["idle_s"], "signin": signin_summary(sc["_ws"]),
-                     "deny_n": len(sc["_ws"]["deny_send"]), "sig": self._ws_sig(sc)})
+                     "sig": self._ws_sig(sc), **limits_summary(sc["_ws"])})
 
     def _ws_count(self, cid):
         self.sweep_sessions()
@@ -940,14 +1096,16 @@ class WsMixin:
                 sid = secrets.token_urlsafe(24)
             s = WsSession(sid, sid[:8], req.client, name, hostport(host, port), ttl, caps, now, who.get("approver"),
                           lambda: self.sessions_clock(), conn,
-                          list(env.values()) + list(self.dest_guard.mask_values), wsc["deny_send"])
+                          list(env.values()) + list(self.dest_guard.mask_values), wsc["deny_send"], wsc.get("allow_send"),
+                          wsc.get("rules") or ())
             s.sig = sp.get("sig")
+            s.profile = (wsc.get("profile") or {}).get("name")
             self._sess[self._skey(sid)] = s
         s.start()
         self.audit("ws_session_opened", req, session=s.pid, host=hostport(host, port), ttl_s=ttl, max_frames=frames,
                    max_bytes=caps["max_bytes"], max_frame_bytes=caps["max_frame"], idle_s=caps["idle_s"],
                    tls=sp["scheme"] == "wss", handshake=bool(wsc["steps"]), signin=signin_summary(wsc),
-                   **target_audit(sp), expires_at=int(clock_mod.now() + ttl),
+                   **limits_audit(wsc), **target_audit(sp), expires_at=int(clock_mod.now() + ttl),
                    shortened=(ttl, frames) != (sp["ttl_s"], sp["max_calls"]))
         return {"session": {"id": sid, "kind": "ws", "expires_in": ttl, "hosts": [hostport(host, port)], "methods": [],
                             "max_calls": frames, "max_frames": frames, "max_bytes": caps["max_bytes"],
@@ -1034,12 +1192,10 @@ class WsMixin:
         if len(data) > s.caps["max_frame"]:
             self._refuse(client, s, "frame_size", f"a frame is limited to {s.caps['max_frame'] // 1024} KB",
                          _event="ws_session_refused")
-        if s.deny_send:
-            why = deny_verdict(text, s.deny_send)
+        if s.deny_send or s.allow_send is not None or s.rules:
+            why = deny_verdict(text, s.deny_send, s.allow_send, s.rules)
             if why:
-                self._refuse(client, s, why, "that message is blocked for this credential"
-                             if why == "denied_type" else "this credential accepts only JSON frames",
-                             _event="ws_session_refused")
+                self._refuse(client, s, why, SEND_REFUSED[why], _event="ws_session_refused", profile=s.profile)
         with s.lock:
             if s.dead:
                 raise S.SessionError(*S.ENDED[s.end_reason if s.end_reason in S.ENDED else "unknown"])
@@ -1112,3 +1268,10 @@ class WsMixin:
         return {"frames_in": s.conn.frames_in, "frames_out": s.frames_out, "bytes_in": s.conn.bytes_in,
                 "bytes_out": s.bytes_out, "messages_in": s.msgs_in, "close_reason": s.finished,
                 "host": s.hosts[0]}
+
+
+# Back-compat views of the built-in profiles (the files in secret_broker/ws_profiles are the source of truth):
+# the handshake steps and the default deny list a `"handshake": "NAME"` preset spelling used to carry.
+PRESETS = {n: (p["handshake"].get("steps") if set(p["handshake"]) == {"steps"} else None)
+           for n, p in wsprofiles.builtin()[0].items() if p["handshake"]}
+PRESET_DENY = {n: list(p["deny_send"]) for n, p in wsprofiles.builtin()[0].items() if p["deny_send"]}
