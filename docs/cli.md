@@ -257,10 +257,32 @@ shown (a note with the length goes to stderr); `recv` says when the broker pause
     printf '%s\n' '{"id":2,"type":"get_config"}' | asb ws $ID --linger 2
     asb ws close $ID
 
+The operator may restrict a credential with a **profile** (blocked or allowed message types, field rules). A refused message
+says "blocked for this credential" or "not allowed for this credential", never reaches the server, and is not a prompt: do not
+work around it, ask the human. Which profile applies is the operator's choice and is shown on the approval card.
+
 Exit codes: 0 ok, 2 usage, 3 refused (credential not set up for WebSocket, host not allowed, too many sessions, connect or sign-in
 failed), 4 denied, 5 unanswered, 7 ended (expired, closed, revoked, idle, the server closed the connection, unknown), 8
 refused (frame or byte cap, oversize frame, rate limit). Details, the operator `ws` setting (handshake steps, query and
 header sign-in), limits and the threat model: [reference.md](reference.md#websocket-sessions-the-broker-holds-the-connection).
+
+### Admin: WebSocket profiles
+
+For the broker's operator, not for agents. Runs on the broker host, stdlib only, no network; it reads and writes profile files
+only. Profiles are JSON files (built in, or the operator's own in `ws_profiles_dir`) that a credential selects with
+`"ws": {"profile": "NAME"}`; the format, rules and built-ins are in
+[reference.md](reference.md#profiles).
+
+    python -m secret_broker ws-profile validate FILE...          # exit 0 all valid, 1 any invalid, 2 usage
+    python -m secret_broker ws-profile new NAME [--from BUILTIN] [--dir DIR]   # write a starter; never overwrites
+    python -m secret_broker ws-profile list [--dir DIR]          # built-in and admin profiles, which overrides which
+    python -m secret_broker ws-profile show NAME [--dir DIR]     # the effective JSON, then its risk notes
+
+`DIR` defaults to `ws_profiles_dir` from the broker settings (`--config FILE` and/or `BROKER_CONFIG`, as for the broker), else
+`ws-profiles/` next to `audit_log`. `validate` prints one line per file (`ok PATH: NAME` or `INVALID PATH: reason` naming the field,
+with fixed text, never the file's content). `new` writes mode 0644, refuses to overwrite and rejects names that are not kebab-case;
+`new NAME --from home-assistant` starts from a built-in (a file with a built-in's own name replaces it for every credential).
+`list` exits 1 when any profile is invalid. `show` exits 1 for an unknown or invalid name.
 
 ### Exit codes
 

@@ -42,6 +42,9 @@ push notification or the dashboard.
 - **WebSocket services too.** `asb ws` has the broker hold a `ws://`/`wss://` connection and sign in itself (a
   per-credential handshake set by the operator), so the token never reaches the agent; one always-high approval,
   fixed deadline, frame and byte caps ([docs](docs/reference.md#websocket-sessions-the-broker-holds-the-connection)).
+  Per-service **profiles** (small JSON files, built in or minted locally with `python -m secret_broker ws-profile new`) bundle the
+  sign-in with what may be sent: blocked or allowed message types and field-level rules
+  ([docs](docs/reference.md#profiles)).
 - **Every use is approved or explicitly allow-listed**, rated by a risk model, and
   written to a hash-chained audit log.
 

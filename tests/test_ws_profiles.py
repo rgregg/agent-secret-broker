@@ -95,6 +95,26 @@ class Builtins(unittest.TestCase):
         self.assertTrue(p["handshake"])
 
 
+class Docs(unittest.TestCase):
+    def test_the_example_profile_in_the_reference_is_valid_and_behaves(self):
+        import re
+        text = open(os.path.join(os.path.dirname(__file__), "..", "docs", "reference.md")).read()
+        m = re.search(r"\n    (\{\n      \"name\": \"chat-gateway\".*?\n    \})\n", text, re.S)
+        self.assertTrue(m)
+        prof = P.parse_profile(json.loads("\n".join(ln[4:] for ln in ("    " + m.group(1)).splitlines())), "chat-gateway")
+        self.assertEqual(W.deny_verdict('{"type": "post", "channel": "general"}', frozenset(prof["deny_send"]),
+                                        frozenset(prof["allow_send"]), prof["rules"]), None)
+        self.assertEqual(W.deny_verdict('{"type": "post", "channel": "admin"}', frozenset(), frozenset(prof["allow_send"]),
+                                        prof["rules"]), "rule_denied")
+        self.assertEqual(W.deny_verdict('{"type": "delete"}', frozenset(), frozenset(prof["allow_send"]), prof["rules"]),
+                         "not_allowed")
+
+    def test_the_builtin_table_in_the_reference_matches_the_files(self):
+        text = open(os.path.join(os.path.dirname(__file__), "..", "docs", "reference.md")).read()
+        for t in P.builtin()[0]["home-assistant-readonly"]["allow_send"]:
+            self.assertIn("`" + t + "`", text, t)
+
+
 # ------------------------------------------------------------------------------- schema
 class Schema(unittest.TestCase):
     def ok(self, **over):

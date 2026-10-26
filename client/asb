@@ -151,11 +151,13 @@ WebSocket sessions (a service that speaks WebSocket, e.g. Home Assistant's /api/
     asb ws recv ID --wait 5                           frames from the server, one per line (waits up to 25 s)
     printf '%s\\n' '{"id":2,"type":"ping"}' | asb ws ID   line pipe: each stdin line is a frame, replies on stdout
     asb ws close ID
-  What you send is not filtered, with one exception: the operator may block message types for a credential (the
-  Home Assistant preset blocks creating or deleting tokens, users and auth providers, signed paths and the
-  supervisor API). A blocked message is refused ("that message is blocked for this credential") and never reaches
-  the server; such a credential accepts only strict JSON frames. Do not try to work around a block (other
-  spellings, wrapping, splitting): ask the human instead. Even when nothing is blocked, the session was what the
+  What you send is not filtered, with one exception: the operator may restrict a credential with a profile. It can
+  block message types (the Home Assistant profiles block creating or deleting tokens, users and auth providers,
+  signed paths and the supervisor API), block calls by field (such as call_service for shell commands), or allow
+  only a fixed list of message types (the read-only profile). A refused message ("that message is blocked for this
+  credential" or "... is not allowed for this credential") never reaches the server; such a credential accepts only
+  strict JSON frames. Do not try to work around a refusal (other spellings, wrapping, splitting): ask the human
+  instead, who can choose a different profile. Even when nothing is restricted, the session was what the
   human approved, so send only what the task needs, and never use it to create new credentials or tokens on the
   server. Frames you receive have the credential masked; binary frames are not shown (a note with
   the length goes to stderr). `recv` prints a note when the broker had to pause reading because you were

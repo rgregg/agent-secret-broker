@@ -2388,11 +2388,14 @@ any port, `host:port` exactly that port). TLS follows the credential's `tls_fing
 the certificate and name are verified, with SNI set to the original host name.
 
     "ws": {
-      "handshake": "home-assistant",                    // a preset, or {"steps": [...]}, or {"wait": X, "send": Y, "expect": Z}
+      "profile": "home-assistant",                      // a named profile (see Profiles) that brings the items below
+      "handshake": {"steps": [...]},                    // or write them here: {"steps": [...]}, or {"wait": X, "send": Y, "expect": Z}
       "query":   {"access_token": "{{VAR}}"},            // optional: added to the upgrade URL query, URL-encoded
       "headers": {"Authorization": "Bearer {{VAR}}"},    // optional: Authorization, Sec-WebSocket-Protocol, Origin only
       "origin": "https://app.example.com",               // optional: no Origin is sent unless configured
-      "subprotocols": ["graphql-ws"]                     // optional: offered, at most one may be chosen by the server
+      "subprotocols": ["graphql-ws"],                    // optional: offered, at most one may be chosen by the server
+      "deny_send_extra": ["config/x"],                   // optional, with a profile: more blocked types
+      "allow_send": ["get_states", "ping"]               // optional: only these types; can only narrow a profile's list
     }
 
 * **Steps** are an ordered list (at most 8) evaluated in the broker. `{"send": Y}` sends one text frame: Y is a JSON
@@ -2408,8 +2411,8 @@ the certificate and name are verified, with SNI set to the original host name.
   Token in the URL: `{"query": {"access_token": "{{VAR}}"}}`. Token in a header: `{"headers": {"Authorization": "Bearer {{VAR}}"}}`.
 * A **text** `send` step (not an object) is sent with the placeholder replaced verbatim and is NOT JSON-escaped: a value with
   a quote or a backslash would break the message. Prefer an object template, which the broker encodes.
-* The preset `home-assistant` is `expect {"type":"auth_required"}`, `send {"type":"auth","access_token":"{{VAR}}"}`,
-  `expect {"type":"auth_ok"}`.
+* The profile `home-assistant` signs in with `expect {"type":"auth_required"}`, `send {"type":"auth","access_token":"{{VAR}}"}`,
+  `expect {"type":"auth_ok"}`. The older spelling `"handshake": "home-assistant"` (a text) still works and means the profile of that name.
 * `{{VAR}}` is the credential's only variable (a credential with several names the one it means). A placeholder is allowed
   only in a `send` step, the `query` values and the `headers` values. The broker owns `Host`, `Upgrade`, `Connection` and
   every `Sec-WebSocket-Key/Version/Extensions/Accept` header: they are never settable, and `headers` takes only the three
@@ -2417,6 +2420,113 @@ the certificate and name are verified, with SNI set to the original host name.
   the credential's `query` owns (compared percent-decoded, `+` as space, case-folded; a `;` in the agent's query is refused), and
   the credential's parameters are placed before the agent's.
 * A bad `ws` setting makes the credential invalid in the catalog (reported like any other bad metadata).
+
+### Profiles
+
+A **profile** is a named JSON file that bundles what a service needs: the sign-in, what the broker blocks or allows on the way
+out, and one sentence for the approval card. Profiles are admin input only: a credential selects one with `"ws": {"profile":
+"NAME"}` in its operator metadata, and nothing an agent sends (a session request, a credential request, `store`) can name,
+select or write one. Code: `secret_broker/wsprofiles.py`; enforcement is `wssessions.deny_verdict`, the one function for
+`deny_send`, `allow_send` and `rules`.
+
+**Where they live.** Built in: `secret_broker/ws_profiles/*.json`, shipped with the package. Admin: `*.json` files in the directory
+named by the config key `ws_profiles_dir` (default: `ws-profiles/` next to the audit log), same format, read at startup and on
+every catalog refresh (so an edit is seen within a minute while a session is open, and at the next request otherwise). An admin
+profile with the **same name as a built-in one replaces it** (`ws_profile_override` is logged with the winner). Nothing else is
+read: the directory is not searched recursively, only `NAME.json` files whose name is kebab-case count.
+
+**Format.** Unknown keys are refused. All text is printable ASCII.
+
+| Field | Required | Meaning |
+|---|---|---|
+| `name` | yes | kebab-case (`a-z`, `0-9`, single hyphens, up to 64); must equal the file stem (`name.json`) |
+| `description` | yes | one line (up to 200 characters) for `ws-profile list` |
+| `card_text` | yes | one short fixed sentence (up to 200 characters) shown on the approval card; plain text, escaped when rendered, never markup |
+| `handshake` | no | `{"steps": [...]}` or `{"wait": X, "send": Y, "expect": Z}`, exactly as in the credential `ws` setting above; `{{VAR}}` is the only placeholder, and only in `send` steps (also `query` and `headers`); the credential must have exactly one variable |
+| `query`, `headers`, `origin`, `subprotocols` | no | same rules as the credential `ws` setting |
+| `deny_send` | no | up to 50 exact JSON `type` values to refuse (the fail-closed semantics below) |
+| `allow_send` | no | 1 to 100 exact `type` values; when set, **every** outgoing frame must be strict JSON whose `type` is in the list |
+| `rules` | no | up to 50 field-level rules, see below |
+| `risk_notes` | no | up to 10 short lines for these docs and `ws-profile show`; never shown on a card or to an agent |
+
+Limits: a file is at most 64 KiB and strict UTF-8 JSON (no byte order mark, no duplicate keys, no `NaN`/`Infinity`, no lone
+surrogate, nested at most 12 deep); the directory holds at most 100 profile files; files must be regular files that are not
+world-writable and are opened without following symlinks (a link, a FIFO or a directory named `x.json` is invalid, so a link cannot
+pull in a file from elsewhere); a world-writable or unreadable directory makes every profile invalid.
+
+**Rules.** `{"match": {...}, "action": "deny", "reason": "why"}`. `action` is `"deny"` (the only action; it may be left out) and
+`reason` is for the operator. `match` is an object of 1 to 8 fields, nested at most 3 deep. A frame (the top-level object, or each
+object of a top-level array) matches when every listed field is present with an equal value: a **list** is any-of, an object
+matches as a subset, there are no regular expressions, and strings compare exactly and case-sensitively. Values are text, whole
+numbers or `true`/`false`. Because a deny rule must not be dodged by a server that coerces types, scalars are compared by their
+text form: a rule value `1` matches the frame's `1`, `1.0`, `1e0` and `"1"`, and `true` matches `true` and `"true"` (but `1` never
+matches `true`). Rules on numbers and booleans are therefore best effort: prefer matching on text fields. Examples:
+
+    {"match": {"type": "call_service", "domain": "shell_command"}, "action": "deny", "reason": "runs shell commands"}
+    {"match": {"type": "call_service", "domain": "homeassistant", "service": ["stop", "restart"]}, "action": "deny"}
+
+**How an outgoing frame is judged.** With anything of `deny_send`, `allow_send` or `rules` set, a frame must parse as strict JSON by
+Python's rules (no duplicate keys, no `NaN`/`Infinity`, no lone surrogate, no byte order mark, nesting at most 16 deep, nothing after
+the value); anything else is refused (`not_json`): a frame that the server's parser might read differently must not get past.
+Then, for the object or each object of a top-level array, in this order: a `type` that is not text, or a denied one: `denied_type`;
+a rule that matches: `rule_denied`; with `allow_send`, anything that is not an object with a text `type` in the list:
+`not_allowed`. **Deny wins**: a type in both `deny_send` and `allow_send` is refused. Two backstops catch a parser difference
+(case, escapes, wrong nesting): no denied type may appear anywhere in the frame (raw or decoded, any case); and a rule whose
+**every** string (its `type`, `domain`, ...) appears anywhere in the frame (raw or decoded, any case) counts as matched, as long as
+the rule has no number or `true`/`false` in it (a rule with one is judged by the structural match alone). The refusal answer to the
+agent is a fixed text; the audit log records the class (`denied_type`, `rule_denied`, `not_allowed`, `not_json`) and the profile
+name, never the frame, the rule or its reason. A refusal is not a prompt: it never reaches the server and cannot be approved.
+
+**Built-in profiles.**
+
+| Name | Blocks | Allows |
+|---|---|---|
+| `home-assistant` | the 10 credential and user-management types of the old preset (`auth/long_lived_access_token`, `auth/sign_path`, `auth/delete_refresh_token`, `config/auth/create|update|delete`, `config/auth_provider/homeassistant/create|admin_change_password|delete`, `supervisor/api`) plus rules refusing `call_service` for the domains `shell_command`, `python_script`, `hassio`, and `homeassistant` `stop`/`restart` | everything else (JSON only) |
+| `home-assistant-readonly` | the same 10 types (defence in depth; deny wins) | only these `type`s: `get_states`, `get_config`, `get_services`, `get_panels`, `subscribe_events`, `unsubscribe_events`, `subscribe_entities`, `ping`, `config/entity_registry/list`, `config/entity_registry/get`, `config/entity_registry/list_for_display`, `config/device_registry/list`, `config/area_registry/list`, `config/floor_registry/list`, `config/label_registry/list`, `lovelace/config`, `lovelace/resources`, `auth/current_user`, `render_template`, `system_log/list` |
+| `home-assistant-admin` | nothing: sign-in only; the card says UNRESTRICTED | everything (any text, not only JSON) |
+
+`home-assistant` is a guardrail, not a sandbox: `execute_script`, `fire_event` and automations can reach services the rules do not
+see (`ws-profile show home-assistant` lists these notes). Use `home-assistant-readonly` when the client only needs to look.
+
+**Per-credential overrides.** Next to `"profile"`, a credential's `ws` may carry: `deny_send_extra` (a list, added to the profile's
+blocks); `allow_send` (a list that **can only narrow**: every entry must already be in the profile's list, or, when the profile has
+none, it adds one); and the one explicit loosening, **`"deny_send": []`**, which drops the profile's blocked types **and rules**
+(not its allow-list) and still works as it always did. With a profile, a non-empty `deny_send` is refused (use `deny_send_extra`);
+with the older `"handshake": "NAME"` spelling a non-empty `deny_send` still replaces the profile's blocks, as before. A credential
+may fill in a sign-in field the profile leaves out (for example `origin`) but not replace one the profile sets. The card says when
+the operator changed anything for a credential.
+
+**Failing closed.** An invalid profile file (or a name that does not exist) makes the credentials that use it invalid in the catalog
+with an error that names the profile, never its content (`ws profile 'x' is invalid`); the broker still starts and logs
+`ws_profile_invalid` (name and source only). An invalid admin file shadows a built-in of the same name: a broken override never falls
+back to the looser built-in. A profile directory that cannot be read at all (`ws_profile_dir_invalid`) invalidates every profile.
+
+**Binding.** The credential's fingerprint (`_ws_sig`) covers the effective profile after overrides (sign-in, blocks, allow-list, rules,
+card text, and its content hash). A change to a profile file therefore ends live sessions on the next catalog refresh (as revoked) and an
+open request approved before the change is refused ("the credential changed since the session was approved"), as for any other change.
+
+**Minting a profile.** On the broker host, with no network and no broker running (`python -m secret_broker ws-profile`, see
+[cli.md](cli.md#admin-websocket-profiles)):
+
+    python -m secret_broker ws-profile new my-service                     # a starter in ws_profiles_dir
+    python -m secret_broker ws-profile new my-ha --from home-assistant    # start from a built-in
+    $EDITOR ws-profiles/my-service.json
+    python -m secret_broker ws-profile validate ws-profiles/my-service.json
+    python -m secret_broker ws-profile show my-service
+
+then set `"ws": {"profile": "my-service"}` on the credential. Example, a chat gateway that signs in client-first and must not be
+used to delete anything:
+
+    {
+      "name": "chat-gateway",
+      "description": "Chat gateway: post and read, no deletes or admin.",
+      "handshake": {"steps": [{"send": {"op": "login", "key": "{{VAR}}"}}, {"expect": {"ok": true}, "timeout": 5}]},
+      "allow_send": ["post", "read", "ping"],
+      "rules": [{"match": {"type": "post", "channel": ["admin", "announcements"]}, "action": "deny",
+                 "reason": "read-only channels"}],
+      "card_text": "Chat gateway: the client may post and read messages, except in the admin and announcements channels.",
+      "risk_notes": ["Anything posted is public to the workspace."]
+    }
 
 **Relay.** `asb ws send ID TEXT`, `asb ws recv ID [--wait S] [--max N]`, `asb ws close ID`, and `asb ws ID` as a
 line-oriented stdin/stdout relay (each stdin line is one text frame; each received text frame is one output line, with
@@ -2430,6 +2540,8 @@ named literally `send`, `recv` or `close` cannot be opened with the shell form. 
 "expires_in","frames_left"}`; close uses `{"mode":"session_close"}`. Text frames only go out; binary frames are never shown
 (a marker with the length). Fragmented messages are reassembled; pings are answered by the broker; a close frame ends the session
 once the queued frames are read.
+
+**Config.** `ws_profiles_dir` (a path; default `ws-profiles/` next to `audit_log`; validated at startup) is the admin profile directory.
 
 **Limits** (config `"ws_sessions"`, validated at startup with hard ceilings; defaults in parentheses): `enabled` (true),
 `default_ttl_s` (900), `max_ttl_s` (3600, at most 1 h), `max_frames` (1000, each direction), `max_bytes` (8 MiB, each
@@ -2473,7 +2585,7 @@ dns | timeout | handshake refused | frame too large)`), never exception or serve
 
 **Catalog freshness and binding.** While any session exists the sweeper re-reads the vault catalog at most once a minute (shared by HTTP and WebSocket
 sessions), so a credential disabled, narrowed or stripped of its `ws` setting in the vault ends an idle session within about a minute. A WebSocket session is bound
-to a fingerprint of its credential's variables, TLS policy and `ws` setting taken when the card was made: a change before the open refuses it, a change after ends
+to a fingerprint of its credential's variables, TLS policy and `ws` setting (including the effective profile read from its file) taken when the card was made: a change before the open refuses it, a change after ends
 the session (as revoked). The client and the scope are checked again under the session lock right before the session is created (the handshake runs unlocked),
 and status reads go through the same check. Open sessions are counted per kind against their own caps (`sessions.max_per_client` for http,
 `ws_sessions.max_per_client` for WebSocket, pending requests included), with the global limit of 20 across both.
@@ -2484,8 +2596,8 @@ when the server closes or the connection fails, and at a broker restart. The age
 made-up id, an HTTP session id and a revoked client all get the same `404 session_unknown` answer.
 
 **Audit.** `ws_session_requested`, `ws_session_opened` (client, `host:port`, ttl, caps, `tls`, whether a handshake ran, a fixed-vocabulary
-`signin` summary), `ws_session_refused` (coalesced like `session_refused`; reason class such as `frames_cap`, `bytes_cap`,
-`frame_size`, `rate`, `open_connection`, `open_handshake_refused`), `ws_session_closed` (`reason`: closed, expired, revoked, idle, peer_closed,
+`signin` summary; the profile name, source and a hash prefix, and the counts of blocked types, rules and allowed types), `ws_session_refused` (coalesced like `session_refused`; reason class such as `frames_cap`, `bytes_cap`,
+`frame_size`, `rate`, `open_connection`, `open_handshake_refused`, and for a profile `denied_type`, `rule_denied`, `not_allowed`, `not_json`, with the profile name), `ws_session_closed` (`reason`: closed, expired, revoked, idle, peer_closed,
 ws_error; `frames_in/out`, `bytes_in/out`, `messages_in`, `close_reason`, `host`). **Counts and byte totals only, never frame
 contents.** Only the first 8 characters of the id are logged. The agent's audit view shows its own ws events through the
 same deny-by-default whitelist.
@@ -2493,15 +2605,14 @@ same deny-by-default whitelist.
 **Threat model.** An approved session lets the client send anything to that server as the credential until the deadline: size
 it by the card. **That includes commands that create new credentials on the server** (Home Assistant's
 `auth/long_lived_access_token` and `auth/sign_path`, for example): what the server returns is a new secret the masker has
-never seen, and it outlives the session and its revocation. The card says so. The operator can block message types per
-credential with `ws.deny_send` (a list of exact JSON `type` values; matching outgoing frames are refused with a fixed error,
-non-JSON frames are refused too, so a credential with `deny_send` set accepts JSON frames only); the `home-assistant` preset blocks the known credential and user-management commands by default (`auth/long_lived_access_token`, `auth/sign_path`,
-`auth/delete_refresh_token`, `config/auth/create|update|delete`, `config/auth_provider/homeassistant/create|admin_change_password|delete`, `supervisor/api`)
-and `"deny_send": []` clears that. The list is a guardrail, not a complete list. This is a
-blocklist for known dangerous commands, not a filter: everything else is relayed. It fails closed: with a deny list set, a frame must parse as strict JSON
-(no duplicate keys, no NaN/Infinity, nesting at most 16, no lone surrogate, no BOM), the `type` of the object (or of each object in a top-level array)
-must be text and not denied, and no denied name may appear anywhere in the frame (raw or decoded, any case), so a parser difference with the server cannot
-smuggle one through. A prompt-injected agent can spend the
+never seen, and it outlives the session and its revocation. The card says so. The operator restricts what a credential may send with a **profile** (see "Profiles"): blocked
+message types (`deny_send`; the `home-assistant` profile blocks the known credential and user-management commands:
+`auth/long_lived_access_token`, `auth/sign_path`, `auth/delete_refresh_token`, `config/auth/create|update|delete`,
+`config/auth_provider/homeassistant/create|admin_change_password|delete`, `supervisor/api`), an allow-list, and field rules such as
+no `call_service` for `shell_command`. `"deny_send": []` clears the blocks. The built-in blocklists are guardrails, not complete lists:
+everything not blocked is relayed unless an allow-list is set. Enforcement fails closed: with any of them set, a frame must parse as
+strict JSON (no duplicate keys, no NaN/Infinity, nesting at most 16, no lone surrogate, no BOM), the `type` of the object (or of each object in a
+top-level array) must be text and not denied, and the backstops described above catch a parser difference with the server. A prompt-injected agent can spend the
 session but cannot extend it, reach another host, read the configured token from a frame, or turn a refusal into a prompt. A hostile server can send frames up to the caps, pause the reader only by flow control,
 and hold a slow frame for 30 s; it cannot make the broker dial elsewhere (no redirects, one pinned connection).
 
