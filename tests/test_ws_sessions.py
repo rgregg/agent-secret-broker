@@ -1476,3 +1476,81 @@ class Cli(ts.CliBase, WsBase):
         rc, out, err = self.run_cli("help", "ws")
         self.assertIn("asb ws NAME URL", out)
         self.assertNotIn(TOKEN, out)
+
+
+class Recheck(WsBase):
+    """A session is re-validated against the live catalog on every use and by the sweeper."""
+
+    def ended(self, sid):
+        self.assertTrue(self.stub.eof[0].wait(5))
+        code, r = self.wrecv(sid, wait=0)
+        self.assertEqual((code, r["code"]), (410, "session_expired"))
+        self.assertIn("revoked", r["error"])
+        self.assertEqual(self.events("ws_session_closed")[0]["reason"], "revoked")
+
+    def check(self, change):
+        sid = self.wopen()
+        change()
+        code, text = self.wsend(sid, "x")
+        self.assertEqual((code, json.loads(text)["code"]), (410, "session_expired"))
+        self.ended(sid)
+
+    def test_credential_removed(self):
+        self.check(lambda: self.broker.cfg["secrets"].pop("ha"))
+
+    def test_host_removed(self):
+        self.check(lambda: self.broker.cfg["secrets"]["ha"].update(allowed_hosts=["other.example.com"]))
+
+    def test_no_hosts_left_env_only(self):
+        self.check(lambda: self.broker.cfg["secrets"]["ha"].update(allowed_hosts=[]))
+
+    def test_turned_into_an_ssh_key(self):
+        self.check(lambda: self.broker.cfg["secrets"]["ha"].update(ssh=True))
+
+    def test_ws_setting_removed(self):
+        self.check(lambda: self.broker.cfg["secrets"]["ha"].update(_ws=None))
+
+    def test_destination_now_refused_by_the_guard(self):
+        p = mock.patch.object(self.broker.dest_guard, "host_refused", lambda h: True)
+        self.check(p.start)
+        p.stop()
+
+    def test_recv_is_rechecked_too(self):
+        sid = self.wopen()
+        self.broker.cfg["secrets"].pop("ha")
+        code, r = self.wrecv(sid, wait=0)
+        self.assertEqual((code, r["code"]), (410, "session_expired"))
+
+    def test_port_narrowed(self):
+        self.broker.cfg["secrets"]["remote"]["allowed_hosts"] = ["ws.example.com"]
+        g = self.broker.dest_guard
+        sid = self.wopen()
+        # a name allowed on any port is narrowed to one other port
+        s = self.sess()
+        s.hosts = (f"ws.example.com:{self.stub.port}",)
+        s.cred = "remote"
+        self.broker.cfg["secrets"]["remote"]["allowed_hosts"] = ["ws.example.com:9"]
+        code, text = self.wsend(sid, "x")
+        self.assertEqual(code, 410)
+
+    def test_client_revoked_mid_session(self):
+        a = self.new_client("alice-box")
+        sid = self.wopen(key=a["secret"])
+        self.broker.clients.revoke(a["id"], "alice")
+        self.assertEqual(self.wsend(sid, "x", key=a["secret"])[0], 401)           # its key no longer authenticates
+        self.broker.sweep_sessions()
+        self.assertTrue(self.stub.eof[0].wait(5))
+        self.assertEqual(len(self.broker._sess), 0)
+
+    def test_catalog_change_while_idle_is_caught_by_the_sweeper(self):
+        sid = self.wopen()
+        self.broker.cfg["secrets"]["ha"]["allowed_hosts"] = []
+        self.assertEqual(self.broker.sweep_sessions(), 1)
+        self.assertTrue(self.stub.eof[0].wait(5))
+        self.assertEqual(self.events("ws_session_closed")[0].get("revoked_by"), "scope_recheck")
+
+    def test_a_reload_that_keeps_the_scope_changes_nothing(self):
+        sid = self.wopen()
+        self.broker.refresh_catalog() if hasattr(self.broker, "refresh_catalog") else None
+        self.broker.sweep_sessions()
+        self.assertEqual(self.wsend(sid, "still")[0], 200)

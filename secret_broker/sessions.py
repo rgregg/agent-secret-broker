@@ -1115,6 +1115,10 @@ class SessionsMixin:
                     self._sess_end_locked(s, "expired", now)
                     n += 1
                 elif getattr(s, "kind", "http") == "ws":
+                    if not self._ws_scope_ok(s):            # the catalog changed under an open session
+                        self._sess_end_locked(s, "revoked", now, actor="scope_recheck")
+                        n += 1
+                        continue
                     r = s.sweep_reason(now)
                     if r:
                         self._sess_end_locked(s, r, now)

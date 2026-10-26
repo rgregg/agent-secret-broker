@@ -736,6 +736,21 @@ class WsMixin:
                             "max_frame_bytes": caps["max_frame"], "idle_s": caps["idle_s"]}}
 
     # -- using ------------------------------------------------------------------------
+    def _ws_scope_ok(self, s):
+        """Is this session still inside what its credential allows NOW? The same checks as at open, repeated on every
+        use and by the sweeper (so a narrowed, removed or retyped credential ends the session). Takes no session lock."""
+        try:
+            sc = self.cfg["secrets"].get(s.cred)
+            if (sc is None or self._internal_hit([s.cred]) or sc.get("ssh") or not sc.get("allowed_hosts")
+                    or sc.get("_ws") is None or not self.clients.is_active(s.cid)):
+                return False
+            host, _, port = s.hosts[0].rpartition(":")
+            port = int(port)
+            return (host in destguard.host_parts(sc["allowed_hosts"]) and not self.dest_guard.host_refused(host)
+                    and self.dest_guard.port_ok(self.allowed_entries(s.cred), host, port))
+        except Exception:  # noqa: BLE001 -- fail closed
+            return False
+
     def _ws_get(self, sid, client):
         """The live WsSession for this client, or raises the fixed error. Another client's session, a made-up
         id, an HTTP session's id and a revoked client's are all the same answer."""
@@ -753,6 +768,11 @@ class WsMixin:
             self._log_refusal("c:" + cid, session=None, reason_class=state, client_id=cid, client_name=client["name"],
                               _event="ws_session_refused")
             raise S.SessionError(msg, code, http)
+        if not self._ws_scope_ok(s):
+            with self._sess_lock:
+                if not s.dead:
+                    self._sess_end_locked(s, "revoked", self.sessions_clock(), actor="scope_recheck")
+            raise S.SessionError(*S.ENDED["revoked"])
         if not s.allow(self.sessions_clock()):
             self._refuse(client, s, "rate", "too many requests; slow down", http=429, _event="ws_session_refused")
         return s
