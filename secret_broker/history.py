@@ -172,6 +172,8 @@ class History:
             row["summary"] = rec["summary"]
             if rec.get("summary_model"):
                 row["summary_model"] = rec["summary_model"]
+        if ev == "requested" and row["mode"] == "session":
+            row["session_kind"] = rec.get("kind") if rec.get("kind") in ("ws", "http") else "http"
         if ev == "escalated":
             row["escalated"] = True
         elif ev == "delivered":

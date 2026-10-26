@@ -266,7 +266,7 @@ class Proto(unittest.TestCase):
         self.assertEqual(p.conn.frame_started, 100.0)
         stop.set()
         th.join(5)
-        self.assertEqual(res, [wsproto.CLOSED])
+        self.assertEqual(res, [wsproto.TIMEOUT])
 
     def test_write_is_masked_and_valid(self):
         p = self.pipe()
@@ -376,7 +376,7 @@ class Pure(unittest.TestCase):
         self.assertEqual([st["op"] for st in ok["steps"]], ["expect", "send", "expect"])
         self.assertEqual(ok["steps"][2]["match"], {"type": "auth_ok"})
         self.assertEqual(W.parse_cred_config({}, ["A", "B"]), {"steps": None, "origin": None, "subprotocols": [],
-                                                              "query": {}, "headers": {}})
+                                                              "query": {}, "headers": {}, "deny_send": []})
         full = W.parse_cred_config({"origin": "https://a.example.com:8443", "subprotocols": ["x", "x", "y"],
                                     "handshake": {"send": {"t": "{{B}}"}, "expect": "ok"}}, ["A", "B"])
         self.assertEqual([st["op"] for st in full["steps"]], ["send", "expect"])
@@ -667,7 +667,7 @@ class Limits(WsBase):
         self.frames_until(sid, 1)                                       # (the echo is activity too: wait for it)
         self.advance(9)
         self.broker.sweep_sessions()
-        self.assertEqual(self.wrecv(sid, wait=0)[0], 200)
+        self.assertEqual(self.as_client(KEY, "GET", "/v1/sessions/" + sid)[0], 200)      # (a status read is not activity)
         self.advance(2)
         self.broker.sweep_sessions()
         self.assertTrue(self.stub.eof[0].wait(5))
@@ -1244,7 +1244,7 @@ class SignIn(WsBase):
     def test_token_in_the_query_is_url_encoded_and_never_leaks(self):
         st, sid = self.go("qcred", lambda c, s: s.default(c))
         line = st.requests[0]["line"]
-        self.assertEqual(line, "GET /ws?a=1&access_token=Q%26t%3D1%20%2B%2Fx-CANARY-9 HTTP/1.1")
+        self.assertEqual(line, "GET /ws?access_token=Q%26t%3D1%20%2B%2Fx-CANARY-9&a=1 HTTP/1.1")
         self.assertNoSecret(Q_TOKEN, "Q%26t%3D1")
         self.wsend(sid, "ECHO:seen " + Q_TOKEN)
         self.assertEqual(self.frames_until(sid, 1)[0]["data"], "seen ***")
@@ -1554,3 +1554,283 @@ class Recheck(WsBase):
         self.broker.refresh_catalog() if hasattr(self.broker, "refresh_catalog") else None
         self.broker.sweep_sessions()
         self.assertEqual(self.wsend(sid, "still")[0], 200)
+
+
+# ------------------------------------------------------------------------------- review follow-ups
+def raw_post(t, path, obj, key=KEY):
+    return t.raw("POST", path, data=json.dumps(obj).encode(), headers={"X-Client-Key": key, "Content-Type": "application/json"})[:2]
+
+
+class DenySend(WsBase):
+    def test_the_home_assistant_preset_blocks_token_minting_by_default(self):
+        sid = self.wopen()
+        for t in ("auth/long_lived_access_token", "auth/sign_path"):
+            code, text = self.wsend(sid, json.dumps({"id": 5, "type": t, "client_name": "x"}))
+            self.assertEqual((code, json.loads(text)["code"]), (403, "session_refused"), t)
+            self.assertNotIn(t, text)                               # fixed text: the type is not echoed
+        code, text = self.wsend(sid, json.dumps([{"id": 1, "type": "ping"}, {"id": 2, "type": "auth/sign_path"}]))
+        self.assertEqual(code, 403)
+        self.assertEqual(self.stub.received, [])
+        self.assertEqual(self.events("ws_session_refused")[0]["reason_class"], "denied_type")
+        for ok in ('{"id": 6, "type": "get_states"}', "not json at all", '{"type": 5}', '{"no": "type"}',
+                   '{"type": "auth/long_lived_access_token_x"}'):
+            self.assertEqual(self.wsend(sid, ok)[0], 200, ok)
+        self.assertEqual(len(self.stub.wait_frames(5)), 5)
+
+    def test_empty_list_clears_the_default_and_a_list_replaces_it(self):
+        for name, ws, sent, expect in (
+                ("hacleared", {"handshake": "home-assistant", "deny_send": []}, "auth/sign_path", 200),
+                ("hacustom", {"handshake": "home-assistant", "deny_send": ["config/x"]}, "auth/sign_path", 200),
+                ("hacustom2", {"handshake": "home-assistant", "deny_send": ["config/x"]}, "config/x", 403)):
+            _, ent = self.broker._entry("Ha", {"name": name, "vars": {"HA_TOKEN": {}}, "allowed_hosts": ["127.0.0.1"], "ws": ws})
+            self.broker.cfg["secrets"][name] = {**ent, "vars": {"HA_TOKEN": {"item": "Ha", "field": "token"}}}
+            sid = self.wopen(cred=name)
+            self.assertEqual(self.wsend(sid, json.dumps({"id": 1, "type": sent}))[0], expect, name)
+            self.as_client(KEY, "POST", "/v1/requests", {"mode": "session_close", "session": sid})
+
+    def test_config_parse(self):
+        self.assertEqual(W.parse_cred_config({"handshake": "home-assistant"}, ["T"])["deny_send"],
+                         ["auth/long_lived_access_token", "auth/sign_path"])
+        self.assertEqual(W.parse_cred_config({"handshake": "home-assistant", "deny_send": []}, ["T"])["deny_send"], [])
+        self.assertEqual(W.parse_cred_config({}, ["T"])["deny_send"], [])
+        self.assertEqual(W.parse_cred_config({"handshake": {"send": "x"}}, ["T"])["deny_send"], [])
+        for bad in ("x", [1], ["a"] * 51 if False else [str(i) for i in range(51)], [""], {"a": 1}):
+            with self.assertRaises(ValueError):
+                W.parse_cred_config({"deny_send": bad}, ["T"])
+
+    def test_the_card_warns_about_minting_and_shows_the_block_count(self):
+        self.wask()
+        page = self.get("/")[1]
+        self.assertIn("create NEW credentials", page)
+        self.assertIn("outlives this session", page)
+        self.assertIn("Message types blocked by the operator: 2", page)
+
+
+class Masking(WsBase):
+    def echo(self, sid, text, n=1):
+        self.wsend(sid, "ECHO:" + text)
+        return self.frames_until(sid, n)
+
+    def test_a_secret_split_across_two_messages_is_masked(self):
+        sid = self.wopen()
+        self.wsend(sid, 'ECHO:{"a":"HA-TOKEN-CA')
+        self.wsend(sid, 'ECHO:NARY-31337","b":1}')
+        got = self.frames_until(sid, 1)
+        blob = "".join(f["data"] for f in got)
+        self.assertIn("***", blob)
+        for frag in ("HA-TOKEN", "NARY-31337", "TOKEN-CA"):
+            self.assertNotIn(frag, blob)
+        code, r = self.wrecv(sid, wait=0)
+        self.assertEqual(r["frames"], [])
+
+    def test_a_secret_split_across_three_messages_is_masked(self):
+        sid = self.wopen()
+        for piece in ("x HA-TOK", "EN-CANA", "RY-31337 y"):
+            self.wsend(sid, "ECHO:" + piece)
+        blob = "".join(f["data"] for f in self.frames_until(sid, 1))
+        self.assertEqual(blob, "x *** y")
+
+    def test_a_held_prefix_is_flushed_as_a_mask_when_the_connection_ends(self):
+        sid = self.wopen()
+        self.wsend(sid, "ECHO:ok HA-TOKEN-CAN")
+        self.assertEqual(self.frames_until(sid, 1)[0]["data"], "ok ")        # delivered up to the possible start of a secret
+        self.wsend(sid, "CLOSE")
+        seen = []
+        end = time.time() + 10
+        while time.time() < end:
+            code, r = self.wrecv(sid, wait=2)
+            seen += [f["data"] for f in r.get("frames", [])]
+            if code != 200 or r["closed"]:
+                break
+        self.assertEqual(seen, ["***"])
+
+    def test_ordinary_messages_are_untouched_and_not_delayed(self):
+        sid = self.wopen()
+        self.assertEqual(self.echo(sid, '{"a":  [1, 2],"b":"HA"}')[0]["data"], '{"a":  [1, 2],"b":"HA"}')
+
+    def test_mixed_unicode_escapes_are_seen_through(self):
+        sid = self.wopen()
+        out = self.echo(sid, '{"v":"\\u0048A-TOKEN-C\\u0041NARY-31337","k":1}')[0]["data"]
+        self.assertNotIn("TOKEN", out)
+        self.assertEqual(json.loads(out), {"v": "***", "k": 1})
+        out = self.echo(sid, '{"HA-TOKEN-CANARY-31337":"\\u0048A-TOKEN-CANARY-31337"}')[0]["data"]
+        self.assertNotIn("TOKEN", out)
+
+    def test_other_casing_is_masked(self):
+        sid = self.wopen()
+        self.assertEqual(self.echo(sid, "x hA-ToKeN-cAnArY-31337 y")[0]["data"], "x *** y")
+
+    def test_partial_percent_encoding_is_masked(self):
+        sid = self.wopen()
+        out = self.echo(sid, "q=HA%2DTOKEN-CANARY%2D31337")[0]["data"]
+        self.assertNotIn("TOKEN", out)
+        self.assertIn("***", out)
+        self.assertEqual(self.echo(sid, "100%25 sure")[0]["data"], "100%25 sure")
+        self.assertNoSecret()
+
+
+class Query(SignIn):
+    def test_semicolon_and_shadow_spellings_are_refused(self):
+        st = self.mkstub(auth=False)
+        for q in ("a=1;access_token=mine", "ACCESS_TOKEN=x", "access%5Ftoken=x", "Access%5fToken=x",
+                  "x=1&access_token%20=x", "access+token=x", "a=1&%61ccess_token=x"):
+            code, text = self.as_client(KEY, "POST", "/v1/requests", {"mode": "session", "kind": "ws", "names": ["qcred"],
+                                                                      "url": self.wurl("/ws?" + q, stub=st)})
+            self.assertIn(code, (400, 403), q) if "access+token" not in q else None
+        self.wask(cred="qcred", url=self.wurl("/ws?access_token_other=1", stub=st))
+
+    def test_the_credentials_parameter_comes_first(self):
+        st, sid = self.go("qcred", lambda c, s: s.default(c))
+        self.assertTrue(st.requests[0]["line"].startswith("GET /ws?access_token="))
+
+
+class Transport_(WsBase):
+    def test_close_never_uses_the_tls_objects_shutdown(self):
+        st, cert = Wss.tls_stub(self)
+        Wss.trusting(self, cert)
+        sid = self.wopen(url=self.wurl(stub=st, host="localhost", scheme="wss"))
+        import ssl
+        with mock.patch.object(ssl.SSLSocket, "shutdown", side_effect=AssertionError("SSLSocket.shutdown called")):
+            self.post("/sessions/revoke", {"pid": sid[:8]})
+        self.assertTrue(st.eof[0].wait(5))
+
+    def test_nothing_is_sent_after_close(self):
+        a, b = socket.socketpair()
+        t = wsproto.Transport(a)
+        t.close()
+        with self.assertRaises(OSError):
+            t.sendall(b"x", 1)
+        b.close()
+
+    def test_no_data_frame_after_our_close_frame(self):
+        p = Pipe()
+        self.addCleanup(p.close)
+        p.conn.write(wsproto.OP_CLOSE, (1000).to_bytes(2, "big"))
+        with self.assertRaises(wsproto.WsError):
+            p.conn.write(wsproto.OP_TEXT, b"late")
+        p.conn.write(wsproto.OP_CLOSE, b"")                    # (another close is harmless)
+
+
+class Robustness(WsBase):
+    def test_huge_wait_values_do_not_crash_the_handler(self):
+        sid = self.wopen()
+        self.wsend(sid, "a")
+        self.frames_until(sid, 1)
+        self.wsend(sid, "b")
+        s = self.sess()
+        with s.cond:
+            s.cond.wait_for(lambda: len(s.queue) == 1, 10)
+        code, text = raw_post(self, "/v1/ws/recv", {"session": sid, "wait": 10 ** 400, "max": 10 ** 400})
+        self.assertEqual(code, 200, text)
+        self.wsend(sid, "c")
+        with s.cond:
+            s.cond.wait_for(lambda: len(s.queue) == 1, 10)
+        for wait in ("Infinity", "-Infinity", "NaN", "1e999", "-1e999"):
+            code, text, _ = self.raw("POST", "/v1/ws/recv", data=('{"session":"%s","wait":%s}' % (sid, wait)).encode(),
+                                     headers={"X-Client-Key": KEY, "Content-Type": "application/json"})
+            self.assertIn(code, (200, 400), (wait, text))
+            self.assertNotEqual(code, 500)
+            if code == 200:
+                self.wsend(sid, "again")
+                with s.cond:
+                    s.cond.wait_for(lambda: len(s.queue) >= 1, 10)
+
+    def test_at_most_two_recv_calls_in_flight(self):
+        sid = self.wopen()
+        results = []
+        ths = [threading.Thread(target=lambda: results.append(self.wrecv(sid, wait=20))) for _ in range(2)]
+        for t in ths:
+            t.start()
+        end = time.time() + 10
+        while self.sess().recv_inflight < 2 and time.time() < end:
+            time.sleep(0.005)
+        code, r = self.wrecv(sid, wait=0)
+        self.assertEqual((code, r["code"]), (429, "session_refused"))
+        self.post("/sessions/revoke", {"pid": sid[:8]})                # wakes both
+        for t in ths:
+            t.join(10)
+            self.assertFalse(t.is_alive())
+        self.assertEqual({c for c, _ in results}, {410})
+
+    def test_a_poll_that_outlives_the_deadline_gets_the_end_not_the_frame(self):
+        sid = self.wopen(ttl_s=60)
+        self.wsend(sid, "a")
+        s = self.sess()
+        with s.cond:
+            s.cond.wait_for(lambda: len(s.queue) == 1, 10)
+        self.advance(61)
+        code, r = self.wrecv(sid, wait=0)
+        self.assertEqual((code, r["code"]), (410, "session_expired"))
+
+    def test_the_reader_enforces_the_frame_deadline_without_the_sweeper(self):
+        self.broker.ws_cfg = W.parse_config({**self.broker.ws_cfg, "idle_s": 3600})
+        sid = self.wopen()
+        s = self.sess()
+        self.wsend(sid, "STALL")
+        end = time.time() + 10
+        while s.conn.frame_started is None and time.time() < end:
+            time.sleep(0.005)
+        self.advance(W.FRAME_DEADLINE_S + 1)
+        with s.cond:
+            self.assertTrue(s.cond.wait_for(lambda: s.finished is not None, 10))
+        self.assertEqual(s.finished, wsproto.TIMEOUT)
+        self.assertTrue(self.stub.eof[0].wait(5))
+
+    def test_recv_polling_counts_as_activity_for_the_idle_timeout(self):
+        self.broker.ws_cfg = W.parse_config({**self.broker.ws_cfg, "idle_s": 10})
+        sid = self.wopen()
+        self.advance(8)
+        self.assertEqual(self.wrecv(sid, wait=0)[0], 200)
+        self.advance(8)
+        self.broker.sweep_sessions()
+        self.assertEqual(self.wrecv(sid, wait=0)[0], 200)
+
+    def test_a_control_frame_is_not_held_to_a_steps_size_limit(self):
+        def h(c, st):
+            c.send_frame(9, b"p" * 100)
+            c.send_text("go")
+            st.default(c)
+        st = self.mkstub(auth=False, handler=h)
+        self.broker.cfg["secrets"]["plainws"]["_ws"] = W.parse_cred_config(
+            {"handshake": {"steps": [{"expect": "go", "max_bytes": 64}]}}, ["PLAINWS_TOKEN"])
+        self.wopen(cred="plainws", url=self.wurl(stub=st))
+
+
+class Reporting(WsBase):
+    def test_operator_audit_has_the_clipped_target_and_a_hash_the_agent_view_lacks(self):
+        sid = self.wopen(url=self.wurl("/api/websocket?x=1"))
+        for ev in ("ws_session_requested", "ws_session_opened"):
+            r = self.events(ev)[0]
+            self.assertEqual(r["target_clip"], "/api/websocket?x=1")
+            self.assertRegex(r["target_sha256"], r"^[0-9a-f]{16}$")
+        code, text = self.as_client(KEY, "GET", "/v1/audit?event=ws_session_opened,ws_session_requested")
+        self.assertNotIn("target", text)
+        self.assertNoSecret()
+
+    def test_history_labels_it_a_websocket_session(self):
+        self.wopen()
+        rows = [r for r in self.broker.history.rows() if r["mode"] == "session"]
+        self.assertEqual(rows[0].get("session_kind"), "ws")
+        self.open()
+        self.assertTrue(any(r.get("session_kind") == "http" for r in self.broker.history.rows() if r["mode"] == "session"))
+
+    def test_ended_messages_do_not_point_at_the_http_command(self):
+        sid = self.wopen()
+        self.as_client(KEY, "POST", "/v1/requests", {"mode": "session_close", "session": sid})
+        code, r = self.wrecv(sid)
+        self.assertNotIn("asb session open", r["error"])
+
+
+class CliText(ts.CliBase, WsBase):
+    wcli_open = Cli.wcli_open
+
+    def test_terminal_control_and_bidi_characters_are_stripped_from_server_text(self):
+        sid, _ = self.wcli_open()
+        self.run_cli("ws", "send", sid, "ECHO:ok \x1b[31mRED\x07 \u202eevil\u2066x\x01y")
+        s = self.sess()
+        with s.cond:
+            s.cond.wait_for(lambda: len(s.queue) == 1, 10)
+        rc, out, err = self.run_cli("ws", "recv", sid, "--wait", "5")
+        self.assertEqual(out, "ok [31mRED evilxy\n".replace("[31m", "[31m"))
+        self.assertNotIn("\x1b", out)
+        self.assertNotIn("\u202e", out)

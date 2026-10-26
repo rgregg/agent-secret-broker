@@ -2406,13 +2406,16 @@ the certificate and name are verified, with SNI set to the original host name.
 * Examples. Client first: `{"handshake": {"steps": [{"send": {"op": "login", "key": "{{VAR}}"}}, {"expect": {"ok": true}}]}}`.
   Multi-step: `{"steps": [{"expect": {"op": "hello"}}, {"send": {"op": "identify", "token": "{{VAR}}"}}, {"expect": {"op": "ready"}, "skip": 1, "timeout": 15}, {"send": "{\"op\":\"subscribe\"}"}, {"expect": "subscribed"}]}`.
   Token in the URL: `{"query": {"access_token": "{{VAR}}"}}`. Token in a header: `{"headers": {"Authorization": "Bearer {{VAR}}"}}`.
+* A **text** `send` step (not an object) is sent with the placeholder replaced verbatim and is NOT JSON-escaped: a value with
+  a quote or a backslash would break the message. Prefer an object template, which the broker encodes.
 * The preset `home-assistant` is `expect {"type":"auth_required"}`, `send {"type":"auth","access_token":"{{VAR}}"}`,
   `expect {"type":"auth_ok"}`.
 * `{{VAR}}` is the credential's only variable (a credential with several names the one it means). A placeholder is allowed
   only in a `send` step, the `query` values and the `headers` values. The broker owns `Host`, `Upgrade`, `Connection` and
   every `Sec-WebSocket-Key/Version/Extensions/Accept` header: they are never settable, and `headers` takes only the three
   names above (so `httpcheck.FORBIDDEN_HEADERS` and everything else stay out). The agent cannot set a query parameter that
-  the credential's `query` owns.
+  the credential's `query` owns (compared percent-decoded, `+` as space, case-folded; a `;` in the agent's query is refused), and
+  the credential's parameters are placed before the agent's.
 * A bad `ws` setting makes the credential invalid in the catalog (reported like any other bad metadata).
 
 **Relay.** `asb ws send ID TEXT`, `asb ws recv ID [--wait S] [--max N]`, `asb ws close ID`, and `asb ws ID` as a
@@ -2432,8 +2435,10 @@ once the queued frames are read.
 `default_ttl_s` (900), `max_ttl_s` (3600, at most 1 h), `max_frames` (1000, each direction), `max_bytes` (8 MiB, each
 direction), `max_frame_bytes` (1 MiB, also the largest reassembled message), `idle_s` (300), `max_per_client` (2),
 `recv_queue_frames` (256), `recv_queue_bytes` (4 MiB). One connection per session; at most 20 open sessions in total. Inbound
-caps count every wire frame (pings and fragments too) with a small allowance for the sign-in. A frame that has started must
-finish within 30 s (slow-drip peers are closed). An agent is rate limited per session (burst 60, 20 per second). The
+caps count every wire frame (pings and fragments too) with a small allowance for the sign-in. Control frames (pings) count toward the inbound cap on purpose (it bounds a ping flood), and a server ping is not activity for the
+idle timeout (so a server cannot keep a session alive forever by pinging; the TTL bounds it anyway); an agent's `recv`, including a
+long-poll, and its sends are activity. A frame that has started must
+finish within 30 s (slow-drip peers are closed). An agent is rate limited per session (burst 60, 20 per second) and may have at most 2 `recv` calls in flight (429 beyond). The
 **receive queue never drops**: when it is full the broker stops reading the socket (TCP flow control pushes back on the
 server) and reports `truncated: true` on the next `recv`; collect frames more often. Exceeding a cap, an oversize frame or a
 protocol violation closes the connection (close codes 1008, 1009, 1002, 1007) and ends the session once the queue is
@@ -2451,9 +2456,14 @@ the name is resolved once, every address must pass (no loopback, link-local, met
 own ports, `destination_deny_cidrs`), and the socket goes to the validated address. No redirect, no environment proxy. The
 agent learns only `connection` for a refusal.
 
-**Masking and what is never exposed.** Every text frame returned is masked by the shared masker (`masking.py`: exact
-matches of the credential's values in their usual encodings; a server that transforms the secret in another way, or splits it
-across messages, defeats it, as for http). The URL, headers and sign-in messages exist only in memory and on the wire: they are in no
+**Masking and what is never exposed.** Every text frame returned is masked by the shared masker (`masking.py`: the credential's
+values in their usual encodings), and additionally: a JSON frame is parsed and every decoded string and key masked (so mixed
+`\uXXXX` escapes are seen through; the frame is re-serialised only when something was masked), matching is also done
+case-insensitively, and a partly percent-encoded spelling is masked. **Across messages** the broker holds back the end of a
+message that could still turn into the start of a secret (a proper prefix of 4 or more characters of any spelling) and joins it to
+the next message, so a secret split over any number of messages is masked; the held text is flushed as a mask when the
+connection ends. The cost: a message ending in the first 4+ characters of a secret waits for the next one and is delivered
+together with it. A server that transforms the secret in some other way (rot13, its own encoding) still defeats it, as for http. The URL, headers and sign-in messages exist only in memory and on the wire: they are in no
 response, log, audit record or card; the failure text to the agent is a fixed class (`could not connect (connection | tls |
 dns | timeout | handshake refused | frame too large)`), never exception or server text.
 
@@ -2470,8 +2480,13 @@ contents.** Only the first 8 characters of the id are logged. The agent's audit 
 same deny-by-default whitelist.
 
 **Threat model.** An approved session lets the client send anything to that server as the credential until the deadline: size
-it by the card. A prompt-injected agent can spend the session but cannot widen it, extend it, reach another host, learn the
-token, or turn a refusal into a prompt. A hostile server can send frames up to the caps, pause the reader only by flow control,
+it by the card. **That includes commands that create new credentials on the server** (Home Assistant's
+`auth/long_lived_access_token` and `auth/sign_path`, for example): what the server returns is a new secret the masker has
+never seen, and it outlives the session and its revocation. The card says so. The operator can block message types per
+credential with `ws.deny_send` (a list of exact JSON `type` values; matching outgoing frames are refused with a fixed error,
+non-JSON frames pass); the `home-assistant` preset blocks those two by default and `"deny_send": []` clears that. This is a
+blocklist for known dangerous commands, not a filter: everything else is relayed. A prompt-injected agent can spend the
+session but cannot extend it, reach another host, read the configured token from a frame, or turn a refusal into a prompt. A hostile server can send frames up to the caps, pause the reader only by flow control,
 and hold a slow frame for 30 s; it cannot make the broker dial elsewhere (no redirects, one pinned connection).
 
 ## Vault session lifetime

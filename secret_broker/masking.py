@@ -191,6 +191,16 @@ class Masker:
         out.append(text[pos:])
         return "".join(out)
 
+    def tail_prefix_len(self, text):
+        """Length of the longest suffix (4+ chars) of `text` that is a proper prefix of some form: the part of a
+        stream that could still turn into a secret when more text arrives (0 when there is none)."""
+        for k in range(min(len(text), self.max_len - 1), MIN_LEN - 1, -1):
+            tail = text[-k:]
+            for f in self._first.get(tail[:MIN_LEN], ()):
+                if len(f) > k and f.startswith(tail):
+                    return k
+        return 0
+
     def mask_tail(self, text):
         """Mask a trailing proper prefix (4+ chars) of any form at the end of `text` (the longest one)."""
         for k in range(min(len(text), self.max_len - 1), MIN_LEN - 1, -1):

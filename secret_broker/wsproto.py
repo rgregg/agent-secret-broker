@@ -98,6 +98,8 @@ class Transport:
         if self.closed:
             raise OSError("closed")
         with self.lock:
+            if self.closed:                 # closed while we waited for the lock: nothing may go out now
+                raise OSError("closed")
             self.sock.settimeout(timeout)
             self.sock.sendall(data)
 
@@ -115,7 +117,9 @@ class Transport:
                 pass
             finally:
                 self.lock.release()
-        for fn in (lambda: self.sock.shutdown(socket.SHUT_RDWR), self.sock.close):
+        # socket.socket.shutdown, not SSLSocket.shutdown: the latter drops the TLS object first, and a send racing
+        # it could then go out in clear text
+        for fn in (lambda: socket.socket.shutdown(self.sock, socket.SHUT_RDWR), self.sock.close):
             try:
                 fn()
             except (OSError, ValueError):
@@ -248,7 +252,7 @@ class Conn:
         self.frame_started = self.clock()
         try:
             if not self._fill(2, lambda: stop(True)):
-                raise WsError(CLOSED)
+                raise WsError(TIMEOUT)
             b0, b1 = self.buf[0], self.buf[1]
             fin, rsv, op = b0 & 0x80, b0 & 0x70, b0 & 0x0F
             if rsv or op not in (0, 1, 2, 8, 9, 10) or (b1 & 0x80):
@@ -256,13 +260,13 @@ class Conn:
             ln, hl = b1 & 0x7F, 2
             if ln == 126:
                 if not self._fill(4, lambda: stop(True)):
-                    raise WsError(CLOSED)
+                    raise WsError(TIMEOUT)
                 ln, hl = int.from_bytes(self.buf[2:4], "big"), 4
                 if ln < 126:
                     raise WsError(PROTOCOL, 1002)       # not the shortest encoding
             elif ln == 127:
                 if not self._fill(10, lambda: stop(True)):
-                    raise WsError(CLOSED)
+                    raise WsError(TIMEOUT)
                 ln, hl = int.from_bytes(self.buf[2:10], "big"), 10
                 if ln < 65536 or ln >> 63:
                     raise WsError(PROTOCOL, 1002)
@@ -271,12 +275,12 @@ class Conn:
             self.frames_in += 1
             if self.frames_in > self.max_frames:
                 raise WsError(LIMIT, 1008)
-            if ln > self.max_frame:
+            if op < 8 and ln > self.max_frame:      # (a control frame is at most 125 bytes whatever a step's size limit)
                 raise WsError(TOO_LARGE, 1009)          # decided from the header: the payload is never read
             if self.bytes_in + ln > self.max_bytes:
                 raise WsError(LIMIT, 1008)
             if not self._fill(hl + ln, lambda: stop(True)):
-                raise WsError(CLOSED)
+                raise WsError(TIMEOUT)
             self._take(hl)
             payload = self._take(ln)
             self.bytes_in += ln
@@ -334,6 +338,10 @@ class Conn:
 
     # -- writing ------------------------------------------------------------------
     def write(self, op, payload=b""):
+        if self.sent_close and op != OP_CLOSE:
+            raise WsError(CLOSED)                   # nothing but (another) close after our close frame
+        if op == OP_CLOSE:
+            self.sent_close = True
         if len(payload) > (125 if op >= 8 else self.max_frame):
             raise WsError(TOO_LARGE)
         n = len(payload)
@@ -354,6 +362,7 @@ class Conn:
 
     def close_frame(self, code=1000):
         """The bytes of a close frame (for Transport.close's best-effort last write)."""
+        self.sent_close = True
         payload = code.to_bytes(2, "big")
         key = os.urandom(4)
         return bytes([0x88, 0x80 | len(payload)]) + key + _mask(payload, key)

@@ -342,10 +342,10 @@ class Jar:
 
 ENDED = {"unknown": ("unknown session", "session_unknown", 404),
          "expired": ("session expired: it reached its time limit and cannot be extended; open a new "
-                     "one with `asb session open`", "session_expired", 410),
+                     "one if the human agrees", "session_expired", 410),
          "ended": ("session ended: too many refused calls; open a new one if the human agrees",
                    "session_expired", 410),
-         "closed": ("session closed; open a new one with `asb session open`", "session_expired", 410),
+         "closed": ("session closed; open a new one if the human agrees", "session_expired", 410),
          "revoked": ("session revoked by the human; do not reopen it without asking",
                      "session_expired", 410)}
 
@@ -1185,8 +1185,10 @@ class SessionsMixin:
         req.risk = {k: a[k] for k in ("level", "model", "reasons")}
         self.audit("assessed", req, model=None, reasons=a["reasons"], summary_source=None, summary_reason=None)
         sp = req.spec
+        from . import wssessions as ws_mod
         self.audit("ws_session_requested" if sp.get("kind") == "ws" else "session_requested", req,
-                   hosts=sp["hosts"], methods=sp["methods"], ttl_s=sp["ttl_s"], max_calls=sp["max_calls"])
+                   hosts=sp["hosts"], methods=sp["methods"], ttl_s=sp["ttl_s"], max_calls=sp["max_calls"],
+                   **(ws_mod.target_audit(sp) if sp.get("kind") == "ws" else {}))
         try:
             self._push(req)
         except Exception:  # noqa: BLE001 -- the card is on the page whatever the transport does

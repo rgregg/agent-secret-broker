@@ -925,6 +925,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                        description_sha256=plans_mod.text_digest(sp["description"]) if sp["description"] else None)
         elif req.mode == "session":
             sp = req.spec       # the manifest and the purpose's length and hash; never the purpose
+            rec.setdefault("kind", sp.get("kind") or "http")
             for k, v in (("hosts", sp["hosts"]), ("methods", sp["methods"]), ("ttl_s", sp["ttl_s"]),
                          ("max_calls", sp["max_calls"]), ("purpose_length", len(sp["purpose"])),
                          ("purpose_sha256", credreq_mod.purpose_digest(sp["purpose"]))):
@@ -5373,13 +5374,15 @@ def client_handler(broker, client_key):
                     out = broker.ws_send(body.get("session"), body.get("text"), self.client)
                 else:
                     wait, mx = body.get("wait", 0), body.get("max", ws_mod.RECV_MAX_FRAMES)
+                    if isinstance(wait, int) and not isinstance(wait, bool):
+                        wait = max(-1, min(wait, 1000))      # (a huge integer must not reach float())
                     if (isinstance(wait, bool) or isinstance(mx, bool) or not isinstance(wait, (int, float))
                             or not isinstance(mx, int) or wait != wait):
                         raise ValueError("wait is a number of seconds and max a whole number")
                     out = broker.ws_recv(body.get("session"), self.client, wait, mx)
             except sessions_mod.SessionError as e:
                 return _json(self, e.http, {"error": str(e), "code": e.code})
-            except (ValueError, KeyError, TypeError, UnicodeError, json.JSONDecodeError):
+            except (ValueError, KeyError, TypeError, UnicodeError, ArithmeticError, json.JSONDecodeError):
                 return _json(self, 400, {"error": "bad request"})     # fixed: the agent's text is never echoed
             except PermissionError as e:
                 return _json(self, 403, {"error": httpcheck.clip(e)})
@@ -5671,7 +5674,7 @@ def approval_handler(broker):
                 elif r["mode"] == "plan":
                     what = "plan"
                 elif r["mode"] == "session":
-                    what = "http session for " + ", ".join(r["names"])
+                    what = ("WebSocket session for " if r.get("session_kind") == "ws" else "http session for ") + ", ".join(r["names"])
                 elif r["mode"] == "guidance":
                     what = f"guidance proposal ({len(r['names'])} credential{'' if len(r['names']) == 1 else 's'})"
                 else:

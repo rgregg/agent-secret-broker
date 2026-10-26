@@ -63,6 +63,7 @@ IN_FRAMES_SLACK = 16              # inbound wire frames allowed beyond the cap: 
 IN_BYTES_SLACK = 4096
 RATE_BURST, RATE_PER_S = 60, 20.0       # agent operations per session
 RECV_WAIT_MAX = 25.0
+MAX_RECV_INFLIGHT = 2           # concurrent recv calls per session
 RECV_MAX_FRAMES = 256
 MAX_API_BODY = (4 << 20) + 4096          # a send body: one frame (4 MB at most) and its JSON wrapping
 RECV_RESPONSE_BYTES = 4 << 20
@@ -71,6 +72,7 @@ _TARGET_RE = re.compile(r"^/[A-Za-z0-9\-._~!$&'()*+,;=:@/?%]{0,2040}\Z")
 _ORIGIN_RE = re.compile(r"^https?://[A-Za-z0-9.-]{1,253}(:[0-9]{1,5})?\Z")
 _PROTO_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,64}\Z")
 HANDSHAKE_KEYS = ("wait", "send", "expect")
+PRESET_DENY = {"home-assistant": ["auth/long_lived_access_token", "auth/sign_path"]}   # minting commands
 MAX_STEPS = 8
 STEP_TIMEOUT_DEFAULT, STEP_TIMEOUT_MAX = 10.0, 30.0
 STEP_BYTES_DEFAULT, STEP_BYTES_MAX = 65536, 1 << 20
@@ -89,7 +91,9 @@ REASON = "a WebSocket session always needs a human to approve it; always high"
 WARNING = ("The requesting agent asked for this session. If you approve, this client may send ANY text "
            "frames it likes to the server below, authenticated with the stored credential, and read what "
            "comes back, WITHOUT asking you again, until the time runs out or a cap is used. Nothing it "
-           "sends is filtered or reviewed. The time limit is fixed from the moment you approve: it is never "
+           "sends is filtered or reviewed, except message types the operator blocked for this credential. "
+           "Many servers let a signed-in client create NEW credentials (for example a long-lived access "
+           "token): anything it creates outlives this session, is not masked and is not revoked with it. The time limit is fixed from the moment you approve: it is never "
            "extended or renewed. Revoke it any time on the Clients tab.")
 
 # end reasons beyond sessions.ENDED's (registered below so the shared lookups keep working)
@@ -231,15 +235,26 @@ def parse_cred_config(raw, var_names):
         "query": {"access_token": "{{VAR}}"}   added to the upgrade URL's query, URL-encoded by the broker
         "headers": {"Authorization": "Bearer {{VAR}}"}   Authorization, Sec-WebSocket-Protocol and Origin only
         "origin": "https://app.example.com", "subprotocols": ["graphql-ws"]
+        "deny_send": ["auth/long_lived_access_token"]   outgoing text frames whose JSON `type` is listed are refused
+            (non-JSON frames pass). The home-assistant preset blocks the token-minting commands by default;
+            `"deny_send": []` clears that.
     The broker owns Host, Upgrade, Connection and every Sec-WebSocket-Key/Version/Extensions header: they are
     never settable. `{{VAR}}` is the credential's only variable (with several, name one: `{{MY_TOKEN}}`)."""
     if not isinstance(raw, dict):
         raise ValueError("ws must be an object")
     for k in raw:
-        if k not in ("handshake", "origin", "subprotocols", "query", "headers"):
+        if k not in ("handshake", "origin", "subprotocols", "query", "headers", "deny_send"):
             raise ValueError(f"ws.{k} is not a known option")
     names = set(var_names)
-    out = {"steps": None, "origin": None, "subprotocols": [], "query": {}, "headers": {}}
+    out = {"steps": None, "origin": None, "subprotocols": [], "query": {}, "headers": {}, "deny_send": []}
+    if "deny_send" in raw:
+        ds = raw["deny_send"]
+        if (not isinstance(ds, list) or len(ds) > 50
+                or not all(isinstance(x, str) and 1 <= len(x) <= 128 for x in ds)):
+            raise ValueError("ws.deny_send is a list of up to 50 message type names")
+        out["deny_send"] = list(dict.fromkeys(ds))
+    elif isinstance(raw.get("handshake"), str):
+        out["deny_send"] = list(PRESET_DENY.get(raw["handshake"], []))      # a preset's default; `deny_send: []` clears it
     if raw.get("handshake") is not None:
         out["steps"] = _norm_steps(raw["handshake"], names)
     q = raw.get("query")
@@ -296,6 +311,11 @@ def matches(spec, text):
     return sub(spec, got)
 
 
+def _qkey(k):
+    """A query parameter name as a server may read it: percent-decoded, plus as space, case-folded."""
+    return urllib.parse.unquote_plus(k).strip().lower()
+
+
 def upgrade_parts(wsc, target, values):
     """(request target, origin, subprotocols, extra headers) for the upgrade request: the agent's path and query
     plus the credential's configured query (URL-encoded) and headers, filled here. The result holds the secret
@@ -304,7 +324,8 @@ def upgrade_parts(wsc, target, values):
     if wsc["query"]:
         extra_q = "&".join(urllib.parse.quote(k, safe="") + "=" + urllib.parse.quote(S.fill(v, vals), safe="")
                            for k, v in wsc["query"].items())
-        target = target + ("&" if "?" in target else "?") + extra_q
+        path, _, agent_q = target.partition("?")
+        target = path + "?" + extra_q + (("&" + agent_q) if agent_q else "")        # the credential's first: it wins
     origin, protos, extra = wsc["origin"], list(wsc["subprotocols"]), []
     for k, v in wsc["headers"].items():
         val = S.fill(v, vals)
@@ -387,10 +408,19 @@ def parse_url(url):
             or destguard.legacy_ip_form(host) or (port is not None and not 1 <= port <= 65535)
             or u.netloc.endswith(":")):
         raise ValueError(msg)
+    if ";" in u.query:                      # some servers read ; as a parameter separator: no way to smuggle one in
+        raise ValueError(msg)
     target = (u.path or "/") + (("?" + u.query) if u.query else "")
     if not _TARGET_RE.match(target):
         raise ValueError(msg)
     return u.scheme, host, port or (443 if u.scheme == "wss" else 80), target
+
+
+def target_audit(sp):
+    """What the human saw, for the operator-only audit events: the agent's path and query (clipped) and its hash.
+    It holds nothing the credential adds (the secret is appended later, on the wire only)."""
+    import hashlib as _h
+    return {"target_clip": sp["target"][:200], "target_sha256": _h.sha256(sp["target"].encode()).hexdigest()[:16]}
 
 
 def hostport(host, port):
@@ -405,9 +435,14 @@ class WsSession(S.Session):
 
     kind = "ws"
 
-    def __init__(self, sid, pid, client, cred, hp, ttl_s, caps, opened, approver, clock, conn, masker):
+    def __init__(self, sid, pid, client, cred, hp, ttl_s, caps, opened, approver, clock, conn, values, deny_send=()):
         super().__init__(sid, pid, client, cred, [hp], [], ttl_s, caps["max_frames"], opened, "", approver, clock)
-        self.clock, self.caps, self.conn, self.masker = clock, caps, conn, masker
+        self.clock, self.caps, self.conn = clock, caps, conn
+        self.masker = masking.get_masker(values)
+        self.masker_lc = masking.get_masker([v.lower() for v in values if isinstance(v, str)])
+        self.hold = ""                  # raw text held back: a possible start of a secret that continues in the next message
+        self.deny_send = frozenset(deny_send)
+        self.recv_inflight = 0
         self.cond = threading.Condition(self.lock)
         self.queue, self.qbytes = deque(), 0
         self.seq = 0
@@ -432,11 +467,94 @@ class WsSession(S.Session):
         with self.cond:
             if self.finished is None:
                 self.finished, self.finished_at = label, self.clock()
+                if self.hold:                             # an unfinished possible secret: never delivered, only masked
+                    self.hold = ""
+                    self.seq += 1
+                    self.queue.append(({"type": "text", "data": masking.MARK, "seq": self.seq}, 3))
+                    self.qbytes += 3
             self.cond.notify_all()
         self.conn.t.close()
 
     def _stopped(self, mid=False):
-        return self.dead or self.finished is not None
+        if self.dead or self.finished is not None:
+            return True
+        if mid:                         # a frame that has started must finish: enforced here, not only by the sweeper
+            fs = self.conn.frame_started
+            return fs is not None and self.clock() - fs >= FRAME_DEADLINE_S
+        return False
+
+    # -- masking what the server sent --------------------------------------------------------
+    def _mask_plain(self, text):
+        t = self.masker.mask(text)
+        low = t.lower()
+        if self.masker_lc.over_budget:
+            return masking.MARK
+        if len(low) == len(t) and self.masker_lc.forms:     # a differently-cased spelling of the secret
+            spans = self.masker_lc._spans(low)
+            if spans is None:
+                return masking.MARK
+            if spans:
+                out, pos = [], 0
+                for st, en in spans:
+                    out += [t[pos:st], masking.MARK]
+                    pos = en
+                t = "".join(out) + t[pos:]
+        return t
+
+    def _mask_one(self, text):
+        t = self._mask_plain(text)
+        if "%" in t:                                          # a partly percent-encoded spelling
+            d = urllib.parse.unquote(t)
+            if d != t:
+                d2 = self._mask_plain(d)
+                if d2 != d:
+                    return d2
+        return t
+
+    def _mask_message(self, text):
+        """Mask one text message. A JSON object or array is parsed and every decoded string and key masked (this sees
+        through mixed \\uXXXX escapes); when that changed anything the masked structure is re-serialised, else the
+        text is kept exactly as the server sent it. The textual masker runs over the result in every case."""
+        if text[:1] in ("{", "["):
+            try:
+                changed = []
+
+                def walk(v, depth=0):
+                    if depth > 64:
+                        raise RecursionError
+                    if isinstance(v, str):
+                        n = self._mask_one(v)
+                        if n != v:
+                            changed.append(1)
+                        return n
+                    if isinstance(v, list):
+                        return [walk(x, depth + 1) for x in v]
+                    if isinstance(v, dict):
+                        return {walk(k, depth + 1): walk(x, depth + 1) for k, x in v.items()}
+                    return v
+                obj = walk(json.loads(text))
+                if changed:
+                    return self._mask_one(json.dumps(obj, ensure_ascii=False))
+            except (ValueError, RecursionError):
+                pass
+        return self._mask_one(text)
+
+    def stream_mask(self, text):
+        """Mask a message in the context of the ones before it, or None when all of it is held back. A server can
+        split a secret across messages, so the end of the text that could still become the start of a secret (a
+        proper prefix, 4+ characters, of any spelling) is HELD in `self.hold` and joined to the next message; it is
+        flushed as a mask at the end of the connection. Sound for any number of pieces; costs only that a message
+        that ends in the first 4+ characters of a secret waits for the next one (and, in that case, the two are
+        delivered as one)."""
+        raw = self.hold + text
+        k = self.masker.tail_prefix_len(raw)
+        if self.masker_lc.forms and len(raw) == len(raw.lower()):
+            k = max(k, self.masker_lc.tail_prefix_len(raw.lower()))
+        self.hold = raw[len(raw) - k:] if k else ""
+        emit = raw[:len(raw) - k] if k else raw
+        if k and not emit:
+            return None
+        return self._mask_message(emit)
 
     def _loop(self):
         conn = self.conn
@@ -459,7 +577,9 @@ class WsSession(S.Session):
                     self._finish(wsproto.CLOSED)
                     return
                 if msg[0] == "text":
-                    text = self.masker.mask(msg[1])
+                    text = self.stream_mask(msg[1])
+                    if text is None:
+                        continue                          # held back until the next message shows what it is
                     size = len(text.encode("utf-8", "replace"))
                     entry = {"type": "text", "data": text}
                 else:
@@ -500,13 +620,14 @@ class WsSession(S.Session):
         RECV_RESPONSE_BYTES of text, never fewer than one). -> dict for the agent."""
         end = time.monotonic() + max(0.0, wait_s)
         with self.cond:
+            self.last_activity = self.clock()               # an agent that is polling is using the session
             while not self.queue and self.finished is None and not self.dead:
                 left = end - time.monotonic()
                 if left <= 0 or self.clock() >= self.expires:
                     break
                 self.cond.wait(min(left, wsproto.POLL_S))
-            if self.dead:
-                return None
+            if self.dead or self.clock() >= self.expires:
+                return None                                 # past the deadline nothing more is handed out
             frames, total = [], 0
             while self.queue and len(frames) < max_n:
                 entry, size = self.queue[0]
@@ -558,6 +679,7 @@ def describe_html(req):
             f"Server: {e(sp['scheme'])}://{e(sp['host'])}:{sp['port']}<br>"
             f"Path and query, as the agent wrote them (unverified): <code>{e(sp['target'])}</code><br>"
             f"Sign-in, set by the operator on this credential: {e(sp.get('signin', ''))}<br>"
+            f"Message types blocked by the operator: {sp.get('deny_n', 0)}<br>"
             f"Time limit: {e(S._fmt_ttl(sp['ttl_s']))} from the moment you approve (fixed, never extended)<br>"
             f"Caps: {sp['max_calls']} frames and {sp['max_bytes'] // 1024} KB in each direction, "
             f"one message at most {sp['max_frame_bytes'] // 1024} KB, closed after {sp['idle_s']} s idle<br>"
@@ -625,9 +747,8 @@ class WsMixin:
                 or not self.dest_guard.port_ok(entries, host, port)):
             raise PermissionError("that host or port is outside this credential's allowed hosts "
                                   "(see `asb list`)")
-        reserved = set(sc["_ws"]["query"])
-        if reserved and any(k in reserved for k, _ in urllib.parse.parse_qsl(target.partition("?")[2],
-                                                                              keep_blank_values=True)):
+        reserved = {_qkey(k) for k in sc["_ws"]["query"]}
+        if reserved and any(_qkey(part.partition("=")[0]) in reserved for part in target.partition("?")[2].split("&")):
             raise ValueError("a query parameter in that url is set by the credential")
         ttl = spec.get("ttl_s", cfg["default_ttl_s"])
         if not S._int(ttl) or ttl < S.TTL_FLOOR:
@@ -644,7 +765,8 @@ class WsMixin:
         spec.update({"kind": "ws", "scheme": scheme, "host": host, "port": port, "target": target,
                      "hosts": [hostport(host, port)], "methods": [], "ttl_s": ttl, "max_calls": frames,
                      "purpose": "", "max_bytes": cfg["max_bytes"], "max_frame_bytes": cfg["max_frame_bytes"],
-                     "idle_s": cfg["idle_s"], "signin": signin_summary(sc["_ws"])})
+                     "idle_s": cfg["idle_s"], "signin": signin_summary(sc["_ws"]),
+                     "deny_n": len(sc["_ws"]["deny_send"])})
 
     def _ws_count(self, cid):
         self.sweep_sessions()
@@ -676,7 +798,6 @@ class WsMixin:
         values = {k: masking.strip_one_newline(v) for k, v in env.items()}
         if len(var_names) == 1:
             values["VAR"] = values[var_names[0]]
-        masker = masking.get_masker(list(env.values()) + list(self.dest_guard.mask_values))
         tls = self._tls_policy([name])
         cfg = self.ws_cfg
         caps = {"max_frames": frames, "max_bytes": sp["max_bytes"], "max_frame": sp["max_frame_bytes"],
@@ -724,12 +845,14 @@ class WsMixin:
             while any(s.pid == sid[:8] for s in self._sess.values()):
                 sid = secrets.token_urlsafe(24)
             s = WsSession(sid, sid[:8], req.client, name, hostport(host, port), ttl, caps, now, who.get("approver"),
-                          lambda: self.sessions_clock(), conn, masker)
+                          lambda: self.sessions_clock(), conn,
+                          list(env.values()) + list(self.dest_guard.mask_values), wsc["deny_send"])
             self._sess[self._skey(sid)] = s
         s.start()
         self.audit("ws_session_opened", req, session=s.pid, host=hostport(host, port), ttl_s=ttl, max_frames=frames,
                    max_bytes=caps["max_bytes"], max_frame_bytes=caps["max_frame"], idle_s=caps["idle_s"],
-                   tls=sp["scheme"] == "wss", handshake=bool(wsc["steps"]), signin=signin_summary(wsc), expires_at=int(clock_mod.now() + ttl),
+                   tls=sp["scheme"] == "wss", handshake=bool(wsc["steps"]), signin=signin_summary(wsc),
+                   **target_audit(sp), expires_at=int(clock_mod.now() + ttl),
                    shortened=(ttl, frames) != (sp["ttl_s"], sp["max_calls"]))
         return {"session": {"id": sid, "kind": "ws", "expires_in": ttl, "hosts": [hostport(host, port)], "methods": [],
                             "max_calls": frames, "max_frames": frames, "max_bytes": caps["max_bytes"],
@@ -795,6 +918,15 @@ class WsMixin:
         if len(data) > s.caps["max_frame"]:
             self._refuse(client, s, "frame_size", f"a frame is limited to {s.caps['max_frame'] // 1024} KB",
                          _event="ws_session_refused")
+        if s.deny_send and text[:1] in ("{", "[", " ", "\t", "\r", "\n"):
+            try:
+                obj = json.loads(text)
+            except (ValueError, RecursionError):
+                obj = None
+            for item in (obj if isinstance(obj, list) else [obj]):
+                if isinstance(item, dict) and isinstance(item.get("type"), str) and item["type"] in s.deny_send:
+                    self._refuse(client, s, "denied_type", "that message type is blocked for this credential",
+                                 _event="ws_session_refused")
         with s.lock:
             if s.dead:
                 raise S.SessionError(*S.ENDED[s.end_reason if s.end_reason in S.ENDED else "unknown"])
@@ -830,9 +962,23 @@ class WsMixin:
         if not self.ws_cfg["enabled"]:
             raise PermissionError("websocket sessions are disabled")
         s = self._ws_get(sid, client)
-        wait = min(max(float(wait), 0.0), RECV_WAIT_MAX)
+        try:
+            wait = float(wait)
+        except (OverflowError, ValueError, TypeError):
+            wait = RECV_WAIT_MAX
+        wait = min(max(wait if wait == wait else 0.0, 0.0), RECV_WAIT_MAX)
         max_n = min(max(int(max_n), 1), RECV_MAX_FRAMES)
-        out = s.take(max_n, wait)
+        with s.lock:
+            busy = s.recv_inflight >= MAX_RECV_INFLIGHT
+            if not busy:
+                s.recv_inflight += 1
+        if busy:                                    # one agent cannot park many handler threads
+            self._refuse(client, s, "concurrency", "too many recv calls at once", http=429, _event="ws_session_refused")
+        try:
+            out = s.take(max_n, wait)
+        finally:
+            with s.lock:
+                s.recv_inflight -= 1
         if out is None or s.dead:
             with self._sess_lock:
                 _, state = self._sess_lookup(sid, client["id"], self.sessions_clock())
