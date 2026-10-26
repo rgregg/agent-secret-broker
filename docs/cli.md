@@ -238,6 +238,30 @@ session has expired, been closed or revoked, or was never yours, the call exits 
 it. Details, limits, the threat model and the audit events are in
 [reference.md](reference.md#http-sessions-multi-step-flows-with-one-approval).
 
+### WebSocket sessions: a connection the broker holds
+
+    asb ws NAME URL [--ttl 15m|900] [--max-frames N]      # open; a human approves one card; prints the id
+    asb ws send [ID] TEXT|-       asb ws recv [ID] [--wait S] [--max N] [--json]       asb ws close [ID]
+    asb ws [ID] [--linger S] [--close]                    # line relay: stdin lines out, frames in on stdout
+
+For services that speak WebSocket (Home Assistant's `/api/websocket`). The broker connects, signs in with the credential's
+operator-configured handshake and relays **text** frames; the token never reaches you. The card is always high risk and is
+never auto-approved. Once approved, **what you send is not filtered**, so send only what the task needs. `export
+ASB_WS_SESSION=ID` lets the later commands omit the id. Received frames have the credential masked; binary frames are not
+shown (a note with the length goes to stderr); `recv` says when the broker paused reading because the buffer was full
+(nothing is dropped). In the line relay, newlines inside a received frame print as spaces.
+
+    ID=$(asb ws ha wss://ha.example.com:8123/api/websocket --ttl 10m)
+    asb ws send $ID '{"id":1,"type":"config/area_registry/list"}'
+    asb ws recv $ID --wait 5
+    printf '%s\n' '{"id":2,"type":"get_config"}' | asb ws $ID --linger 2
+    asb ws close $ID
+
+Exit codes: 0 ok, 2 usage, 3 refused (credential not set up for WebSocket, host not allowed, too many sessions, connect or sign-in
+failed), 4 denied, 5 unanswered, 7 ended (expired, closed, revoked, idle, the server closed the connection, unknown), 8
+refused (frame or byte cap, oversize frame, rate limit). Details, the operator `ws` setting (handshake steps, query and
+header sign-in), limits and the threat model: [reference.md](reference.md#websocket-sessions-the-broker-holds-the-connection).
+
 ### Exit codes
 
 | Code | Meaning |

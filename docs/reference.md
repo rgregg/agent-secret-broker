@@ -2361,6 +2361,150 @@ calls into prompts. A malicious upstream cannot redirect the credential or cooki
 masking cannot stop: an upstream that echoes a value in a transformed form (encoded or split), and a program on the
 agent's machine that has its own access to the broker's client key.
 
+## WebSocket sessions (the broker holds the connection)
+
+HTTP mode cannot speak WebSocket (`Upgrade` and `Connection` are forbidden headers), and env mode would put the token in
+a script's environment. A **WebSocket session** lets the broker open the `ws://` or `wss://` connection itself, sign
+in with the credential, and relay text frames for the agent. The token never reaches the agent. The motivating case is
+Home Assistant's `/api/websocket` (registry, dashboard and device edits).
+
+It lives in the same session table as HTTP sessions (so lookup, the per-client binding, tombstones, expiry, revoke, client
+revoke and the Clients tab are one implementation) and is a separate kind. Code: `secret_broker/wssessions.py` (sessions,
+config, handshake steps), `secret_broker/wsproto.py` (a minimal RFC 6455 client over `socket`/`ssl`, stdlib only).
+
+**Approval.** `asb ws NAME URL [--ttl N] [--max-frames N]` asks for a session. The card is **always HIGH**, decided
+by code with no model call, never auto-approved (policy `allow`, Always, timed grants, SSH rules and `auto_approve_max`
+cannot cover it), and the notification has no buttons: only the approval site decides. The card names the credential,
+`scheme://host:port`, how the credential signs in, the time limit (fixed from approval, never extended) and the caps; the
+approver may shorten the time and frame cap, never lengthen them. The agent supplies no purpose text (it is refused); the
+path and query it chose are shown escaped and labelled unverified, and are not in the notification. Session-level approval
+only: **what the agent sends once approved is not filtered** (no message-type allowlist). The session is the unit of
+approval; an optional per-credential allowlist could be added later without changing the protocol.
+
+**Operator setup (never agent input).** A credential can open a WebSocket session only if its broker metadata has a `ws`
+object (fail closed: with none, the open is refused). The credential also needs `allowed_hosts` as for http; the host and
+port of the URL must be allowed by the same rule as http (`ws` defaults to port 80, `wss` to 443; a bare name entry allows
+any port, `host:port` exactly that port). TLS follows the credential's `tls_fingerprint` / `tls_verify` as for http, otherwise
+the certificate and name are verified, with SNI set to the original host name.
+
+    "ws": {
+      "handshake": "home-assistant",                    // a preset, or {"steps": [...]}, or {"wait": X, "send": Y, "expect": Z}
+      "query":   {"access_token": "{{VAR}}"},            // optional: added to the upgrade URL query, URL-encoded
+      "headers": {"Authorization": "Bearer {{VAR}}"},    // optional: Authorization, Sec-WebSocket-Protocol, Origin only
+      "origin": "https://app.example.com",               // optional: no Origin is sent unless configured
+      "subprotocols": ["graphql-ws"]                     // optional: offered, at most one may be chosen by the server
+    }
+
+* **Steps** are an ordered list (at most 8) evaluated in the broker. `{"send": Y}` sends one text frame: Y is a JSON
+  value whose strings are filled (`{{VAR}}`; the broker encodes the JSON, so a value cannot break out of its string) or a
+  text. `{"expect": X, "timeout": 10, "max_bytes": 65536, "skip": 0}` waits for a text frame matching X: a JSON object
+  (every field present with an equal value in the parsed frame, same types) or a text (an exact substring). There are no
+  regular expressions. `skip` is how many non-matching frames may be passed over; any other mismatch, a binary or oversize
+  reply, or a timeout fails the open. **Server first** (Home Assistant: wait for `auth_required`) is a first `expect` step;
+  **client first** is a first `send` step; multi-step flows (identify, subscribe, wait for ready) are more steps. Replies
+  consumed by the steps are never shown to the agent.
+* Examples. Client first: `{"handshake": {"steps": [{"send": {"op": "login", "key": "{{VAR}}"}}, {"expect": {"ok": true}}]}}`.
+  Multi-step: `{"steps": [{"expect": {"op": "hello"}}, {"send": {"op": "identify", "token": "{{VAR}}"}}, {"expect": {"op": "ready"}, "skip": 1, "timeout": 15}, {"send": "{\"op\":\"subscribe\"}"}, {"expect": "subscribed"}]}`.
+  Token in the URL: `{"query": {"access_token": "{{VAR}}"}}`. Token in a header: `{"headers": {"Authorization": "Bearer {{VAR}}"}}`.
+* A **text** `send` step (not an object) is sent with the placeholder replaced verbatim and is NOT JSON-escaped: a value with
+  a quote or a backslash would break the message. Prefer an object template, which the broker encodes.
+* The preset `home-assistant` is `expect {"type":"auth_required"}`, `send {"type":"auth","access_token":"{{VAR}}"}`,
+  `expect {"type":"auth_ok"}`.
+* `{{VAR}}` is the credential's only variable (a credential with several names the one it means). A placeholder is allowed
+  only in a `send` step, the `query` values and the `headers` values. The broker owns `Host`, `Upgrade`, `Connection` and
+  every `Sec-WebSocket-Key/Version/Extensions/Accept` header: they are never settable, and `headers` takes only the three
+  names above (so `httpcheck.FORBIDDEN_HEADERS` and everything else stay out). The agent cannot set a query parameter that
+  the credential's `query` owns (compared percent-decoded, `+` as space, case-folded; a `;` in the agent's query is refused), and
+  the credential's parameters are placed before the agent's.
+* A bad `ws` setting makes the credential invalid in the catalog (reported like any other bad metadata).
+
+**Relay.** `asb ws send ID TEXT`, `asb ws recv ID [--wait S] [--max N]`, `asb ws close ID`, and `asb ws ID` as a
+line-oriented stdin/stdout relay (each stdin line is one text frame; each received text frame is one output line, with
+newlines replaced by spaces; it lingers `--linger` seconds, default 2, after the last line or frame, and leaves the session
+open unless `--close`). The id is printed by `asb ws NAME URL`; `export ASB_WS_SESSION=ID` lets later commands omit it (a
+separate variable from `ASB_SESSION`, so `asb http` is never turned into a call on a WebSocket session). A credential
+named literally `send`, `recv` or `close` cannot be opened with the shell form. API: `POST /v1/requests` with
+`{"mode":"session","kind":"ws","names":[NAME],"url":URL,"ttl_s":N,"max_frames":N}`, then `POST /v1/ws/send`
+`{"session","text"}` and `POST /v1/ws/recv` `{"session","wait","max"}` (long-poll, at most 25 s) returning
+`{"frames":[{"seq","type":"text","data"}|{"seq","type":"binary","bytes":N}],"queued","truncated","closed","close_reason",
+"expires_in","frames_left"}`; close uses `{"mode":"session_close"}`. Text frames only go out; binary frames are never shown
+(a marker with the length). Fragmented messages are reassembled; pings are answered by the broker; a close frame ends the session
+once the queued frames are read.
+
+**Limits** (config `"ws_sessions"`, validated at startup with hard ceilings; defaults in parentheses): `enabled` (true),
+`default_ttl_s` (900), `max_ttl_s` (3600, at most 1 h), `max_frames` (1000, each direction), `max_bytes` (8 MiB, each
+direction), `max_frame_bytes` (1 MiB, also the largest reassembled message), `idle_s` (300), `max_per_client` (2),
+`recv_queue_frames` (256), `recv_queue_bytes` (4 MiB). One connection per session; at most 20 open sessions in total. Inbound
+caps count every wire frame (pings and fragments too) with a small allowance for the sign-in. Control frames (pings) count toward the inbound cap on purpose (it bounds a ping flood), and a server ping is not activity for the
+idle timeout (so a server cannot keep a session alive forever by pinging; the TTL bounds it anyway); an agent's `recv`, including a
+long-poll, and its sends are activity. A frame that has started must
+finish within 30 s (slow-drip peers are closed). An agent is rate limited per session (burst 60, 20 per second) and may have at most 2 `recv` calls in flight (429 beyond). The
+**receive queue never drops**: when it is full the broker stops reading the socket (TCP flow control pushes back on the
+server) and reports `truncated: true` on the next `recv`; collect frames more often. Exceeding a cap, an oversize frame or a
+protocol violation closes the connection (close codes 1008, 1009, 1002, 1007) and ends the session once the queue is
+read; outbound caps refuse the send (exit 8) and keep the session.
+
+**Protocol checks.** The handshake request is fixed (no extensions or compression offered, no cookie, no agent header). The
+answer must be `101` with a correct `Sec-WebSocket-Accept` (constant-time compare), `Upgrade: websocket` and
+`Connection: Upgrade`; a redirect, any other status, a missing or wrong accept, an extension, an unoffered subprotocol,
+a duplicated security header or an obs-fold fails the open. Client frames are masked with a fresh key. Server frames must be
+unmasked, have no reserved bit, a defined opcode and the shortest length encoding; control frames are at most 125 bytes
+and unfragmented; text must be valid UTF-8; sizes are checked from the frame header before any payload is read.
+
+**Destination guard.** The connection is made with `DestGuard.connect`, the same code HTTP calls and HTTP sessions use:
+the name is resolved once, every address must pass (no loopback, link-local, metadata, this host's own addresses, the broker's
+own ports, `destination_deny_cidrs`), and the socket goes to the validated address. No redirect, no environment proxy. The
+agent learns only `connection` for a refusal.
+
+**Masking and what is never exposed.** Every text frame returned is masked by the shared masker (`masking.py`: the credential's
+values in their usual encodings), and additionally: a JSON frame is parsed and every decoded string and key masked (so mixed
+`\uXXXX` escapes are seen through; the frame is re-serialised only when something was masked), matching is also done
+case-insensitively, and a partly percent-encoded spelling is masked. **Across messages** the broker holds back the end of a
+message that could still turn into the start of a secret (a proper prefix, one character or more, of any spelling) and joins it to
+the next message, so a secret split over any number of messages is masked; the held text is flushed as a mask when the
+connection ends. The cost: a plain-text message ending in a character that starts some spelling of a secret waits for the next one and is delivered
+together with it (a complete JSON document is never held, so JSON protocols such as Home Assistant's are unaffected). Residual: a hostile server that splits the
+secret across separate frames inside structured JSON values cannot be fully masked, nor one that splits it across frames while also mixing spellings
+(for example a partly percent-encoded or partly `\\u`-escaped secret cut mid-escape): the cross-message guarantee is for a secret split in ONE spelling (the
+raw value or any of the forms the masker knows), same class as a server that transforms it. The hold can also replace a held tail with `***` when the
+connection ends, even if it was not a secret. A server that transforms the secret in some other way (rot13, its own encoding) still defeats it, as for http. The URL, headers and sign-in messages exist only in memory and on the wire: they are in no
+response, log, audit record or card; the failure text to the agent is a fixed class (`could not connect (connection | tls |
+dns | timeout | handshake refused | frame too large)`), never exception or server text.
+
+**Catalog freshness and binding.** While any session exists the sweeper re-reads the vault catalog at most once a minute (shared by HTTP and WebSocket
+sessions), so a credential disabled, narrowed or stripped of its `ws` setting in the vault ends an idle session within about a minute. A WebSocket session is bound
+to a fingerprint of its credential's variables, TLS policy and `ws` setting taken when the card was made: a change before the open refuses it, a change after ends
+the session (as revoked). The client and the scope are checked again under the session lock right before the session is created (the handshake runs unlocked),
+and status reads go through the same check. Open sessions are counted per kind against their own caps (`sessions.max_per_client` for http,
+`ws_sessions.max_per_client` for WebSocket, pending requests included), with the global limit of 20 across both.
+
+**Ending.** The deadline is fixed (never extended). A session also ends on `asb ws close`, on revoke (Clients tab) or client
+revocation (the socket is closed at once, best effort close frame), after `idle_s` without a data frame in either direction,
+when the server closes or the connection fails, and at a broker restart. The agent gets exit 7 afterwards. Another client, a
+made-up id, an HTTP session id and a revoked client all get the same `404 session_unknown` answer.
+
+**Audit.** `ws_session_requested`, `ws_session_opened` (client, `host:port`, ttl, caps, `tls`, whether a handshake ran, a fixed-vocabulary
+`signin` summary), `ws_session_refused` (coalesced like `session_refused`; reason class such as `frames_cap`, `bytes_cap`,
+`frame_size`, `rate`, `open_connection`, `open_handshake_refused`), `ws_session_closed` (`reason`: closed, expired, revoked, idle, peer_closed,
+ws_error; `frames_in/out`, `bytes_in/out`, `messages_in`, `close_reason`, `host`). **Counts and byte totals only, never frame
+contents.** Only the first 8 characters of the id are logged. The agent's audit view shows its own ws events through the
+same deny-by-default whitelist.
+
+**Threat model.** An approved session lets the client send anything to that server as the credential until the deadline: size
+it by the card. **That includes commands that create new credentials on the server** (Home Assistant's
+`auth/long_lived_access_token` and `auth/sign_path`, for example): what the server returns is a new secret the masker has
+never seen, and it outlives the session and its revocation. The card says so. The operator can block message types per
+credential with `ws.deny_send` (a list of exact JSON `type` values; matching outgoing frames are refused with a fixed error,
+non-JSON frames are refused too, so a credential with `deny_send` set accepts JSON frames only); the `home-assistant` preset blocks the known credential and user-management commands by default (`auth/long_lived_access_token`, `auth/sign_path`,
+`auth/delete_refresh_token`, `config/auth/create|update|delete`, `config/auth_provider/homeassistant/create|admin_change_password|delete`, `supervisor/api`)
+and `"deny_send": []` clears that. The list is a guardrail, not a complete list. This is a
+blocklist for known dangerous commands, not a filter: everything else is relayed. It fails closed: with a deny list set, a frame must parse as strict JSON
+(no duplicate keys, no NaN/Infinity, nesting at most 16, no lone surrogate, no BOM), the `type` of the object (or of each object in a top-level array)
+must be text and not denied, and no denied name may appear anywhere in the frame (raw or decoded, any case), so a parser difference with the server cannot
+smuggle one through. A prompt-injected agent can spend the
+session but cannot extend it, reach another host, read the configured token from a frame, or turn a refusal into a prompt. A hostile server can send frames up to the caps, pause the reader only by flow control,
+and hold a slow frame for 30 s; it cannot make the broker dial elsewhere (no redirects, one pinned connection).
+
 ## Vault session lifetime
 
 The vault is not kept open (the local backend drops its decrypted contents after

@@ -25,6 +25,8 @@
   asb http ... [--session ID] [--capture NAME=header:X|cookie:N|json:$.a.b]
                                               http call inside a session (no new prompt, cookies kept by the broker);
                                               prefer export ASB_SESSION=ID, which keeps the id out of `ps`
+  asb ws NAME URL [--ttl 15m] [--max-frames N]  hold a ws:// or wss:// connection in the broker (a human approves);
+                                              prints a session id. Then: asb ws send|recv|close ID, or asb ws ID (line pipe)
   asb guidance propose FILE|- | --from-dir DIR  propose risk guidance; the human reviews it
   asb guidance status ID                      outcome of a proposal (no approval)
   asb enroll [--name NAME] [--url URL] [--force]  get this machine its own credential; a human approves
@@ -100,6 +102,7 @@ Which command? (decision rule)
   HTTP API, one call or a few independent ones   asb http
   Multi-step HTTP flow (log in, reuse the cookie, carry a CSRF token, log out)
                                                  asb session open ... then asb http ... --session ID
+  A service that speaks WebSocket (e.g. Home Assistant's /api/websocket)   asb ws NAME URL (see below)
   A program that needs the secret itself (an official CLI, a library)   env mode: asb NAME -- command
   Do not write a script around curl or requests to do an HTTP flow: use a session. The broker keeps
   the cookies and tokens, so the secret and the session never reach you.
@@ -138,6 +141,30 @@ HTTP sessions (multi-step flows; one human approval for a bounded unit of work)
   open a new session if you really need more. Do not retry a denied or revoked session.
   Exit 7: session expired, closed, revoked or unknown. Exit 8: refused (host, method, call cap, missing
   {{session.NAME}}). Never put a secret in --for.
+
+WebSocket sessions (a service that speaks WebSocket, e.g. Home Assistant's /api/websocket)
+  asb ws ha wss://ha.example.com:8123/api/websocket --ttl 10m
+  The human approves ONE card (always high risk: it names the credential, host and port, time limit and
+  caps); the broker opens the connection and signs in itself with the credential's handshake, so you never
+  see the token. Prints the session id; `export ASB_WS_SESSION=ID` lets you leave the id off below.
+    asb ws send ID '{"id":1,"type":"get_states"}'     one text frame to the server
+    asb ws recv ID --wait 5                           frames from the server, one per line (waits up to 25 s)
+    printf '%s\\n' '{"id":2,"type":"ping"}' | asb ws ID   line pipe: each stdin line is a frame, replies on stdout
+    asb ws close ID
+  What you send is not filtered, with one exception: the operator may block message types for a credential (the
+  Home Assistant preset blocks creating or deleting tokens, users and auth providers, signed paths and the
+  supervisor API). A blocked message is refused ("that message is blocked for this credential") and never reaches
+  the server; such a credential accepts only strict JSON frames. Do not try to work around a block (other
+  spellings, wrapping, splitting): ask the human instead. Even when nothing is blocked, the session was what the
+  human approved, so send only what the task needs, and never use it to create new credentials or tokens on the
+  server. Frames you receive have the credential masked; binary frames are not shown (a note with
+  the length goes to stderr). `recv` prints a note when the broker had to pause reading because you were
+  slow to collect frames (nothing is dropped; collect more often). Newlines inside a received frame are
+  printed as spaces. Counts, never contents, are logged. The deadline is fixed (15 min by default, never
+  extended); there are frame and byte caps in each direction, a frame size cap and an idle timeout. Exit 7:
+  the session ended (expired, closed by you, revoked, idle, the server closed the connection, or unknown).
+  Exit 8: refused (a cap, rate limit or oversize frame). A credential literally named send, recv or close
+  cannot be opened with the shell form. Do not retry a denied or revoked session.
 
 Approval
   The command blocks, printing "waiting for approval", for up to about 5 minutes.
@@ -238,6 +265,21 @@ Exit codes
 """
 
 HELP = {
+    "ws": """usage: asb ws NAME URL [--ttl 15m|900] [--max-frames N]     open (a human approves one card); prints the session id
+       asb ws send [ID] TEXT|-                                one text frame (- reads stdin)
+       asb ws recv [ID] [--wait S] [--max N] [--json]         frames from the server, one per line
+       asb ws close [ID]
+       asb ws [ID] [--linger S] [--close]                     line pipe: stdin lines are sent, frames printed
+
+URL is ws:// or wss:// on a host and port the credential allows. The broker connects, signs in with the
+credential's handshake (set by the operator; you never see the token) and relays text frames. ID defaults
+to $ASB_WS_SESSION. Nothing you send is filtered once the session is approved; the credential is masked in
+what you receive, binary frames are not shown. The pipe waits --linger seconds (default 2) after the last
+line or frame before it exits, and leaves the session open unless --close is given.
+Exit 0 ok, 2 usage, 3 broker error or refused (not set up, host not allowed, too many sessions), 4 denied,
+5 open unanswered, 7 ended (expired, closed, revoked, idle, server closed, unknown), 8 refused (cap, rate, size).
+example: asb ws ha wss://ha.example.com:8123/api/websocket --ttl 10m
+         asb ws send ID '{"id":1,"type":"get_states"}' && asb ws recv ID --wait 5""",
     "plan": """usage: asb plan submit FILE|- [--no-wait]
        asb plan status ID [--json]
        asb plan list [--json]
@@ -918,6 +960,228 @@ def run_session(argv):
     print(f"asb: session open for {s['expires_in']}s (fixed: no extension or renewal), up to {s['max_calls']} calls, "
           f"hosts {','.join(s['hosts'])}, methods {','.join(s['methods'])}", file=sys.stderr)
     return 0
+
+
+WS_ID_ENV = "ASB_WS_SESSION"
+WS_MAX_SEND = 4 << 20
+
+
+def ws_rc(code, r):
+    """(exit code, message) for a broker answer that is not a success."""
+    c = r.get("code") if isinstance(r, dict) else None
+    msg = _srv((r.get("error") if isinstance(r, dict) else None) or f"broker returned {code}")
+    if c in ("session_unknown", "session_expired"):
+        return EXIT_SESSION_ENDED, msg
+    if c == "session_refused":
+        return EXIT_SESSION_REFUSED, msg
+    return EXIT_BROKER, msg
+
+
+def ws_post(base, key, path, body, timeout=40):
+    code, r = call(base, key, path, body, timeout)
+    if code != 200:
+        rc, msg = ws_rc(code, r)
+        die(msg, rc)
+    return r
+
+
+_WS_BAD = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]")
+
+
+def ws_clean(text):
+    """Server text for a terminal: newlines become spaces (one frame, one line); other control characters and the
+    bidirectional override characters (which can make text read differently from what it is) are removed."""
+    return _WS_BAD.sub("", str(text).replace("\r", " ").replace("\n", " "))
+
+
+def ws_print(frames):
+    """Text frames to stdout, one per line; a binary marker to stderr."""
+    for f in frames:
+        if f.get("type") == "text":
+            sys.stdout.write(ws_clean(f.get("data", "")) + "\n")
+        else:
+            print(f"asb: binary frame ({int(f.get('bytes', 0))} bytes) not shown", file=sys.stderr)
+    sys.stdout.flush()
+
+
+def ws_notes(r):
+    if r.get("truncated"):
+        print("asb: the broker's receive buffer filled and it paused reading (nothing was dropped); "
+              "collect frames more often", file=sys.stderr)
+
+
+def ws_session_id(pos, need_more):
+    """(session id, remaining positionals): the first positional when it is an id and there are `need_more`
+    more after it, else $ASB_WS_SESSION."""
+    if pos and len(pos) > need_more and SESSION_ID_RE.match(pos[0]):
+        return pos[0], pos[1:]
+    env = os.environ.get(WS_ID_ENV, "").strip()
+    if env:
+        if not SESSION_ID_RE.match(env):
+            die(f"{WS_ID_ENV} is not a session id (the one `asb ws NAME URL` printed)")
+        return env, pos
+    die("a session id is needed (the one `asb ws NAME URL` printed, or export " + WS_ID_ENV + "=ID)\n" + HELP["ws"])
+
+
+def ws_flags(argv, allowed, bools=()):
+    """(positionals, flags). Flags take a value unless listed in `bools`."""
+    pos, flags, i = [], {}, 0
+    while i < len(argv):
+        a = argv[i]
+        if a in bools:
+            flags[a] = True
+            i += 1
+        elif a in allowed:
+            if i + 1 >= len(argv):
+                die(f"{a} needs a value\n" + HELP["ws"])
+            if a in flags:
+                die(f"{a} given twice")
+            flags[a] = argv[i + 1]
+            i += 2
+        elif a.startswith("-") and a != "-" and not SESSION_ID_RE.match(a):     # (an id may start with "-")
+            die(f"unexpected argument {a!r}\n" + HELP["ws"])
+        else:
+            pos.append(a)
+            i += 1
+    return pos, flags
+
+
+def ws_number(text, what, lo, hi, integer=False):
+    try:
+        v = float(text) if not integer else (int(text) if text.isascii() and text.isdigit() else None)
+    except ValueError:
+        v = None
+    if v is None or v != v or not lo <= v <= hi:
+        die(f"{what} must be a number from {lo} to {hi}")
+    return v
+
+
+def run_ws(argv):
+    """asb ws: open, send, recv, close, pipe. The credential never reaches this process."""
+    if not argv:
+        die(HELP["ws"])
+    sub = argv[0]
+    if sub == "send":
+        pos, _ = ws_flags(argv[1:], ())
+        sid, rest = ws_session_id(pos, 1)
+        if len(rest) != 1:
+            die("usage: asb ws send [ID] TEXT|-\n" + HELP["ws"])
+        text = sys.stdin.read() if rest[0] == "-" else rest[0]
+        if rest[0] == "-" and text.endswith("\n"):
+            text = text[:-1]
+        if len(text.encode("utf-8", "replace")) > WS_MAX_SEND:
+            die("a frame is limited to 4 MB")
+        base, key = config()
+        r = ws_post(base, key, "/v1/ws/send", {"session": sid, "text": text})
+        print(f"sent ({r.get('frames_left')} frames left, {r.get('expires_in')}s left)", file=sys.stderr)
+        return 0
+    if sub == "recv":
+        pos, fl = ws_flags(argv[1:], ("--wait", "--max"), ("--json",))
+        sid, rest = ws_session_id(pos, 0)
+        if rest:
+            die("usage: asb ws recv [ID] [--wait S] [--max N] [--json]\n" + HELP["ws"])
+        wait = ws_number(fl.get("--wait", "0"), "--wait", 0, 25)
+        mx = ws_number(fl.get("--max", "256"), "--max", 1, 256, integer=True)
+        base, key = config()
+        r = ws_post(base, key, "/v1/ws/recv", {"session": sid, "wait": wait, "max": int(mx)}, timeout=int(wait) + 20)
+        if "--json" in fl:
+            print(json.dumps(r))
+            return 0
+        ws_print(r.get("frames") or [])
+        ws_notes(r)
+        if r.get("queued"):
+            print(f"asb: {r['queued']} more frames waiting", file=sys.stderr)
+        if r.get("closed"):
+            print("asb: the connection is closed (" + _srv(r.get("close_reason") or "closed") + ")", file=sys.stderr)
+            return 0 if r.get("frames") else EXIT_SESSION_ENDED
+        return 0
+    if sub == "close":
+        pos, _ = ws_flags(argv[1:], ())
+        sid, rest = ws_session_id(pos, 0)
+        if rest:
+            die("usage: asb ws close [ID]\n" + HELP["ws"])
+        base, key = config()
+        code, r = call(base, key, "/v1/requests", {"mode": "session_close", "session": sid})
+        if code == 200:
+            print("closed")
+            return 0
+        rc, msg = ws_rc(code, r)
+        die(msg, rc)
+    pos, fl = ws_flags(argv, ("--ttl", "--max-frames", "--linger"), ("--close",))
+    if len(pos) == 2 and not ({"--linger", "--close"} & set(fl)):
+        return ws_open(pos[0], pos[1], fl)
+    if len(pos) > 1 or ({"--ttl", "--max-frames"} & set(fl)):
+        die("usage: asb ws NAME URL [--ttl 15m] [--max-frames N]  |  asb ws [ID] [--linger S] [--close]\n" + HELP["ws"])
+    sid, _ = ws_session_id(pos, 0)
+    return ws_pipe(sid, ws_number(fl.get("--linger", "2"), "--linger", 0, 300), "--close" in fl)
+
+
+def ws_open(name, url, fl):
+    check_name(name)
+    if not re.match(r"^wss?://", url or "") or len(url) > 2048:
+        die("URL must be ws://host[:port]/path or wss://host[:port]/path\n" + HELP["ws"])
+    payload = {"mode": "session", "kind": "ws", "names": [name], "url": url}
+    if "--ttl" in fl:
+        t = fl["--ttl"]
+        payload["ttl_s"] = int(t) if t.isascii() and t.isdigit() and len(t) <= 6 else parse_ttl(t)
+    if "--max-frames" in fl:
+        payload["max_frames"] = int(ws_number(fl["--max-frames"], "--max-frames", 1, 100000, integer=True))
+    s = obtain(payload, "waiting for the human to approve the WebSocket session...")["session"]
+    print(s["id"])
+    print(f"asb: WebSocket session open for {s['expires_in']}s (fixed: no extension or renewal), up to "
+          f"{s.get('max_frames', s['max_calls'])} frames each way, {s['hosts'][0]}; "
+          f"export {WS_ID_ENV}=ID to leave the id off the other commands", file=sys.stderr)
+    return 0
+
+
+def ws_pipe(sid, linger, close_at_end):
+    """Line relay: every stdin line is one text frame to the server; every text frame from the server is one
+    stdout line. Leaves after `linger` seconds without a frame in either direction once stdin has ended, or when
+    the server closes the connection."""
+    import threading
+    base, key = config()
+    st = {"rc": 0, "msg": None, "done": False, "last": time.monotonic(), "stop": False}
+
+    def writer():
+        try:
+            for line in sys.stdin:
+                line = line.rstrip("\r\n")
+                if not line:
+                    continue
+                if st["stop"]:
+                    return
+                code, r = call(base, key, "/v1/ws/send", {"session": sid, "text": line})
+                st["last"] = time.monotonic()
+                if code != 200:
+                    st["rc"], st["msg"] = ws_rc(code, r)
+                    st["stop"] = True
+                    return
+        except SystemExit as e:                     # `call` died: the broker is unreachable
+            st["rc"], st["stop"] = (e.code if isinstance(e.code, int) else EXIT_BROKER), True
+        finally:
+            st["done"] = True
+            st["last"] = time.monotonic()
+    threading.Thread(target=writer, daemon=True).start()
+    while not st["stop"]:
+        left = linger - (time.monotonic() - st["last"]) if st["done"] else 10
+        if st["done"] and left <= 0:
+            break
+        code, r = call(base, key, "/v1/ws/recv", {"session": sid, "wait": max(0.2, min(10, left)) if st["done"] else 10, "max": 256}, 40)
+        if code != 200:
+            rc, msg = ws_rc(code, r)
+            die(msg, rc)
+        if r.get("frames"):
+            st["last"] = time.monotonic()
+        ws_print(r.get("frames") or [])
+        ws_notes(r)
+        if r.get("closed"):
+            print("asb: the connection is closed (" + _srv(r.get("close_reason") or "closed") + ")", file=sys.stderr)
+            return 0 if r.get("frames") or st["rc"] == 0 else st["rc"]
+    if st["msg"]:
+        print("asb: " + st["msg"], file=sys.stderr)
+    if close_at_end and not st["rc"]:
+        call(base, key, "/v1/requests", {"mode": "session_close", "session": sid})
+    return st["rc"]
 
 
 def read_body(arg):
@@ -2709,6 +2973,9 @@ def main(argv):
     if argv[0] == "session":
         return run_session(argv[1:])
 
+    if argv[0] == "ws":
+        return run_ws(argv[1:])
+
     if argv[0] == "enroll":
         return run_enroll(argv[1:])
 
@@ -2858,7 +3125,7 @@ def main(argv):
         return 0 if r["status"] < 400 else EXIT_HTTP_ERROR
 
     if "--" not in argv:
-        die(f"unknown command {argv[0]!r}.\ncommands: list, which, status, audit, http, session, plan, store, update, "
+        die(f"unknown command {argv[0]!r}.\ncommands: list, which, status, audit, http, session, ws, plan, store, update, "
             "request-credential, guidance, enroll, ssh-agent, fingerprint, help, guide; or: asb NAME -- command\n"
             "start with `asb guide`")
     i = argv.index("--")

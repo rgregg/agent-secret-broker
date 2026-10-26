@@ -134,6 +134,7 @@ class Masker:
     def _index(self):
         self.max_len = max((len(f) for f in self.forms), default=0)
         self._first, self._last = {}, {}
+        self._short = {f[:k] for f in self.forms for k in (1, 2, 3)}     # every 1 to 3 character start of a form
         for f in self.forms:
             self._first.setdefault(f[:MIN_LEN], []).append(f)
             self._last.setdefault(f[-MIN_LEN:], []).append(f)
@@ -190,6 +191,21 @@ class Masker:
             pos = en
         out.append(text[pos:])
         return "".join(out)
+
+    def tail_prefix_len(self, text, min_len=MIN_LEN):
+        """Length of the longest suffix (`min_len` or more chars, at most 3 below MIN_LEN) of `text` that is a proper
+        prefix of some form: the part of a stream that could still turn into a secret when more text arrives (0 when
+        there is none)."""
+        for k in range(min(len(text), self.max_len - 1), max(1, min_len) - 1, -1):
+            tail = text[-k:]
+            if k < MIN_LEN:
+                if tail in self._short:
+                    return k
+                continue
+            for f in self._first.get(tail[:MIN_LEN], ()):
+                if len(f) > k and f.startswith(tail):
+                    return k
+        return 0
 
     def mask_tail(self, text):
         """Mask a trailing proper prefix (4+ chars) of any form at the end of `text` (the longest one)."""

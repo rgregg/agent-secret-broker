@@ -57,6 +57,7 @@ from . import clock as clock_mod
 from . import plans as plans_mod
 from . import planflow
 from . import sessions as sessions_mod
+from . import wssessions as ws_mod
 from . import sshhosts as sshhosts_mod
 from . import sshrules as sshrules_mod
 from . import risk as risk_mod
@@ -222,7 +223,7 @@ class _InternalRefused(ValueError):
 
 
 class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.SessionsMixin,
-             planflow.PlansMixin):
+             ws_mod.WsMixin, planflow.PlansMixin):
     def __init__(self, config, backend, notifier, audit=None, summarizer=None,
                  background_load=False, push=None, dest_guard=None):
         self.push = push                # PushStore when the webpush transport is configured
@@ -315,6 +316,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             kp.attach(self._summary_key_read, self.log)     # internal vault read; see below
         self._init_clients(config)
         self._init_sessions(config)
+        self._init_ws(config)
         self._init_grants(config)
         self._init_plans(config)
         self._init_ssh_rules()
@@ -460,11 +462,18 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             note, ginvalid = guidance_mod.from_meta(meta), None   # policy context, never shown to agents
         except guidance_mod.HiddenCharsError as e:
             note, ginvalid = None, str(e)       # ignored for classification; the credential stays valid
+        ws_cfg = None
+        if meta.get("ws") is not None:
+            if ssh or not hosts:
+                raise ValueError("ws only applies to an http credential with allowed_hosts")
+            ws_cfg = ws_mod.parse_cred_config(meta["ws"], vars_)
         entry = {**meta, "vars": vars_, "allowed_hosts": [h.lower() for h in hosts],
                  "_human": "created" not in meta,     # not made by a store / credential request
                  "approval": approval, "_item": item, "_meta": meta,
                  "_tls": {"fingerprint": fp, "verify": verify}}
         entry.pop("guidance", None)
+        entry.pop("ws", None)
+        entry["_ws"] = ws_cfg           # operator config (handshake template, origin); never agent input, never listed
         if ginvalid:
             entry["guidance_invalid"] = ginvalid
         entry.pop("ssh_hosts", None)
@@ -845,6 +854,8 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                          "legacy_client_key": self.clients_cfg["legacy"],
                          "http_sessions": {k: self.sessions_cfg[k] for k in (
                              "enabled", "default_ttl_s", "max_ttl_s", "max_calls", "max_per_client")},
+                     "ws_sessions": {k: self.ws_cfg[k] for k in (
+                             "enabled", "default_ttl_s", "max_ttl_s", "max_frames", "max_per_client")},
                      "client_list": "unreadable" if self.clients.unreadable else
                                     ("unsaved" if self.clients.unsaved() else "ok")},
         }
@@ -914,6 +925,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                        description_sha256=plans_mod.text_digest(sp["description"]) if sp["description"] else None)
         elif req.mode == "session":
             sp = req.spec       # the manifest and the purpose's length and hash; never the purpose
+            rec.setdefault("kind", sp.get("kind") or "http")
             for k, v in (("hosts", sp["hosts"]), ("methods", sp["methods"]), ("ttl_s", sp["ttl_s"]),
                          ("max_calls", sp["max_calls"]), ("purpose_length", len(sp["purpose"])),
                          ("purpose_sha256", credreq_mod.purpose_digest(sp["purpose"]))):
@@ -1413,12 +1425,15 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                     err = "too many pending requests"
                 if mode == "session":
                     cid_ = (client or clients_mod.ClientStore.LEGACY_VIEW)["id"]
-                    mine, total = self.session_counts(cid_)
-                    waiting = sum(r.status == "pending" and r.mode == "session" and r.client["id"] == cid_
-                                  for r in self._by_id.values())
-                    if waiting >= sessions_mod.MAX_PENDING_PER_CLIENT:
+                    kind = spec.get("kind") or "http"
+                    mine, total = self.session_counts(cid_, kind)       # each kind against its own cap
+                    pend = [r for r in self._by_id.values()
+                            if r.status == "pending" and r.mode == "session" and r.client["id"] == cid_]
+                    waiting = sum((r.spec.get("kind") or "http") == kind for r in pend)
+                    cap = (self.ws_cfg if kind == "ws" else self.sessions_cfg)["max_per_client"]
+                    if len(pend) >= sessions_mod.MAX_PENDING_PER_CLIENT:
                         err = "too many pending session requests"
-                    elif mine + waiting >= self.sessions_cfg["max_per_client"] or total >= sessions_mod.MAX_TOTAL:
+                    elif mine + waiting >= cap or total >= sessions_mod.MAX_TOTAL:
                         err = "too many open sessions"
                 if mode == "credential":
                     open_cr = [r for r in self._by_id.values() if r.status == "pending" and r.mode == "credential"]
@@ -2013,8 +2028,12 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                     f"{', '.join(req.names)}")
         elif req.mode == "session":
             sp = req.spec
-            what = (f"HTTP session requested: {req.names[0]} on {', '.join(sp['hosts'])} "
-                    f"({', '.join(sp['methods'])}), {sessions_mod._fmt_ttl(sp['ttl_s'])}, up to {sp['max_calls']} calls")
+            if sp.get("kind") == "ws":
+                what = (f"WebSocket session requested: {req.names[0]} on {', '.join(sp['hosts'])} "
+                        f"({sp['scheme']}), {sessions_mod._fmt_ttl(sp['ttl_s'])}, up to {sp['max_calls']} frames")
+            else:
+                what = (f"HTTP session requested: {req.names[0]} on {', '.join(sp['hosts'])} "
+                        f"({', '.join(sp['methods'])}), {sessions_mod._fmt_ttl(sp['ttl_s'])}, up to {sp['max_calls']} calls")
         elif req.mode == "ssh_sign":
             what = "\n".join([f"SSH key {req.spec['fingerprint']}: {req.spec['ssh']['text']}"]
                              + sshkey.host_lines(req.spec.get("host")))
@@ -2035,7 +2054,8 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             title = "Plan requested"
         elif req.mode == "session":     # no purpose (untrusted agent text); the card has everything
             msg = f"{what}\nFrom {req.source}. Open the approval page to review and approve or deny."
-            title = "HTTP session requested [HIGH]"
+            title = ("WebSocket session requested [HIGH]" if req.spec.get("kind") == "ws"
+                     else "HTTP session requested [HIGH]")
         n = notify_mod.make_notification(
             rid=req.id, tag=f"secret-{req.id[:8]}", title=title, text=msg, names=req.names,
             risk=req.risk["level"] if req.risk and req.mode != "plan" else None, url=url,
@@ -4678,7 +4698,7 @@ def _describe(req):
     if req.mode == "plan":
         return plans_mod.describe_html(req)
     if req.mode == "session":
-        return sessions_mod.describe_html(req)
+        return (ws_mod if req.spec.get("kind") == "ws" else sessions_mod).describe_html(req)
     if req.mode == "ssh_sign":
         host = "".join("<br>" + html.escape(x) for x in sshkey.host_lines(req.spec.get("host")))
         return (f"SSH signature with key <code>{html.escape(req.spec['fingerprint'])}</code><br>"
@@ -4785,7 +4805,7 @@ def _approve_actions(broker, req):
     if req.mode == "plan":          # duration, Approve (second step for a high plan), Deny
         return plans_mod.card_actions_html(req)
     if req.mode == "session":       # shorten-only limits, Approve or Deny; no Always, no timed grant
-        return sessions_mod.actions_html(broker, req)
+        return (ws_mod if req.spec.get("kind") == "ws" else sessions_mod).actions_html(broker, req)
     e = html.escape
     names = e(", ".join(req.names))
     row1 = ("<div class=decide-row><button class='btn approve' name=decision value=approve>"
@@ -4984,12 +5004,14 @@ def _detail_html(r, evs, retained=""):
             f"{rq.get('description_length', '?')} characters)")
     elif r["mode"] == "session":
         # manifest and hash prefix only: the purpose text is not retained
-        req_ev, opened = first("requested") or {}, first("session_opened") or {}
-        add("Operation", "http session (a time-boxed permission for specific hosts and methods)")
+        req_ev, opened = first("requested") or {}, first("session_opened") or first("ws_session_opened") or {}
+        add("Operation", "WebSocket session (a time-boxed connection the broker holds and relays; frame contents are never logged)"
+            if first("ws_session_opened") or first("ws_session_requested") else
+            "http session (a time-boxed permission for specific hosts and methods)")
         add("Hosts", ", ".join(req_ev.get("hosts") or []))
         add("Methods", ", ".join(opened.get("methods") or []) or None)
         add("Time limit", f"{opened['ttl_s']} s from approval (fixed)" if opened.get("ttl_s") else None)
-        add("Call cap", opened.get("max_calls"))
+        add("Call cap", opened.get("max_calls") or opened.get("max_frames"))
         add("Session", opened.get("session"))
         add("Purpose", f"not retained ({req_ev.get('purpose_length', '?')} characters, sha256 "
             f"<code>{e(str(req_ev.get('purpose_sha256') or ''))}</code>)", True)
@@ -5184,7 +5206,7 @@ def client_handler(broker, client_key):
                              {"Retry-After": "60"})
             try:
                 body = json.loads(self.rfile.read(n).decode("utf-8"))
-            except (ValueError, UnicodeDecodeError):
+            except (ValueError, UnicodeDecodeError, RecursionError):
                 body = None
             code, out = broker.enroll_submit(body, peer)
             _json(self, code, out)
@@ -5226,7 +5248,7 @@ def client_handler(broker, client_key):
                 return _json(self, 413 if n > 2048 else 400, {"ok": False})
             try:
                 body = json.loads(self.rfile.read(n).decode("utf-8"))
-            except (ValueError, UnicodeDecodeError):
+            except (ValueError, UnicodeDecodeError, RecursionError):
                 body = None
             ok_id = lambda v, mx: isinstance(v, str) and re.fullmatch(  # noqa: E731
                 r"[A-Za-z0-9_-]{1,%d}" % mx, v) is not None
@@ -5256,8 +5278,10 @@ def client_handler(broker, client_key):
                 return
             if planflow.client_request(self, broker, "POST", self.path.split("?")[0]):
                 return
+            if self.path.split("?")[0] in ("/v1/ws/send", "/v1/ws/recv"):
+                return self._ws_api(self.path.split("?")[0])
             if self.path != "/v1/requests":
-                # the client API has one request endpoint plus the plan endpoints; none takes a secret value
+                # the client API has one request endpoint plus the plan and ws endpoints; none takes a secret value
                 return _json(self, 404, {"error": "not found"})
             try:
                 n = int(self.headers.get("Content-Length", 0))
@@ -5289,7 +5313,8 @@ def client_handler(broker, client_key):
                     elif body.get("capture") is not None:
                         raise ValueError("--capture needs --session")
                 elif mode == "session":
-                    spec = {k: body[k] for k in ("purpose", "hosts", "methods", "ttl_s", "max_calls") if k in body}
+                    spec = {k: body[k] for k in ("purpose", "hosts", "methods", "ttl_s", "max_calls", "kind", "url",
+                                                 "max_frames") if k in body}
                     spec.setdefault("purpose", None)
                 elif mode == "session_close":
                     state = broker.session_close(body.get("session"), self.client)
@@ -5325,6 +5350,8 @@ def client_handler(broker, client_key):
                                     peer=self._ip, client=self.client)
             except sessions_mod.SessionError as e:
                 return _json(self, e.http, {"error": str(e), "code": e.code})
+            except RecursionError:                      # a absurdly nested body: a fixed answer, no traceback
+                return _json(self, 400, {"error": "bad request"})
             except (ValueError, KeyError, TypeError, json.JSONDecodeError) as e:
                 if not str(e) or not isinstance(e, ValueError) or isinstance(e, json.JSONDecodeError):
                     broker.log("bad_request", peer=self._ip, error=httpcheck.clip(e),
@@ -5336,6 +5363,35 @@ def client_handler(broker, client_key):
                 return _json(self, 403, {"error": httpcheck.clip(e)})
             _json(self, 202, {"id": req.id, "status": req.status, "error": req.error,
                               "expires_in": int(req.expires - time.time())})
+
+        def _ws_api(self, path):
+            """WebSocket session relay: /v1/ws/send {session, text}, /v1/ws/recv {session, wait, max}. The
+            session is looked up for THIS client only; every refusal is the session machinery's fixed text."""
+            try:
+                n = int(self.headers.get("Content-Length", 0))
+                if n < 0 or n > ws_mod.MAX_API_BODY:
+                    self.close_connection = True
+                    return _json(self, 413, {"error": "request too large"})
+                body = json.loads(self.rfile.read(n))
+                if not isinstance(body, dict):
+                    raise ValueError("bad request")
+                if path == "/v1/ws/send":
+                    out = broker.ws_send(body.get("session"), body.get("text"), self.client)
+                else:
+                    wait, mx = body.get("wait", 0), body.get("max", ws_mod.RECV_MAX_FRAMES)
+                    if isinstance(wait, int) and not isinstance(wait, bool):
+                        wait = max(-1, min(wait, 1000))      # (a huge integer must not reach float())
+                    if (isinstance(wait, bool) or isinstance(mx, bool) or not isinstance(wait, (int, float))
+                            or not isinstance(mx, int) or wait != wait):
+                        raise ValueError("wait is a number of seconds and max a whole number")
+                    out = broker.ws_recv(body.get("session"), self.client, wait, mx)
+            except sessions_mod.SessionError as e:
+                return _json(self, e.http, {"error": str(e), "code": e.code})
+            except (ValueError, KeyError, TypeError, UnicodeError, ArithmeticError, RecursionError, json.JSONDecodeError):
+                return _json(self, 400, {"error": "bad request"})     # fixed: the agent's text is never echoed
+            except PermissionError as e:
+                return _json(self, 403, {"error": httpcheck.clip(e)})
+            _json(self, 200, out)
 
         def _no_write(self):
             if self._authed():
@@ -5623,7 +5679,7 @@ def approval_handler(broker):
                 elif r["mode"] == "plan":
                     what = "plan"
                 elif r["mode"] == "session":
-                    what = "http session for " + ", ".join(r["names"])
+                    what = ("WebSocket session for " if r.get("session_kind") == "ws" else "http session for ") + ", ".join(r["names"])
                 elif r["mode"] == "guidance":
                     what = f"guidance proposal ({len(r['names'])} credential{'' if len(r['names']) == 1 else 's'})"
                 else:
@@ -6254,7 +6310,7 @@ def approval_handler(broker):
                 return self._json(413, {"ok": False})
             try:
                 body = json.loads(self.rfile.read(n).decode("utf-8"))
-            except (ValueError, UnicodeDecodeError):
+            except (ValueError, UnicodeDecodeError, RecursionError):
                 body = None
             tab = body.get("tab", "") if isinstance(body, dict) else None
             if (not isinstance(body, dict) or not isinstance(body.get("v"), bool)
@@ -6287,7 +6343,7 @@ def approval_handler(broker):
                 return self._json(413, {"ok": False})
             try:
                 body = json.loads(self.rfile.read(n).decode("utf-8"))
-            except (ValueError, UnicodeDecodeError):
+            except (ValueError, UnicodeDecodeError, RecursionError):
                 body = None
             if (not isinstance(body, dict) or body.get("decision") not in ("approve", "deny")
                     or not isinstance(body.get("token"), str) or not body["token"]
