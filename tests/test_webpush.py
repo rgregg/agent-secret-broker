@@ -686,8 +686,8 @@ class PushDecide(t.Dashboard):
         import urllib.request
         js = urllib.request.urlopen(urllib.request.Request(
             self.abase + "/sw.js", headers={"X-authentik-username": "alice"})).read().decode()
-        self.assertEqual(broker_mod.SW_VERSION, "14")
-        self.assertIn("SW_VERSION='14'", js)
+        self.assertEqual(broker_mod.SW_VERSION, "15")
+        self.assertIn("SW_VERSION='15'", js)
         for needle in ("/push/decide", "X-Requested-With", "credentials:'same-origin'",
                        "redirect:'manual'", "action_click", "action_decide",
                        "Could not '+verb+' - tap to review", "'Approved'", "'Denied'",
@@ -801,7 +801,8 @@ const src=fs.readFileSync(process.argv[2],'utf8');
 const payload=JSON.parse(process.argv[3]);
 const mode=process.argv[4]||'';
 const listeners={}; let live=[]; const log=[]; const calls=[];
-global.setTimeout=(f)=>setImmediate(f);
+const held=[]; const manual=process.env.HOLD_MANUAL==='1';
+global.setTimeout=(f,ms)=>{calls.push('timer');if(manual&&ms>=1000){held.push(f);return 0;}return setImmediate(f);};
 const reg={
   showNotification:(t,o)=>{
     calls.push('show');
@@ -825,12 +826,20 @@ new Function(src).call(global);
   let p=null,threw=null;
   const data=mode==='nodata'?null:{json:()=>{if(mode==='badjson')throw new SyntaxError('x');return payload;}};
   try{listeners.push({data,waitUntil:(x)=>{p=x;}});}catch(e){threw=String(e);}
+  let settled=false,pendingTimers=0,showsBeforeHold=0;
+  if(manual&&p){
+    p.then(()=>{settled=true;},()=>{settled=true;});
+    for(let i=0;i<200;i++)await new Promise(r=>setImmediate(r));
+    pendingTimers=held.length; showsBeforeHold=calls.filter(c=>c==='show').length;
+    var settledBeforeRelease=settled;
+    while(held.length)held.shift()();
+  }
   await p;
-  console.log(JSON.stringify({threw,live:live.map(n=>n.title),waited:p!==null,calls}));
+  console.log(JSON.stringify({threw,live:live.map(n=>n.title),waited:p!==null,calls,settledBeforeRelease:manual?settledBeforeRelease:null,pendingTimers,showsBeforeHold}));
 })();
 """
 
-    def run_push(self, payload, ua="", mode="", old_resolved=False):
+    def run_push(self, payload, ua="", mode="", old_resolved=False, manual=False):
         import subprocess
         import shutil
         node = shutil.which("node")
@@ -844,6 +853,8 @@ new Function(src).call(global);
         env = {**os.environ, "UA": ua}
         if old_resolved:
             env["OLD_RESOLVED"] = "1"
+        if manual:
+            env["HOLD_MANUAL"] = "1"
         r = subprocess.run([node, os.path.join(d, "h.js"), os.path.join(d, "sw.js"),
                             json.dumps(payload), mode], capture_output=True, text=True, timeout=30, env=env)
         self.assertEqual(r.returncode, 0, r.stderr)
@@ -882,6 +893,30 @@ new Function(src).call(global);
                 calls = out["calls"]
                 self.assertIn("show", calls, (ua, payload))
                 self.assertNotIn("get", calls[calls.index("show"):], (ua, payload, calls))
+
+    def test_chromium_push_is_held_open_after_the_show_with_a_plain_timer(self):
+        # Chrome adds its own "updated in the background" banner if no notification is registered as
+        # displayed when the push event settles; macOS's native path is not instant, so v15 holds the event.
+        for ua in (self.MAC_CHROME, self.WIN_CHROME):
+            for payload in (self.REQUEST, self.RESOLVED):
+                out = self.run_push(payload, ua=ua, old_resolved=True, manual=True)
+                calls = out["calls"]
+                self.assertEqual(out["showsBeforeHold"], 1, (ua, payload, out))
+                self.assertEqual(out["pendingTimers"], 1, (ua, payload, out))       # the hold, pending
+                self.assertFalse(out["settledBeforeRelease"], (ua, payload, out))  # event not settled early
+                # the hold starts only after the show, and nothing reads the list after the show
+                self.assertGreater(calls.index("timer"), calls.index("show"), calls)
+                self.assertNotIn("get", calls[calls.index("show"):], calls)
+
+    def test_non_chromium_push_is_not_held(self):
+        for ua in (self.MAC_SAFARI, self.IOS_SAFARI):
+            out = self.run_push(self.REQUEST, ua=ua, manual=True)
+            self.assertEqual(out["pendingTimers"], 0, ua)
+
+    def test_fallback_show_is_also_held_on_chromium(self):
+        out = self.run_push(self.REQUEST, ua=self.MAC_CHROME, mode="reject-full", manual=True)
+        self.assertEqual(out["pendingTimers"], 1, out)
+        self.assertFalse(out["settledBeforeRelease"], out)
 
     def test_request_push_shows_first_only_after_the_sweep_finished(self):
         # the sweep must be sequenced before the show, not run next to it
@@ -1266,8 +1301,8 @@ new Function(src).call(global);
         self.assertTrue(n["o"]["silent"])
 
     def test_version_bumped_and_old_version_gone(self):
-        self.assertEqual(broker_mod.SW_VERSION, "14")
-        self.assertIn("SW_VERSION='14'", broker_mod._SERVICE_WORKER)
+        self.assertEqual(broker_mod.SW_VERSION, "15")
+        self.assertIn("SW_VERSION='15'", broker_mod._SERVICE_WORKER)
         self.assertNotIn("SW_VERSION='9'", broker_mod._SERVICE_WORKER)
 
     def test_source_has_replace_then_close_logic(self):

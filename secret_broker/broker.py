@@ -4239,7 +4239,7 @@ _DASH_JS = _KEEP_JS + _DASH_JS + proposals_mod.JS_INIT
 
 # Single source of truth for the worker version: rendered into the worker, the
 # X-SW-Version header on /sw.js, and the Settings page ("expected" version).
-SW_VERSION = "14"
+SW_VERSION = "15"
 
 _SERVICE_WORKER = r"""
 var SW_VERSION='__SW_VERSION__';
@@ -4334,6 +4334,13 @@ function minimalShow(tag,title){
 // never after it and never alongside it.
 // Chromium leaves the brief "Approved: x" notice up (it replaces the approval
 // notification under the same tag); sweep earlier notices out BEFORE showing the next one.
+// Chromium enforces userVisibleOnly when the push event settles: it checks whether a notification
+// is on display and, if not, adds its own "This site has been updated in the background". On
+// macOS's native path a notification that showNotification() just resolved is not always
+// registered as displayed yet, so the event is held open for a moment after the show. The hold is a
+// plain timer: it must not touch notifications (see above) and must be inside waitUntil.
+var HOLD_MS=1500;
+function hold(){return CHROMIUM?new Promise(function(res){setTimeout(res,HOLD_MS);}):Promise.resolve();}
 function sweepResolved(except){
   return self.registration.getNotifications().then(function(ns){
     ns.forEach(function(n){try{if(n.data&&n.data.resolved&&n.tag!==except)n.close();}catch(x){}});
@@ -4357,14 +4364,14 @@ function resolvedPush(d){
     function(){return 0;});}).then(function(had){
     return self.registration.showNotification(title,{body:'',tag:tag,
       renotify:false,silent:!CHROMIUM,requireInteraction:false,data:{url:'/',resolved:true}}).then(function(){
-      if(CHROMIUM)return;
+      if(CHROMIUM)return hold();
       return new Promise(function(res){setTimeout(res,1000);}).then(closeAll);
     }).then(function(){
       return rep('resolved',{ok:true,tag:tag,note:String(d.status||'').slice(0,12)+(had?'':' none')+(CHROMIUM?' kept':''),
         ms:Date.now()-t0});
     },function(err){
       return minimalShow(tag,title).then(function(ok){
-        return rep('resolved',{ok:false,tag:tag,err:em(err),note:ok?'fallback':'nofallback',ms:Date.now()-t0});});});
+        return hold().then(function(){return rep('resolved',{ok:false,tag:tag,err:em(err),note:ok?'fallback':'nofallback',ms:Date.now()-t0});});});});
   });
   return p.catch(function(){});
 }
@@ -4396,12 +4403,13 @@ self.addEventListener('push',function(e){
     body:d.body||'A secret was requested',tag:tag,requireInteraction:PERSIST,
     data:data,actions:acts,renotify:true,
     timestamp:t0});}).then(function(){
-      return rep('show',{ok:true,tag:tag,ms:Date.now()-t0,persist:PERSIST,
-        note:acts.map(function(a){return a.action;}).join(',')});},
+      // hold the event open (Chromium) while the diag row is written; see hold()
+      return Promise.all([hold(),rep('show',{ok:true,tag:tag,ms:Date.now()-t0,persist:PERSIST,
+        note:acts.map(function(a){return a.action;}).join(',')})]);},
     function(err){
       // e.g. unsupported option: still show a plain one rather than let Chrome add its own
       return minimalShow(tag).then(function(ok){
-        return rep('show',{ok:false,tag:tag,err:em(err),note:ok?'fallback':'nofallback',ms:Date.now()-t0});});});
+        return Promise.all([hold(),rep('show',{ok:false,tag:tag,err:em(err),note:ok?'fallback':'nofallback',ms:Date.now()-t0})]);});});
   e.waitUntil(Promise.all([r1,r2]));
   }catch(err){
     e.waitUntil(minimalShow(tag).then(function(){return rep('show',{ok:false,tag:tag,err:em(err),note:'fallback'});}));

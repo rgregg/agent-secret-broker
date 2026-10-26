@@ -132,7 +132,10 @@ class Late(E.Harness):
         before = (self.req_obj(rid).status, self.req_obj(rid).risk, len(self.records()))
         self.release_rating.set()
         self.release_text.set()
-        self.until(lambda: self.req_obj(rid).summary_source == "model", "description did not arrive")
+        # the description and the late rating come from two threads: wait for BOTH records
+        self.until(lambda: self.req_obj(rid).summary_source == "model"
+                   and {"description_updated", "rated_late"} <= {e["event"] for e in self.records()[before[2]:]},
+                   "description and late rating did not both arrive")
         r = self.req_obj(rid)
         self.assertEqual((r.status, r.risk), before[:2])
         self.assertEqual({e["event"] for e in self.records()[before[2]:]}, {"description_updated", "rated_late"})
