@@ -1232,6 +1232,11 @@ class SignIn(WsBase):
         err = self.failed("tight", lambda c, st: c.send_text("go" + "x" * 500))
         self.assertEqual(err, "session not opened: could not connect (frame too large)")
 
+    def test_all_steps_together_are_bounded(self):
+        with mock.patch.object(W, "HANDSHAKE_TOTAL_S", 0.3):
+            err = self.failed("multi", lambda c, st: (c.send_json({"op": "hello"}), time.sleep(1)))
+        self.assertEqual(err, "session not opened: could not connect (timeout)")
+
     def test_a_binary_reply_never_satisfies_an_expect(self):
         err = self.failed("tight", lambda c, st: c.send_frame(2, b"go"))
         self.assertEqual(err, "session not opened: could not connect (handshake refused)")

@@ -56,6 +56,7 @@ FLOOR = {"idle_s": 10, "max_frame_bytes": 1024, "recv_queue_frames": 1, "recv_qu
 MAX_URL = 2048
 CONNECT_S = 10.0
 HANDSHAKE_S = 10.0
+HANDSHAKE_TOTAL_S = 60.0         # every sign-in step together
 FRAME_DEADLINE_S = 30           # a frame that has started must finish within this (slow-drip peers)
 DRAIN_GRACE_S = 60              # a finished connection keeps its unread frames this long
 IN_FRAMES_SLACK = 16              # inbound wire frames allowed beyond the cap: the handshake's replies and pings
@@ -344,13 +345,14 @@ def run_handshake(conn, steps, values):
     """The credential's steps, evaluated here, in order. Raises wsproto.WsError with a fixed label on a mismatch
     (handshake refused), a timeout or an oversize reply: nothing the server said is kept or reported."""
     keep = conn.max_frame
+    total_end = time.monotonic() + HANDSHAKE_TOTAL_S        # all steps together, however many and however slow
     try:
         for st in steps:
             if st["op"] == "send":
                 msg = _fill_json(st["value"], values)
                 conn.write(wsproto.OP_TEXT, (msg if isinstance(msg, str) else json.dumps(msg)).encode("utf-8"))
                 continue
-            end = time.monotonic() + st["timeout"]
+            end = min(time.monotonic() + st["timeout"], total_end)
             conn.max_frame = min(keep, st["max_bytes"])
             skipped = 0
             while True:
@@ -794,6 +796,9 @@ class WsMixin:
             s.conn.write(wsproto.OP_TEXT, data)
         except wsproto.WsError as e:
             s._finish(e.label)
+            with s.lock:                            # closed under us by a revoke, close or deadline: say that
+                if s.dead:
+                    raise S.SessionError(*S.ENDED[s.end_reason if s.end_reason in S.ENDED else "unknown"]) from None
             raise S.SessionError(*S.ENDED["ws_error"]) from None
         with s.lock:
             if s.dead:

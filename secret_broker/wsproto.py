@@ -82,7 +82,9 @@ class Transport:
             raise OSError("closed")
         try:
             if not (self.is_ssl and self.sock.pending()):
-                if not select.select([self.sock], [], [], wait)[0]:
+                p = select.poll()                   # (not select(): a descriptor number above 1023 would break it)
+                p.register(self.sock, select.POLLIN)
+                if not p.poll(int(wait * 1000)):
                     return None
             with self.lock:
                 self.sock.settimeout(POLL_S)
