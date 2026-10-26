@@ -1,0 +1,30 @@
+{
+  "name": "home-assistant-admin",
+  "description": "Home Assistant WebSocket API: sign-in only, no message is blocked.",
+  "handshake": {
+    "steps": [
+      {
+        "expect": {
+          "type": "auth_required"
+        }
+      },
+      {
+        "send": {
+          "type": "auth",
+          "access_token": "{{VAR}}"
+        }
+      },
+      {
+        "expect": {
+          "type": "auth_ok"
+        }
+      }
+    ]
+  },
+  "card_text": "Home Assistant, UNRESTRICTED: nothing the client sends is filtered, including commands that create long-lived tokens, manage users or run shell commands.",
+  "risk_notes": [
+    "No deny list, no allow list, no rules: the client can do anything the signed-in user can do.",
+    "Anything it creates (for example a long-lived access token) outlives the session and is not masked or revoked with it.",
+    "Use only for a short, supervised session that needs these commands."
+  ]
+}

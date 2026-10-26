@@ -1,0 +1,65 @@
+{
+  "name": "home-assistant-readonly",
+  "description": "Home Assistant WebSocket API: read-only commands only (states, config, registries, dashboards).",
+  "handshake": {
+    "steps": [
+      {
+        "expect": {
+          "type": "auth_required"
+        }
+      },
+      {
+        "send": {
+          "type": "auth",
+          "access_token": "{{VAR}}"
+        }
+      },
+      {
+        "expect": {
+          "type": "auth_ok"
+        }
+      }
+    ]
+  },
+  "deny_send": [
+    "auth/long_lived_access_token",
+    "auth/sign_path",
+    "auth/delete_refresh_token",
+    "config/auth/create",
+    "config/auth/update",
+    "config/auth/delete",
+    "config/auth_provider/homeassistant/create",
+    "config/auth_provider/homeassistant/admin_change_password",
+    "config/auth_provider/homeassistant/delete",
+    "supervisor/api"
+  ],
+  "allow_send": [
+    "get_states",
+    "get_config",
+    "get_services",
+    "get_panels",
+    "subscribe_events",
+    "unsubscribe_events",
+    "subscribe_entities",
+    "ping",
+    "config/entity_registry/list",
+    "config/entity_registry/get",
+    "config/entity_registry/list_for_display",
+    "config/device_registry/list",
+    "config/area_registry/list",
+    "config/floor_registry/list",
+    "config/label_registry/list",
+    "lovelace/config",
+    "lovelace/resources",
+    "auth/current_user",
+    "render_template",
+    "system_log/list"
+  ],
+  "card_text": "Home Assistant, read-only: the client may only send a fixed list of read commands (states, configuration, registries, dashboards, logs); every other command is refused.",
+  "risk_notes": [
+    "Only the listed read message types may be sent; the credential-minting commands are also blocked by name.",
+    "The client still sees everything the signed-in user can read, including entity states and attributes.",
+    "render_template evaluates a template on the server; it can read state but cannot call services.",
+    "subscribe_events lets the client watch any event type."
+  ]
+}
