@@ -9,8 +9,9 @@ should notice, and restores the line. KILLED is what you want (a test failed). S
 behaviour: add one. BAD-ANCHOR means the line was refactored and the entry needs updating (it is reported loudly so
 a stale entry cannot pass for a clean result). Exits non-zero if anything survived or an anchor is stale.
 
-Commit first: it mutates a copy of HEAD, not your working tree. R15 (the helper must run as root) and a few others
-are caught only by the end-to-end test (tests/e2e_root_exec/run.sh), which this script does not run.
+Commit first: it mutates a copy of HEAD, not your working tree. Entries marked "e2e" can only be caught by the
+container end-to-end test (tests/e2e_root_exec/run.sh); they run it when docker is available and are reported as
+SKIPPED, not failed, when it is not.
 """
 import os
 import shutil
@@ -61,7 +62,7 @@ MUTATIONS = [
  ("R12","crates/asb-root-exec/src/resolve.rs",'check_chain(&real, trusted_uid, Kind::Program, trust_root)?;','',"rs","program trust check"),
  ("R13","crates/asb-root-exec/src/lib.rs",'trust::check_chain(&path, policy.trusted_uid, Kind::Secret, &policy.trust_root)','Ok::<(), String>(())',"rs","config file trust check"),
  ("R14","crates/asb-root-exec/src/trust.rs",'Kind::Secret if bits & 0o077 != 0 =>','Kind::Secret if bits & 0o007 != 0 =>',"rs","config must be 0600"),
- ("R15","crates/asb-root-exec/src/main.rs",'if unsafe { libc::geteuid() } != 0 {','if false {',"rs","helper must run as root"),
+ ("R15","crates/asb-root-exec/src/main.rs",'if unsafe { libc::geteuid() } != 0 {','if false {',"e2e","helper must run as root"),
  ("R16","crates/asb-root-exec/src/scriptcheck.rs",'if code.starts_with(\'-\') || code.starts_with(\'+\') {','if false {',"rs","inline code must be next word"),
  ("R17","crates/asb-root-exec/src/scriptcheck.rs",'!POSITIONAL_AFTER_CODE.contains(&interpreter.as_str())','false',"rs","switches after inline code"),
  ("R18","crates/asb-root-exec/src/scriptcheck.rs",'file_args(args, 1, cwd, trusted_uid, trust_root, &mut out)?;','',"rs","file arguments trusted"),
@@ -74,7 +75,7 @@ def main():
     wt = os.path.join(tmp, "wt")
     subprocess.run(["git", "worktree", "add", "-q", "--detach", wt, "HEAD"], cwd=REPO, check=True)
     env = {**os.environ, "CARGO_TARGET_DIR": os.path.join(tmp, "target")}
-    bad = []
+    bad, skipped = [], []
     try:
         for mid, rel, old, new, runner, what in todo:
             path = os.path.join(wt, rel)
@@ -84,8 +85,16 @@ def main():
                 bad.append(mid)
                 continue
             open(path, "w").write(src.replace(old, new))
+            if runner == "e2e" and not shutil.which("docker"):
+                open(path, "w").write(src)
+                skipped.append(mid)
+                print(f"{mid:4} SKIPPED      {what} (needs docker for the end-to-end test)", flush=True)
+                continue
             try:
-                if runner == "py":
+                if runner == "e2e":
+                    r = subprocess.run([os.path.join(wt, "tests", "e2e_root_exec", "run.sh")], cwd=wt,
+                                       capture_output=True, text=True, timeout=900)
+                elif runner == "py":
                     r = subprocess.run(PY, cwd=os.path.join(wt, "tests"), capture_output=True, text=True, timeout=300)
                 else:
                     r = subprocess.run(RS, cwd=wt, capture_output=True, text=True, timeout=500, env=env)
@@ -100,7 +109,10 @@ def main():
     finally:
         subprocess.run(["git", "worktree", "remove", "--force", wt], cwd=REPO)
         shutil.rmtree(tmp, ignore_errors=True)
-    print(f"\n{len(todo) - len(bad)} of {len(todo)} mutations killed" + (f"; need attention: {', '.join(bad)}" if bad else ""))
+    killed = len(todo) - len(bad) - len(skipped)
+    print(f"\n{killed} of {len(todo)} mutations killed"
+          + (f"; skipped (no docker): {', '.join(skipped)}" if skipped else "")
+          + (f"; need attention: {', '.join(bad)}" if bad else ""))
     sys.exit(1 if bad else 0)
 
 

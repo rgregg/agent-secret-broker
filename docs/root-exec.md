@@ -166,4 +166,5 @@ Passing tests only help if they fail when the code is wrong. `python tools/mutat
 security-critical line at a time in a throwaway copy of `HEAD` (the allow-list check, the trust checks, the
 post-approval re-checks, the notification-button protections, ...) and reports which breakages the tests notice.
 Run it before changing that code. `SURVIVED` means no test pins that behaviour; `BAD-ANCHOR` means the line moved and
-the entry needs updating. It takes a few minutes and needs `cargo`.
+the entry needs updating. It takes a few minutes and needs `cargo`; the one mutation only the container test can catch runs that test when
+`docker` is available and is reported as skipped (not failed) when it is not.
