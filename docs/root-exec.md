@@ -141,7 +141,9 @@ but the command could not be started.
   powerful as its text and is **not** checked: you approve names, not contents. What a trusted script itself runs,
   sources or imports is also its own business. Interpreters such as `python3` may load modules from the current
   directory, which the agent controls: run root commands from a directory only root can write to when that
-  matters. Put anything root should run in a root-owned location.
+  matters. Put anything root should run in a root-owned location whose every parent directory is also root-owned
+  and not writable by group or others (check with `namei -m /path/to/script`). `/opt` is group-writable on some
+  systems, for example GitHub's hosted runners, and the helper will refuse a script under it.
 - v1 runs as root only (no `-u USER`), has no interactive terminal handling beyond inheriting stdio, and
   never auto-approves: there is no "always" for a root command.
 - Linux only.

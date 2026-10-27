@@ -33,7 +33,10 @@ HELPER_DEST = "/usr/local/sbin/asb-root-exec"
 CONFIG_DIR = "/etc/secret-broker"
 CONFIG = f"{CONFIG_DIR}/root-exec.json"
 SUDOERS = "/etc/sudoers.d/asb-root-exec"
-WORK = "/opt/asb-e2e"                    # root-owned: the client copy and a trusted script live here
+# Root-owned, and every directory above must be root-owned and closed to group/other writes, or the helper (rightly)
+# refuses to run a script from it. /opt is group-writable on some images (GitHub's runners), so use the helper's
+# own directory chain, which has to be trusted for the helper to start at all.
+WORK = "/usr/local/sbin/asb-e2e"       # the client copy and a trusted script live here
 AGENT = "agent"
 AGENT_HOME = f"/home/{AGENT}"
 AGENT_CWD = f"{AGENT_HOME}/work"
