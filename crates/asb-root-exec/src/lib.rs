@@ -164,21 +164,28 @@ fn resolve_command(
     .map_err(|m| fail(exit::REFUSED_LOCALLY, m))
 }
 
-/// An interpreter's script file must be one the agent cannot rewrite (see `scriptcheck`).
-fn check_script_operand(
+/// The arguments to show and run: an interpreter's script files must be ones the agent cannot rewrite, and
+/// each is replaced by its resolved real path so a symlink cannot show one file and run another (see
+/// `scriptcheck`).
+fn checked_args(
     policy: &Policy,
     resolved: &resolve::Resolved,
     args: &[String],
     ctx: &Context,
-) -> Result<(), Failure> {
-    scriptcheck::check(
+) -> Result<Vec<String>, Failure> {
+    let replace = scriptcheck::check(
         &[&resolved.shown, &resolved.real],
         args,
         &ctx.cwd,
         policy.trusted_uid,
         &policy.trust_root,
     )
-    .map_err(|m| fail(exit::REFUSED_LOCALLY, m))
+    .map_err(|m| fail(exit::REFUSED_LOCALLY, m))?;
+    let mut out = args.to_vec();
+    for (i, real) in replace {
+        out[i] = real;
+    }
+    Ok(out)
 }
 
 fn load_config(policy: &Policy) -> Result<Config, Failure> {
@@ -235,9 +242,9 @@ pub fn prepare(
         .to_str()
         .ok_or_else(|| fail(exit::REFUSED_LOCALLY, "the command path is not valid UTF-8"))?
         .to_string();
-    check_script_operand(policy, &resolved, &command[1..], ctx)?;
+    let args = checked_args(policy, &resolved, &command[1..], ctx)?;
     let mut argv = vec![shown.clone()];
-    argv.extend(command[1..].iter().cloned());
+    argv.extend(args.iter().cloned());
 
     let source: String = format!(
         "{}@{}",
@@ -262,11 +269,16 @@ pub fn prepare(
             "the command changed while waiting for approval",
         ));
     }
-    check_script_operand(policy, &resolved, &command[1..], ctx)?;
+    if checked_args(policy, &resolved, &command[1..], ctx)? != args {
+        return Err(fail(
+            exit::REFUSED_LOCALLY,
+            "a script changed while waiting for approval",
+        ));
+    }
     Ok(Plan {
         program: resolved.real,
         arg0: shown,
-        args: argv[1..].to_vec(),
+        args,
         env: child_env(policy, ctx),
     })
 }

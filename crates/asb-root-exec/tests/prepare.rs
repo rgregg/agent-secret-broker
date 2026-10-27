@@ -350,7 +350,15 @@ fn script_in_cwd(t: &Tree, name: &str, mode: u32) -> PathBuf {
 }
 
 fn with_interpreters(t: &Tree) {
-    for name in ["bash", "python3", "env", "cat"] {
+    for name in [
+        "bash",
+        "python3",
+        "python3.11",
+        "perl5.36",
+        "env",
+        "timeout",
+        "cat",
+    ] {
         t.program(name, "true");
     }
 }
@@ -371,7 +379,11 @@ fn an_interpreter_running_a_script_the_agent_could_rewrite_is_refused_without_as
         let broker = MockBroker::start(approve_replies());
         let e = run(&t, &broker, words).unwrap_err();
         assert_eq!(e.code, 10, "{words:?}: {e:?}");
-        assert!(e.message.contains("script"), "{words:?}: {}", e.message);
+        assert!(
+            e.message.contains("will not run as root"),
+            "{words:?}: {}",
+            e.message
+        );
         assert!(
             broker.requests().is_empty(),
             "{words:?}: the broker was contacted"
@@ -428,18 +440,146 @@ fn inline_code_has_no_file_to_check_and_is_allowed() {
 }
 
 #[test]
-fn only_the_script_is_checked_not_the_data_it_is_given_and_non_interpreters_are_not_checked() {
+fn every_file_operand_of_an_interpreter_is_checked_not_only_the_first() {
+    // a trusted decoy first (`--rcfile` takes a file), then the untrusted script
+    let t = Tree::new();
+    with_interpreters(&t);
+    script_in_cwd(&t, "decoy", 0o644);
+    script_in_cwd(&t, "evil.sh", 0o666);
+    let broker = MockBroker::start(approve_replies());
+    let e = run(&t, &broker, &["bash", "--rcfile", "decoy", "evil.sh"]).unwrap_err();
+    assert_eq!(e.code, 10, "{e:?}");
+    assert!(broker.requests().is_empty());
+    // data files given to a trusted script are file operands too: they must also be trusted
     let t = Tree::new();
     with_interpreters(&t);
     script_in_cwd(&t, "good.sh", 0o644);
     script_in_cwd(&t, "data.txt", 0o666);
     let broker = MockBroker::start(approve_replies());
+    assert_eq!(
+        run(&t, &broker, &["bash", "good.sh", "data.txt"])
+            .unwrap_err()
+            .code,
+        10
+    );
+    fs::set_permissions(
+        t.root.join("home/data.txt"),
+        fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    let broker = MockBroker::start(approve_replies());
     assert!(run(&t, &broker, &["bash", "good.sh", "data.txt"]).is_ok());
+}
+
+#[test]
+fn programs_that_are_not_interpreters_or_wrappers_are_not_checked() {
+    let t = Tree::new();
+    with_interpreters(&t);
+    script_in_cwd(&t, "data.txt", 0o666);
     let broker = MockBroker::start(approve_replies());
     assert!(
         run(&t, &broker, &["cat", "data.txt"]).is_ok(),
         "cat is not an interpreter"
     );
+}
+
+#[test]
+fn an_interpreter_with_no_script_would_read_stdin_or_a_file_that_does_not_exist_yet() {
+    let cases: [&[&str]; 6] = [
+        &["bash"],
+        &["bash", "-s"],
+        &["bash", "-"],
+        &["python3"],
+        &["bash", "nope.sh"], // the agent could create it after approval
+        &["bash", "--norc"],
+    ];
+    for words in cases {
+        let t = Tree::new();
+        with_interpreters(&t);
+        let broker = MockBroker::start(approve_replies());
+        let e = run(&t, &broker, words).unwrap_err();
+        assert_eq!(e.code, 10, "{words:?}: {e:?}");
+        assert!(broker.requests().is_empty(), "{words:?}");
+    }
+    // printing a version is harmless
+    let t = Tree::new();
+    with_interpreters(&t);
+    let broker = MockBroker::start(approve_replies());
+    assert!(run(&t, &broker, &["bash", "--version"]).is_ok());
+}
+
+#[test]
+fn versioned_interpreter_names_and_wrappers_are_recognised() {
+    let cases: [&[&str]; 4] = [
+        &["python3.11", "deploy.sh"],
+        &["perl5.36", "deploy.sh"],
+        &["timeout", "5", "bash", "deploy.sh"],
+        &["env", "-i", "bash", "deploy.sh"],
+    ];
+    for words in cases {
+        let t = Tree::new();
+        with_interpreters(&t);
+        script_in_cwd(&t, "deploy.sh", 0o666);
+        let broker = MockBroker::start(approve_replies());
+        let e = run(&t, &broker, words).unwrap_err();
+        assert_eq!(e.code, 10, "{words:?}: {e:?}");
+        assert!(broker.requests().is_empty(), "{words:?}");
+    }
+    // a wrapper that starts a file directly
+    let t = Tree::new();
+    with_interpreters(&t);
+    script_in_cwd(&t, "evil", 0o777);
+    let broker = MockBroker::start(approve_replies());
+    assert_eq!(
+        run(&t, &broker, &["timeout", "5", "./evil"])
+            .unwrap_err()
+            .code,
+        10
+    );
+    // a wrapper around something that is not a file or an interpreter is fine
+    let broker = MockBroker::start(approve_replies());
+    assert!(run(&t, &broker, &["env", "ls"]).is_ok());
+}
+
+#[test]
+fn the_script_shown_and_run_is_the_resolved_real_file_not_the_link() {
+    let t = Tree::new();
+    with_interpreters(&t);
+    let real = fs::canonicalize(script_in_cwd(&t, "real.sh", 0o644)).unwrap();
+    symlink(&real, t.root.join("home/link.sh")).unwrap();
+    let broker = MockBroker::start(approve_replies());
+    let plan = run(&t, &broker, &["bash", "-x", "link.sh", "arg"]).unwrap();
+    let sent: serde_json::Value = serde_json::from_str(&broker.requests()[0].body).unwrap();
+    let want = real.to_str().unwrap();
+    let sent_args: Vec<&str> = sent["argv"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .skip(1)
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(sent_args, ["-x", want, "arg"]);
+    assert_eq!(plan.args, ["-x", want, "arg"]);
+}
+
+#[test]
+fn a_script_link_retargeted_while_waiting_is_not_run() {
+    let t = Tree::new();
+    with_interpreters(&t);
+    script_in_cwd(&t, "a.sh", 0o644);
+    script_in_cwd(&t, "b.sh", 0o644);
+    let link = t.root.join("home/link.sh");
+    symlink(t.root.join("home/a.sh"), &link).unwrap();
+    let (l2, b) = (link.clone(), t.root.join("home/b.sh"));
+    let broker = MockBroker::start_hooked(approve_replies(), move |n| {
+        if n == 1 {
+            fs::remove_file(&l2).unwrap();
+            symlink(&b, &l2).unwrap();
+        }
+    });
+    let e = run(&t, &broker, &["bash", "link.sh"]).unwrap_err();
+    assert_eq!(e.code, 10, "{e:?}");
+    assert!(e.message.contains("changed"), "{}", e.message);
 }
 
 #[test]
