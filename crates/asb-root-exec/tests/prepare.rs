@@ -515,7 +515,18 @@ fn switches_after_inline_code_are_refused_where_the_interpreter_would_still_pars
     }
     assert!(refused(|_| {}, &["bash", "-c"]).contains("no code"));
     // a code argument of `-` is read from stdin by some interpreters (pwsh -c -)
-    assert!(refused(|_| {}, &["pwsh", "-c", "-"]).contains("`-`"));
+    assert!(refused(|_| {}, &["pwsh", "-c", "-"]).contains("starts like an option"));
+    // shells keep parsing options after -c: the real code would be the word after `-x`
+    for words in [
+        &["bash", "-c", "-x", "echo hi"][..],
+        &["bash", "-c", "+x", "echo hi"],
+        &["bash", "-c", "-O", "extglob", "echo hi"],
+        &["bash", "-c", "--rcfile", "x", "echo hi"],
+        &["python3", "-c", "-X", "dev"],
+    ] {
+        let msg = refused(|_| {}, words);
+        assert!(msg.contains("starts like an option"), "{words:?}: {msg}");
+    }
     // shells and Python take every later word as a plain argument, so these are fine
     for words in [
         &["bash", "-c", "echo $1", "x", "-x"][..],

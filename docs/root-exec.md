@@ -75,7 +75,8 @@ own request or replay an old one. If the broker is down, denies, or does not ans
     python's `pdb` or `cProfile` executes its argument as code, so a file argument is not just data. To give a
     root command an agent-owned data file, copy it somewhere root owns first.
   - `INTERP -c CODE [ARGS...]` (or the interpreter's one exact inline flag: `-e` for perl and ruby, `-r` for php,
-    ...): the code is in the command you read. For shells and Python every word after the code is a plain
+    ...): the code is in the command you read, and must be the very next word (one starting with `-` or `+` is
+    refused: shells keep parsing options after `-c`). For shells and Python every word after the code is a plain
     argument. Perl, Ruby, Node, PHP and the like keep parsing switches after the code (`perl -e CODE -MEvil`), so
     for them any later word starting with `-` is refused.
   A lone `--version` or `--help` is allowed. Any other option before the script is refused (`-m`, `-r`, `-i`, `-s`,

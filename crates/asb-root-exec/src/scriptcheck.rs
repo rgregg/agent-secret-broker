@@ -220,9 +220,12 @@ pub fn check(
         let Some(code) = args.get(1) else {
             return Err("the inline-code flag has no code after it".into());
         };
-        if code == "-" {
+        // Shells keep parsing options after `-c` (`bash -c -x 'echo hi'` runs the word after `-x`), so a word
+        // that starts like an option is not clearly the code; `-` alone is read from stdin by some interpreters.
+        if code.starts_with('-') || code.starts_with('+') {
             return Err(
-                "the inline code is `-`, which some interpreters read from standard input".into(),
+                "the word after the inline-code flag starts like an option, so it is not clearly the code"
+                    .into(),
             );
         }
         // After the code, shells and Python treat every remaining word as a plain argument. Perl, Ruby, Node,
