@@ -6,8 +6,9 @@
 About 18 test files run the CLI as a subprocess (`python -I client/asb ARGS`). In a throwaway copy of the repo this
 replaces client/asb with a shim that executes the Rust binary, so those tests run UNMODIFIED against it and every
 failure is a real difference in behaviour, down to the exact message. The shim only executes when run as a script, so
-the few tests that import client/asb as a module (they exercise Python internals, such as the script analyser) fail
-at the attribute they look up: they need golden vectors instead, see docs/proposals/rust-cli.md.
+the few tests that import client/asb as a module (they exercise Python internals, such as the script analyser) can
+never pass: they are listed in tests/rust_cli_python_internal.txt, ignored here, and covered by golden vectors instead
+(docs/proposals/rust-cli.md).
 
 It prints the tests that fail and compares them with tests/rust_cli_known_gaps.txt, the tests that are expected to
 fail until their command is ported. It exits non-zero on a failure that is NOT in that list, and on a listed test that
@@ -23,12 +24,20 @@ import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GAPS = os.path.join(ROOT, "tests", "rust_cli_known_gaps.txt")
+INTERNAL = os.path.join(ROOT, "tests", "rust_cli_python_internal.txt")
 SHIM = '''#!/usr/bin/env python3
 import os, sys
 RUST = {rust!r}
 if __name__ == "__main__":
     os.execv(RUST, [RUST] + sys.argv[1:])
 '''
+
+
+def read_list(path):
+    """The test names in a list file (one per line, `#` comments)."""
+    if not os.path.exists(path):
+        return set()
+    return {l.strip() for l in open(path) if l.strip() and not l.startswith("#")}
 
 
 def build(release):
@@ -56,7 +65,8 @@ def main():
         shutil.rmtree(tmp, ignore_errors=True)
     out = r.stdout + r.stderr
     failing = sorted(set(re.findall(r"^(?:FAIL|ERROR): (\S+) \(([\w.]+)\)", out, re.M)))
-    names = sorted({f"{mod_test}" for _, mod_test in failing})
+    internal = read_list(INTERNAL)
+    names = sorted({f"{mod_test}" for _, mod_test in failing} - internal)   # Python-internal tests are never compared
     if "-v" in args:
         print(out)
     summary = [l for l in out.splitlines() if re.search(r"\d+ tests, \d+ failing", l)]
@@ -64,9 +74,7 @@ def main():
     if list_only:
         print("\n".join(names))
         return 0
-    known = set()
-    if os.path.exists(GAPS):
-        known = {l.strip() for l in open(GAPS) if l.strip() and not l.startswith("#")}
+    known = read_list(GAPS)
     new, fixed = sorted(set(names) - known), sorted(known - set(names)) if not k else []
     if prune and fixed:
         keep = [l for l in open(GAPS) if l.startswith("#") or l.strip() not in set(fixed)]
