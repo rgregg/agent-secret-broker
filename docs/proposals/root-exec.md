@@ -94,12 +94,13 @@ Install is documented, not scripted, because it writes to `/usr/local/sbin`, `/e
   review: a link in an agent-writable directory could otherwise make `rm` display as `ls`). The same path is
   `argv[0]`, so multi-call binaries do not work through aliases.
 - **Script operands:** a security review found that `bash x.sh` approved as root could be edited by the agent
-  afterwards (the card shows argv, not the file). The helper now refuses, before asking, an interpreter or wrapper
-  any file operand the agent could write, shows and runs each as its resolved real path, and refuses an
-  interpreter with no script file or inline code (stdin, or a file that does not exist yet); it re-checks after
-  approval (`scriptcheck.rs`). A second review pass tightened the first version (first-file-only, symlink display,
-  stdin, versioned names, wrappers). It is still a heuristic and says so; its blind spots (and import-from-cwd)
-  are listed in root-exec.md.
-- **Not covered:** what a trusted script itself runs, sources or imports.
+  afterwards (the card shows argv, not the file). A first fix that scanned the arguments for files was found
+  leaky in two further review rounds (`--rcfile` decoys, `-m`, `-s`, `-i`, `-h`, `--version` followed by a file,
+  `xargs`, stdin programs): parsing each interpreter's options does not converge. It was replaced by a strict
+  grammar (`scriptcheck.rs`): for a known interpreter only `INTERP SCRIPT [ARGS]` (SCRIPT first, trusted, shown
+  and run as its resolved real path) or `INTERP -c CODE` is allowed, a lone `--version`/`--help` too, and
+  everything else is refused; wrappers are refused outright. It is re-checked after approval.
+- **Not covered:** programs that are not known interpreters (`find -exec`, `git`, `make`, editors, `awk -f`, ...),
+  and what a trusted script itself runs, sources or imports; the card is the control for those.
 - **User-Agent:** unrelated but shipped alongside: the broker's outbound requests, and the `asb` and Rust
   clients, now send a name of their own instead of urllib's default, which Cloudflare blocks.

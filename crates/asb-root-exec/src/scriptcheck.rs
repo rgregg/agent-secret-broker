@@ -1,16 +1,22 @@
 //! Interpreters run files the approval card does not show. `bash /home/ryan/deploy.sh` approved as root
 //! would run whatever that file holds when it runs, and the agent can rewrite a file it owns after you
-//! approve. So when the command is an interpreter (or a wrapper that starts one):
+//! approve. Parsing every interpreter's command line to find the file is a game that cannot be won (each has
+//! options that load modules, read stdin or take their code from elsewhere), so this does not try. For a
+//! command that is an interpreter it allows exactly two forms and refuses everything else:
 //!
-//! * every operand that is an existing file must be trusted (see `trust`), not only the first, or the
-//!   command is refused before the broker is asked;
-//! * each such operand is replaced by its resolved real path, in what you are shown and in what runs, so a
-//!   symlink cannot show one file and run another;
-//! * an interpreter with no script file and no inline code would read its program from standard input, or
-//!   from a file that does not exist yet, and is refused.
+//! * `INTERP SCRIPT [ARGS...]`: SCRIPT is the first argument, not an option, and an existing file that is
+//!   trusted (see `trust`). It is shown to you, and run, as its resolved real path. ARGS are the script's own
+//!   arguments: the trusted script decides what to do with them.
+//! * `INTERP -c CODE [ARGS...]`: the interpreter's one exact inline-code flag first, so the code is in the
+//!   command you read.
 //!
-//! This is a heuristic, not a parser of every interpreter's command line. It errs towards refusing; its limits
-//! are listed in docs/root-exec.md.
+//! That leaves no way to add `-m`, `-r`, `--rcfile`, `-s`, `-i`, `-`, a version flag followed by a file, or
+//! any other option ahead of the script. A lone `--version`/`--help` is allowed. A wrapper (`env`, `nice`,
+//! `timeout`, `xargs`, ...) starts a command this check cannot see, so wrappers are refused.
+//!
+//! Only programs this list knows are interpreters are checked. Anything else that can run other commands or
+//! read files (`find -exec`, `git`, `make`, editors, pagers, `awk -f`) is as powerful as its text, and the
+//! card is the control for those. See docs/root-exec.md.
 
 use crate::trust::{check_chain, Kind};
 use std::fs;
@@ -50,28 +56,14 @@ const INTERPRETERS: &[&str] = &[
     "racket",
     "ts-node",
 ];
-/// Programs that start another command: that command (or the interpreter it starts) is what must be checked.
+/// Programs that start another command, which this check cannot see: refused.
 const WRAPPERS: &[&str] = &[
     "env", "nice", "nohup", "timeout", "time", "stdbuf", "ionice", "setsid", "xargs", "chroot",
     "flock", "strace", "watch", "unshare", "nsenter", "runuser", "su", "doas", "sudo", "busybox",
+    "parallel", "script", "xvfb-run",
 ];
-/// An option that puts the code on the command line (so it is in the shown argv, with no file to read).
-const INLINE: &[&str] = &[
-    "-c",
-    "-e",
-    "-E",
-    "-m",
-    "-r",
-    "-p",
-    "--eval",
-    "--command",
-    "--exec",
-];
-/// Options that only print something and exit.
-const INFO: &[&str] = &["--version", "-version", "--help", "-V", "-h"];
-const SHELLS: &[&str] = &[
-    "sh", "bash", "dash", "zsh", "ksh", "ash", "fish", "csh", "tcsh",
-];
+/// An option that only prints something and exits, allowed only as the sole argument.
+const INFO: &[&str] = &["--version", "-version", "--help", "-V"];
 
 fn norm(path: &Path) -> String {
     let name = path
@@ -82,77 +74,25 @@ fn norm(path: &Path) -> String {
         .to_string()
 }
 
-struct Ctx<'a> {
-    cwd: &'a Path,
-    trusted_uid: u32,
-    trust_root: &'a Path,
-}
-
-impl Ctx<'_> {
-    /// If `arg` names an existing file, check it and return its resolved path.
-    fn file(&self, arg: &str) -> Result<Option<String>, String> {
-        let path = if Path::new(arg).is_absolute() {
-            Path::new(arg).to_path_buf()
-        } else {
-            self.cwd.join(arg)
-        };
-        // follows symlinks: a link to a file is a file
-        if !fs::metadata(&path).map(|m| m.is_file()).unwrap_or(false) {
-            return Ok(None);
+/// The one exact flag that makes this interpreter take its program from the next argument.
+fn inline_flags(interpreter: &str) -> &'static [&'static str] {
+    match interpreter {
+        "sh" | "bash" | "dash" | "zsh" | "ksh" | "ash" | "fish" | "csh" | "tcsh" | "python"
+        | "guile" => &["-c"],
+        "perl" => &["-e", "-E"],
+        "ruby" | "lua" | "luajit" | "Rscript" | "julia" | "groovy" | "osascript" | "racket" => {
+            &["-e"]
         }
-        let real = fs::canonicalize(&path).map_err(|e| format!("{arg}: {e}"))?;
-        check_chain(&real, self.trusted_uid, Kind::Script, self.trust_root).map_err(|m| {
-            format!("{m}; the agent could change this file after you approve it, so it will not run as root")
-        })?;
-        real.to_str()
-            .map(|s| Some(s.to_string()))
-            .ok_or_else(|| format!("{arg}: path is not valid UTF-8"))
-    }
-}
-
-/// Scan an interpreter's arguments from `start`: every existing-file operand is checked and replaced.
-fn interpreter(
-    args: &[String],
-    start: usize,
-    shell: bool,
-    cx: &Ctx,
-    out: &mut Vec<(usize, String)>,
-) -> Result<(), String> {
-    let mut found = false;
-    for (i, arg) in args.iter().enumerate().skip(start) {
-        if arg == "-" {
-            return Err(
-                "it would read its program from standard input, which cannot be shown to you"
-                    .into(),
-            );
-        }
-        if let Some(flags) = arg.strip_prefix('-') {
-            if INFO.contains(&arg.as_str()) {
-                return Ok(());
-            }
-            // a shell's short-option cluster with `c` (`-c`, `-lc`, `-ec`) takes its code from the next word
-            if INLINE.contains(&arg.as_str())
-                || (shell && !flags.starts_with('-') && flags.contains('c'))
-            {
-                return Ok(()); // the code is in argv, which the human is shown
-            }
-            continue;
-        }
-        if let Some(real) = cx.file(arg)? {
-            out.push((i, real));
-            found = true;
-        }
-    }
-    if found {
-        Ok(())
-    } else {
-        Err("it names no script file and no inline code (it would read standard input, or a file that does not exist yet)".into())
+        "node" | "nodejs" | "bun" | "ts-node" => &["-e", "--eval"],
+        "php" => &["-r"],
+        "pwsh" => &["-c", "-Command"],
+        _ => &[],
     }
 }
 
 /// What to change in the arguments, or why the command is refused. `names` are the program's names (as found
-/// and as resolved): either may identify it. Returns `(index into args, resolved real path)` for each file
-/// operand the interpreter will read; the caller substitutes them so what is shown is what runs.
+/// and as resolved): either may identify it. Returns `(index into args, resolved real path)` for the script
+/// the interpreter will read; the caller substitutes it so what is shown is what runs.
 pub fn check(
     names: &[&Path],
     args: &[String],
@@ -160,30 +100,44 @@ pub fn check(
     trusted_uid: u32,
     trust_root: &Path,
 ) -> Result<Vec<(usize, String)>, String> {
-    let cx = Ctx {
-        cwd,
-        trusted_uid,
-        trust_root,
-    };
     let bases: Vec<String> = names.iter().map(|p| norm(p)).collect();
-    let is = |list: &[&str]| bases.iter().any(|b| list.contains(&b.as_str()));
-    let mut out = Vec::new();
-    if is(WRAPPERS) {
-        for (i, arg) in args.iter().enumerate() {
-            if arg.starts_with('-') {
-                continue;
-            }
-            if INTERPRETERS.contains(&norm(Path::new(arg)).as_str()) {
-                let shell = SHELLS.contains(&norm(Path::new(arg)).as_str());
-                interpreter(args, i + 1, shell, &cx, &mut out)?;
-                return Ok(out);
-            }
-            if let Some(real) = cx.file(arg)? {
-                out.push((i, real)); // the wrapper starts this file directly
-            }
-        }
-    } else if is(INTERPRETERS) {
-        interpreter(args, 0, is(SHELLS), &cx, &mut out)?;
+    if bases.iter().any(|b| WRAPPERS.contains(&b.as_str())) {
+        return Err("a wrapper command (env, nice, timeout, xargs, ...) starts another command that cannot be shown to you; run that command directly".into());
     }
-    Ok(out)
+    let Some(interpreter) = bases.iter().find(|b| INTERPRETERS.contains(&b.as_str())) else {
+        return Ok(vec![]);
+    };
+    let Some(first) = args.first() else {
+        return Err("an interpreter with no script would read its program from standard input, which cannot be shown to you".into());
+    };
+    if args.len() == 1 && INFO.contains(&first.as_str()) {
+        return Ok(vec![]);
+    }
+    if inline_flags(interpreter).contains(&first.as_str()) {
+        return Ok(vec![]); // the code is the next argument, which you are shown
+    }
+    if first.starts_with('-') {
+        return Err(format!(
+            "an interpreter option ({}) before the script is refused: allowed forms are `{interpreter} SCRIPT [ARGS]` and `{interpreter} {} CODE`",
+            first.chars().take(24).collect::<String>(),
+            inline_flags(interpreter).first().copied().unwrap_or("(no inline form)"),
+        ));
+    }
+    let path = if Path::new(first).is_absolute() {
+        Path::new(first).to_path_buf()
+    } else {
+        cwd.join(first)
+    };
+    // follows symlinks: a link to a file is a file
+    if !fs::metadata(&path).map(|m| m.is_file()).unwrap_or(false) {
+        return Err("the interpreter's first argument is not an existing file (it could be created after you approve)".into());
+    }
+    let real = fs::canonicalize(&path).map_err(|e| format!("{first}: {e}"))?;
+    check_chain(&real, trusted_uid, Kind::Script, trust_root)
+        .map_err(|m| format!("{m}; the agent could change this file after you approve it, so it will not run as root"))?;
+    let real = real
+        .to_str()
+        .ok_or("the script path is not valid UTF-8")?
+        .to_string();
+    Ok(vec![(0, real)])
 }

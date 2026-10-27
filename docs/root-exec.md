@@ -65,21 +65,23 @@ own request or replay an old one. If the broker is down, denies, or does not ans
 - Refuses (exit 10, **without contacting the broker**) unless the file, and every directory above it, is
   owned by root and not writable by group or others. Running something the agent could rewrite as root
   would be a way around the approval, so a script in `~/bin` is refused by design.
-- When the command is an interpreter (`sh`, `bash`, `python3`, `perl`, `ruby`, `node`, `php`, ... including
-  versioned names like `python3.11`) or a wrapper that starts one or starts a file directly (`env`, `nice`,
-  `timeout`, `xargs`, ...):
-  - **every** operand that is an existing file must be owned by root, closed to group and other writes, with
-    the same for every directory above it, or the command is refused (exit 10, without contacting the broker).
-    The agent could otherwise rewrite it after you approved the card. This includes data files given to a
-    script: copy them somewhere root owns first.
-  - each such file is shown to you, and run, as its **resolved real path**, so a symlink cannot show one file
-    and run another.
-  - an interpreter with no script file and no inline code is refused: it would read its program from standard
-    input (which cannot be shown to you) or from a file that does not exist yet (the agent could create it after
-    you approve). `--version` and `--help` are allowed. Inline code (`bash -c '...'`, `python3 -c '...'`) is in
-    the command you read, so it needs no file.
-- Looks again after you approve (the program and every file above) and refuses if anything is no longer what
-  you were shown.
+- For an interpreter (`sh`, `bash`, `python3`, `perl`, `ruby`, `node`, `php`, ..., including versioned names such
+  as `python3.11`) it allows exactly two forms and refuses everything else, before contacting the broker:
+  - `INTERP SCRIPT [ARGS...]`: SCRIPT is the **first** argument (not an option) and an existing file owned by
+    root, closed to group and other writes, with the same for every directory above it. The agent could
+    otherwise rewrite it after you approved the card. You are shown, and the interpreter runs, SCRIPT's
+    **resolved real path**, so a symlink cannot show one file and run another. ARGS are the script's own: the
+    trusted script decides what to do with them (including data files).
+  - `INTERP -c CODE [ARGS...]` (or the interpreter's one exact inline flag: `-e` for perl and ruby, `-r` for php,
+    ...): the code is in the command you read.
+  A lone `--version` or `--help` is allowed. Any other option before the script is refused (`-m`, `-r`, `-i`, `-s`,
+  `--rcfile`, `-lc`, ...), as are `-`, a missing file and an interpreter with no script: each of those loads or
+  reads something the card does not show. This is a grammar, not an option parser, on purpose: parsing every
+  interpreter's command line cannot be done reliably. Use `bash -c '...'` rather than `bash -lc '...'`.
+- **Wrapper commands** (`env`, `nice`, `timeout`, `xargs`, `su`, `busybox`, ...) are refused: they start a
+  command the helper cannot see. Run that command directly.
+- Looks again after you approve (the program and the script) and refuses if anything is no longer what you were
+  shown.
 - Runs the command with no shell, in the working directory it inherited (it never changes directory by
   path after you approve, so the directory you were shown cannot be swapped underneath it), and only `PATH`, `HOME=/root`, `USER`, `LOGNAME`,
   `LANG` and `TERM` (plus `SUDO_USER` for information). Nothing else of the caller's environment survives.
@@ -95,13 +97,12 @@ but the command could not be started.
 
 - You approve the **text** of a command. `bash -c '...'`, an editor, `make` or a package manager do more
   than their name says, so read those cards closely.
-- The script check is a heuristic, not a parser of every interpreter's command line. It does not see:
-  `awk -f` and `sed -f` files, programs it does not know are interpreters, or what a trusted script itself
-  runs, sources or imports. A script operand that does not exist yet is caught only when the interpreter has no
-  other file operand. Interpreters such as `python3` may also load modules from the current directory, which the
-  agent controls: run root commands from a directory only root can write to when that matters. Commands that
-  are not interpreters or wrappers (`cp`, `cat`, `chown`) are not checked for file operands: you approve the
-  names, not the contents, of any file you name. Put anything root should run in a root-owned location.
+- The script check covers only programs it knows are interpreters. Anything else that can run other commands or
+  read files (`find -exec`, `git`, `make`, editors, pagers, `awk -f`, `cp` of a file the agent can change) is as
+  powerful as its text and is **not** checked: you approve names, not contents. What a trusted script itself runs,
+  sources or imports is also its own business. Interpreters such as `python3` may load modules from the current
+  directory, which the agent controls: run root commands from a directory only root can write to when that
+  matters. Put anything root should run in a root-owned location.
 - v1 runs as root only (no `-u USER`), has no interactive terminal handling beyond inheriting stdio, and
   never auto-approves: there is no "always" for a root command.
 - Linux only.
