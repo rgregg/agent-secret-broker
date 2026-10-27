@@ -39,5 +39,18 @@ class CliTextSync(unittest.TestCase):
             self.assertIn(f'"{name}" => Some(', gen)
 
 
+class GoldenVectorsInSync(unittest.TestCase):
+    """The golden vectors the Rust tests check are what the Python client computes right now."""
+
+    def test_the_committed_golden_files_match_python(self):
+        path = os.path.join(ROOT, "tools", "gen_cli_golden.py")
+        loader = importlib.machinery.SourceFileLoader("gen_cli_golden", path)
+        tool = importlib.util.module_from_spec(importlib.util.spec_from_loader("gen_cli_golden", loader))
+        loader.exec_module(tool)
+        for name, content in tool.generate().items():
+            with open(os.path.join(tool.OUT, name), encoding="utf-8") as f:
+                self.assertEqual(f.read(), content, f"run `python tools/gen_cli_golden.py`: {name} is out of date")
+
+
 if __name__ == "__main__":
     unittest.main()

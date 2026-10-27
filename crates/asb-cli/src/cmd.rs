@@ -5,7 +5,10 @@ use crate::exit::{die, Die, BROKER, NOT_FOUND, R, USAGE};
 use crate::pyfmt::{json_dumps, py_str, quote, repr, truthy};
 use crate::text_gen::{self, DOC, GUIDE, HELP_TOPICS};
 use crate::util::{check_name, die_help};
-use crate::{cmd_agent_setup, cmd_audit, cmd_enroll, cmd_guidance, cmd_http, cmd_store, cmd_sudo};
+use crate::{
+    cmd_agent_setup, cmd_audit, cmd_enroll, cmd_guidance, cmd_http, cmd_plan, cmd_session,
+    cmd_store, cmd_sudo,
+};
 use serde_json::Value;
 
 pub fn run(argv: &[String]) -> i32 {
@@ -36,6 +39,8 @@ fn dispatch(argv: &[String]) -> R {
             &rest[..rest.len().min(3)]
         } else if cmd == "sudo" {
             &rest[..rest.iter().position(|a| a == "--").unwrap_or(rest.len())]
+        } else if cmd == "plan" {
+            &rest[..rest.len().min(2)] // a later --help belongs to the subcommand
         } else {
             rest
         };
@@ -50,6 +55,8 @@ fn dispatch(argv: &[String]) -> R {
         "which" => which(argv),
         "http" => cmd_http::run(argv),
         "agent-setup" => cmd_agent_setup::run(&argv[1..]),
+        "plan" => cmd_plan::run(&argv[1..]),
+        "session" => cmd_session::run(&argv[1..]),
         "audit" => cmd_audit::run(&argv[1..]),
         "guidance" => cmd_guidance::run(&argv[1..]),
         "sudo" => cmd_sudo::run(&argv[1..]),

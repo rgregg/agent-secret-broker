@@ -83,10 +83,27 @@ jobs:
           sudo env "PATH=$PATH" ASB_E2E_DISPOSABLE=1 ASB_E2E_HELPER="$PWD/target/release/asb-root-exec"
           "$(which python)" tests/e2e_root_exec/driver.py
 
+  # The existing test-suite, unmodified, against the Rust `asb` (see docs/proposals/rust-cli.md). It fails on a failing
+  # test that is not in tests/rust_cli_known_gaps.txt, and on a listed test that now passes, so the list only shrinks.
+  rust-cli-parity:
+    name: rust-cli-parity
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - run: pip install -r requirements.txt
+      - run: rustup toolchain install stable --profile minimal
+      - run: python tools/run_tests_against_rust_cli.py
+
   # The single check to require in branch protection: it keeps the name "test" and is green only when
   # every shard and the Rust job are.
   test:
-    needs: [shard, rust, root-e2e]
+    needs: [shard, rust, root-e2e, rust-cli-parity]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -94,6 +111,7 @@ jobs:
           test "${{ needs.shard.result }}" = "success" || { echo "tests: ${{ needs.shard.result }}"; exit 1; }
           test "${{ needs.rust.result }}" = "success" || { echo "rust: ${{ needs.rust.result }}"; exit 1; }
           test "${{ needs.root-e2e.result }}" = "success" || { echo "root-e2e: ${{ needs.root-e2e.result }}"; exit 1; }
+          test "${{ needs.rust-cli-parity.result }}" = "success" || { echo "rust-cli-parity: ${{ needs.rust-cli-parity.result }}"; exit 1; }
 
   image:
     needs: test

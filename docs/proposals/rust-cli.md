@@ -38,6 +38,20 @@ ever ported too. Not a rewrite for its own sake: behaviour does not change.
 `asb-cli` (binary `asb`) on top of `asb-client` (config-free HTTP and approval polling, shared with the root helper) and
 `asb-proto`. No new heavy dependencies: `ureq`+rustls, `serde_json`, `libc`.
 
+## Progress
+
+| Stage | State |
+|---|---|
+| 0 plumbing, `help`/`guide`/`list`/`which`/`status` | done |
+| 1 `http` `store` `update` `request-credential` `guidance` `audit` `sudo` `enroll` | done |
+| 2 `session` `plan` `agent-setup` | done (`agent-setup`'s dry-run diff is Python's `difflib`, ported and held to 30 golden cases) |
+| 3 env mode `NAME -- command` and the script analyser | not started |
+| 4 `ws` (and its line pipe), `ssh-agent`, `fingerprint` | not started |
+
+`tests/rust_cli_known_gaps.txt` lists what still fails against the Rust binary (17 tests, all from stages 3 and 4);
+`tests/rust_cli_python_internal.txt` lists the 29 tests that import Python functions and can never pass against a
+binary (their Rust side is the unit tests and golden vectors). CI runs the parity suite on every change.
+
 ## Order
 
 | Stage | Commands | Why this order |

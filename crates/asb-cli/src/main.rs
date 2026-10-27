@@ -12,6 +12,8 @@ mod cmd_audit;
 mod cmd_enroll;
 mod cmd_guidance;
 mod cmd_http;
+mod cmd_plan;
+mod cmd_session;
 mod cmd_store;
 mod cmd_sudo;
 mod difflib;
