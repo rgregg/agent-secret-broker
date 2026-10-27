@@ -39,9 +39,12 @@ fn audit_line(ev: &Value) -> String {
         }
     }
     let ts: String = py_str(&ev["ts"]).chars().take(19).collect();
-    let request = Some(py_str(&ev["request"]))
-        .filter(|_| ev.get("request").is_some_and(crate::pyfmt::truthy))
-        .unwrap_or_else(|| "-".into());
+    // `(ev.get("request") or "-")[:8]`
+    let request = if ev.get("request").is_some_and(crate::pyfmt::truthy) {
+        py_str(&ev["request"])
+    } else {
+        "-".into()
+    };
     let request: String = request.chars().take(8).collect();
     format!(
         "{ts}Z  {:<16} {:<8}  {}",
