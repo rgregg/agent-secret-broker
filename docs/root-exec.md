@@ -19,7 +19,7 @@ own request or replay an old one. If the broker is down, denies, or does not ans
 
 ## Install (once per machine, as root)
 
-1. **Build and install the helper.** Needs a Rust toolchain.
+1. **Build and install the helper.** Needs Rust 1.88 or newer.
 
        cargo build --release --locked -p asb-root-exec
        sudo install -o root -g root -m 0755 target/release/asb-root-exec /usr/local/sbin/asb-root-exec

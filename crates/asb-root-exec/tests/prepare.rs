@@ -184,6 +184,26 @@ fn a_link_planted_where_the_agent_can_write_cannot_pass_for_something_else() {
 }
 
 #[test]
+fn a_program_link_retargeted_to_another_trusted_program_while_waiting_is_not_run() {
+    // both programs are trusted, so only comparing what the name resolves to before and after catches this
+    let t = Tree::new();
+    let a = t.program("a", "true");
+    let b = t.program("b", "true");
+    let link = t.root.join("bin/svc");
+    symlink(&a, &link).unwrap();
+    let (l2, b2) = (link.clone(), b.clone());
+    let broker = MockBroker::start_hooked(approve_replies(), move |n| {
+        if n == 1 {
+            fs::remove_file(&l2).unwrap();
+            symlink(&b2, &l2).unwrap();
+        }
+    });
+    let e = run(&t, &broker, &["svc"]).unwrap_err();
+    assert_eq!(e.code, 10, "{e:?}");
+    assert!(e.message.contains("changed"), "{}", e.message);
+}
+
+#[test]
 fn denial_and_an_unreachable_broker_run_nothing() {
     let t = Tree::new();
     t.program("svc", "true");

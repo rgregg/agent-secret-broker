@@ -51,6 +51,9 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
       - run: cargo build --release --locked -p asb-root-exec
+      # `rust-version` in Cargo.toml is a claim; build with exactly that compiler so it cannot go stale. (With the
+      # locked dependencies the real minimum is 1.88: the ICU crates behind `ureq` need it.)
+      - run: rustup toolchain install 1.88 --profile minimal && cargo +1.88 check --workspace --locked
       - uses: actions/upload-artifact@v4
         with:
           name: asb-root-exec-linux-x86_64

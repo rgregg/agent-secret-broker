@@ -6,6 +6,7 @@ notification button); the approval carries no value, only {"approved": true}, de
 the audit log keeps the command's words and nothing else.
 """
 import _fast  # noqa: F401  (test-only: prompt server shutdown, fake-clock helpers)
+import hashlib
 import json
 import os
 import shutil
@@ -22,6 +23,7 @@ from test_client_rules import ClientMixin  # noqa: E402
 from secret_broker import destguard as _destguard  # noqa: E402
 _destguard.allow_loopback_for_tests()   # test stubs live on 127.0.0.1; no config key does this
 from secret_broker import sudomode  # noqa: E402
+from secret_broker.notify import FakeNotifier  # noqa: E402
 
 ARGV = ["/usr/bin/systemctl", "restart", "nginx"]
 
@@ -72,6 +74,13 @@ class Sudo(SudoBase):
         self.assertEqual(code, 403, b)
         self.assertEqual(self.notifier.sent, [])
 
+    def test_disabled_refuses_even_a_listed_client(self):
+        # enabled=false must stand on its own: not only "nobody is listed"
+        self.broker.sudo_cfg = sudomode.parse_config({"enabled": False, "clients": [self.helper.id]})
+        code, b = self.ask()
+        self.assertEqual(code, 403, b)
+        self.assertIn("disabled", b)
+
     def test_only_listed_clients(self):
         for key in (self.other.secret, t.KEY):
             code, b = self.api("POST", "/v1/requests", {"mode": "sudo", "argv": ARGV}, key=key)
@@ -94,6 +103,27 @@ class Sudo(SudoBase):
         self.assertIn("systemctl restart nginx", n.text)
         self.assertEqual(n.actions, [])
         self.assertIsNone(n.action_token)
+
+    def test_a_notification_that_could_carry_buttons_carries_none(self):
+        # the default fake offers no buttons at all, which would hide a missing protection
+        self.broker.notifier = FakeNotifier(supports_actions=("approve", "deny"))
+        rid = self.pending()
+        req = self.broker._by_id[rid]
+        self.assertEqual((req.notification.actions, req.notification.action_token), ([], None))
+        self.assertEqual(req.offered, frozenset())
+        self.assertIsNone(self.broker.notifier.sent[0]["context"]["action_token"])
+
+    def test_even_a_valid_looking_action_token_cannot_decide_it(self):
+        # the second layer: suppose a token existed anyway, the push and HA channels still refuse it
+        self.broker.notifier = FakeNotifier(supports_actions=("approve", "deny"))
+        rid = self.pending()
+        req = self.broker._by_id[rid]
+        token = "t" * 32
+        req.action_hash = hashlib.sha256(token.encode()).digest()
+        req.offered = frozenset({"approve", "deny"})
+        for channel in ("push", "ha"):
+            self.assertEqual(self.broker.decide_via(channel, rid, "approve", "u", token=token), (403, None), channel)
+        self.assertEqual(req.status, "pending")
 
     def test_approval_is_a_bare_flag_delivered_once(self):
         rid = self.pending()
