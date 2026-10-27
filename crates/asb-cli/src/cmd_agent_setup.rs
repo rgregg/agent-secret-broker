@@ -152,8 +152,10 @@ fn apply_block(text: &str, remove: bool) -> Result<(String, String), String> {
     Ok((format!("{text}{sep}{eol}{block}{eol}"), "installed".into()))
 }
 
-/// `os.path.realpath`: symlinks resolved as far as they exist, the rest kept as written.
-fn realpath(path: &Path) -> PathBuf {
+/// `os.path.realpath`: symlinks resolved as far as they exist, the rest kept as written. Unlike Python's, it FAILS
+/// when it cannot finish (a link loop or too many hops, an unreadable link): a path-safety check must not go on
+/// with a half-resolved path.
+fn realpath(path: &Path) -> Result<PathBuf, String> {
     let mut pending: VecDeque<OsString> = VecDeque::new();
     let mut result = if path.is_absolute() {
         PathBuf::from("/")
@@ -177,14 +179,15 @@ fn realpath(path: &Path) -> PathBuf {
         match fs::symlink_metadata(&next) {
             Ok(m) if m.file_type().is_symlink() => {
                 hops += 1;
-                let Ok(target) = fs::read_link(&next) else {
-                    result = next;
-                    continue;
-                };
                 if hops > 40 {
-                    result = next;
-                    continue;
+                    return Err(format!(
+                        "too many levels of symbolic links resolving {}",
+                        path.display()
+                    ));
                 }
+                let target = fs::read_link(&next).map_err(|e| {
+                    format!("cannot read the link {}: {}", next.display(), strerror(&e))
+                })?;
                 if target.is_absolute() {
                     result = PathBuf::from("/");
                 }
@@ -203,7 +206,7 @@ fn realpath(path: &Path) -> PathBuf {
             _ => result = next,
         }
     }
-    result
+    Ok(result)
 }
 
 fn abspath(path: &Path) -> PathBuf {
@@ -354,7 +357,10 @@ fn plan_target(
     scope: &str,
     cwd: &str,
 ) -> Plan {
-    let real = realpath(Path::new(path));
+    let (real, resolve_error) = match realpath(Path::new(path)) {
+        Ok(p) => (p, None),
+        Err(e) => (PathBuf::from(path), Some(e)),
+    };
     let mut r = Plan {
         agent: agent.into(),
         path: path.into(),
@@ -367,8 +373,11 @@ fn plan_target(
         backup: None,
     };
     let result: Result<(), String> = (|| {
+        if let Some(e) = resolve_error {
+            return Err(e);
+        }
         if scope == "project" {
-            let root = realpath(Path::new(cwd));
+            let root = realpath(Path::new(cwd))?;
             if !real.starts_with(&root) {
                 return Err(format!(
                     "resolves to {}, outside the project directory {}; refusing to follow it",
@@ -634,7 +643,9 @@ pub fn run(args: &[String]) -> R {
     let mut bad = false;
     for p in &plans {
         let mut label = format!("{} ({scope}): {}", p.agent, p.path);
-        if realpath(Path::new(&p.path)) != abspath(Path::new(&p.path)) {
+        if realpath(Path::new(&p.path)).ok().as_deref()
+            != Some(abspath(Path::new(&p.path)).as_path())
+        {
             label += &format!(" -> {}", p.real.display());
         }
         if let Some(err) = &p.error {
@@ -672,6 +683,16 @@ pub fn run(args: &[String]) -> R {
     if !dry {
         for p in &mut plans {
             if p.new != p.old {
+                // the plan checked this path a moment ago: refuse if it now leads somewhere else (a swapped link)
+                if realpath(Path::new(&p.path)).ok().as_deref() != Some(p.real.as_path()) {
+                    return Err(die(
+                        format!(
+                            "{} changed while it was being checked; nothing more was written",
+                            p.path
+                        ),
+                        USAGE,
+                    ));
+                }
                 if let Err(e) = write_target(p) {
                     return Err(die(
                         format!("cannot write {}: {}", p.path, strerror(&e)),
@@ -726,6 +747,39 @@ mod tests {
         assert!(apply_block(&doubled, false)
             .unwrap_err()
             .contains("duplicated"));
+    }
+
+    #[test]
+    fn realpath_fails_on_a_symlink_loop_instead_of_returning_half_an_answer() {
+        let dir = std::env::temp_dir().join(format!("asb-realpath-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let (a, b) = (dir.join("a"), dir.join("b"));
+        let _ = fs::remove_file(&a);
+        let _ = fs::remove_file(&b);
+        std::os::unix::fs::symlink(&b, &a).unwrap();
+        std::os::unix::fs::symlink(&a, &b).unwrap();
+        let err = realpath(&a).unwrap_err();
+        assert!(err.contains("symbolic links"), "{err}");
+        // and a plan for it is refused with that reason
+        let plan = plan_target("claude", a.to_str().unwrap(), false, true, "user", "/");
+        assert!(
+            plan.error
+                .as_deref()
+                .is_some_and(|e| e.contains("symbolic links")),
+            "{:?}",
+            plan.error
+        );
+        // an ordinary chain still resolves, and a missing tail is kept as written
+        let (target, link) = (dir.join("real"), dir.join("link"));
+        let _ = fs::remove_file(&link);
+        fs::write(&target, "x").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert_eq!(realpath(&link).unwrap(), fs::canonicalize(&target).unwrap());
+        assert_eq!(
+            realpath(&dir.join("missing/file")).unwrap(),
+            fs::canonicalize(&dir).unwrap().join("missing/file")
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

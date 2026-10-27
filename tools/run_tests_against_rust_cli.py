@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run the existing test-suite against the Rust `asb` instead of client/asb.
 
-    python tools/run_tests_against_rust_cli.py [-k SUBSTRING] [--release] [--list] [--prune]
+    python tools/run_tests_against_rust_cli.py [-k SUBSTRING] [--release] [--list] [--prune] [-v]
 
 About 18 test files run the CLI as a subprocess (`python -I client/asb ARGS`). In a throwaway copy of the repo this
 replaces client/asb with a shim that executes the Rust binary, so those tests run UNMODIFIED against it and every
@@ -12,7 +12,7 @@ at the attribute they look up: they need golden vectors instead, see docs/propos
 It prints the tests that fail and compares them with tests/rust_cli_known_gaps.txt, the tests that are expected to
 fail until their command is ported. It exits non-zero on a failure that is NOT in that list, and on a listed test that
 now passes (so the list can only shrink). `--list` prints the failing tests without comparing. `--prune` rewrites the
-list without the tests that now pass (never adding one), then reports as usual.
+list without the tests that now pass (never adding one), then reports as usual. `-v` prints the failure details.
 """
 import os
 import re
@@ -57,6 +57,8 @@ def main():
     out = r.stdout + r.stderr
     failing = sorted(set(re.findall(r"^(?:FAIL|ERROR): (\S+) \(([\w.]+)\)", out, re.M)))
     names = sorted({f"{mod_test}" for _, mod_test in failing})
+    if "-v" in args:
+        print(out)
     summary = [l for l in out.splitlines() if re.search(r"\d+ tests, \d+ failing", l)]
     print(summary[-1] if summary else "(no summary line: the run did not finish)")
     if list_only:
