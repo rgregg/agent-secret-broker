@@ -396,8 +396,8 @@ asks the broker, you approve the exact command on your phone, and only then does
 exists anywhere. The command runs with a clean environment and a fixed PATH, in the current directory;
 the file it runs must be root-owned and not writable by others. For an interpreter (bash, python3, perl, ...)
 only two forms are accepted: `bash SCRIPT [args]` with SCRIPT first and root-owned (a script in your home
-directory is refused: copy it somewhere root owns), or `bash -c 'code'`. Other options, stdin programs and
-wrapper commands (env, xargs, timeout, ...) are refused. A denial or timeout is final: stop and
+directory is refused: copy it somewhere root owns), or `bash -c 'code'`. Any file named as a later argument
+must be root-owned too. Other options, stdin programs and wrapper commands (env, xargs, timeout, ...) are refused. A denial or timeout is final: stop and
 tell the human what you needed. Exit codes: the command's own, or 2 usage, 3 broker, 4 denied, 5 expired,
 10 refused locally (unsafe file, config or directory), 11 approved but could not start.
 

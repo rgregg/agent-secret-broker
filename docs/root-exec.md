@@ -70,18 +70,22 @@ own request or replay an old one. If the broker is down, denies, or does not ans
   - `INTERP SCRIPT [ARGS...]`: SCRIPT is the **first** argument (not an option) and an existing file owned by
     root, closed to group and other writes, with the same for every directory above it. The agent could
     otherwise rewrite it after you approved the card. You are shown, and the interpreter runs, SCRIPT's
-    **resolved real path**, so a symlink cannot show one file and run another. ARGS are the script's own: the
-    trusted script decides what to do with them (including data files).
+    **resolved real path**, so a symlink cannot show one file and run another. Any later argument that names an
+    existing file must be trusted the same way, and is shown and run as its resolved path: a runner such as
+    python's `pdb` or `cProfile` executes its argument as code, so a file argument is not just data. To give a
+    root command an agent-owned data file, copy it somewhere root owns first.
   - `INTERP -c CODE [ARGS...]` (or the interpreter's one exact inline flag: `-e` for perl and ruby, `-r` for php,
     ...): the code is in the command you read. For shells and Python every word after the code is a plain
     argument. Perl, Ruby, Node, PHP and the like keep parsing switches after the code (`perl -e CODE -MEvil`), so
     for them any later word starting with `-` is refused.
   A lone `--version` or `--help` is allowed. Any other option before the script is refused (`-m`, `-r`, `-i`, `-s`,
-  `--rcfile`, `-lc`, ...), as are `-`, a missing file and an interpreter with no script: each of those loads or
-  reads something the card does not show. This is a grammar, not an option parser, on purpose: parsing every
+  `--rcfile`, `-lc`, ...), as are `-` (also as the inline code), a missing file and an interpreter with no script:
+  each of those loads or reads something the card does not show. This is a grammar, not an option parser, on purpose: parsing every
   interpreter's command line cannot be done reliably. Use `bash -c '...'` rather than `bash -lc '...'`.
-- **Wrapper commands** (`env`, `nice`, `timeout`, `xargs`, `su`, `busybox`, ...) are refused: they start a
-  command the helper cannot see. Run that command directly.
+- **Wrapper commands** (`env`, `nice`, `timeout`, `xargs`, `su`, `busybox`, `taskset`, `setpriv`, `systemd-run`,
+  `ssh`, `gdb`, `valgrind`, ...) are refused: they start a command the helper cannot see. Run that command
+  directly. The list is a denylist and cannot be complete: a launcher that is not on it is only as safe as its
+  card.
 - Looks again after you approve (the program and the script) and refuses if anything is no longer what you were
   shown.
 - Runs the command with no shell, in the working directory it inherited (it never changes directory by

@@ -361,6 +361,11 @@ fn with_interpreters(t: &Tree) {
         "ruby",
         "node",
         "php",
+        "pwsh",
+        "taskset",
+        "setpriv",
+        "systemd-run",
+        "ssh",
         "env",
         "timeout",
         "xargs",
@@ -425,17 +430,47 @@ fn a_script_the_agent_could_rewrite_is_refused() {
 }
 
 #[test]
-fn a_script_the_agent_cannot_write_is_allowed_and_its_args_are_its_own() {
+fn a_script_the_agent_cannot_write_is_allowed_and_plain_args_pass_through() {
     let (_, plan, broker) = allowed(
         |t| {
             script_in_cwd(t, "good.sh", 0o644);
-            script_in_cwd(t, "data.txt", 0o666); // a script argument: the trusted script's business
         },
-        &["bash", "good.sh", "data.txt", "-x"],
+        &["bash", "good.sh", "plain", "-x", "somedir"],
     );
-    assert_eq!(plan.args.len(), 3);
-    assert_eq!(&plan.args[1..], ["data.txt", "-x"]);
+    assert_eq!(&plan.args[1..], ["plain", "-x", "somedir"]);
     assert_eq!(broker.requests().len(), 2);
+}
+
+#[test]
+fn files_named_after_the_script_must_be_trusted_too_and_are_shown_as_their_real_paths() {
+    // a trusted runner executes its argument as code (python's pdb, cProfile, trace ...)
+    let bad = |t: &Tree| {
+        script_in_cwd(t, "runner.py", 0o644);
+        script_in_cwd(t, "evil.py", 0o666);
+    };
+    for words in [
+        &["python3", "runner.py", "evil.py"][..],
+        &["python3", "runner.py", "--flag", "evil.py"],
+        &["bash", "runner.py", "x", "evil.py"],
+        &["bash", "-c", "source \"$1\"", "x", "evil.py"], // inline code may source what it is handed
+        &["perl5.36", "-e", "do shift", "evil.py"],
+    ] {
+        let msg = refused(bad, words);
+        assert!(msg.contains("will not run as root"), "{words:?}: {msg}");
+    }
+    // a trusted data file is fine, and is shown and run as its resolved path (a link cannot hide the target)
+    let mut real_data = PathBuf::new();
+    let (_, plan, broker) = allowed(
+        |t| {
+            script_in_cwd(t, "runner.py", 0o644);
+            real_data = fs::canonicalize(script_in_cwd(t, "data.txt", 0o644)).unwrap();
+            symlink(&real_data, t.root.join("home/link.txt")).unwrap();
+        },
+        &["python3", "runner.py", "link.txt"],
+    );
+    assert_eq!(plan.args[1], real_data.to_str().unwrap());
+    let sent: serde_json::Value = serde_json::from_str(&broker.requests()[0].body).unwrap();
+    assert_eq!(sent["argv"][2], real_data.to_str().unwrap());
 }
 
 #[test]
@@ -479,6 +514,8 @@ fn switches_after_inline_code_are_refused_where_the_interpreter_would_still_pars
         assert!(msg.contains("after the inline code"), "{words:?}: {msg}");
     }
     assert!(refused(|_| {}, &["bash", "-c"]).contains("no code"));
+    // a code argument of `-` is read from stdin by some interpreters (pwsh -c -)
+    assert!(refused(|_| {}, &["pwsh", "-c", "-"]).contains("`-`"));
     // shells and Python take every later word as a plain argument, so these are fine
     for words in [
         &["bash", "-c", "echo $1", "x", "-x"][..],
@@ -537,6 +574,10 @@ fn wrappers_are_refused_because_they_hide_the_command() {
         &["timeout", "5", "./deploy.sh"],
         &["xargs", "bash"], // xargs builds arguments from stdin
         &["env", "ls"],     // even a harmless one: the check cannot tell
+        &["taskset", "1", "bash", "deploy.sh"],
+        &["setpriv", "--reuid=0", "bash", "deploy.sh"],
+        &["systemd-run", "bash", "deploy.sh"],
+        &["ssh", "host", "bash", "deploy.sh"],
     ] {
         let msg = refused(bad, words);
         assert!(msg.contains("wrapper"), "{words:?}: {msg}");

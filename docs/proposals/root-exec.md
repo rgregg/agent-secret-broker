@@ -99,7 +99,9 @@ Install is documented, not scripted, because it writes to `/usr/local/sbin`, `/e
   `xargs`, stdin programs): parsing each interpreter's options does not converge. It was replaced by a strict
   grammar (`scriptcheck.rs`): for a known interpreter only `INTERP SCRIPT [ARGS]` (SCRIPT first, trusted, shown
   and run as its resolved real path) or `INTERP -c CODE` is allowed, a lone `--version`/`--help` too, and
-  everything else is refused; wrappers are refused outright. It is re-checked after approval.
+  everything else is refused; any later argument naming an existing file must also be trusted (a runner like `pdb`
+  executes its argument); switches after inline code are refused except for shells and Python; wrappers are
+  refused outright (a denylist, extended as reviews name more launchers). It is re-checked after approval.
 - **Not covered:** programs that are not known interpreters (`find -exec`, `git`, `make`, editors, `awk -f`, ...),
   and what a trusted script itself runs, sources or imports; the card is the control for those.
 - **User-Agent:** unrelated but shipped alongside: the broker's outbound requests, and the `asb` and Rust

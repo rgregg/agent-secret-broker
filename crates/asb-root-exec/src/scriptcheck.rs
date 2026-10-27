@@ -5,8 +5,8 @@
 //! command that is an interpreter it allows exactly two forms and refuses everything else:
 //!
 //! * `INTERP SCRIPT [ARGS...]`: SCRIPT is the first argument, not an option, and an existing file that is
-//!   trusted (see `trust`). It is shown to you, and run, as its resolved real path. ARGS are the script's own
-//!   arguments: the trusted script decides what to do with them.
+//!   trusted (see `trust`). It is shown to you, and run, as its resolved real path. Any later argument that
+//!   names an existing file must be trusted too (a runner such as `pdb` executes its argument as code).
 //! * `INTERP -c CODE [ARGS...]`: the interpreter's one exact inline-code flag first, so the code is in the
 //!   command you read.
 //!
@@ -35,13 +35,17 @@ const INTERPRETERS: &[&str] = &[
     "csh",
     "tcsh",
     "python",
+    "pypy",
     "perl",
     "ruby",
+    "jruby",
     "node",
     "nodejs",
     "deno",
     "bun",
+    "ts-node",
     "php",
+    "php-cgi",
     "lua",
     "luajit",
     "tclsh",
@@ -54,13 +58,62 @@ const INTERPRETERS: &[&str] = &[
     "osascript",
     "guile",
     "racket",
-    "ts-node",
 ];
 /// Programs that start another command, which this check cannot see: refused.
 const WRAPPERS: &[&str] = &[
-    "env", "nice", "nohup", "timeout", "time", "stdbuf", "ionice", "setsid", "xargs", "chroot",
-    "flock", "strace", "watch", "unshare", "nsenter", "runuser", "su", "doas", "sudo", "busybox",
-    "parallel", "script", "xvfb-run",
+    "env",
+    "nice",
+    "nohup",
+    "timeout",
+    "time",
+    "stdbuf",
+    "ionice",
+    "setsid",
+    "xargs",
+    "chroot",
+    "flock",
+    "strace",
+    "watch",
+    "unshare",
+    "nsenter",
+    "runuser",
+    "su",
+    "doas",
+    "sudo",
+    "busybox",
+    "parallel",
+    "script",
+    "xvfb-run",
+    "taskset",
+    "chrt",
+    "setpriv",
+    "capsh",
+    "sg",
+    "systemd-run",
+    "ltrace",
+    "valgrind",
+    "gdb",
+    "faketime",
+    "fakeroot",
+    "firejail",
+    "bwrap",
+    "proot",
+    "ssh",
+    "rlwrap",
+    "sshpass",
+    "torsocks",
+    "proxychains",
+    "eatmydata",
+    "numactl",
+    "cpulimit",
+    "prlimit",
+    "setarch",
+    "linux32",
+    "linux64",
+    "unbuffer",
+    "pkexec",
+    "newgrp",
+    "start-stop-daemon",
 ];
 /// Interpreters that take every word after `-c CODE` as a plain argument, never as an option.
 const POSITIONAL_AFTER_CODE: &[&str] = &["sh", "bash", "dash", "zsh", "ksh", "ash", "python"];
@@ -92,9 +145,55 @@ fn inline_flags(interpreter: &str) -> &'static [&'static str] {
     }
 }
 
+/// If `arg` names an existing file (following symlinks), check that the agent cannot change it and return its
+/// resolved real path; `None` when it is not a file.
+fn trusted_file(
+    arg: &str,
+    cwd: &Path,
+    trusted_uid: u32,
+    trust_root: &Path,
+) -> Result<Option<String>, String> {
+    let path = if Path::new(arg).is_absolute() {
+        Path::new(arg).to_path_buf()
+    } else {
+        cwd.join(arg)
+    };
+    if !fs::metadata(&path).map(|m| m.is_file()).unwrap_or(false) {
+        return Ok(None);
+    }
+    let real = fs::canonicalize(&path).map_err(|e| format!("{arg}: {e}"))?;
+    check_chain(&real, trusted_uid, Kind::Script, trust_root)
+        .map_err(|m| format!("{m}; the agent could change this file after you approve it, so it will not run as root"))?;
+    real.to_str()
+        .map(|s| Some(s.to_string()))
+        .ok_or_else(|| "a file path is not valid UTF-8".to_string())
+}
+
+/// Every later argument that names an existing file must be trusted too, and is shown and run as its resolved
+/// path. A trusted runner (`pdb`, `cProfile`, `trace`) executes its argument as code, and inline code may
+/// `source` or `import` what it is handed, so a file argument is not just data.
+fn file_args(
+    args: &[String],
+    from: usize,
+    cwd: &Path,
+    uid: u32,
+    root: &Path,
+    out: &mut Vec<(usize, String)>,
+) -> Result<(), String> {
+    for (i, a) in args.iter().enumerate().skip(from) {
+        if a.starts_with('-') {
+            continue;
+        }
+        if let Some(real) = trusted_file(a, cwd, uid, root)? {
+            out.push((i, real));
+        }
+    }
+    Ok(())
+}
+
 /// What to change in the arguments, or why the command is refused. `names` are the program's names (as found
-/// and as resolved): either may identify it. Returns `(index into args, resolved real path)` for the script
-/// the interpreter will read; the caller substitutes it so what is shown is what runs.
+/// and as resolved): either may identify it. Returns `(index into args, resolved real path)` for each file the
+/// interpreter will read or be handed; the caller substitutes them so what is shown is what runs.
 pub fn check(
     names: &[&Path],
     args: &[String],
@@ -115,10 +214,16 @@ pub fn check(
     if args.len() == 1 && INFO.contains(&first.as_str()) {
         return Ok(vec![]);
     }
+    let mut out = Vec::new();
     if inline_flags(interpreter).contains(&first.as_str()) {
         // the code is the next argument, which you are shown
-        if args.len() < 2 {
+        let Some(code) = args.get(1) else {
             return Err("the inline-code flag has no code after it".into());
+        };
+        if code == "-" {
+            return Err(
+                "the inline code is `-`, which some interpreters read from standard input".into(),
+            );
         }
         // After the code, shells and Python treat every remaining word as a plain argument. Perl, Ruby, Node,
         // PHP, Lua and the rest keep parsing switches (`perl -e CODE -MEvil`, `node -e CODE --require x`), so
@@ -131,7 +236,8 @@ pub fn check(
                     .into(),
             );
         }
-        return Ok(vec![]);
+        file_args(args, 2, cwd, trusted_uid, trust_root, &mut out)?;
+        return Ok(out);
     }
     if first.starts_with('-') {
         return Err(format!(
@@ -140,21 +246,10 @@ pub fn check(
             inline_flags(interpreter).first().copied().unwrap_or("(no inline form)"),
         ));
     }
-    let path = if Path::new(first).is_absolute() {
-        Path::new(first).to_path_buf()
-    } else {
-        cwd.join(first)
-    };
-    // follows symlinks: a link to a file is a file
-    if !fs::metadata(&path).map(|m| m.is_file()).unwrap_or(false) {
-        return Err("the interpreter's first argument is not an existing file (it could be created after you approve)".into());
+    match trusted_file(first, cwd, trusted_uid, trust_root)? {
+        Some(real) => out.push((0, real)),
+        None => return Err("the interpreter's first argument is not an existing file (it could be created after you approve)".into()),
     }
-    let real = fs::canonicalize(&path).map_err(|e| format!("{first}: {e}"))?;
-    check_chain(&real, trusted_uid, Kind::Script, trust_root)
-        .map_err(|m| format!("{m}; the agent could change this file after you approve it, so it will not run as root"))?;
-    let real = real
-        .to_str()
-        .ok_or("the script path is not valid UTF-8")?
-        .to_string();
-    Ok(vec![(0, real)])
+    file_args(args, 1, cwd, trusted_uid, trust_root, &mut out)?;
+    Ok(out)
 }
