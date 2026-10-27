@@ -50,9 +50,24 @@ impl Tree {
         p
     }
 
+    /// The config most tests use: `allow_all`, so they exercise the other checks, not the policy.
     fn config(&self, url: &str) -> PathBuf {
+        self.config_with(url, r#""mode":"allow_all""#)
+    }
+
+    /// The config with the policy keys spelled out (`extra` is JSON members, or empty for none).
+    fn config_with(&self, url: &str, extra: &str) -> PathBuf {
         let p = self.root.join("etc/root-exec.json");
-        fs::write(&p, format!(r#"{{"url":"{url}","key":"HELPER-KEY"}}"#)).unwrap();
+        let extra = if extra.is_empty() {
+            String::new()
+        } else {
+            format!(",{extra}")
+        };
+        fs::write(
+            &p,
+            format!(r#"{{"url":"{url}","key":"HELPER-KEY"{extra}}}"#),
+        )
+        .unwrap();
         chmod(&p, 0o600);
         p
     }
@@ -661,4 +676,151 @@ fn a_script_that_becomes_writable_while_waiting_is_not_run() {
     });
     let e = run(&t, &broker, &["bash", "deploy.sh"]).unwrap_err();
     assert_eq!(e.code, 10, "{e:?}");
+}
+
+// ---- the admin's policy: which programs may run at all ------------------------------------------------
+
+/// Run `words` under a config with these policy members; returns the failure message if refused.
+fn under_policy(extra: &str, words: &[&str], setup: impl Fn(&Tree)) -> Result<Plan, Failure> {
+    let t = Tree::new();
+    t.program("svc", "true");
+    t.program("other", "true");
+    t.program("bash", "true");
+    setup(&t);
+    let broker = MockBroker::start(approve_replies());
+    t.config_with(&broker.url, extra);
+    let out = prepare(&t.policy(), &args(words), &t.ctx(), |_| {});
+    if out.is_err() {
+        assert!(
+            broker.requests().is_empty(),
+            "refused, yet the broker was contacted"
+        );
+    }
+    out
+}
+
+fn svc(t: &Tree) -> String {
+    t.root.join("bin/svc").display().to_string()
+}
+
+#[test]
+fn with_no_policy_keys_nothing_may_run() {
+    let e = under_policy("", &["svc"], |_| {}).unwrap_err();
+    assert_eq!(e.code, 10, "{e:?}");
+    assert!(e.message.contains("allow-list"), "{}", e.message);
+    // an empty list and an explicit empty allowlist are the same thing
+    assert_eq!(
+        under_policy(r#""allow":[]"#, &["svc"], |_| {})
+            .unwrap_err()
+            .code,
+        10
+    );
+    assert_eq!(
+        under_policy(r#""mode":"allowlist""#, &["svc"], |_| {})
+            .unwrap_err()
+            .code,
+        10
+    );
+}
+
+#[test]
+fn only_the_listed_programs_run_in_allowlist_mode() {
+    let t = Tree::new();
+    t.program("svc", "true");
+    t.program("other", "true");
+    let broker = MockBroker::start(approve_replies());
+    t.config_with(
+        &broker.url,
+        &format!(r#""mode":"allowlist","allow":["{}"]"#, svc(&t)),
+    );
+    assert!(prepare(&t.policy(), &args(&["svc"]), &t.ctx(), |_| {}).is_ok());
+    let e = prepare(&t.policy(), &args(&["other"]), &t.ctx(), |_| {}).unwrap_err();
+    assert_eq!(e.code, 10);
+    assert!(e.message.contains("not on the allow-list"), "{}", e.message);
+    assert_eq!(
+        broker.requests().len(),
+        2,
+        "only the allowed program reached the broker"
+    );
+}
+
+#[test]
+fn a_symlinked_allow_entry_matches_the_file_it_points_to() {
+    let t = Tree::new();
+    let real = t.program("real", "true");
+    symlink(&real, t.root.join("bin/alias")).unwrap();
+    let broker = MockBroker::start(approve_replies());
+    t.config_with(
+        &broker.url,
+        &format!(r#""allow":["{}"]"#, t.root.join("bin/alias").display()),
+    );
+    assert!(prepare(&t.policy(), &args(&["real"]), &t.ctx(), |_| {}).is_ok());
+}
+
+#[test]
+fn allow_all_must_be_written_and_lifts_only_the_list() {
+    let ok = under_policy(r#""mode":"allow_all""#, &["other"], |_| {});
+    assert!(ok.is_ok(), "{ok:?}");
+    // the integrity checks still apply: an unsafe program is refused even under allow_all
+    let e = under_policy(r#""mode":"allow_all""#, &["svc"], |t| {
+        chmod(&t.root.join("bin/svc"), 0o777)
+    })
+    .unwrap_err();
+    assert_eq!(e.code, 10);
+    // and so do the script rules
+    let e = under_policy(r#""mode":"allow_all""#, &["bash", "-x", "y.sh"], |_| {}).unwrap_err();
+    assert!(e.message.contains("refused"), "{}", e.message);
+}
+
+#[test]
+fn the_script_rules_still_apply_to_an_allowed_interpreter() {
+    let t = Tree::new();
+    t.program("bash", "true");
+    let evil = t.root.join("home/evil.sh");
+    fs::write(&evil, "echo hi\n").unwrap();
+    chmod(&evil, 0o666);
+    let broker = MockBroker::start(approve_replies());
+    t.config_with(
+        &broker.url,
+        &format!(r#""allow":["{}"]"#, t.root.join("bin/bash").display()),
+    );
+    let e = prepare(&t.policy(), &args(&["bash", "evil.sh"]), &t.ctx(), |_| {}).unwrap_err();
+    assert_eq!(e.code, 10, "{e:?}");
+    assert!(broker.requests().is_empty());
+}
+
+#[test]
+fn a_mistyped_policy_is_an_error_not_a_different_policy() {
+    for extra in [
+        r#""mode":"allow-all""#, // typo
+        r#""mode":"ALLOW_ALL""#, // case
+        r#""mode":true"#,
+        r#""allow":"/usr/bin/id""#, // a string, not a list
+        r#""allow":["relative/path"]"#,
+        r#""allow":[1]"#,
+        r#""allow":[null]"#,
+    ] {
+        let e = under_policy(extra, &["svc"], |_| {}).unwrap_err();
+        assert_eq!(e.code, 10, "{extra}: {e:?}");
+        assert!(
+            e.message.contains("mode") || e.message.contains("allow"),
+            "{extra}: {}",
+            e.message
+        );
+    }
+}
+
+#[test]
+fn parse_access_reads_the_documented_forms() {
+    use asb_root_exec::{parse_access, Access};
+    assert_eq!(parse_access("{}").unwrap(), Access::Only(vec![]));
+    assert_eq!(
+        parse_access(r#"{"mode":"allow_all","allow":["bad"]}"#).unwrap(),
+        Access::AllowAll
+    );
+    assert_eq!(
+        parse_access(r#"{"allow":["/usr/bin/id","/usr/bin/systemctl"]}"#).unwrap(),
+        Access::Only(vec!["/usr/bin/id".into(), "/usr/bin/systemctl".into()])
+    );
+    assert!(parse_access("not json").is_err());
 }

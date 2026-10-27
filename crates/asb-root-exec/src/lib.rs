@@ -188,7 +188,68 @@ fn checked_args(
     Ok(out)
 }
 
-fn load_config(policy: &Policy) -> Result<Config, Failure> {
+/// Which programs the admin lets the helper run, from `mode` and `allow` in the root-only config.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Access {
+    /// Any program (every other check still applies). Must be written explicitly: `"mode": "allow_all"`.
+    AllowAll,
+    /// Only these absolute paths; each is compared with the resolved real file, so a symlinked entry works.
+    /// The default, and with no `allow` list that is nothing at all.
+    Only(Vec<PathBuf>),
+}
+
+/// Read `mode` (`allowlist`, the default, or `allow_all`) and `allow` (absolute program paths) from the config
+/// text. Anything else is an error, so a typo cannot turn into a different policy.
+pub fn parse_access(text: &str) -> Result<Access, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(text).map_err(|_| "config is not valid JSON".to_string())?;
+    match v.get("mode") {
+        None => {}
+        Some(m) if m == "allowlist" => {}
+        Some(m) if m == "allow_all" => return Ok(Access::AllowAll),
+        Some(_) => return Err("\"mode\" must be \"allowlist\" or \"allow_all\"".into()),
+    }
+    let bad = || "\"allow\" must be a list of absolute program paths".to_string();
+    let mut paths = Vec::new();
+    if let Some(list) = v.get("allow") {
+        for item in list.as_array().ok_or_else(bad)? {
+            let p = item
+                .as_str()
+                .filter(|p| p.starts_with('/') && !p.contains('\0'))
+                .ok_or_else(bad)?;
+            paths.push(PathBuf::from(p));
+        }
+    }
+    Ok(Access::Only(paths))
+}
+
+/// `Ok` if the admin allows running `real` (the resolved program).
+pub fn check_allowed(
+    access: &Access,
+    real: &std::path::Path,
+    config_path: &std::path::Path,
+) -> Result<(), String> {
+    match access {
+        Access::AllowAll => Ok(()),
+        Access::Only(list) => {
+            if list
+                .iter()
+                .filter_map(|p| std::fs::canonicalize(p).ok())
+                .any(|c| c == real)
+            {
+                Ok(())
+            } else {
+                Err(format!(
+                    "{} is not on the allow-list; an admin can add it to \"allow\" in {} (or set \"mode\": \"allow_all\")",
+                    real.display(),
+                    config_path.display()
+                ))
+            }
+        }
+    }
+}
+
+fn load_config(policy: &Policy) -> Result<(Config, Access), Failure> {
     let path = std::fs::canonicalize(&policy.config_path).map_err(|e| {
         fail(
             exit::REFUSED_LOCALLY,
@@ -199,8 +260,11 @@ fn load_config(policy: &Policy) -> Result<Config, Failure> {
         .map_err(|m| fail(exit::REFUSED_LOCALLY, m))?;
     let text = std::fs::read_to_string(&path)
         .map_err(|e| fail(exit::REFUSED_LOCALLY, format!("{}: {e}", path.display())))?;
-    Config::parse(&text)
-        .map_err(|m| fail(exit::REFUSED_LOCALLY, format!("{}: {m}", path.display())))
+    let refuse = |m: String| fail(exit::REFUSED_LOCALLY, format!("{}: {m}", path.display()));
+    Ok((
+        Config::parse(&text).map_err(refuse)?,
+        parse_access(&text).map_err(refuse)?,
+    ))
 }
 
 /// Check, ask the broker, and return what to run. `args` is everything after the program name and
@@ -220,7 +284,7 @@ pub fn prepare(
             "usage: asb-root-exec -- COMMAND [ARGS...]",
         ));
     }
-    let cfg = load_config(policy)?;
+    let (cfg, access) = load_config(policy)?;
     let cwd = ctx
         .cwd
         .to_str()
@@ -237,6 +301,8 @@ pub fn prepare(
     // Showing the name that was typed or found would let a link planted somewhere the agent can write
     // (`~/ls` -> `/bin/rm`) pass for something else. The same path is the process's argv[0].
     let resolved = resolve_command(policy, &command[0], ctx)?;
+    check_allowed(&access, &resolved.real, &policy.config_path)
+        .map_err(|m| fail(exit::REFUSED_LOCALLY, m))?;
     let shown = resolved
         .real
         .to_str()

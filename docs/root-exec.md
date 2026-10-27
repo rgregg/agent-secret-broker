@@ -37,6 +37,26 @@ own request or replay an old one. If the broker is down, denies, or does not ans
 
    The file must be mode 0600 and owned by root, or the helper refuses to read it.
 
+   **Then say which programs it may run.** Out of the box it runs **nothing**: with no policy keys the
+   allow-list is empty. Add `mode` and `allow` to the same file (root edits it; the agent cannot):
+
+       sudo python3 - <<'PY'
+       import json
+       p = "/etc/secret-broker/root-exec.json"
+       c = json.load(open(p))
+       c["allow"] = ["/usr/bin/systemctl", "/usr/bin/journalctl", "/usr/bin/id"]
+       json.dump(c, open(p, "w"), indent=2)
+       PY
+
+   `allow` is a list of absolute paths. Each is compared with the file a command resolves to (symlinks
+   followed), so `/usr/bin/python3` matches whatever it points to. `"mode": "allowlist"` is the default.
+
+   **To allow every program instead,** set `"mode": "allow_all"` (it must be written; there is no way to get it
+   by omission, and a misspelled `mode` makes the helper refuse to run, not fall back). `allow` is then ignored.
+   Only the allow-list is lifted: every check under "What the helper does and refuses" still applies (a program
+   the agent could rewrite, the script rules, refusing wrappers, your approval for every command). Prefer an
+   allow-list: with `allow_all`, each approval card is the only thing deciding what root may run.
+
 3. **Allow it on the broker.** Note the new client's id (the Clients tab shows it, like `c-1a2b3c4d`) and add
    it to the broker's config (off by default; see reference.md):
 
@@ -51,11 +71,15 @@ own request or replay an old one. If the broker is down, denies, or does not ans
    This is the only passwordless rule needed. Do not add `SETENV`, and do not allow arguments to be
    edited by wildcards: the helper takes the whole command after `--`.
 
-5. **Try it.** `asb sudo -- /usr/bin/id` should send a card to your phone; approve it and it prints
-   `uid=0(root)...`; deny it and it exits 4.
+5. **Try it.** With `/usr/bin/id` in `allow`, `asb sudo -- /usr/bin/id` should send a card to your phone;
+   approve it and it prints `uid=0(root)...`; deny it and it exits 4. A program that is not allowed is refused
+   at once (exit 10) without sending anything to your phone.
 
 ## What the helper does and refuses
 
+- Runs only programs the admin allowed (`allow` in `/etc/secret-broker/root-exec.json`, or `"mode": "allow_all"`).
+  The check is on the resolved real file and happens before the broker is asked, so a disallowed command never
+  reaches your phone.
 - Resolves the command's first word before asking, and shows you the **file that will actually run**:
   symlinks are followed first, so a link in a place the agent can write (`~/ls` pointing at `/bin/rm`)
   appears as `/bin/rm`, never as `ls`. That path is also the process's `argv[0]`, so multi-call binaries
@@ -97,13 +121,15 @@ own request or replay an old one. If the broker is down, denies, or does not ans
 ## Exit codes
 
 The command's own, or: `2` usage, `3` broker unreachable or refused the request, `4` you denied it,
-`5` it expired unanswered, `10` refused locally (unsafe file, config, directory or binary), `11` approved
+`5` it expired unanswered, `10` refused locally (not on the allow-list, unsafe file, config, directory or binary), `11` approved
 but the command could not be started.
 
 ## Limits to know about
 
 - You approve the **text** of a command. `bash -c '...'`, an editor, `make` or a package manager do more
   than their name says, so read those cards closely.
+- With an allow-list, the programs that can run are the ones you chose, and the script rules below apply to any
+  interpreter you allowed. Under `allow_all` there is no such choice, and the following limits matter more.
 - The script check covers only programs it knows are interpreters. Anything else that can run other commands or
   read files (`find -exec`, `git`, `make`, editors, pagers, `awk -f`, `cp` of a file the agent can change) is as
   powerful as its text and is **not** checked: you approve names, not contents. What a trusted script itself runs,
