@@ -73,7 +73,9 @@ own request or replay an old one. If the broker is down, denies, or does not ans
     **resolved real path**, so a symlink cannot show one file and run another. ARGS are the script's own: the
     trusted script decides what to do with them (including data files).
   - `INTERP -c CODE [ARGS...]` (or the interpreter's one exact inline flag: `-e` for perl and ruby, `-r` for php,
-    ...): the code is in the command you read.
+    ...): the code is in the command you read. For shells and Python every word after the code is a plain
+    argument. Perl, Ruby, Node, PHP and the like keep parsing switches after the code (`perl -e CODE -MEvil`), so
+    for them any later word starting with `-` is refused.
   A lone `--version` or `--help` is allowed. Any other option before the script is refused (`-m`, `-r`, `-i`, `-s`,
   `--rcfile`, `-lc`, ...), as are `-`, a missing file and an interpreter with no script: each of those loads or
   reads something the card does not show. This is a grammar, not an option parser, on purpose: parsing every

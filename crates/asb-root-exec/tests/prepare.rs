@@ -358,6 +358,9 @@ fn with_interpreters(t: &Tree) {
         "python3",
         "python3.11",
         "perl5.36",
+        "ruby",
+        "node",
+        "php",
         "env",
         "timeout",
         "xargs",
@@ -460,6 +463,29 @@ fn any_option_before_the_script_is_refused() {
             msg.contains("refused") || msg.contains("allowed forms"),
             "{words:?}: {msg}"
         );
+    }
+}
+
+#[test]
+fn switches_after_inline_code_are_refused_where_the_interpreter_would_still_parse_them() {
+    for words in [
+        &["perl5.36", "-e", "print 1", "-MEvil"][..],
+        &["perl5.36", "-e", "print 1", "-I/tmp/x"],
+        &["ruby", "-e", "puts 1", "-r", "evil"],
+        &["node", "-e", "1", "--require", "./evil.js"],
+        &["php", "-r", "echo 1;", "-d", "auto_prepend_file=evil"],
+    ] {
+        let msg = refused(|_| {}, words);
+        assert!(msg.contains("after the inline code"), "{words:?}: {msg}");
+    }
+    assert!(refused(|_| {}, &["bash", "-c"]).contains("no code"));
+    // shells and Python take every later word as a plain argument, so these are fine
+    for words in [
+        &["bash", "-c", "echo $1", "x", "-x"][..],
+        &["python3", "-c", "import sys; print(sys.argv)", "-X", "dev"],
+        &["perl5.36", "-e", "print 1", "plain", "args"], // later words that are not switches
+    ] {
+        allowed(|_| {}, words);
     }
 }
 

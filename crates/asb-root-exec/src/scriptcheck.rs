@@ -62,6 +62,8 @@ const WRAPPERS: &[&str] = &[
     "flock", "strace", "watch", "unshare", "nsenter", "runuser", "su", "doas", "sudo", "busybox",
     "parallel", "script", "xvfb-run",
 ];
+/// Interpreters that take every word after `-c CODE` as a plain argument, never as an option.
+const POSITIONAL_AFTER_CODE: &[&str] = &["sh", "bash", "dash", "zsh", "ksh", "ash", "python"];
 /// An option that only prints something and exits, allowed only as the sole argument.
 const INFO: &[&str] = &["--version", "-version", "--help", "-V"];
 
@@ -114,7 +116,22 @@ pub fn check(
         return Ok(vec![]);
     }
     if inline_flags(interpreter).contains(&first.as_str()) {
-        return Ok(vec![]); // the code is the next argument, which you are shown
+        // the code is the next argument, which you are shown
+        if args.len() < 2 {
+            return Err("the inline-code flag has no code after it".into());
+        }
+        // After the code, shells and Python treat every remaining word as a plain argument. Perl, Ruby, Node,
+        // PHP, Lua and the rest keep parsing switches (`perl -e CODE -MEvil`, `node -e CODE --require x`), so
+        // any later switch is refused for them.
+        if !POSITIONAL_AFTER_CODE.contains(&interpreter.as_str())
+            && args[2..].iter().any(|a| a.starts_with('-'))
+        {
+            return Err(
+                "an option after the inline code is refused: this interpreter would still parse it"
+                    .into(),
+            );
+        }
+        return Ok(vec![]);
     }
     if first.starts_with('-') {
         return Err(format!(
