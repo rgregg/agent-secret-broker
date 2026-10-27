@@ -1955,6 +1955,30 @@ validated exactly as the catalog will read it back before anything is written. I
   `credential_provided` and `credential_refused` are hidden approver activity.
   History shows the request, follows a rename, and the detail view says the purpose is not retained.
 
+## Root commands (request mode `sudo`, proposal: docs/proposals/root-exec.md)
+
+A helper running as root on the agent's machine asks the broker before it runs a command as root.
+The request names no credential and the approved answer carries no value: the human's decision is
+the whole result.
+
+- Request: `POST /v1/requests` `{"mode": "sudo", "argv": ["/usr/bin/systemctl", "restart", "nginx"],
+  "cwd": "/home/ryan", "user": "root", "invoker": "ryan", "source": "..."}`. `argv` is 1 to 64 strings
+  (each at most 4096 characters, 16384 in total; control characters other than tab and newline and
+  hidden characters are refused, 400). `user` is `root` (the only value in v1). `cwd` is an absolute
+  path. `invoker` is the local user who asked, shown as unverified. `names` must be absent or empty.
+- Off by default. `"sudo": {"enabled": true, "clients": ["c-1a2b3c4d"], "ttl_s": 300,
+  "max_pending_per_client": 3}` (validated at startup). Only the client ids listed may ask (others,
+  and the legacy shared key, get 403). `ttl_s` is 60 to 900. `GET /v1/status` shows `features.sudo`.
+- Always HIGH by code with no model call. Never auto-approved: `approval: allow`, Always, timed grants,
+  SSH rules and `auto_modes` cannot reach it, and a form post asking for one is refused (400) and
+  claims nothing. No notification button can decide it; the notification carries the command and a link,
+  and only the approval page approves. The card shows the command shell-quoted, with every non-ASCII
+  character as `<U+XXXX>`.
+- Result: `GET /v1/requests/<id>` returns `{"status": "approved", "approved": true}` once, then
+  `{"status": "released"}`; denial and expiry are final, as for every mode.
+- Audit: `requested` carries `argv` (first 50 words, each clipped to 300), `argc`, `cwd`, `target_user`
+  and `invoker`; no environment is ever sent or logged. History shows the mode as "root command".
+
 ## Plans (task-scoped grants for unattended jobs)
 
 An unattended or long job (an overnight sync, a multi-step task while nobody is at the phone) can make

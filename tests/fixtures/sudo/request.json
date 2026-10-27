@@ -1,0 +1,1 @@
+{"mode": "sudo", "argv": ["/usr/bin/systemctl", "restart", "nginx"], "cwd": "/home/ryan", "user": "root", "invoker": "ryan", "source": "ryan@box"}

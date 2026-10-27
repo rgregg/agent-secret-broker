@@ -52,6 +52,7 @@ from . import standing as standing_mod
 from . import guidance as guidance_mod
 from . import proposals as proposals_mod
 from . import credreq as credreq_mod
+from . import sudomode as sudo_mod
 from . import clients as clients_mod
 from . import clock as clock_mod
 from . import plans as plans_mod
@@ -181,7 +182,7 @@ class Request:
         # credential presented), unlike `source`, which is the client's own user@host claim.
         self.client = client or dict(clients_mod.ClientStore.LEGACY_VIEW)
         self.nonce = secrets.token_urlsafe(24)
-        self.mode = mode          # "env" | "http" | "store" | "ssh_sign" | "guidance" | "credential" | "plan" | "session"
+        self.mode = mode          # "env" | "http" | "store" | "ssh_sign" | "guidance" | "credential" | "plan" | "session" | "sudo"
         self.plan_id = None       # mode "plan": the plan this card would start
         self.names = names
         self.spec = spec
@@ -305,6 +306,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         self._default_auto_modes = risk_mod.parse_auto_modes(config.get("risk"), "risk")
         self.proposals_cfg = proposals_mod.parse_config(config.get("guidance_proposals"))
         self.credreq_cfg = credreq_mod.parse_config(config.get("credential_requests"))
+        self.sudo_cfg = sudo_mod.parse_config(config.get("sudo"))
         # guidance applies: vault writes are serialized and spaced; transient errors are retried.
         # The clock, sleep and jitter are attributes so tests can drive them.
         self._gwrite_lock = threading.Lock()
@@ -849,6 +851,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                          "timed_grants": bool(self.grants_cfg["enabled"]),
                          "guidance_proposals": bool(self.proposals_cfg["enabled"]),
                          "credential_requests": bool(self.credreq_cfg["enabled"]),
+                         "sudo": bool(self.sudo_cfg["enabled"]),
                          "plans": bool(self.plans_cfg["enabled"]),
                          "client_enrollment": bool(self.clients_cfg["enrollment"]["enabled"]),
                          "legacy_client_key": self.clients_cfg["legacy"],
@@ -930,6 +933,8 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                          ("max_calls", sp["max_calls"]), ("purpose_length", len(sp["purpose"])),
                          ("purpose_sha256", credreq_mod.purpose_digest(sp["purpose"]))):
                 rec.setdefault(k, v)
+        elif req.mode == "sudo":
+            rec.update(sudo_mod.audit_fields(req.spec))     # the command's first words; never an environment
         elif req.mode == "ssh_sign":
             sp = req.spec
             rec.update(ssh_kind=sp["ssh"]["kind"], ssh_what=sp["ssh"]["text"],
@@ -1371,6 +1376,11 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                 if not names or any(n not in secrets_cfg or n in internal for n in names):
                     self._refresh_if(0)
                 self._validate_session(names, spec, client)
+            elif mode == "sudo":
+                if names:
+                    raise ValueError("a sudo request names no credential")
+                sudo_mod.check_allowed(self.sudo_cfg, client)
+                sudo_mod.validate(spec)
             else:
                 if not names or any(n not in secrets_cfg or n in internal for n in names):
                     if not self._backend_ok:
@@ -1435,6 +1445,11 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                         err = "too many pending session requests"
                     elif mine + waiting >= cap or total >= sessions_mod.MAX_TOTAL:
                         err = "too many open sessions"
+                if mode == "sudo":
+                    cid_ = (client or clients_mod.ClientStore.LEGACY_VIEW)["id"]
+                    if sum(r.status == "pending" and r.mode == "sudo" and r.client["id"] == cid_
+                           for r in self._by_id.values()) >= self.sudo_cfg["max_pending_per_client"]:
+                        err = "too many pending sudo requests"
                 if mode == "credential":
                     open_cr = [r for r in self._by_id.values() if r.status == "pending" and r.mode == "credential"]
                     if len(open_cr) >= credreq_mod.MAX_PENDING:
@@ -1445,7 +1460,8 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                 for n in names:
                     if now - self._denied_at.get(n, 0) < DENY_COOLDOWN:
                         err = f"{n} was denied recently; try again later"
-                ttl = self.credreq_cfg["ttl_s"] if mode == "credential" else self.cfg.get("ttl_seconds", 120)
+                ttl = (self.credreq_cfg["ttl_s"] if mode == "credential" else
+                       self.sudo_cfg["ttl_s"] if mode == "sudo" else self.cfg.get("ttl_seconds", 120))
             if err is None:
                 req = Request(mode, names, spec, source, ttl, peer, client)
                 self._by_id[req.id] = req
@@ -1456,6 +1472,8 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             raise PermissionError(err)
         self.audit("requested", req)
         self._retain_details(req)
+        if mode == "sudo":
+            return self._sudo_pending(req)      # no vault, no model, no policy: a human decides
         # unlock while the human is reaching for their phone (a backend that cannot
         # or should not do this does not declare "warm")
         self.warm_backend()
@@ -1654,6 +1672,20 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         auto-approved, notified by name only with no action buttons: only the approval page
         can decide it, after the human typed the value there."""
         a = risk_mod.assess("credential", req.names, {}, None)
+        req.risk = {k: a[k] for k in ("level", "model", "reasons")}
+        self.audit("assessed", req, model=None, reasons=a["reasons"], summary_source=None,
+                   summary_reason=None)
+        try:
+            self._push(req)
+        except Exception:  # noqa: BLE001 -- a request must always settle; the notify error text is never kept
+            self._finish(req, "failed", error="could not notify")
+        return req
+
+    def _sudo_pending(self, req):
+        """Hand a validated root-command request to the human. High by code with no model call,
+        never auto-approved (no policy, grant or standing rule reaches this mode), and no
+        notification button can decide it: only the approval page can."""
+        a = risk_mod.assess("sudo", req.names, {}, None)
         req.risk = {k: a[k] for k in ("level", "model", "reasons")}
         self.audit("assessed", req, model=None, reasons=a["reasons"], summary_source=None,
                    summary_reason=None)
@@ -2034,6 +2066,8 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             else:
                 what = (f"HTTP session requested: {req.names[0]} on {', '.join(sp['hosts'])} "
                         f"({', '.join(sp['methods'])}), {sessions_mod._fmt_ttl(sp['ttl_s'])}, up to {sp['max_calls']} calls")
+        elif req.mode == "sudo":
+            what = sudo_mod.push_text(req.spec)
         elif req.mode == "ssh_sign":
             what = "\n".join([f"SSH key {req.spec['fingerprint']}: {req.spec['ssh']['text']}"]
                              + sshkey.host_lines(req.spec.get("host")))
@@ -2052,6 +2086,9 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         elif req.mode == "plan":        # names only: never the task, description or any rule text
             msg = f"{what}\nOpen the approval page to read the plan and approve or deny it."
             title = "Plan requested"
+        elif req.mode == "sudo":        # the command is the point; the card has the rest. No buttons below.
+            msg = f"{what}\nFrom {req.source}. Open the approval page to read it and approve or deny."
+            title = "Root command requested [HIGH]"
         elif req.mode == "session":     # no purpose (untrusted agent text); the card has everything
             msg = f"{what}\nFrom {req.source}. Open the approval page to review and approve or deny."
             title = ("WebSocket session requested [HIGH]" if req.spec.get("kind") == "ws"
@@ -2062,7 +2099,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             source=req.source if req.mode != "plan" else req.client["name"],
             summary=req.summary, expires_at=req.expires, transport=self.notifier,
             default_policy=self.action_policy)
-        if req.mode in ("guidance", "credential", "plan", "session"):
+        if req.mode in ("guidance", "credential", "plan", "session", "sudo"):
             # no buttons on any transport: only the dashboard or the link page can decide
             n = dataclasses.replace(n, actions=[], action_token=None, transport_actions={
                 id(leaf): [] for leaf in notify_mod.leaves(self.notifier)})
@@ -2791,7 +2828,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                     if match is None:
                         code, refused_log = (403 if cands else 410), True
                     elif ch.token_required and (decision not in match.offered
-                                                or match.mode in ("guidance", "credential", "plan", "session")):
+                                                or match.mode in ("guidance", "credential", "plan", "session", "sudo")):
                         # Token is valid but this action was never offered (action
                         # policy): refuse like a bad token and do NOT spend it.
                         code, refused_log, unoffered = 403, True, match
@@ -2839,6 +2876,10 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                         req.spec["final"], req.spec["secret"] = credential
                 elif req is not None and credential is not None:
                     req, code = None, 400
+                if req is not None and req.mode == "sudo" and (
+                        always or grant_minutes is not None or ssh_rule is not None or credential is not None
+                        or plan is not None or session_limits is not None):
+                    req, code = None, 400   # a root command is approved once, as shown; nothing is claimed
                 if req is not None and req.mode == "session":
                     # no Always, grant or SSH rule; the approver may only shorten the limits
                     fin = sessions_mod.check_limits(session_limits, req.spec) if approve else (0, 0)
@@ -3331,6 +3372,8 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             raise BackendError("plans are started only by a human decision")
         if req.mode == "session":       # opened only by _session_open, after a human decision
             raise BackendError("sessions are opened only by a human decision")
+        if req.mode == "sudo":          # there is no value: the approval itself is the answer
+            return {"approved": True}
         if req.mode == "store":
             return self._store(req)
         if req.mode == "ssh_sign":
@@ -3449,7 +3492,8 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                 delivered = False
         if delivered:
             self.audit("delivered", req, to_peer=peer, kind={"env": "env", "ssh_sign": "ssh_signature",
-                                                             "credential": "stored", "session": "session"}.get(req.mode, "http_response"))
+                                                             "credential": "stored", "session": "session",
+                                                             "sudo": "approval"}.get(req.mode, "http_response"))
             return {"status": "approved", **(out or {})}
         if req.status == "released":
             return {"status": "released"}
@@ -4699,6 +4743,8 @@ def _describe(req):
         return plans_mod.describe_html(req)
     if req.mode == "session":
         return (ws_mod if req.spec.get("kind") == "ws" else sessions_mod).describe_html(req)
+    if req.mode == "sudo":
+        return sudo_mod.describe_html(req)
     if req.mode == "ssh_sign":
         host = "".join("<br>" + html.escape(x) for x in sshkey.host_lines(req.spec.get("host")))
         return (f"SSH signature with key <code>{html.escape(req.spec['fingerprint'])}</code><br>"
@@ -4779,7 +4825,7 @@ _CHANNEL_LABEL = {"dashboard": "web dashboard", "push": "browser push notificati
                   "ha": "Home Assistant", "link": "approval link"}
 _MODE_LABEL = {"http": "web", "env": "run-with-secret", "ssh_sign": "ssh signing",
                "guidance": "guidance proposal", "credential": "credential request", "plan": "plan",
-               "session": "http session"}
+               "session": "http session", "sudo": "root command"}
 _CLIENT_NOTES = {"planrevoked": "Plan revoked: it stops matching before its next call.",
                  "plangone": "That plan is no longer active.", "sesrevoked": "Session revoked. Its next call fails.",
                  "sesgone": "That session had already ended.", "renamed": "Client renamed.", "revoked": "Client revoked. Its next request fails.",
@@ -4808,6 +4854,11 @@ def _approve_actions(broker, req):
         return (ws_mod if req.spec.get("kind") == "ws" else sessions_mod).actions_html(broker, req)
     e = html.escape
     names = e(", ".join(req.names))
+    if req.mode == "sudo":          # Approve or Deny only: no Always, no timed grant
+        return ("<div class=decide-row><button class='btn approve' name=decision value=approve>"
+                "Approve</button><button class='btn deny' name=decision value=deny>Deny</button></div>"
+                "<p class=scope><small class=muted>Approves this one command, as shown. No standing "
+                "approval can cover a root command.</small></p>")
     row1 = ("<div class=decide-row><button class='btn approve' name=decision value=approve>"
             "Approve</button><button class='btn deny' name=decision value=deny>Deny</button></div>")
     ok_g, _ = broker.grant_eligibility(req)
@@ -4975,6 +5026,12 @@ def _detail_html(r, evs, retained=""):
         add("Allowed hosts", ", ".join(r["hosts"] or []))
         if (last("stored") or {}).get("value_bytes") is not None:
             add("Value size", f"{last('stored')['value_bytes']} bytes (never recorded)")
+    elif r["mode"] == "sudo":
+        req_ev = first("requested") or {}
+        add("Operation", "run a command as root (approval only; nothing is released)")
+        add("Command", " ".join(req_ev.get("argv") or []) or None)
+        add("Directory", req_ev.get("cwd"))
+        add("Asked by local user", req_ev.get("invoker"))
     elif r["mode"] == "credential":
         # kind, hosts, variable names and sizes only: the purpose text and the value are not retained
         req_ev, prov, st = first("requested") or {}, last("credential_provided") or {}, last("stored") or {}
@@ -5293,7 +5350,7 @@ def client_handler(broker, client_key):
                     if n > proposals_mod.BODY_CAP:
                         return _json(self, 413, {"error": "guidance proposal too large"})
                     names = proposals_mod.names_of(body.get("entries"))
-                elif mode == "session_close":
+                elif mode in ("session_close", "sudo"):
                     names = []
                 else:
                     names = list(body["names"])
@@ -5338,6 +5395,11 @@ def client_handler(broker, client_key):
                     spec = {"kind": body.get("kind"), "purpose": body.get("purpose"),
                             "hosts": body.get("hosts"), "var": body.get("var"),
                             "cred_mode": body.get("cred_mode")}
+                elif mode == "sudo":
+                    if body.get("names"):
+                        raise ValueError("a sudo request names no credential")
+                    spec = {"argv": body.get("argv"), "cwd": body.get("cwd"), "user": body.get("user", "root"),
+                            "invoker": body.get("invoker")}
                 elif mode == "ssh_sign":
                     spec = {"data_b64": body.get("data_b64"), "flags": body.get("flags", 0),
                             "binds": body.get("binds"), "claimed_dest": body.get("claimed_dest"),
@@ -5648,7 +5710,7 @@ def approval_handler(broker):
                 if arg("outcome") in OUTCOMES + ("unknown",) and arg("outcome") != "pending":
                     a["outcome"] = arg("outcome")
                 a["secret"] = arg("secret")
-                if arg("mode") in ("http", "env", "store", "ssh_sign", "guidance", "credential", "plan", "session"):
+                if arg("mode") in ("http", "env", "store", "ssh_sign", "guidance", "credential", "plan", "session", "sudo"):
                     a["mode"] = arg("mode")
             try:
                 n = int(arg("limit") or HIST_PAGE)
@@ -5676,6 +5738,8 @@ def approval_handler(broker):
                     what = r.get("ssh_what") or "ssh signature"
                 elif r["mode"] == "credential":
                     what = "credential request"
+                elif r["mode"] == "sudo":
+                    what = "run as root: " + " ".join(r.get("argv") or [])[:100]
                 elif r["mode"] == "plan":
                     what = "plan"
                 elif r["mode"] == "session":

@@ -2825,7 +2825,7 @@ class StatusEndpoint(Harness):
         self.assertEqual(st["features"], {"ha_hook": True, "ssh": False, "webpush_actions": False,
                                          "auto_approve_max": "low", "timed_grants": True,
                                          "guidance_proposals": True, "credential_requests": True,
-                                         "plans": True, "client_enrollment": True, "legacy_client_key": "allow",
+                                         "sudo": False, "plans": True, "client_enrollment": True, "legacy_client_key": "allow",
                                          "client_list": "ok",
                                          "http_sessions": {"enabled": True, "default_ttl_s": 900,
                                                            "max_ttl_s": 3600, "max_calls": 200,
