@@ -1,0 +1,40 @@
+asb: ask the broker for a secret, wait for phone approval, use it.
+
+  asb NAME[,NAME2] -- command args...         run with secrets in the env
+  asb sudo -- command args...                 run as root through the root helper; a human approves the exact command
+  asb list [--json]                           what credentials exist? (no approval)
+  asb store NAME --hosts H[,H] [--field F] [--item I] [--var V]  < value
+  asb store NAME --ssh < private_key          move an SSH private key into the broker
+  asb update NAME [--var V]                   < value
+  asb request-credential NAME --kind token|login --for "purpose" [--host H]... [--var V] [--mode http|env]
+                                              ask the human to enter a NEW credential (you never see it)
+  asb which HOST|URL                          is a credential available? (no approval)
+  asb status [--json]                         broker version, uptime, catalog health (no approval)
+  asb audit [--request ID] [--event E[,E]] [--secret NAME] [--since 15m] [--tail] [--json]
+                                              what happened to my requests? (redacted; no approval)
+  asb audit verify                            is the broker's audit log intact?
+  asb ssh-agent [--socket PATH] [-- command args...]  local ssh-agent; keys stay in the broker
+  asb fingerprint HOST[:PORT]                 print a server certificate's sha256 (for tls_fingerprint)
+  asb http NAME METHOD URL [-H 'K: V']... [-d BODY | -d @file | -d @-] [--plan ID]
+                                              broker makes the call itself (--plan: under an approved plan)
+  asb plan submit FILE|- [--no-wait] | status ID | list | close ID
+                                              plan mode: one human approval for an unattended job's calls
+  asb session open NAME --for "purpose" --host H [--host H2]... [--methods GET,HEAD,POST] [--ttl 15m] [--max-calls N]
+                                              a time-boxed multi-call permission (login + cookie flows); a human approves
+  asb session close ID | asb session status ID
+  asb http ... [--session ID] [--capture NAME=header:X|cookie:N|json:$.a.b]
+                                              http call inside a session (no new prompt, cookies kept by the broker);
+                                              prefer export ASB_SESSION=ID, which keeps the id out of `ps`
+  asb ws NAME URL [--ttl 15m] [--max-frames N]  hold a ws:// or wss:// connection in the broker (a human approves);
+                                              prints a session id. Then: asb ws send|recv|close ID, or asb ws ID (line pipe)
+  asb guidance propose FILE|- | --from-dir DIR  propose risk guidance; the human reviews it
+  asb guidance status ID                      outcome of a proposal (no approval)
+  asb enroll [--name NAME] [--url URL] [--force]  get this machine its own credential; a human approves
+  asb agent-setup [--agent claude|codex|copilot|all] [--scope user|project] [--dry-run] [--remove]
+                                              install/remove the broker instructions in the agents' instruction files (local only)
+
+Config: SECRET_BROKER_URL / SECRET_BROKER_KEY, or
+~/.config/secret-broker/client.json {"url": ..., "key": ...}.
+
+asb help COMMAND    usage and an example for one command
+asb guide           the manual for agents: workflow, placeholders, approvals, exit codes

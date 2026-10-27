@@ -1,0 +1,9 @@
+usage: asb NAME[,NAME] -- command [args...]
+
+Run a command with the credential's variables in its environment. Waits for
+approval; stdout/stderr of the command are masked. Exits with the command's code.
+If the command runs a script file (bash deploy.sh, python3 sync.py, ./run.sh) its text
+(up to 32 KB, up to 3 files, text only) is sent with the request for the approver and
+the risk check; it is re-hashed just before running and, if it changed after approval,
+nothing runs and asb exits 6. Advisory and best effort.
+example: asb grafana -- sh -c 'curl -s -H "Authorization: Bearer $GRAFANA_TOKEN" $URL'

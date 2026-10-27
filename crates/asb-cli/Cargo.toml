@@ -1,0 +1,17 @@
+[package]
+name = "asb-cli"
+description = "asb: the agent secret broker's command line (Rust port of client/asb)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "asb"
+path = "src/main.rs"
+
+[dependencies]
+asb-proto = { path = "../asb-proto" }
+asb-client = { path = "../asb-client" }
+libc.workspace = true
+serde_json = { workspace = true, features = ["preserve_order"] }

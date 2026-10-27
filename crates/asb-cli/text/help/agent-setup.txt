@@ -1,0 +1,21 @@
+usage: asb agent-setup [--agent claude|codex|copilot|all] [--scope user|project]
+                      [--dry-run] [--remove]
+
+Install a short block telling a coding agent to use asb (which/list/http, never read
+credential files, a denial is final, request-credential when nothing covers a service,
+`asb guide` for the rest) into its instruction file. Local only: no broker call, and
+client.json is never read.
+  claude   user: ~/.claude/CLAUDE.md          project: ./CLAUDE.md (or ./.claude/CLAUDE.md if only that exists)
+  codex    user: $CODEX_HOME or ~/.codex/AGENTS.md   project: ./AGENTS.md
+  copilot  user: $COPILOT_HOME or ~/.copilot/copilot-instructions.md
+           project: ./.github/copilot-instructions.md
+--agent defaults to auto-detect (config directory or program on PATH, or an existing
+project file); it says what it found and only creates files in directories that exist.
+An explicit --agent (or all) also creates missing files and directories. --scope
+defaults to user; project means the current directory.
+The block sits between "<!-- asb:agent-setup begin vN -->" and "... end -->" markers;
+re-runs replace it in place, text outside is never touched, and a changed file is
+backed up first (FILE.asb-bak-STAMP). --dry-run prints a diff and writes nothing;
+--remove deletes only the block. Damaged markers or an unwritable file: nothing is
+written, exit 2. Exit 0 ok, 1 no agent found, 2 usage or refused.
+example: asb agent-setup --agent claude --scope user --dry-run

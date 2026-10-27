@@ -105,14 +105,22 @@ pub struct Client {
 
 impl Client {
     pub fn new(cfg: Config) -> Client {
-        // No redirects: the key header must only ever go to the configured broker.
-        let agent = ureq::AgentBuilder::new()
-            .redirects(0)
-            .user_agent(concat!(
+        Self::with_user_agent(
+            cfg,
+            concat!(
                 "asb-client/",
                 env!("CARGO_PKG_VERSION"),
                 " (+https://github.com/rgregg/agent-secret-broker)"
-            ))
+            ),
+        )
+    }
+
+    /// A client that names itself `user_agent` (the `asb` command does, as the Python one always has).
+    pub fn with_user_agent(cfg: Config, user_agent: &str) -> Client {
+        // No redirects: the key header must only ever go to the configured broker.
+        let agent = ureq::AgentBuilder::new()
+            .redirects(0)
+            .user_agent(user_agent)
             .build();
         Client { cfg, agent }
     }
@@ -124,6 +132,18 @@ impl Client {
         body: Option<&str>,
         timeout: Duration,
     ) -> Result<(u16, String), Error> {
+        self.call_reason(method, path, body, timeout)
+            .map(|(code, text, _)| (code, text))
+    }
+
+    /// Like `call`, and also the HTTP reason phrase of the answer ("Forbidden", "Not Found", ...).
+    fn call_reason(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&str>,
+        timeout: Duration,
+    ) -> Result<(u16, String, String), Error> {
         let url = format!("{}{}", self.cfg.url, path);
         let req = self
             .agent
@@ -137,17 +157,36 @@ impl Client {
         };
         match out {
             Ok(resp) => {
-                let code = resp.status();
-                Ok((
-                    code,
-                    resp.into_string()
-                        .map_err(|e| Error::Protocol(clean(&e.to_string(), 120)))?,
-                ))
+                let (code, reason) = (resp.status(), resp.status_text().to_string());
+                let text = resp
+                    .into_string()
+                    .map_err(|e| Error::Protocol(clean(&e.to_string(), 120)))?;
+                Ok((code, text, reason))
             }
             Err(ureq::Error::Status(code, resp)) => {
-                Ok((code, resp.into_string().unwrap_or_default()))
+                let reason = resp.status_text().to_string();
+                Ok((code, resp.into_string().unwrap_or_default(), reason))
             }
             Err(ureq::Error::Transport(t)) => Err(Error::Unreachable(clean(&t.to_string(), 160))),
+        }
+    }
+
+    /// One JSON call, for the CLI: `(HTTP status, parsed body)`. A GET when `body` is `None`, else a POST of it.
+    /// An error status whose body is not JSON becomes `{"error": <reason phrase>}`, as the Python client does; a
+    /// 2xx whose body is not JSON is a protocol error. `Error::Unreachable` means the broker could not be reached.
+    pub fn json(
+        &self,
+        path: &str,
+        body: Option<&serde_json::Value>,
+        timeout: Duration,
+    ) -> Result<(u16, serde_json::Value), Error> {
+        let text = body.map(|b| b.to_string());
+        let method = if body.is_some() { "POST" } else { "GET" };
+        let (code, text, reason) = self.call_reason(method, path, text.as_deref(), timeout)?;
+        match serde_json::from_str(&text) {
+            Ok(v) => Ok((code, v)),
+            Err(_) if code >= 400 => Ok((code, serde_json::json!({ "error": reason }))),
+            Err(_) => Err(Error::Protocol("the broker's answer was not JSON".into())),
         }
     }
 

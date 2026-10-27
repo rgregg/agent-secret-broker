@@ -1,0 +1,21 @@
+usage: asb session open NAME --for "purpose" --host H [--host H2]... [--methods GET,HEAD,POST]
+                        [--ttl 15m] [--max-calls N]
+       asb session close ID
+       asb session status ID
+
+Ask the human for a time-boxed permission to make several related calls with credential NAME (an
+http credential; env and ssh credentials are refused). Use it for multi-step flows (log in, reuse a
+cookie, carry a CSRF token); use plain `asb http` for single calls and env mode only when a program
+needs the secret itself. --host (required, repeatable or comma separated) is HOST (only ports 80 and 443,
+by scheme) or HOST:PORT (exactly that port); the host must be inside the credential's allowed hosts: a
+session only narrows. Redirects are never followed: you get the 3xx and make a new call. Calls accept only a fixed header allowlist
+(`asb guide` lists it); an API that needs another auth header uses plain `asb http`. --methods defaults to GET,HEAD; declare POST, PUT,
+PATCH, DELETE or OPTIONS if you need them (the human sees them). --ttl is s, m or h (default 15m, the
+broker has a maximum). --max-calls defaults to 200. --for is one line, up to 300 characters; the human
+sees it as your unverified claim.
+open waits for the human (about 2 minutes), then prints the session id on stdout. Pass it to
+`asb http ... --session ID`. The deadline is absolute: it never moves, whatever you do, and there is
+no renewal. `status` prints time and calls left; `close` ends it now. Only the client that opened a
+session can use it. Exit 0 ok, 4 denied, 5 open expired unanswered, 3 refused (too many sessions,
+disabled, bad credential or host), 2 usage, 7 session expired/closed/revoked/unknown (ended), 8 call refused (outside the approved scope).
+example: asb session open unifi --for "read stats and rename a client" --host unifi.local --methods GET,HEAD,POST,PUT --ttl 10m

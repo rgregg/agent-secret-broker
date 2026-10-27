@@ -1,0 +1,191 @@
+asb guide (for agents)
+
+Use this instead of reading credential files. Real values never reach you: the
+broker adds them to the call, and output is masked (set-cookie headers are removed; use a session for cookie flows). Every use asks the human to
+approve on their phone (a few secrets are pre-approved; low-risk ones may be too).
+
+No credential for it yet? If `asb which HOST` / `asb list` show nothing that covers the
+service, do NOT ask the human to paste a secret into chat, look for one on disk, or
+guess: run `asb request-credential` (see "Asking the human for a credential you do not
+have" below). The human enters the value on the approval page, you never see it, and
+then you use the stored name as usual.
+
+Workflow
+  1. asb which api.example.com      which credential covers this host?
+     (or: asb list                  all credentials; add --json for scripts)
+     prints:  NAME <tab> VAR,VAR   -- the VAR names are the placeholders you can use
+  2. asb http NAME GET https://api.example.com/v1/things \
+         -H 'Authorization: Bearer {{VAR}}'
+     {{VAR}} is replaced by the broker in the URL, headers and body. Use -d BODY,
+     -d @file or -d @- (stdin) for a request body.
+     The broker only sends the credential to the hosts it is allowed for.
+  3. Or run a local command with the value in its environment (output is masked):
+     asb NAME -- curl -sH "Authorization: Bearer $VAR" https://api.example.com/
+     If the command runs a script (bash deploy.sh, python3 sync.py, ./run.sh), asb
+     reads it (up to 32 KB, text only) and sends it with the request so the human and
+     the risk check can see what it does. Obvious secrets in it are removed. Just before
+     running, asb re-checks the script; if it changed after approval it does not run
+     (exit 6). Advisory: asb cannot prove what finally runs. Scripts piped on stdin
+     cannot be shown and make the request look more opaque.
+
+Which command? (decision rule)
+  HTTP API, one call or a few independent ones   asb http
+  Multi-step HTTP flow (log in, reuse the cookie, carry a CSRF token, log out)
+                                                 asb session open ... then asb http ... --session ID
+  A service that speaks WebSocket (e.g. Home Assistant's /api/websocket)   asb ws NAME URL (see below)
+  A program that needs the secret itself (an official CLI, a library)   env mode: asb NAME -- command
+  A command that needs root (the helper only runs what its admin allowed)  asb sudo -- command
+  Do not write a script around curl or requests to do an HTTP flow: use a session. The broker keeps
+  the cookies and tokens, so the secret and the session never reach you.
+
+HTTP sessions (multi-step flows; one human approval for a bounded unit of work)
+  asb session open unifi --for "list clients and rename one" --host unifi.local:443 --methods GET,HEAD,POST,PUT
+  prints the session id; the human approves a card showing the credential, hosts, methods, time limit
+  and call cap. Defaults: methods GET,HEAD; 15 minutes; 200 calls (--ttl 20m, --max-calls 50).
+  Prefer `export ASB_SESSION=ID` (keeps the id out of the process list; --session ID does the same and wins).
+  Unset it when the flow is over. Then use it, with no further prompts:
+    asb http unifi POST https://unifi.local/api/auth/login --session ID         -H 'Content-Type: application/json'         -d '{"username":"{{UNIFI_USERNAME}}","password":"{{UNIFI_PASSWORD}}"}'         --capture CSRF=header:X-CSRF-Token
+    asb http unifi GET  https://unifi.local/proxy/network/api/s/default/stat/sta --session ID
+    asb http unifi PUT  https://unifi.local/proxy/network/api/s/default/rest/user/ID --session ID         -H 'X-CSRF-Token: {{session.CSRF}}' -d '{"name":"x"}'
+    asb session close ID
+  The broker stores cookies from responses (and removes Set-Cookie from what you see) and sends them
+  on later calls to the same host. --capture saves a value (header:NAME, cookie:NAME or json:$.a.b[0])
+  for later use as {{session.NAME}} in the URL, headers and body; you never see it.
+  Session calls accept ONLY these headers (exact names): Accept, Accept-Language, Content-Type, User-Agent,
+  If-None-Match, If-Modified-Since, Authorization, X-CSRF-Token, X-Updated-CSRF-Token, X-Requested-With,
+  X-API-Key. Content-Type must be application/json, application/x-www-form-urlencoded, text/plain,
+  application/graphql or multipart/form-data (with a boundary), plus at most charset=utf-8. A value that carries
+  a placeholder must be exactly {{NAME}}, optionally after "Bearer ", "Basic " or "Token " (so
+  `Authorization: Bearer {{TOKEN}}` and `X-API-Key: {{KEY}}` work). Every other header (X-Auth-Token,
+  Content-Length, Cookie, Host, Connection, ...) is refused, even with a placeholder: an API that needs another
+  auth header must use plain `asb http` without --session for now. Any text containing "method" in the URL,
+  headers or body is refused too (plain `asb http` for fields like payment_method), and bodies are limited to 256 KB.
+  --host is HOST (ports 80 and 443 only) or HOST:PORT (exactly that port). Redirects are never followed:
+  you get the 3xx and its Location, and make a new call yourself.
+  Rules you cannot change: the session ends at its deadline (it is NEVER extended or renewed, however
+  much you use it), after --max-calls, on `asb session close`, or when the human revokes it; it only
+  works for the client that opened it. A call outside its hosts or methods is refused, not prompted:
+  open a new session if you really need more. Do not retry a denied or revoked session.
+  Exit 7: session expired, closed, revoked or unknown. Exit 8: refused (host, method, call cap, missing
+  {{session.NAME}}). Never put a secret in --for.
+
+WebSocket sessions (a service that speaks WebSocket, e.g. Home Assistant's /api/websocket)
+  asb ws ha wss://ha.example.com:8123/api/websocket --ttl 10m
+  The human approves ONE card (always high risk: it names the credential, host and port, time limit and
+  caps); the broker opens the connection and signs in itself with the credential's handshake, so you never
+  see the token. Prints the session id; `export ASB_WS_SESSION=ID` lets you leave the id off below.
+    asb ws send ID '{"id":1,"type":"get_states"}'     one text frame to the server
+    asb ws recv ID --wait 5                           frames from the server, one per line (waits up to 25 s)
+    printf '%s\n' '{"id":2,"type":"ping"}' | asb ws ID   line pipe: each stdin line is a frame, replies on stdout
+    asb ws close ID
+  What you send is not filtered, with one exception: the operator may block message types for a credential (the
+  Home Assistant preset blocks creating or deleting tokens, users and auth providers, signed paths and the
+  supervisor API). A blocked message is refused ("that message is blocked for this credential") and never reaches
+  the server; such a credential accepts only strict JSON frames. Do not try to work around a block (other
+  spellings, wrapping, splitting): ask the human instead. Even when nothing is blocked, the session was what the
+  human approved, so send only what the task needs, and never use it to create new credentials or tokens on the
+  server. Frames you receive have the credential masked; binary frames are not shown (a note with
+  the length goes to stderr). `recv` prints a note when the broker had to pause reading because you were
+  slow to collect frames (nothing is dropped; collect more often). Newlines inside a received frame are
+  printed as spaces. Counts, never contents, are logged. The deadline is fixed (15 min by default, never
+  extended); there are frame and byte caps in each direction, a frame size cap and an idle timeout. Exit 7:
+  the session ended (expired, closed by you, revoked, idle, the server closed the connection, or unknown).
+  Exit 8: refused (a cap, rate limit or oversize frame). A credential literally named send, recv or close
+  cannot be opened with the shell form. Do not retry a denied or revoked session.
+
+Approval
+  The command blocks, printing "waiting for approval", for up to about 5 minutes.
+  Do not retry or work around a denial or timeout: the human said no or was away.
+  Stop and tell them what you needed and why.
+
+SSH keys
+  Keys the broker holds never leave it; ssh asks the broker to sign instead.
+    asb ssh-agent -- git push          agent lives for that command; each login asks the human
+    eval "$(asb ssh-agent)"            or: leave an agent running and set SSH_AUTH_SOCK
+  Do not look for private keys on disk. `asb list` shows keys as NAME with no VARS.
+
+Proposing risk guidance (you cannot set it; the human decides)
+  Guidance tells the risk classifier how to rate requests for a credential and can
+  lower ratings, so only the human writes it. You may PROPOSE text; it reaches the
+  human on the approval page, entry by entry, and nothing changes unless they tick it.
+    asb guidance propose proposal.json     [{"name": "komodo", "text": "..."}, ...]
+    asb guidance propose --from-dir DIR    DIR/NAME.txt per credential
+    asb guidance status ID                 applied / denied / failed names
+  Up to 25 entries, 2000 characters each; empty text proposes removing the guidance.
+  Prints "applied:", "denied:" and "failed:" names; exit 0 if at least one was applied,
+  4 if denied, 5 if it expired (about an hour). You cannot read the current guidance and
+  there is no command for it; write proposals from what you know about the credential.
+  Never ask for broader trust than the credential's real use justifies, and do not
+  retry a denial.
+
+Asking the human for a credential you do not have (you never see the value)
+  asb request-credential myapi --kind token --for "read the Example API for the report" \
+      --host api.example.com
+  asb request-credential mysite --kind login --for "log in to the admin portal" --host admin.example.com
+  The human gets a card on the approval page (and a phone notification with just the name),
+  types the secret there, can edit the name, hosts, variable and mode, and presses Store.
+  The broker stores it with approval on every use. You get only the stored name; then use it
+  as usual (asb list shows its variables): asb http NAME GET https://... -H 'Authorization: Bearer {{VAR}}'.
+  Exit 0 stored; 4 denied; 5 expired (about 15 minutes); 3 broker refused (name exists: use
+  `asb update`; invalid name; too many pending; disabled); 2 usage. Never put a secret in --for or
+  any argument, and do not retry a denial. A request is always high risk and always needs the human.
+
+Plans: an unattended or long job (use one for MANY calls; do not submit a plan for one call)
+  A plan is a manifest of the exact calls the job will make, approved by the human ONCE, for a limited
+  time, on this machine only. Write the manifest (asb help plan has the format), then:
+    asb plan submit manifest.json          waits for the human; prints the plan id when approved
+    asb http NAME GET URL ... --plan ID    (or set ASB_PLAN=ID) released with no prompt if it matches a rule
+    asb plan status ID | asb plan list | asb plan close ID
+  A call that does not match a rule is REFUSED (exit 8, with a reason), never turned into a prompt;
+  make that call without --plan if you need the normal approval. Exit 7: the plan is not usable
+  (kind: ended, exhausted, closed, revoked or unknown, e.g. the broker restarted): stop and submit a
+  new plan, which needs the human again. Exit 9: slow down (rate or in-flight limit), retry after the
+  printed seconds. There is no renewal. Do not submit a broader plan to get around a refusal.
+
+Giving this machine its own credential
+  asb enroll --name NAME [--url URL]   prints a confirmation code and waits for the human to approve
+  the card showing the same code; then ~/.config/secret-broker/client.json holds this machine's own
+  key. Do this only when the human asked you to; never approve or script around it. Exit 0 enrolled,
+  4 denied, 5 expired, 3 refused, 2 usage (an existing key needs --force and is backed up).
+  If a command says "this client has been revoked", stop and tell the human.
+
+Storing and rotating (value ONLY on stdin, never as an argument)
+  printf '%s' "$VALUE" | asb store NAME --hosts a.example.com[,b] [--field F] [--item I] [--var V]
+  printf '%s' "$VALUE" | asb update NAME [--var V]
+  store creates a credential without a tap; update asks for approval.
+
+Checking the broker (after a deploy)
+  asb status           version (git sha), uptime, catalog count/invalid/adopted, backend ok
+  asb status --json    the same for scripts; no secret names or hosts are included
+  No approval needed; exit 3 if the broker is unreachable or refuses the key.
+
+Debugging
+  asb audit --request ID      what happened to one request (ID is in the broker's reply)
+  asb audit --since 15m       recent events; filter with --event, --secret, --source
+  asb audit --tail            follow new events (Ctrl-C to stop); --json for scripts
+  Redacted by design: it shows requests, outcomes, who decided and how the call went,
+  but never risk verdicts or reasons, approval policy, or values. No approval needed;
+  exit 1 if nothing matches, 3 if the broker is unreachable or refuses the key.
+
+Setting up a machine (local only; no broker call, never reads client.json)
+  asb agent-setup                    put a short, marked "use asb" block in the instruction
+                                     files of the coding agents it finds (Claude Code, Codex,
+                                     GitHub Copilot); --agent NAME|all, --scope user|project
+  asb agent-setup --dry-run          print the diff, write nothing
+  asb agent-setup --remove           delete only the marked block
+  Re-runs replace the block between the begin/end markers in place; text outside them is
+  never touched; a changed file gets a timestamped backup (FILE.asb-bak-STAMP). A damaged
+  marker (begin without end, duplicates) is refused with an explanation, exit 2.
+
+Exit codes
+  0 ok            1 nothing found (which/list/audit; agent-setup found no agent)     2 usage or config error
+  3 broker unreachable or refused the request
+  4 denied by the human (or the policy)            5 expired or timed out waiting
+  6 env: a script changed between the request and the run (nothing was executed)
+  7 ended: a session or plan is over or unusable (expired, closed, revoked, exhausted, unknown or lost to a
+    broker restart): stop; a new one needs the human again
+  8 refused by the approved scope: a session or plan call outside what was approved (reason printed); it is
+    never turned into a prompt; do not retry it
+  9 retry later: a plan call over its rate or in-flight limit; wait the printed retry_after_s
+  22 http: the upstream answered with status >= 400 (body is still printed)
+  other: env mode returns the wrapped command's own exit code

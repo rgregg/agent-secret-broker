@@ -1,0 +1,3 @@
+usage: asb guide
+
+Print the manual for agents.

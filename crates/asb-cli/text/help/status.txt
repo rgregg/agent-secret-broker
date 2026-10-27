@@ -1,0 +1,7 @@
+usage: asb status [--json]
+
+Show the running broker's build version (git sha), uptime, catalog size
+(count, invalid, adopted) and whether the vault backend is healthy. No approval
+needed; reads the broker's in-memory state, no secret names or hosts. Exit 3 if
+the broker is unreachable. Use it to verify a deploy.
+example: asb status --json

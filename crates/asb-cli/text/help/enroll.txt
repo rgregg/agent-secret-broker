@@ -1,0 +1,14 @@
+usage: asb enroll [--name NAME] [--url URL] [--force]
+
+Give THIS machine its own broker credential instead of a copied shared key. asb makes a random
+256-bit secret locally, sends the broker only a hash of it, prints a confirmation code and waits
+for the human to approve the card with the same code on the approval page. On approval it writes
+~/.config/secret-broker/client.json (the url, and the new secret as "key", mode 0600). The secret
+is never printed, never sent while enrolling and never an argument.
+--name sets the client's name (lowercase letters, digits, - _ . up to 32 characters; default: this
+host name; the human may change it). --url is the broker's client URL (default: SECRET_BROKER_URL
+or the url in client.json). An existing client.json that already has a key is replaced only with
+--force, and is first copied to client.json.bak-<time>.
+Exit 0 enrolled, 4 denied, 5 expired or timed out, 3 the broker refused or is unreachable, 2 usage.
+Only the human who started this should approve it: refuse any card whose code you do not recognise.
+example: asb enroll --name build-box

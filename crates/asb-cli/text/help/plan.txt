@@ -1,0 +1,37 @@
+usage: asb plan submit FILE|- [--no-wait]
+       asb plan status ID [--json]
+       asb plan list [--json]
+       asb plan close ID
+       asb http NAME METHOD URL [-H ...] [-d ...] --plan ID      (or ASB_PLAN=ID)
+
+Plan mode for an unattended job: you declare the calls in a manifest, the human approves the whole
+list once (they read a rendering of every rule), and matching calls then run with no prompt until the
+deadline. Anything not in the manifest is refused, never prompted. `submit` waits for the human (about
+15 minutes) and prints the plan id; --no-wait prints the pending id and returns at once.
+Manifest (JSON):
+  {"v": 1, "task": "nightly sync", "description": "what and why", "ttl_seconds": 28800,
+   "rules": [{"secret": "ledger", "method": "POST", "host": "ledger.example.com",
+              "path_prefix": "/v1/notes", "max_uses": 5,
+              "body": {"json": {"keys": ["text", "kind"], "pin": {"kind": "reconcile"}}}},
+             {"secret": "monarch", "method": "GET", "host": "api.example.com",
+              "path_prefix": "/v1/accounts", "max_uses": 50}]}
+  rule keys: secret, method (uppercase), host (lowercase, one of the credential's hosts), path_prefix
+  (absolute, covers the path and everything under it), max_uses, optional port, scheme (https; http only
+  for a private IP address), query ("any" or "none"), body. body is one of {"none": true},
+  {"json": {"keys": [...], "pin": {...}}}, {"graphql": {"document": "...", "operation_name": "...",
+  "variables_keys": [...]}}; a rule that writes (POST, PUT, PATCH, DELETE) must declare a body.
+  A GraphQL call must send exactly the declared document. Send the same Content-Type
+  application/json and use only these headers: Accept, Content-Type, Content-Length, If-None-Match,
+  User-Agent, plus Authorization-style headers whose whole value is the credential's own {{VAR}}.
+  No {{VAR}} in the URL or body. A rule that writes allows no URL query string unless it lists
+  "query": ["key", ...]; a GraphQL rule never does. Only %20 may be percent-encoded in a path, and a path is ASCII.
+  Redirects are never followed.
+Exit codes: 0 ok; 3 broker refused (manifest invalid, too many plans); 4 denied by
+the human; 5 expired; 7 plan not usable (kind: ended|exhausted|closed|revoked|unknown): submit a new
+plan; 8 the call is outside the approved plan (no_rule, uses_exhausted, wrong_policy); 9 slow down
+(rate_limited or inflight_limit; prints retry_after_s); 2 usage.
+A plan is bound to this machine's own credential (run `asb enroll` first; the shared key cannot
+submit plans), has an absolute deadline, and ends when the broker restarts.
+example: asb plan submit manifest.json && asb http ledger POST https://ledger.example.com/v1/notes \
+             -H 'Authorization: Bearer {{LEDGER_TOKEN}}' -H 'Content-Type: application/json' \
+             -d '{"text": "ok", "kind": "reconcile"}' --plan $PLAN_ID

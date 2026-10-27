@@ -1,0 +1,16 @@
+usage: asb ssh-agent [--socket PATH] [-- command [args...]]
+
+Serve the ssh-agent protocol on a private local socket. ssh, git and scp that
+find it through SSH_AUTH_SOCK offer the broker's SSH keys and ask the broker to
+sign; each signature waits for the human's approval and the private key never
+reaches this machine. With a command, the agent runs just for that command and
+exits with its code. Without one it prints `SSH_AUTH_SOCK=...; export ...` and
+keeps serving (use: eval "$(asb ssh-agent)"). With a command, the destination it
+names (ssh, scp, sftp, rsync -e ssh, git remotes) is sent to the broker as an
+unverified claim; a bare agent has no command, so no claim. OpenSSH 8.9+ also
+proves the server's host key to the broker (session-bind).
+--socket PATH listens at that fixed path instead of a temp one, for a long-lived
+agent (a systemd user service) that ~/.ssh/config points at with IdentityAgent.
+It replaces a stale socket, refuses to start over a live one, and removes the
+socket when stopped.
+example: asb ssh-agent -- git -C repo pull
