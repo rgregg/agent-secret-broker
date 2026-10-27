@@ -28,7 +28,7 @@ def load_python_cli():
 def generate():
     """{relative path: file content} for everything this tool owns."""
     cli = load_python_cli()
-    files = {"text/doc.txt": cli.__doc__, "text/guide.txt": cli.GUIDE}
+    files = {"text/doc.txt": cli.__doc__, "text/guide.txt": cli.GUIDE, "text/agent_block_body.txt": cli.AGENT_BLOCK_BODY}
     for name, text in cli.HELP.items():
         files[f"text/help/{name}.txt"] = text
     arms = "\n".join(f'        "{name}" => Some(include_str!("../text/help/{name}.txt")),' for name in cli.HELP)
@@ -40,6 +40,11 @@ pub const DOC: &str = include_str!("../text/doc.txt");
 
 /// What `asb guide` prints.
 pub const GUIDE: &str = include_str!("../text/guide.txt");
+
+/// The instruction block `asb agent-setup` writes between its markers (without the marker lines).
+pub const AGENT_BLOCK_BODY: &str = include_str!("../text/agent_block_body.txt");
+pub const AGENT_MARK: &str = "{cli.AGENT_MARK}";
+pub const AGENT_BLOCK_VERSION: u32 = {cli.AGENT_BLOCK_VERSION};
 
 /// The commands that have `asb help COMMAND` text, in the order the Python CLI lists them.
 pub const HELP_TOPICS: &[&str] = &[{order}];

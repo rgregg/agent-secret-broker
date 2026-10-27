@@ -6,6 +6,11 @@ pub const DOC: &str = include_str!("../text/doc.txt");
 /// What `asb guide` prints.
 pub const GUIDE: &str = include_str!("../text/guide.txt");
 
+/// The instruction block `asb agent-setup` writes between its markers (without the marker lines).
+pub const AGENT_BLOCK_BODY: &str = include_str!("../text/agent_block_body.txt");
+pub const AGENT_MARK: &str = "asb:agent-setup";
+pub const AGENT_BLOCK_VERSION: u32 = 1;
+
 /// The commands that have `asb help COMMAND` text, in the order the Python CLI lists them.
 pub const HELP_TOPICS: &[&str] = &["ws", "plan", "list", "which", "status", "audit", "http", "session", "sudo", "run", "store", "request-credential", "update", "ssh-agent", "fingerprint", "guidance", "enroll", "agent-setup", "guide"];
 
