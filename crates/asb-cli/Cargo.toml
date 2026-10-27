@@ -15,3 +15,4 @@ asb-proto = { path = "../asb-proto" }
 asb-client = { path = "../asb-client" }
 libc.workspace = true
 serde_json = { workspace = true, features = ["preserve_order"] }
+sha2 = "0.10"

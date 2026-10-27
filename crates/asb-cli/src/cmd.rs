@@ -4,6 +4,8 @@ use crate::broker;
 use crate::exit::{die, Die, BROKER, NOT_FOUND, R, USAGE};
 use crate::pyfmt::{json_dumps, py_str, quote, repr, truthy};
 use crate::text_gen::{self, DOC, GUIDE, HELP_TOPICS};
+use crate::util::{check_name, die_help};
+use crate::{cmd_audit, cmd_enroll, cmd_guidance, cmd_http, cmd_store, cmd_sudo};
 use serde_json::Value;
 
 pub fn run(argv: &[String]) -> i32 {
@@ -46,6 +48,13 @@ fn dispatch(argv: &[String]) -> R {
         "list" => list(&argv[1..]),
         "status" => status(&argv[1..]),
         "which" => which(argv),
+        "http" => cmd_http::run(argv),
+        "audit" => cmd_audit::run(&argv[1..]),
+        "guidance" => cmd_guidance::run(&argv[1..]),
+        "sudo" => cmd_sudo::run(&argv[1..]),
+        "enroll" => cmd_enroll::run(&argv[1..]),
+        "store" | "update" => cmd_store::store_or_update(argv),
+        "request-credential" => cmd_store::request_credential(&argv[1..]),
         _ if argv.iter().any(|a| a == "--") || is_known(cmd) => unported(cmd),
         _ => Err(die(
             format!(
@@ -62,17 +71,9 @@ fn is_known(cmd: &str) -> bool {
         "agent-setup",
         "plan",
         "ssh-agent",
-        "store",
-        "update",
-        "request-credential",
         "session",
         "ws",
-        "sudo",
-        "enroll",
         "fingerprint",
-        "audit",
-        "guidance",
-        "http",
     ]
     .contains(&cmd)
 }
@@ -109,11 +110,6 @@ fn help(topic: Option<&str>) -> R {
         },
     }
     Ok(0)
-}
-
-/// `die(HELP[topic])`: the help text becomes the error message.
-fn die_help(topic: &str) -> Die {
-    die(text_gen::help(topic).unwrap_or_default(), USAGE)
 }
 
 fn broker_error(code: u16, r: &Value) -> Die {
@@ -262,15 +258,4 @@ fn which(argv: &[String]) -> R {
         return Ok(NOT_FOUND);
     }
     Ok(0)
-}
-
-/// A flag where a name should be is a mistake worth saying so about.
-pub fn check_name(name: &str, what: &str) -> Result<(), Die> {
-    if name.starts_with('-') {
-        return Err(die(
-            format!("{what} {} looks like a flag, not a credential name (see `asb list`; `asb help` for usage)", repr(name)),
-            USAGE,
-        ));
-    }
-    Ok(())
 }

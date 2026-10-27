@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run the existing test-suite against the Rust `asb` instead of client/asb.
 
-    python tools/run_tests_against_rust_cli.py [-k SUBSTRING] [--release] [--list]
+    python tools/run_tests_against_rust_cli.py [-k SUBSTRING] [--release] [--list] [--prune]
 
 About 18 test files run the CLI as a subprocess (`python -I client/asb ARGS`). In a throwaway copy of the repo this
 replaces client/asb with a shim that executes the Rust binary, so those tests run UNMODIFIED against it and every
@@ -11,7 +11,8 @@ at the attribute they look up: they need golden vectors instead, see docs/propos
 
 It prints the tests that fail and compares them with tests/rust_cli_known_gaps.txt, the tests that are expected to
 fail until their command is ported. It exits non-zero on a failure that is NOT in that list, and on a listed test that
-now passes (so the list can only shrink). `--list` prints the failing tests without comparing.
+now passes (so the list can only shrink). `--list` prints the failing tests without comparing. `--prune` rewrites the
+list without the tests that now pass (never adding one), then reports as usual.
 """
 import os
 import re
@@ -38,13 +39,15 @@ def build(release):
 
 def main():
     args = sys.argv[1:]
-    release, list_only = "--release" in args, "--list" in args
+    release, list_only, prune = "--release" in args, "--list" in args, "--prune" in args
     k = args[args.index("-k") + 1] if "-k" in args else None
     rust = build(release)
     tmp = tempfile.mkdtemp(prefix="asb-rust-cli-")
     try:
         tree = os.path.join(tmp, "repo")
         shutil.copytree(ROOT, tree, ignore=shutil.ignore_patterns(".git", "target", "__pycache__", "*.pyc", ".superpowers"))
+        # needs the real client/asb's text, which the shim replaces; it is checked in the normal suite
+        os.remove(os.path.join(tree, "tests", "test_cli_text_sync.py"))
         with open(os.path.join(tree, "client", "asb"), "w") as f:
             f.write(SHIM.format(rust=rust))
         cmd = [sys.executable, os.path.join("tests", "run_tests.py"), "-j8"] + (["-k", k] if k else [])
@@ -63,6 +66,11 @@ def main():
     if os.path.exists(GAPS):
         known = {l.strip() for l in open(GAPS) if l.strip() and not l.startswith("#")}
     new, fixed = sorted(set(names) - known), sorted(known - set(names)) if not k else []
+    if prune and fixed:
+        keep = [l for l in open(GAPS) if l.startswith("#") or l.strip() not in set(fixed)]
+        open(GAPS, "w").writelines(keep)
+        print(f"\npruned {len(fixed)} test(s) that now pass from tests/rust_cli_known_gaps.txt")
+        fixed = []
     if new:
         print(f"\n{len(new)} failing test(s) NOT in tests/rust_cli_known_gaps.txt:")
         print("\n".join("  " + n for n in new))

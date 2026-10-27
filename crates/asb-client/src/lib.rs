@@ -304,6 +304,52 @@ impl Client {
     }
 }
 
+/// An unauthenticated JSON call, for enrollment (which happens before the client has a key). `Err` is the CLASS of a
+/// network failure and never its text: the secret is not involved, but the Python client reports class only. An
+/// error status with a body that is not a JSON object gives an empty object.
+pub fn anonymous_json(
+    base: &str,
+    user_agent: &str,
+    path: &str,
+    body: Option<&serde_json::Value>,
+    timeout: Duration,
+) -> Result<(u16, serde_json::Value), String> {
+    let agent = ureq::AgentBuilder::new()
+        .redirects(0)
+        .user_agent(user_agent)
+        .build();
+    let url = format!("{base}{path}");
+    let req = agent
+        .request(if body.is_some() { "POST" } else { "GET" }, &url)
+        .timeout(timeout)
+        .set("Content-Type", "application/json");
+    let out = match body {
+        Some(b) => req.send_string(&b.to_string()),
+        None => req.call(),
+    };
+    match out {
+        Ok(resp) => {
+            let code = resp.status();
+            let text = resp.into_string().map_err(|_| "OSError".to_string())?;
+            serde_json::from_str(&text)
+                .map(|v| (code, v))
+                .map_err(|_| "JSONDecodeError".to_string())
+        }
+        Err(ureq::Error::Status(code, resp)) => {
+            let v = resp
+                .into_string()
+                .ok()
+                .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok());
+            Ok((
+                code,
+                v.filter(|v| v.is_object())
+                    .unwrap_or_else(|| serde_json::json!({})),
+            ))
+        }
+        Err(ureq::Error::Transport(_)) => Err("URLError".to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
