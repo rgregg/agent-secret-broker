@@ -132,3 +132,51 @@ fn an_unreachable_broker_is_an_error() {
         Err(Error::Unreachable(_))
     ));
 }
+
+#[test]
+fn an_approval_that_lands_before_the_create_call_returns_is_still_collected() {
+    // found by the end-to-end test: a fast approver beat the create response, which then said so
+    for early in ["deciding", "approved"] {
+        let created = (
+            202,
+            format!(r#"{{"id":"rid_1","status":"{early}","error":null,"expires_in":300}}"#),
+        );
+        let (r, broker) = run(vec![created, (200, fixture("approved.json"))]);
+        assert_eq!(r, Ok(()), "{early}");
+        assert_eq!(
+            broker.requests().len(),
+            2,
+            "{early}: the approval was collected by a poll"
+        );
+    }
+}
+
+#[test]
+fn a_poll_that_says_deciding_keeps_waiting() {
+    let deciding = (200, r#"{"status":"deciding","error":null}"#.to_string());
+    let (r, _) = run(vec![
+        created(),
+        deciding.clone(),
+        deciding,
+        (200, fixture("approved.json")),
+    ]);
+    assert_eq!(r, Ok(()));
+}
+
+#[test]
+fn a_create_answer_that_is_already_final_or_nonsense_is_an_error() {
+    let mk = |status: &str, error: &str| {
+        (
+            202,
+            format!(r#"{{"id":"rid_1","status":"{status}","error":{error},"expires_in":300}}"#),
+        )
+    };
+    let (r, _) = run(vec![mk("denied", "null")]);
+    assert_eq!(r, Err(Error::Denied));
+    let (r, _) = run(vec![mk("failed", r#""boom""#)]);
+    assert_eq!(r, Err(Error::Failed("boom".into())));
+    for bad in ["released", "maybe"] {
+        let (r, _) = run(vec![mk(bad, "null")]);
+        assert!(matches!(r, Err(Error::Protocol(_))), "{bad}: {r:?}");
+    }
+}

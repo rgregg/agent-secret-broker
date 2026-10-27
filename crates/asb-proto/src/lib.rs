@@ -103,6 +103,8 @@ pub struct Polled {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
     Pending,
+    /// The broker is acting on a decision that has just been made; the next poll shows the outcome.
+    Deciding,
     Approved,
     Denied,
     Expired,
@@ -115,6 +117,7 @@ impl Status {
     pub fn parse(word: &str) -> Status {
         match word {
             "pending" => Status::Pending,
+            "deciding" => Status::Deciding,
             "approved" => Status::Approved,
             "denied" => Status::Denied,
             "expired" => Status::Expired,

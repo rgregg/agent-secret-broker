@@ -192,13 +192,22 @@ impl Client {
     pub fn approve_sudo(&self, req: &SudoRequest, mut note: impl FnMut(&str)) -> Result<(), Error> {
         let created = self.create_sudo(req)?;
         match Status::parse(&created.status) {
-            Status::Pending => {}
+            // An approval can land before the create call has returned (a fast approver, a busy broker), so the
+            // answer may already say `deciding` or `approved`. The approval itself is only delivered by a poll,
+            // so go and collect it.
+            Status::Pending | Status::Deciding | Status::Approved => {}
             Status::Denied => return Err(Error::Denied),
             Status::Expired => return Err(Error::Expired),
-            _ => {
+            Status::Failed => {
                 return Err(Error::Failed(clean(
-                    created.error.as_deref().unwrap_or(&created.status),
+                    created.error.as_deref().unwrap_or("failed"),
                     160,
+                )))
+            }
+            Status::Released | Status::Unknown => {
+                return Err(Error::Protocol(format!(
+                    "unexpected status {} for a new request",
+                    clean(&created.status, 40)
                 )))
             }
         }
@@ -226,7 +235,7 @@ impl Client {
             let polled: Polled = serde_json::from_str(&text)
                 .map_err(|_| Error::Protocol("bad poll answer".into()))?;
             match Status::parse(&polled.status) {
-                Status::Pending => continue,
+                Status::Pending | Status::Deciding => continue,
                 Status::Approved if polled.approved => return Ok(()),
                 Status::Approved => {
                     return Err(Error::Protocol("approved without an approval".into()))
