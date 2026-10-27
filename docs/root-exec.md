@@ -48,8 +48,14 @@ own request or replay an old one. If the broker is down, denies, or does not ans
        json.dump(c, open(p, "w"), indent=2)
        PY
 
-   `allow` is a list of absolute paths. Each is compared with the file a command resolves to (symlinks
-   followed), so `/usr/bin/python3` matches whatever it points to. `"mode": "allowlist"` is the default.
+   `allow` is a list of absolute **real** paths: the file that actually runs. A command typed as `systemctl`
+   or invoked through a symlink resolves to its real file first, and that file must be in the list exactly. An
+   entry that is itself a symlink (or has `..` or `//` in it) makes the helper refuse to start and prints the real
+   path to list instead (`/usr/bin/python3` is usually a link: list `readlink -f /usr/bin/python3`). This is on
+   purpose: if a link were accepted it would silently allow whatever it points to, and for a multi-call program
+   such as busybox or uutils `coreutils`, listing the link `id` would allow every applet, since they take the
+   applet name from the first argument. Listing a multi-call binary allows all of its applets, so don't. An
+   entry for a program that is not installed is kept and matches nothing. `"mode": "allowlist"` is the default.
 
    **To allow every program instead,** set `"mode": "allow_all"` (it must be written; there is no way to get it
    by omission, and a misspelled `mode` makes the helper refuse to run, not fall back). `allow` is then ignored.

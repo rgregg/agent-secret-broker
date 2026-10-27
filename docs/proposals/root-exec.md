@@ -39,8 +39,9 @@ see and approve the exact command.
   forge it, and a approval cannot be replayed: the helper only runs a command whose own request
   came back approved. Denial, timeout, broker unreachable: exit non-zero and run nothing (fail
   closed).
-- **Policy.** The helper runs only programs the admin allowed: `allow` (absolute paths, compared with the resolved
-  real file) in the root-only config, empty by default, or an explicit `"mode": "allow_all"`. A mistyped policy is
+- **Policy.** The helper runs only programs the admin allowed: `allow` (absolute real paths, compared exactly with
+  the resolved real file; a symlinked entry is refused, because it would silently allow what it points to, and for
+  a multi-call binary every applet) in the root-only config, empty by default, or an explicit `"mode": "allow_all"`. A mistyped policy is
   an error, never a different policy. The allow-list, not the argument checks below, is the main control on what
   root can be asked to do; those checks are defense in depth that keeps the approval card honest.
 - **Exec.** argv is run directly (no shell) with the path resolved against a fixed secure PATH,

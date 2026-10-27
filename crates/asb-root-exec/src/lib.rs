@@ -193,8 +193,8 @@ fn checked_args(
 pub enum Access {
     /// Any program (every other check still applies). Must be written explicitly: `"mode": "allow_all"`.
     AllowAll,
-    /// Only these absolute paths; each is compared with the resolved real file, so a symlinked entry works.
-    /// The default, and with no `allow` list that is nothing at all.
+    /// Only these absolute paths, each of which must already be a real path (see `validate_entries`) and is
+    /// compared with the resolved real file exactly. The default, and with no `allow` list that is nothing at all.
     Only(Vec<PathBuf>),
 }
 
@@ -223,6 +223,28 @@ pub fn parse_access(text: &str) -> Result<Access, String> {
     Ok(Access::Only(paths))
 }
 
+/// Every entry that exists must be its own canonical path. A symlinked entry would silently allow whatever it
+/// points to: allowing `/usr/bin/id` when that is a link to `/bin/busybox` would allow every busybox applet, since
+/// the helper runs the real file. Making the admin write the real path makes the list say what it allows. An
+/// entry that does not exist (yet) is kept, and simply matches nothing.
+pub fn validate_entries(access: &Access) -> Result<(), String> {
+    if let Access::Only(list) = access {
+        for p in list {
+            if let Ok(real) = std::fs::canonicalize(p) {
+                if &real != p {
+                    return Err(format!(
+                        "\"allow\" entry {} is not a real path: it resolves to {}; list {} (what is allowed is the file that runs, and a multi-call program such as busybox allows all of its applets)",
+                        p.display(),
+                        real.display(),
+                        real.display()
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `Ok` if the admin allows running `real` (the resolved program).
 pub fn check_allowed(
     access: &Access,
@@ -232,11 +254,7 @@ pub fn check_allowed(
     match access {
         Access::AllowAll => Ok(()),
         Access::Only(list) => {
-            if list
-                .iter()
-                .filter_map(|p| std::fs::canonicalize(p).ok())
-                .any(|c| c == real)
-            {
+            if list.iter().any(|p| p == real) {
                 Ok(())
             } else {
                 Err(format!(
@@ -261,10 +279,11 @@ fn load_config(policy: &Policy) -> Result<(Config, Access), Failure> {
     let text = std::fs::read_to_string(&path)
         .map_err(|e| fail(exit::REFUSED_LOCALLY, format!("{}: {e}", path.display())))?;
     let refuse = |m: String| fail(exit::REFUSED_LOCALLY, format!("{}: {m}", path.display()));
-    Ok((
-        Config::parse(&text).map_err(refuse)?,
-        parse_access(&text).map_err(refuse)?,
-    ))
+    Ok((Config::parse(&text).map_err(refuse)?, {
+        let access = parse_access(&text).map_err(refuse)?;
+        validate_entries(&access).map_err(refuse)?;
+        access
+    }))
 }
 
 /// Check, ask the broker, and return what to run. `args` is everything after the program name and

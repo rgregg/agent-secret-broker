@@ -745,16 +745,58 @@ fn only_the_listed_programs_run_in_allowlist_mode() {
 }
 
 #[test]
-fn a_symlinked_allow_entry_matches_the_file_it_points_to() {
+fn an_allow_entry_must_be_the_real_path_so_the_list_says_what_runs() {
+    // `bin/id` is a link to the multi-call `bin/coreutils`. Allowing the link must NOT quietly allow coreutils (and
+    // so every applet: the helper runs the real file, and a multi-call binary takes its applet from argv[1]).
     let t = Tree::new();
-    let real = t.program("real", "true");
-    symlink(&real, t.root.join("bin/alias")).unwrap();
+    let real = t.program("coreutils", "true");
+    symlink(&real, t.root.join("bin/id")).unwrap();
     let broker = MockBroker::start(approve_replies());
     t.config_with(
         &broker.url,
-        &format!(r#""allow":["{}"]"#, t.root.join("bin/alias").display()),
+        &format!(r#""allow":["{}"]"#, t.root.join("bin/id").display()),
     );
-    assert!(prepare(&t.policy(), &args(&["real"]), &t.ctx(), |_| {}).is_ok());
+    let e = prepare(&t.policy(), &args(&["id"]), &t.ctx(), |_| {}).unwrap_err();
+    assert_eq!(e.code, 10, "{e:?}");
+    assert!(e.message.contains("not a real path"), "{}", e.message);
+    assert!(
+        e.message.contains(real.to_str().unwrap()),
+        "names the path to list: {}",
+        e.message
+    );
+    assert!(broker.requests().is_empty());
+    // "rm" is another link to the same file: it must not be reachable through the "id" entry either
+    symlink(&real, t.root.join("bin/rm")).unwrap();
+    assert_eq!(
+        prepare(&t.policy(), &args(&["rm"]), &t.ctx(), |_| {})
+            .unwrap_err()
+            .code,
+        10
+    );
+}
+
+#[test]
+fn listing_the_real_file_allows_it_by_any_name_it_is_found_under() {
+    let t = Tree::new();
+    let real = t.program("coreutils", "true");
+    symlink(&real, t.root.join("bin/id")).unwrap();
+    let broker = MockBroker::start(approve_replies());
+    t.config_with(&broker.url, &format!(r#""allow":["{}"]"#, real.display()));
+    // the admin listed the multi-call binary itself: that is what is allowed, applets included
+    assert!(prepare(&t.policy(), &args(&["id"]), &t.ctx(), |_| {}).is_ok());
+}
+
+#[test]
+fn an_allow_entry_for_a_program_that_is_not_installed_is_kept_and_matches_nothing() {
+    let t = Tree::new();
+    t.program("svc", "true");
+    let broker = MockBroker::start(approve_replies());
+    let missing = t.root.join("bin/not-installed-yet");
+    t.config_with(
+        &broker.url,
+        &format!(r#""allow":["{}","{}"]"#, missing.display(), svc(&t)),
+    );
+    assert!(prepare(&t.policy(), &args(&["svc"]), &t.ctx(), |_| {}).is_ok());
 }
 
 #[test]
