@@ -31,6 +31,8 @@ _EV_KEYS = ("reason", "reasons", "model", "risk", "error", "via", "channel", "de
             # credential requests: kind, hosts and counts; never the purpose text or any value
             "cred_kind", "cred_mode", "purpose_length", "purpose_sha256", "edited", "requested_name",
             "var_names", "no_hosts",
+            # root commands: the directory, who asked and the word count (the command itself is the row's argv)
+            "cwd", "invoker", "argc", "target_user",
             # per-client credentials: whose request it was and whom a rule created from it applies to
             "client_id", "client_name", "rule_client",
             # plans: ids, counts, lengths and hash prefixes; never the task, description or any rule text

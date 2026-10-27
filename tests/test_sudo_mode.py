@@ -130,7 +130,7 @@ class Sudo(SudoBase):
         self.assertEqual(ev["names"], [])
 
     def test_bad_requests_are_refused(self):
-        for body in ({"argv": []}, {"argv": "ls"}, {"argv": ["ls", 3]}, {"argv": ["a\x00b"]},
+        for body in ({"argv": []}, {"argv": ""}, {"argv": [""]}, {"argv": "ls"}, {"argv": ["ls", 3]}, {"argv": ["a\x00b"]},
                      {"argv": ["a‮b"]}, {"user": "bob"}, {"cwd": "relative"}, {"names": ["svc"]},
                      {"invoker": "Not A User"}):
             code, b = self.ask(**body)
@@ -183,9 +183,51 @@ class Sudo(SudoBase):
         _, hist = self.get("/?view=all")
         self.assertIn("&lt;U+000A&gt;", hist)
 
+    def test_the_history_detail_shows_the_command_and_cwd(self):
+        rid = self.pending(argv=["/bin/sh", "-c", "echo a\nb"])
+        self.decide(rid, "approve")
+        self.result(rid)
+        status, body = self.get(f"/request/{rid}")
+        self.assertEqual(status, 200)
+        self.assertIn("run a command as root", body)
+        self.assertIn("/bin/sh -c", body)                    # the command itself, not only its label
+        self.assertIn("echo a&lt;U+000A&gt;b", body)         # the newline is visible, as everywhere else
+        self.assertIn("/home/ryan", body)                    # the directory
+        self.assertIn("Asked by local user", body)
+
+    def test_a_long_command_says_how_much_of_it_the_detail_page_keeps(self):
+        words = [f"longword{i}" for i in range(40)]
+        rid = self.pending(argv=["/bin/echo", *words])
+        self.decide(rid, "approve")
+        self.result(rid)
+        body = self.get(f"/request/{rid}")[1]
+        self.assertIn("41 words in all", body)
+        self.assertIn("longword28", body)
+        self.assertNotIn("longword29", body)       # history keeps the first 30 words, /bin/echo included
+
+    def test_html_in_a_command_is_escaped_on_every_page(self):
+        evil = "<script>alert(1)</script>"
+        rid = self.pending(argv=["/bin/echo", evil], cwd="/home/ryan")
+        nonce = self.broker._by_id[rid].nonce
+        pages = {"/": self.get("/")[1], f"/a/{nonce}": self.get(f"/a/{nonce}")[1]}
+        self.decide(rid, "approve")
+        self.result(rid)
+        pages["/?view=all"] = self.get("/?view=all")[1]
+        pages[f"/request/{rid}"] = self.get(f"/request/{rid}")[1]
+        for path, body in pages.items():
+            self.assertNotIn(evil, body, path)
+            self.assertIn("&lt;script&gt;", body, path)
+
+    def test_creating_one_directly_with_credential_names_is_refused(self):
+        with self.assertRaises(ValueError):
+            self.broker.create("sudo", ["svc"], {"argv": ARGV}, "ryan@box", client={
+                "id": self.helper.id, "name": "root-helper", "legacy": False})
+
     def test_config_is_validated(self):
         for bad in ({"enabled": "yes"}, {"clients": ["legacy"]}, {"clients": "c-1a2b3c4d"},
-                    {"ttl_s": 5}, {"nope": 1}, []):
+                    {"ttl_s": 5}, {"nope": 1}, [], {"max_pending_per_client": 0},
+                    {"max_pending_per_client": 21}, {"max_pending_per_client": "3"},
+                    {"max_pending_per_client": True}):
             with self.assertRaises(ValueError):
                 sudomode.parse_config(bad)
 

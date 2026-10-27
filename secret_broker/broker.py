@@ -5029,7 +5029,12 @@ def _detail_html(r, evs, retained=""):
     elif r["mode"] == "sudo":
         req_ev = first("requested") or {}
         add("Operation", "run a command as root (approval only; nothing is released)")
-        add("Command", sudo_mod.display_text(req_ev["argv"]) if req_ev.get("argv") else None)
+        # the command comes from the row (history keeps a sanitised argv there, never from raw events)
+        argv = r.get("argv") or []
+        cmd = sudo_mod.display_text(argv) if argv else None
+        if cmd and (req_ev.get("argc") or 0) > len(argv):
+            cmd += f"  ... ({req_ev['argc']} words in all; this page keeps the first {len(argv)})"
+        add("Command", cmd)
         add("Directory", req_ev.get("cwd"))
         add("Asked by local user", req_ev.get("invoker"))
     elif r["mode"] == "credential":
