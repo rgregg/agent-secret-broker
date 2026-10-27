@@ -119,7 +119,6 @@ pub struct Plan {
     pub arg0: String,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
-    pub cwd: PathBuf,
 }
 
 /// The only environment the command gets.
@@ -249,18 +248,20 @@ pub fn prepare(
         arg0: shown,
         args: argv[1..].to_vec(),
         env: child_env(policy, ctx),
-        cwd: ctx.cwd.clone(),
     })
 }
 
 /// The process to start for a plan: the resolved file, the shown argv[0], a cleared environment.
+///
+/// No `current_dir`: the command inherits the working directory this process already has, which is the
+/// directory the human was shown (sudo preserves the caller's). Changing directory by path after the
+/// approval would let the agent swap what that path means while the human decides.
 pub fn build_command(plan: &Plan) -> Command {
     let mut c = Command::new(&plan.program);
     c.arg0(&plan.arg0)
         .args(&plan.args)
         .env_clear()
-        .envs(plan.env.iter().cloned())
-        .current_dir(&plan.cwd);
+        .envs(plan.env.iter().cloned());
     c
 }
 

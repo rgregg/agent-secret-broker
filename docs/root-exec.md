@@ -66,7 +66,8 @@ own request or replay an old one. If the broker is down, denies, or does not ans
   owned by root and not writable by group or others. Running something the agent could rewrite as root
   would be a way around the approval, so a script in `~/bin` is refused by design.
 - Looks again after you approve and refuses if what would run is no longer what you were shown.
-- Runs the command with no shell, the current directory, and only `PATH`, `HOME=/root`, `USER`, `LOGNAME`,
+- Runs the command with no shell, in the working directory it inherited (it never changes directory by
+  path after you approve, so the directory you were shown cannot be swapped underneath it), and only `PATH`, `HOME=/root`, `USER`, `LOGNAME`,
   `LANG` and `TERM` (plus `SUDO_USER` for information). Nothing else of the caller's environment survives.
   `umask` is 022. It disables core dumps and ptrace of itself while it holds the broker key.
 

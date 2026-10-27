@@ -115,7 +115,8 @@ fn an_approved_command_becomes_a_plan_for_the_resolved_file() {
     assert_eq!(plan.program, prog);
     assert_eq!(plan.arg0, prog.to_str().unwrap());
     assert_eq!(plan.args, ["restart", "web"]);
-    assert_eq!(plan.cwd, t.root.join("home"));
+    // the working directory is inherited, never re-entered by path after the approval
+    assert_eq!(build_command(&plan).get_current_dir(), None);
     // the human was shown the resolved path, the directory and who asked
     let sent: serde_json::Value = serde_json::from_str(&broker.requests()[0].body).unwrap();
     assert_eq!(sent["mode"], "sudo");
