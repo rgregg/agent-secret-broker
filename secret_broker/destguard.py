@@ -27,6 +27,8 @@ import time
 import urllib.parse
 import urllib.request
 
+from .useragent import USER_AGENT
+
 REFUSED_TEXT = "destination not allowed"
 # Added by the broker to EVERY outbound call (overwriting anything the agent supplied); the
 # broker's own listeners refuse any request carrying it. The real SSO proxy never sets it.
@@ -404,7 +406,9 @@ def build_opener(guard, tls=None, entries=None):
             _mark(req, guard.strip_headers)
             return self.do_open(secure, req, context=self._context)
     sh = S(context=ctx) if ctx is not None else S()
-    return urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect, H(), sh)
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect, H(), sh)
+    opener.addheaders = [("User-Agent", USER_AGENT)]    # a default only: a request's own header wins
+    return opener
 
 
 # -- operator-configured outbound clients ---------------------------------------------------------
@@ -431,4 +435,5 @@ def operator_urlopen(req, timeout=None):
     global _OP_OPENER
     if _OP_OPENER is None:
         _OP_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _OpHTTP, _OpHTTPS)
+        _OP_OPENER.addheaders = [("User-Agent", USER_AGENT)]
     return _OP_OPENER.open(req, timeout=timeout)

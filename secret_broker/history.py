@@ -31,6 +31,8 @@ _EV_KEYS = ("reason", "reasons", "model", "risk", "error", "via", "channel", "de
             # credential requests: kind, hosts and counts; never the purpose text or any value
             "cred_kind", "cred_mode", "purpose_length", "purpose_sha256", "edited", "requested_name",
             "var_names", "no_hosts",
+            # root commands: the directory, who asked and the word count (the command itself is the row's argv)
+            "cwd", "invoker", "argc", "target_user",
             # per-client credentials: whose request it was and whom a rule created from it applies to
             "client_id", "client_name", "rule_client",
             # plans: ids, counts, lengths and hash prefixes; never the task, description or any rule text
@@ -65,6 +67,16 @@ def _clean(v, depth=0):
     if isinstance(v, (list, tuple)) and depth == 0:
         return [_clean(x, 1) for x in v[:30]]
     return None
+
+
+def _clean_argv(v):
+    """argv for a page: like `_clean`, but a newline or tab is shown as <U+000A> / <U+0009> instead of
+    becoming a space. To a shell a newline inside a quoted word separates commands, so rendering it as a
+    space would show a different command than the one that ran."""
+    if isinstance(v, (list, tuple)):
+        return [_clean(x.replace("\n", "<U+000A>").replace("\t", "<U+0009>") if isinstance(x, str) else x, 1)
+                for x in v[:30]]
+    return _clean(v)
 
 
 def _scripts(rec):
@@ -141,7 +153,7 @@ class History:
                 "key": rec.get("key"), "hosts": rec.get("hosts"), "final_seq": -1,
                 "ssh_what": rec.get("ssh_what"), "peer": rec.get("peer"),
                 "client_id": rec.get("client_id"), "client_name": rec.get("client_name"),
-                "argv": _clean(rec.get("argv")), "scripts": _scripts(rec), "risk_reasons": None, "risk_model": None,
+                "argv": _clean_argv(rec.get("argv")), "scripts": _scripts(rec), "risk_reasons": None, "risk_model": None,
             }
             self._events[rid] = []
             while len(self._rows) > self._max:

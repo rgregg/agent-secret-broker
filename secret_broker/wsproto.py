@@ -30,6 +30,8 @@ import ssl
 import threading
 import time
 
+from .useragent import USER_AGENT
+
 GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 OP_CONT, OP_TEXT, OP_BIN, OP_CLOSE, OP_PING, OP_PONG = 0, 1, 2, 8, 9, 10
 HEAD_LIMIT = 16384              # response header block
@@ -148,6 +150,8 @@ def handshake(t, host_header, target, origin=None, subprotocols=(), deadline_s=1
              "Sec-WebSocket-Key: " + key.decode(), "Sec-WebSocket-Version: 13"]
     if origin:
         lines.append("Origin: " + origin)
+    if not any(k.lower() == "user-agent" for k, _ in extra_headers):
+        lines.append("User-Agent: " + USER_AGENT)          # a default only: configured headers win
     if subprotocols:
         lines.append("Sec-WebSocket-Protocol: " + ", ".join(subprotocols))
     for k, v in extra_headers:

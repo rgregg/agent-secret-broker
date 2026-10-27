@@ -1,0 +1,20 @@
+[package]
+name = "asb-client"
+description = "Client for the agent secret broker's HTTP API: config, calls and approval polling"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+asb-proto = { path = "../asb-proto" }
+serde.workspace = true
+serde_json.workspace = true
+ureq.workspace = true
+
+[features]
+# an in-process fake broker for the tools' own tests; never part of a release build
+mock = []
+
+[dev-dependencies]
+asb-client = { path = ".", features = ["mock"] }

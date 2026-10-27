@@ -44,6 +44,11 @@ def assess(mode, names, spec, analyzer=None, guidance=None):
         return {"level": "high", "model": None, "summary": None, "summary_model": None,
                 "summary_source": None, "summary_reason": None,
                 "reasons": ["credential requests always need a human to supply the value; always high"]}
+    if mode == "sudo":
+        # a root command: high by code, no model sees it (the command is untrusted text and the human reads it)
+        return {"level": "high", "model": None, "summary": None, "summary_model": None,
+                "summary_source": None, "summary_reason": None,
+                "reasons": ["root commands always need a human to read the exact command; always high"]}
     if mode == "session":
         # an http session: high by code, no model sees the request (the purpose is untrusted agent text)
         return {"level": "high", "model": None, "summary": None, "summary_model": None,

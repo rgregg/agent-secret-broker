@@ -551,6 +551,28 @@ class Relay(WsBase):
 
 # ------------------------------------------------------------------------------- limits
 class Limits(WsBase):
+    def test_a_writer_defers_to_the_reader_for_the_reason_the_session_ended(self):
+        # The race behind a flaky byte-cap test: the reader hit the cap while a sender's write failed on the
+        # closed socket. Whichever finished the session first named the reason, so "limit reached" could be
+        # reported as "closed". The reader knows the cause; the writer should let it say so.
+        sid = self.wopen()
+        s = self.sess()
+        reader = threading.Timer(0.05, s._finish, (wsproto.LIMIT,))
+        reader.start()
+        s._finish_unless_reader_does(wsproto.CLOSED, grace=5)
+        reader.join()
+        self.assertEqual(s.finished, wsproto.LIMIT)
+        self.assertEqual(self.wrecv(sid, wait=0)[1]["close_reason"], "limit reached")
+
+    def test_a_writer_names_the_reason_itself_when_the_reader_never_does(self):
+        # a stalled reader (backpressure) must not leave the session open: after the grace the writer finishes it
+        self.wopen()
+        s = self.sess()
+        t0 = time.time()
+        s._finish_unless_reader_does(wsproto.CLOSED, grace=0.05)
+        self.assertEqual(s.finished, wsproto.CLOSED)
+        self.assertLess(time.time() - t0, 5)
+
     def test_outbound_frame_cap_refuses_and_keeps_the_session(self):
         sid = self.wopen(max_frames=2)
         self.assertEqual([self.wsend(sid, "a")[0], self.wsend(sid, "b")[0]], [200, 200])
@@ -1647,9 +1669,12 @@ class Masking(WsBase):
         sid = self.wopen()
         self.wsend(sid, 'ECHO:{"a":"HA-TOKEN-CA')
         self.wsend(sid, 'ECHO:NARY-31337","b":1}')
-        got = self.frames_until(sid, 1)
-        blob = "".join(f["data"] for f in got)
-        self.assertIn("***", blob)
+        # The broker holds back the tail of a possible secret until the next message shows what it is, so the first
+        # poll can hold only the safe prefix `{"a":"`: read until the whole echoed text has come out.
+        blob, end = "", time.time() + 15
+        while not blob.endswith('"b":1}') and time.time() < end:
+            blob += "".join(f["data"] for f in self.frames_until(sid, 1))
+        self.assertEqual(blob, '{"a":"***","b":1}')
         for frag in ("HA-TOKEN", "NARY-31337", "TOKEN-CA"):
             self.assertNotIn(frag, blob)
         code, r = self.wrecv(sid, wait=0)

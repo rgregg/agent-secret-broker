@@ -1,0 +1,4 @@
+# keep the build context small: the host's build output and history are not needed
+target
+.git
+**/__pycache__
