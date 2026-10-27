@@ -119,9 +119,21 @@ def command_text(spec):
     return shlex.join(spec["argv"])
 
 
+def visible(text):
+    """`text` with tab and newline shown as <U+0009> and <U+000A>. A newline inside a quoted argument is a
+    command separator to a shell (`sh -c 'a<newline>b'` runs two commands) but renders as a space almost
+    everywhere, so every place that shows a command must make it visible."""
+    return text.replace("\n", "<U+000A>").replace("\t", "<U+0009>")
+
+
+def display_text(argv):
+    """The command as one plain-text line for any display: shell-quoted, whitespace controls visible."""
+    return visible(shlex.join(argv))
+
+
 def push_text(spec):
     """One line for a notification: the command, clipped."""
-    return "run as root: " + command_text(spec)[:200]
+    return "run as root: " + display_text(spec["argv"])[:200]
 
 
 def audit_fields(spec):
@@ -136,7 +148,7 @@ def _esc(text):
     """HTML for untrusted text where every non-ASCII character is shown as <U+XXXX> (the real
     character in the tooltip), so a look-alike cannot pass for an ASCII letter."""
     return "".join(
-        html.escape(ch) if ord(ch) < 128 else
+        html.escape(ch) if ord(ch) < 128 and ch not in "\n\t" else
         f"<span class=gu title=\"{html.escape(ch)}\">&lt;U+{ord(ch):04X}&gt;</span>" for ch in text)
 
 
@@ -146,6 +158,8 @@ def describe_html(req):
     text = command_text(sp)
     na = guidance_mod.non_ascii_count(text)
     flag = (f" <span class='pill warn'>Non-ASCII characters: {na} (shown as U+XXXX)</span>" if na else "")
+    if "\n" in text or "\t" in text:
+        flag += " <span class='pill warn'>Contains a newline or tab (shown as U+000A / U+0009)</span>"
     where = f"<br>In directory: <code>{_esc(sp['cwd'])}</code>" if sp.get("cwd") else ""
     who = f"<br>Asked by local user: <code>{html.escape(sp['invoker'])}</code> (unverified)" if sp.get("invoker") else ""
     what = (f"<b>Run as {html.escape(sp['user'])}</b> on {html.escape(req.source)}:"

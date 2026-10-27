@@ -67,6 +67,16 @@ def _clean(v, depth=0):
     return None
 
 
+def _clean_argv(v):
+    """argv for a page: like `_clean`, but a newline or tab is shown as <U+000A> / <U+0009> instead of
+    becoming a space. To a shell a newline inside a quoted word separates commands, so rendering it as a
+    space would show a different command than the one that ran."""
+    if isinstance(v, (list, tuple)):
+        return [_clean(x.replace("\n", "<U+000A>").replace("\t", "<U+0009>") if isinstance(x, str) else x, 1)
+                for x in v[:30]]
+    return _clean(v)
+
+
 def _scripts(rec):
     """[{path, size, sha}] from a `requested` record: path, size and hash only (the
     text is not in the audit log; it is kept in the request-details store)."""
@@ -141,7 +151,7 @@ class History:
                 "key": rec.get("key"), "hosts": rec.get("hosts"), "final_seq": -1,
                 "ssh_what": rec.get("ssh_what"), "peer": rec.get("peer"),
                 "client_id": rec.get("client_id"), "client_name": rec.get("client_name"),
-                "argv": _clean(rec.get("argv")), "scripts": _scripts(rec), "risk_reasons": None, "risk_model": None,
+                "argv": _clean_argv(rec.get("argv")), "scripts": _scripts(rec), "risk_reasons": None, "risk_model": None,
             }
             self._events[rid] = []
             while len(self._rows) > self._max:

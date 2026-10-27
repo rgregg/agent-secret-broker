@@ -5029,7 +5029,7 @@ def _detail_html(r, evs, retained=""):
     elif r["mode"] == "sudo":
         req_ev = first("requested") or {}
         add("Operation", "run a command as root (approval only; nothing is released)")
-        add("Command", " ".join(req_ev.get("argv") or []) or None)
+        add("Command", sudo_mod.display_text(req_ev["argv"]) if req_ev.get("argv") else None)
         add("Directory", req_ev.get("cwd"))
         add("Asked by local user", req_ev.get("invoker"))
     elif r["mode"] == "credential":
@@ -5739,7 +5739,7 @@ def approval_handler(broker):
                 elif r["mode"] == "credential":
                     what = "credential request"
                 elif r["mode"] == "sudo":
-                    what = "run as root: " + " ".join(r.get("argv") or [])[:100]
+                    what = "run as root: " + sudo_mod.display_text(r.get("argv") or [])[:100]
                 elif r["mode"] == "plan":
                     what = "plan"
                 elif r["mode"] == "session":

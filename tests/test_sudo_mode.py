@@ -166,6 +166,23 @@ class Sudo(SudoBase):
         self.assertEqual(status, 200)
         self.assertIn("run as root", body)
 
+    def test_newlines_and_tabs_are_made_visible_everywhere_the_command_is_shown(self):
+        # to a shell the newline separates two commands; rendered as a space it would look like one
+        rid = self.pending(argv=["/bin/sh", "-c", "echo hi\nrm /x\tz"])
+        nonce = self.broker._by_id[rid].nonce
+        for path in ("/", f"/a/{nonce}"):
+            _, body = self.get(path)
+            self.assertIn("&lt;U+000A&gt;", body, path)
+            self.assertIn("&lt;U+0009&gt;", body, path)
+            self.assertIn("Contains a newline or tab", body, path)
+            self.assertNotIn("echo hi\nrm", body, path)
+        text = self.notifier.sent[0]["message"]
+        self.assertIn("echo hi<U+000A>rm /x<U+0009>z", text)
+        self.assertNotIn("\nrm", text)
+        self.decide(rid, "approve")
+        _, hist = self.get("/?view=all")
+        self.assertIn("&lt;U+000A&gt;", hist)
+
     def test_config_is_validated(self):
         for bad in ({"enabled": "yes"}, {"clients": ["legacy"]}, {"clients": "c-1a2b3c4d"},
                     {"ttl_s": 5}, {"nope": 1}, []):
