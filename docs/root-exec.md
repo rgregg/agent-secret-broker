@@ -65,7 +65,15 @@ own request or replay an old one. If the broker is down, denies, or does not ans
 - Refuses (exit 10, **without contacting the broker**) unless the file, and every directory above it, is
   owned by root and not writable by group or others. Running something the agent could rewrite as root
   would be a way around the approval, so a script in `~/bin` is refused by design.
-- Looks again after you approve and refuses if what would run is no longer what you were shown.
+- When the command is an interpreter (`sh`, `bash`, `python3`, `perl`, `ruby`, `node`, `php`, ...) or a wrapper
+  that starts one (`env`, `nice`, `timeout`, `xargs`, ...), the first operand that is an existing file is the
+  script it will run. That file, and every directory above it, must be owned by root and not writable by
+  group or others, or the command is refused (exit 10, without contacting the broker). Otherwise the agent
+  could rewrite the script after you approved the card. Inline code (`bash -c '...'`, `python3 -c '...'`) is
+  in the command you read, so it needs no file. Only the first file operand is checked, so data files given to a
+  trusted script are fine.
+- Looks again after you approve (the program, and the script) and refuses if anything is no longer what you
+  were shown.
 - Runs the command with no shell, in the working directory it inherited (it never changes directory by
   path after you approve, so the directory you were shown cannot be swapped underneath it), and only `PATH`, `HOME=/root`, `USER`, `LOGNAME`,
   `LANG` and `TERM` (plus `SUDO_USER` for information). Nothing else of the caller's environment survives.
@@ -80,8 +88,13 @@ but the command could not be started.
 ## Limits to know about
 
 - You approve the **text** of a command. `bash -c '...'`, an editor, `make` or a package manager do more
-  than their name says, so read those cards closely. A script operand (`bash /home/ryan/x.sh`) can be edited
-  by the agent after you approve it; the helper only checks the interpreter file, not the script it is given.
+  than their name says, so read those cards closely.
+- The script check is a heuristic, not a parser of every interpreter's command line. It does not see:
+  scripts named only by an option value the check mistakes for something else, `awk -f` and `sed -f` files,
+  programs it does not know are interpreters, or what a script itself runs, sources or imports. Interpreters
+  such as `python3` may also load modules from the current directory, which the agent controls: run root
+  commands from a directory only root can write to when that matters. Put anything root should run in a
+  root-owned location.
 - v1 runs as root only (no `-u USER`), has no interactive terminal handling beyond inheriting stdio, and
   never auto-approves: there is no "always" for a root command.
 - Linux only.

@@ -10,6 +10,8 @@ use std::path::Path;
 pub enum Kind {
     /// A program to run: a regular file with an execute bit.
     Program,
+    /// A script an interpreter will run: a regular file (no execute bit needed) that the agent cannot write.
+    Script,
     /// A secrets file: a regular file closed to group and other entirely.
     Secret,
 }

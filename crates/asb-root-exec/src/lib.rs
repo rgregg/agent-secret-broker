@@ -6,6 +6,7 @@
 //! `exec` replaces the process. Fails closed at every step; see docs/proposals/root-exec.md.
 
 pub mod resolve;
+pub mod scriptcheck;
 pub mod trust;
 
 use asb_client::{clean, Client, Config};
@@ -163,6 +164,23 @@ fn resolve_command(
     .map_err(|m| fail(exit::REFUSED_LOCALLY, m))
 }
 
+/// An interpreter's script file must be one the agent cannot rewrite (see `scriptcheck`).
+fn check_script_operand(
+    policy: &Policy,
+    resolved: &resolve::Resolved,
+    args: &[String],
+    ctx: &Context,
+) -> Result<(), Failure> {
+    scriptcheck::check(
+        &[&resolved.shown, &resolved.real],
+        args,
+        &ctx.cwd,
+        policy.trusted_uid,
+        &policy.trust_root,
+    )
+    .map_err(|m| fail(exit::REFUSED_LOCALLY, m))
+}
+
 fn load_config(policy: &Policy) -> Result<Config, Failure> {
     let path = std::fs::canonicalize(&policy.config_path).map_err(|e| {
         fail(
@@ -217,6 +235,7 @@ pub fn prepare(
         .to_str()
         .ok_or_else(|| fail(exit::REFUSED_LOCALLY, "the command path is not valid UTF-8"))?
         .to_string();
+    check_script_operand(policy, &resolved, &command[1..], ctx)?;
     let mut argv = vec![shown.clone()];
     argv.extend(command[1..].iter().cloned());
 
@@ -243,6 +262,7 @@ pub fn prepare(
             "the command changed while waiting for approval",
         ));
     }
+    check_script_operand(policy, &resolved, &command[1..], ctx)?;
     Ok(Plan {
         program: resolved.real,
         arg0: shown,

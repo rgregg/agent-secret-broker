@@ -93,7 +93,10 @@ Install is documented, not scripted, because it writes to `/usr/local/sbin`, `/e
 - **What the card shows:** the resolved real path, not the name typed or the link followed (found in
   review: a link in an agent-writable directory could otherwise make `rm` display as `ls`). The same path is
   `argv[0]`, so multi-call binaries do not work through aliases.
-- **Not covered:** a script file given as an operand to an interpreter (`bash x.sh`) can still be edited after
-  approval; the card shows the interpreter's argv, not the script (see root-exec.md, "Limits to know about").
+- **Script operands:** a security review found that `bash x.sh` approved as root could be edited by the agent
+  afterwards (the card shows argv, not the file). The helper now refuses, before asking, an interpreter or wrapper
+  whose first file operand the agent could write (`scriptcheck.rs`), and re-checks after approval. It is a heuristic
+  and says so; its blind spots (and import-from-cwd) are listed in root-exec.md.
+- **Not covered:** what a trusted script itself runs, sources or imports.
 - **User-Agent:** unrelated but shipped alongside: the broker's outbound requests, and the `asb` and Rust
   clients, now send a name of their own instead of urllib's default, which Cloudflare blocks.

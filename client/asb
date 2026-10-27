@@ -394,7 +394,8 @@ example: asb session open unifi --for "read stats and rename a client" --host un
 With no NAME: run the command as root through the installed root helper (asb-root-exec). The helper
 asks the broker, you approve the exact command on your phone, and only then does it run. No password
 exists anywhere. The command runs with a clean environment and a fixed PATH, in the current directory;
-the file it runs must be root-owned and not writable by others. A denial or timeout is final: stop and
+the file it runs, and the script an interpreter such as bash or python3 is given, must be root-owned and not
+writable by others (a script in your home directory is refused: copy it somewhere root owns first). A denial or timeout is final: stop and
 tell the human what you needed. Exit codes: the command's own, or 2 usage, 3 broker, 4 denied, 5 expired,
 10 refused locally (unsafe file, config or directory), 11 approved but could not start.
 
