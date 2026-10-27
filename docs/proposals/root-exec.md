@@ -2,7 +2,9 @@
 
 Status: **implemented** (native `sudo` broker mode, Rust helper and `asb sudo --`). Install and operation:
 [../root-exec.md](../root-exec.md). Validated against the real broker with the real Rust client in tests;
-the helper's final `exec` as uid 0 is covered by unit tests of everything before it, not run as root in CI.
+the whole path as real root (real sudo, a sudoers rule, an unprivileged user, the real broker and approval page) is
+tested by `tests/e2e_root_exec/` in a throwaway container and in CI. That test found and fixed a race in the Rust
+client (an approval that lands before the create call returns).
 
 ## Problem
 

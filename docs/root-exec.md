@@ -145,3 +145,15 @@ but the command could not be started.
 - v1 runs as root only (no `-u USER`), has no interactive terminal handling beyond inheriting stdio, and
   never auto-approves: there is no "always" for a root command.
 - Linux only.
+
+## Testing it without trusting a real machine
+
+`tests/e2e_root_exec/run.sh` builds a throwaway container (Debian, real root and sudo, an unprivileged `agent` user),
+installs the helper root-owned with the one sudoers rule, starts the real broker in it, and drives the real `asb`
+client as `agent`. The "phone" approves or denies through the approval page's HTTP endpoint. It checks, among other
+things, that an approved command runs as uid 0, a denial runs nothing, a program not on the allow-list never reaches
+the phone, the agent cannot read the helper's key or use sudo for anything else, and a script the agent wrote is
+refused. Nothing on your machine changes: no host mounts, not privileged, no Docker socket, and the container is
+removed afterwards. CI runs the same driver on a disposable runner. The driver edits `/etc` and creates a user, so
+it refuses to start unless `ASB_E2E_DISPOSABLE=1`, which only the container and CI set.
+It cannot test `systemctl` and other things that need systemd, which a container does not have.

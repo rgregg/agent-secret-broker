@@ -57,16 +57,40 @@ jobs:
           path: target/release/asb-root-exec
           if-no-files-found: error
 
+  # The root helper against REAL root and sudo: a broker, the helper installed root-owned, a sudoers rule and an
+  # unprivileged user. It edits /etc and creates a user, which is fine on a runner that is thrown away after the
+  # job; the driver refuses to run anywhere that has not said so (ASB_E2E_DISPOSABLE). Locally, use
+  # tests/e2e_root_exec/run.sh, which does the same inside a throwaway container.
+  root-e2e:
+    name: root-e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - run: pip install -r requirements.txt
+      - run: rustup toolchain install stable --profile minimal
+      - run: cargo build --release --locked -p asb-root-exec
+      - name: run the helper end to end as root
+        run: >
+          sudo env "PATH=$PATH" ASB_E2E_DISPOSABLE=1 ASB_E2E_HELPER="$PWD/target/release/asb-root-exec"
+          "$(which python)" tests/e2e_root_exec/driver.py
+
   # The single check to require in branch protection: it keeps the name "test" and is green only when
   # every shard and the Rust job are.
   test:
-    needs: [shard, rust]
+    needs: [shard, rust, root-e2e]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - run: |
           test "${{ needs.shard.result }}" = "success" || { echo "tests: ${{ needs.shard.result }}"; exit 1; }
           test "${{ needs.rust.result }}" = "success" || { echo "rust: ${{ needs.rust.result }}"; exit 1; }
+          test "${{ needs.root-e2e.result }}" = "success" || { echo "root-e2e: ${{ needs.root-e2e.result }}"; exit 1; }
 
   image:
     needs: test
