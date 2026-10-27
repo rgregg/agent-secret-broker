@@ -44,7 +44,7 @@ Check it:
                   -H 'Authorization: Bearer {{GRAFANA_TOKEN}}'
 
     asb NAME[,NAME] -- command args...    # run a command with the value in its environment
-    asb sudo NAME -- command args...      # run a command under sudo; the broker supplies the password
+    asb sudo -- command args...           # run a command as root through the root helper (you approve it)
 
     printf '%s' "$VALUE" | asb store NAME --hosts a.example.com   # add a credential
     printf '%s' "$VALUE" | asb update NAME                        # rotate one (needs approval)
@@ -95,21 +95,11 @@ Check it:
   rates within `risk.auto_approve_max`, it runs without a phone prompt, and the
   plaintext value is released to this machine; a script that cannot be read or
   comes from stdin always asks. A standing approval (Always or timed) can cover it too.
-- `asb sudo -- command` (no NAME) runs the command as root through the compiled helper `asb-root-exec`, which
-  asks the broker itself; you approve the exact command and no password exists anywhere. Install and what
-  it refuses: [root-exec.md](root-exec.md). `asb sudo NAME -- command` is the password variant below.
-- `asb sudo NAME -- command` runs `sudo -A -k -- command` with the password from credential `NAME`
-  (one variable holding the sudo password; store it with `asb store`, or let the agent ask with
-  `asb request-credential --mode env`). **This is a fallback with a real cost: the password is released to the
-  agent's machine and handed to sudo's askpass helper, which runs as the agent's own user, so anything running as
-  that user can effectively read it.** Prefer `asb sudo -- command` above, which never releases a password. It is
-  an env-mode request, so you approve on your phone and
-  see `sudo command...` (the broker already unwraps `sudo` to judge the inner command). The password
-  reaches sudo through a private askpass helper (`SUDO_ASKPASS`, a 0700 temp directory removed
-  afterwards) and is masked in the command's output; it is never on the agent's terminal or in an
-  argument. `-k` ignores a cached sudo timestamp so each use is approved separately. Like all env mode,
-  the value is released to the agent's machine and the broker cannot see what the command does with
-  it. Exits with the command's code.
+- `asb sudo -- command` runs the command as root through the compiled helper `asb-root-exec`, which asks the
+  broker itself. You approve the exact command on your phone, the helper runs only programs its admin put on its
+  allow-list, and no password exists anywhere. Install, the allow-list and what it refuses:
+  [root-exec.md](root-exec.md). (An earlier `asb sudo NAME -- command` that fed a stored sudo password to `sudo`
+  was removed: it released a reusable password to the agent's own user.)
 - **Scripts are shown to you.** For `NAME -- command`, `asb` looks for the script
   file the command runs and sends its text with the request, so the approval card
   and the risk check see what the script does, not just `bash deploy.sh`. It skips

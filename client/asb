@@ -2,7 +2,7 @@
 """asb: ask the broker for a secret, wait for phone approval, use it.
 
   asb NAME[,NAME2] -- command args...         run with secrets in the env
-  asb sudo NAME -- command args...            run under sudo; the broker supplies the password after a human approves
+  asb sudo -- command args...                 run as root through the root helper; a human approves the exact command
   asb list [--json]                           what credentials exist? (no approval)
   asb store NAME --hosts H[,H] [--field F] [--item I] [--var V]  < value
   asb store NAME --ssh < private_key          move an SSH private key into the broker
@@ -105,7 +105,7 @@ Which command? (decision rule)
                                                  asb session open ... then asb http ... --session ID
   A service that speaks WebSocket (e.g. Home Assistant's /api/websocket)   asb ws NAME URL (see below)
   A program that needs the secret itself (an official CLI, a library)   env mode: asb NAME -- command
-  A command that needs root (sudo asks for a password)                  asb sudo NAME -- command
+  A command that needs root (the helper only runs what its admin allowed)  asb sudo -- command
   Do not write a script around curl or requests to do an HTTP flow: use a session. The broker keeps
   the cookies and tokens, so the secret and the session never reach you.
 
@@ -389,29 +389,18 @@ session can use it. Exit 0 ok, 4 denied, 5 open expired unanswered, 3 refused (t
 disabled, bad credential or host), 2 usage, 7 session expired/closed/revoked/unknown (ended), 8 call refused (outside the approved scope).
 example: asb session open unifi --for "read stats and rename a client" --host unifi.local --methods GET,HEAD,POST,PUT --ttl 10m""",
     "sudo": """usage: asb sudo -- command [args...]
-       asb sudo NAME -- command [args...]
 
-With no NAME: run the command as root through the installed root helper (asb-root-exec). The helper only
-runs programs its admin put on its allow-list (refused at once, exit 10, otherwise). It asks the broker, you approve the exact command on your phone, and only then does it run. No password
-exists anywhere. The command runs with a clean environment and a fixed PATH, in the current directory;
-the file it runs must be root-owned and not writable by others. For an interpreter (bash, python3, perl, ...)
-only two forms are accepted: `bash SCRIPT [args]` with SCRIPT first and root-owned (a script in your home
-directory is refused: copy it somewhere root owns), or `bash -c 'code'`. Any file named as a later argument
-must be root-owned too. Other options, stdin programs and wrapper commands (env, xargs, timeout, ...) are refused. A denial or timeout is final: stop and
-tell the human what you needed. Exit codes: the command's own, or 2 usage, 3 broker, 4 denied, 5 expired,
-10 refused locally (unsafe file, config or directory), 11 approved but could not start.
-
-With a NAME (fallback; prefer the form above): run the command under `sudo -A`, with the sudo password
-supplied by the broker. WARNING: the password is released to this machine and handed to sudo's askpass helper,
-which runs as your own user, so anything running as you can effectively read it. The broker cannot protect it
-once released; the approval only gates when it is handed out. Use it only where the root helper cannot be
-installed. NAME is a
-credential whose single variable holds the password (store it with `asb store NAME --hosts ...`,
-or ask the human with `asb request-credential`). Waits for approval; the approver sees
-`sudo command args...`. The password reaches sudo through a private askpass helper, never your
-terminal, and is masked in the command's output. Each use is approved separately (a cached sudo
-timestamp is ignored). Exits with the command's code; 4 denied, 5 expired, 3 broker error.
-example: asb sudo homesudo -- systemctl restart nginx""",
+Run a command as root through the installed root helper (asb-root-exec). The helper only runs programs its
+admin put on its allow-list (refused at once, exit 10, otherwise). It asks the broker, you approve the exact
+command on your phone, and only then does it run. No password exists anywhere. The command runs with a clean
+environment and a fixed PATH, in the current directory; the file it runs must be root-owned and not writable by
+others. For an interpreter (bash, python3, perl, ...) only two forms are accepted: `bash SCRIPT [args]` with
+SCRIPT first and root-owned (a script in your home directory is refused: copy it somewhere root owns), or
+`bash -c 'code'`. Any file named as a later argument must be root-owned too. Other options, stdin programs and
+wrapper commands (env, xargs, timeout, ...) are refused. A denial or timeout is final: stop and tell the human
+what you needed. Exit codes: the command's own, or 2 usage, 3 broker, 4 denied, 5 expired, 10 refused locally
+(not allowed, or an unsafe file, config or directory), 11 approved but could not start.
+example: asb sudo -- /usr/bin/systemctl restart nginx""",
     "run": """usage: asb NAME[,NAME] -- command [args...]
 
 Run a command with the credential's variables in its environment. Waits for
@@ -2967,44 +2956,13 @@ def run_root_exec(cmd):
 
 
 def run_sudo(argv):
-    """`asb sudo -- command...` (root helper, no password) or `asb sudo NAME -- command...` (a stored
-    sudo password credential, fed to sudo through askpass)."""
+    """`asb sudo -- command...`: run a command as root through the root helper, after a human approves it."""
     if argv[:1] == ["--"] and len(argv) > 1:
         return run_root_exec(argv[1:])
-    if len(argv) < 3 or argv[1] != "--":
-        die(HELP["sudo"])
-    name, cmd = check_name(argv[0]), argv[2:]
-    if "," in name:
-        die("asb sudo uses exactly one credential")
-    # The broker is shown (and risk-rates) the command as sudo will run it; it already unwraps `sudo`.
-    payload, scripts = env_payload([name], ["sudo"] + cmd)
-    env = obtain(payload, "waiting for approval to run under sudo...")["env"]
-    if len(env) != 1:
-        die(f"credential {name!r} must have exactly one variable (the sudo password), it has {len(env)}",
-            EXIT_BROKER)
-    password = next(iter(env.values())).rstrip("\r\n")
-    moved = changed_script(scripts)
-    if moved:
-        die(f"script {moved} changed after it was reviewed", EXIT_SCRIPT_CHANGED)
-    tmp = tempfile.mkdtemp(prefix="asb-sudo-")      # 0700; holds only the helper, never the password
-    try:
-        helper = os.path.join(tmp, "askpass")
-        with open(helper, "w") as f:
-            f.write("#!/bin/sh\nprintf '%s\\n' \"$ASB_SUDO_PASSWORD\"\n")
-        os.chmod(helper, 0o700)
-        child_env = {**os.environ, "SUDO_ASKPASS": helper, "ASB_SUDO_PASSWORD": password}
-        # -A: ask through the helper (no tty needed). -k: ignore a cached sudo timestamp, so every
-        # use is approved here rather than riding on an earlier one.
-        try:
-            p = subprocess.run(["sudo", "-A", "-k", "--"] + cmd, env=child_env, stdin=subprocess.DEVNULL,
-                               capture_output=True, text=True)
-        except FileNotFoundError:
-            die("sudo is not installed on this machine")
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
-    sys.stdout.write(mask(p.stdout, [password]))
-    sys.stderr.write(mask(p.stderr, [password]))
-    return p.returncode
+    if len(argv) >= 3 and argv[1] == "--":
+        die("the form `asb sudo NAME -- command` (a stored sudo password) was removed: use "
+            "`asb sudo -- command`, which runs it through the root helper (`asb help sudo`)")
+    die(HELP["sudo"])
 
 
 def main(argv):

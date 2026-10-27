@@ -1,29 +1,16 @@
-"""`asb sudo NAME -- command`: the broker-approved env release is fed to sudo through an askpass
-helper; the password stays out of the output and the helper is cleaned up."""
+"""`asb sudo -- command`: the client hands the command to the root helper through the one sudoers rule.
+The helper (crates/asb-root-exec) asks the broker itself; the client never requests a credential and no
+password exists. The old `asb sudo NAME -- command` (a stored sudo password) is gone."""
 import contextlib
 import importlib.machinery
 import importlib.util
 import io
 import os
-import stat
-import sys
 import tempfile
 import unittest
 from unittest import mock
 
 CLI = os.path.join(os.path.dirname(__file__), "..", "client", "asb")
-PW = "hunter2-pw"
-
-# stands in for sudo: runs askpass the way sudo -A does, and only runs the command if the password matches
-FAKE_SUDO = """#!/bin/sh
-[ "$1" = "-A" ] || { echo "no -A" >&2; exit 90; }
-[ "$2" = "-k" ] || { echo "no -k" >&2; exit 91; }
-shift 3
-got=$("$SUDO_ASKPASS" "Password: ")
-[ "$got" = "hunter2-pw" ] || { echo "sorry" >&2; exit 1; }
-echo "askpass said $got"
-exec "$@"
-"""
 
 
 def load():
@@ -37,81 +24,84 @@ class AsbSudo(unittest.TestCase):
     def setUp(self):
         self.asb = load()
         self.bin = tempfile.mkdtemp()
-        fake = os.path.join(self.bin, "sudo")
-        with open(fake, "w") as f:
-            f.write(FAKE_SUDO)
-        os.chmod(fake, 0o755)
-        patcher = mock.patch.dict(os.environ, {"PATH": self.bin + os.pathsep + os.environ["PATH"]})
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        self.log = os.path.join(self.bin, "args.txt")
+        self.fake_sudo("exit 0")
+        p = mock.patch.dict(os.environ, {"PATH": self.bin + os.pathsep + os.environ["PATH"]})
+        p.start()
+        self.addCleanup(p.stop)
+        os.environ.pop("ASB_ROOT_EXEC", None)
 
-    def run_sudo(self, argv, env=None):
-        sent = []
+    def fake_sudo(self, body):
+        """A sudo that records its arguments (one per line) and then runs `body`."""
+        path = os.path.join(self.bin, "sudo")
+        with open(path, "w") as f:
+            f.write(f'#!/bin/sh\nprintf "%s\\n" "$@" > {self.log}\n{body}\n')
+        os.chmod(path, 0o755)
 
-        def obtain(payload, waiting=""):
-            sent.append(payload)
-            return {"env": env if env is not None else {"SUDO_PW": PW}}
+    def sudo_args(self):
+        with open(self.log) as f:
+            return f.read().split("\n")[:-1]
+
+    def run_asb(self, argv):
         out, err = io.StringIO(), io.StringIO()
-        with mock.patch.object(self.asb, "obtain", obtain), \
+
+        def no_broker(*a, **k):
+            raise AssertionError("the client must not talk to the broker: the helper does")
+        with mock.patch.object(self.asb, "obtain", no_broker), mock.patch.object(self.asb, "call", no_broker), \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             try:
                 rc = self.asb.main(["sudo"] + argv)
             except SystemExit as e:
                 rc = e.code
-        return rc, out.getvalue(), err.getvalue(), sent
+        return rc, out.getvalue(), err.getvalue()
 
-    def test_runs_command_with_password_masked(self):
-        rc, out, err, sent = self.run_sudo(["homesudo", "--", "echo", "done"])
+    def test_it_calls_the_root_helper_through_sudo_n(self):
+        rc, _, err = self.run_asb(["--", "/usr/bin/systemctl", "restart", "nginx"])
         self.assertEqual(rc, 0, err)
-        self.assertIn("done", out)
-        self.assertNotIn(PW, out + err)
-        self.assertIn("askpass said ***", out)
+        self.assertEqual(self.sudo_args(), ["-n", "/usr/local/sbin/asb-root-exec", "--",
+                                            "/usr/bin/systemctl", "restart", "nginx"])
 
-    def test_broker_sees_the_command_under_sudo(self):
-        _, _, _, sent = self.run_sudo(["homesudo", "--", "echo", "done"])
-        self.assertEqual(sent[0]["mode"], "env")
-        self.assertEqual(sent[0]["names"], ["homesudo"])
-        self.assertEqual(sent[0]["argv"], ["sudo", "echo", "done"])
+    def test_the_commands_exit_code_passes_through(self):
+        self.fake_sudo("exit 7")
+        self.assertEqual(self.run_asb(["--", "/usr/bin/true"])[0], 7)
 
-    def test_exit_code_passes_through(self):
-        rc, *_ = self.run_sudo(["homesudo", "--", "sh", "-c", "exit 7"])
-        self.assertEqual(rc, 7)
-
-    def test_helper_removed_and_holds_no_password(self):
-        seen = []
-        real = tempfile.mkdtemp
-        with mock.patch.object(tempfile, "mkdtemp", lambda **k: seen.append(real(**k)) or seen[-1]):
-            self.run_sudo(["homesudo", "--", "true"])
-        self.assertEqual(len(seen), 1)
-        self.assertFalse(os.path.exists(seen[0]))
-
-    def test_without_a_name_it_calls_the_root_helper_through_sudo_n(self):
-        log = os.path.join(self.bin, "args.txt")
-        with open(os.path.join(self.bin, "sudo"), "w") as f:
-            f.write(f'#!/bin/sh\nprintf "%s\\n" "$@" > {log}\necho "from helper"\nexit 7\n')
-        rc, out, err, sent = self.run_sudo(["--", "systemctl", "restart", "nginx"], env={})
-        self.assertEqual(rc, 7)
-        self.assertEqual(sent, [])          # no password request: the helper talks to the broker itself
-        with open(log) as f:
-            self.assertEqual(f.read().split(), ["-n", "/usr/local/sbin/asb-root-exec", "--",
-                                                "systemctl", "restart", "nginx"])
+    def test_the_helper_path_can_be_overridden_but_only_the_installed_one_is_in_sudoers(self):
+        with mock.patch.dict(os.environ, {"ASB_ROOT_EXEC": "/opt/asb/asb-root-exec"}):
+            self.run_asb(["--", "/usr/bin/true"])
+        self.assertEqual(self.sudo_args()[:3], ["-n", "/opt/asb/asb-root-exec", "--"])
 
     def test_a_help_flag_after_the_dashes_belongs_to_the_command(self):
-        rc, out, err, _ = self.run_sudo(["n", "--", "echo", "--help"])
+        rc, out, err = self.run_asb(["--", "/usr/bin/ls", "--help"])
         self.assertEqual(rc, 0, err)
-        self.assertIn("--help", out)
+        self.assertEqual(self.sudo_args()[-2:], ["/usr/bin/ls", "--help"])
         self.assertNotIn("usage: asb sudo", out)
 
-    def test_usage_errors(self):
-        for argv in ([], ["n"], ["n", "echo"], ["a,b", "--", "true"], ["-x", "--", "true"]):
-            rc, _, err, sent = self.run_sudo(argv)
-            self.assertEqual(rc, 2, argv)
-            self.assertEqual(sent, [])
+    def test_the_old_password_form_is_gone_and_says_what_to_use(self):
+        rc, out, err = self.run_asb(["homesudo", "--", "systemctl", "restart", "nginx"])
+        self.assertEqual(rc, 2)
+        self.assertIn("was removed", err)
+        self.assertIn("asb sudo -- command", err)
+        self.assertFalse(os.path.exists(self.log), "sudo must not have been run")
 
-    def test_credential_must_have_one_variable(self):
-        rc, out, err, _ = self.run_sudo(["n", "--", "true"], env={"A": "x" * 8, "B": "y" * 8})
-        self.assertEqual(rc, 3)
-        self.assertNotIn("xxxxxxxx", out + err)
+    def test_usage_errors_exit_2_and_run_nothing(self):
+        for argv in ([], ["--"], ["somecommand"], ["-x", "ls"]):
+            rc, _, err = self.run_asb(argv)
+            self.assertEqual(rc, 2, argv)
+            self.assertIn("usage: asb sudo", err, argv)
+        self.assertFalse(os.path.exists(self.log))
+
+    def test_no_sudo_on_the_machine_is_a_clear_error(self):
+        empty = tempfile.mkdtemp()
+        with mock.patch.dict(os.environ, {"PATH": empty}):
+            rc, _, err = self.run_asb(["--", "/usr/bin/true"])
+        self.assertEqual(rc, 2)
+        self.assertIn("sudo is not installed", err)
+
+    def test_help_describes_only_the_helper_form(self):
+        text = self.asb.HELP["sudo"]
+        for gone in ("NAME", "askpass", "password is released"):
+            self.assertNotIn(gone, text)
+        self.assertIn("allow-list", text)
 
 
 if __name__ == "__main__":
