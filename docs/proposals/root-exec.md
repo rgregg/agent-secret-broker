@@ -3,7 +3,6 @@
 Status: **implemented** (native `sudo` broker mode, Rust helper and `asb sudo --`). Install and operation:
 [../root-exec.md](../root-exec.md). Validated against the real broker with the real Rust client in tests;
 the helper's final `exec` as uid 0 is covered by unit tests of everything before it, not run as root in CI.
-one stays as the fallback for machines where a root helper cannot be installed.
 
 ## Problem
 
@@ -58,9 +57,7 @@ see and approve the exact command.
   * *Card and audit:* the card shows the exact argv, cwd and target user; the audit log records the argv
     (first 50 words, as env mode does) and the client, never environment values.
   * *Delivery:* once, like env values; a second poll says `released`.
-- **Client.** `asb sudo -- CMD...` is a thin front end for `sudo -n asb-root-exec -- CMD...`. An earlier
-  `asb sudo NAME -- CMD...` that fed a stored sudo password to `sudo -A` was removed: it released a reusable
-  password to the agent's own user (found in review).
+- **Client.** `asb sudo -- CMD...` is a thin front end for `sudo -n asb-root-exec -- CMD...`.
 
 ## Constraints and risks
 

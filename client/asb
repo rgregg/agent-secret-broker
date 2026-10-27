@@ -2959,9 +2959,6 @@ def run_sudo(argv):
     """`asb sudo -- command...`: run a command as root through the root helper, after a human approves it."""
     if argv[:1] == ["--"] and len(argv) > 1:
         return run_root_exec(argv[1:])
-    if len(argv) >= 3 and argv[1] == "--":
-        die("the form `asb sudo NAME -- command` (a stored sudo password) was removed: use "
-            "`asb sudo -- command`, which runs it through the root helper (`asb help sudo`)")
     die(HELP["sudo"])
 
 

@@ -98,8 +98,7 @@ Check it:
 - `asb sudo -- command` runs the command as root through the compiled helper `asb-root-exec`, which asks the
   broker itself. You approve the exact command on your phone, the helper runs only programs its admin put on its
   allow-list, and no password exists anywhere. Install, the allow-list and what it refuses:
-  [root-exec.md](root-exec.md). (An earlier `asb sudo NAME -- command` that fed a stored sudo password to `sudo`
-  was removed: it released a reusable password to the agent's own user.)
+  [root-exec.md](root-exec.md).
 - **Scripts are shown to you.** For `NAME -- command`, `asb` looks for the script
   file the command runs and sends its text with the request, so the approval card
   and the risk check see what the script does, not just `bash deploy.sh`. It skips

@@ -1,6 +1,6 @@
 """`asb sudo -- command`: the client hands the command to the root helper through the one sudoers rule.
 The helper (crates/asb-root-exec) asks the broker itself; the client never requests a credential and no
-password exists. The old `asb sudo NAME -- command` (a stored sudo password) is gone."""
+password exists."""
 import contextlib
 import importlib.machinery
 import importlib.util
@@ -76,15 +76,8 @@ class AsbSudo(unittest.TestCase):
         self.assertEqual(self.sudo_args()[-2:], ["/usr/bin/ls", "--help"])
         self.assertNotIn("usage: asb sudo", out)
 
-    def test_the_old_password_form_is_gone_and_says_what_to_use(self):
-        rc, out, err = self.run_asb(["homesudo", "--", "systemctl", "restart", "nginx"])
-        self.assertEqual(rc, 2)
-        self.assertIn("was removed", err)
-        self.assertIn("asb sudo -- command", err)
-        self.assertFalse(os.path.exists(self.log), "sudo must not have been run")
-
     def test_usage_errors_exit_2_and_run_nothing(self):
-        for argv in ([], ["--"], ["somecommand"], ["-x", "ls"]):
+        for argv in ([], ["--"], ["somecommand"], ["-x", "ls"], ["NAME", "--", "ls"]):
             rc, _, err = self.run_asb(argv)
             self.assertEqual(rc, 2, argv)
             self.assertIn("usage: asb sudo", err, argv)
@@ -99,8 +92,7 @@ class AsbSudo(unittest.TestCase):
 
     def test_help_describes_only_the_helper_form(self):
         text = self.asb.HELP["sudo"]
-        for gone in ("NAME", "askpass", "password is released"):
-            self.assertNotIn(gone, text)
+        self.assertNotIn("NAME", text)
         self.assertIn("allow-list", text)
 
 
