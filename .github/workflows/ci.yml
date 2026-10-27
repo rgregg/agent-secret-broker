@@ -31,15 +31,42 @@ jobs:
       - run: pip install -r requirements.txt
       - run: python tests/run_tests.py --shard ${{ matrix.shard }}/4
 
+  # The Rust tools (crates/): the shared client crates and the root helper. `--locked` builds exactly
+  # the dependency versions in Cargo.lock.
+  rust:
+    name: rust
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal --component clippy --component rustfmt
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+      - run: cargo build --release --locked -p asb-root-exec
+      - uses: actions/upload-artifact@v4
+        with:
+          name: asb-root-exec-linux-x86_64
+          path: target/release/asb-root-exec
+          if-no-files-found: error
+
   # The single check to require in branch protection: it keeps the name "test" and is green only when
-  # every shard is.
+  # every shard and the Rust job are.
   test:
-    needs: shard
+    needs: [shard, rust]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - run: |
           test "${{ needs.shard.result }}" = "success" || { echo "tests: ${{ needs.shard.result }}"; exit 1; }
+          test "${{ needs.rust.result }}" = "success" || { echo "rust: ${{ needs.rust.result }}"; exit 1; }
 
   image:
     needs: test

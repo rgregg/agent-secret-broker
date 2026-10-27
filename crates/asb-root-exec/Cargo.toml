@@ -1,0 +1,25 @@
+[package]
+name = "asb-root-exec"
+description = "Run a command as root only after the broker's human approves it"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "asb_root_exec"
+path = "src/lib.rs"
+
+[[bin]]
+name = "asb-root-exec"
+path = "src/main.rs"
+
+[dependencies]
+asb-proto = { path = "../asb-proto" }
+asb-client = { path = "../asb-client" }
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+asb-client = { path = "../asb-client", features = ["mock"] }

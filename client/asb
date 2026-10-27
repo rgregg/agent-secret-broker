@@ -2,6 +2,7 @@
 """asb: ask the broker for a secret, wait for phone approval, use it.
 
   asb NAME[,NAME2] -- command args...         run with secrets in the env
+  asb sudo NAME -- command args...            run under sudo; the broker supplies the password after a human approves
   asb list [--json]                           what credentials exist? (no approval)
   asb store NAME --hosts H[,H] [--field F] [--item I] [--var V]  < value
   asb store NAME --ssh < private_key          move an SSH private key into the broker
@@ -104,6 +105,7 @@ Which command? (decision rule)
                                                  asb session open ... then asb http ... --session ID
   A service that speaks WebSocket (e.g. Home Assistant's /api/websocket)   asb ws NAME URL (see below)
   A program that needs the secret itself (an official CLI, a library)   env mode: asb NAME -- command
+  A command that needs root (sudo asks for a password)                  asb sudo NAME -- command
   Do not write a script around curl or requests to do an HTTP flow: use a session. The broker keeps
   the cookies and tokens, so the secret and the session never reach you.
 
@@ -386,6 +388,23 @@ no renewal. `status` prints time and calls left; `close` ends it now. Only the c
 session can use it. Exit 0 ok, 4 denied, 5 open expired unanswered, 3 refused (too many sessions,
 disabled, bad credential or host), 2 usage, 7 session expired/closed/revoked/unknown (ended), 8 call refused (outside the approved scope).
 example: asb session open unifi --for "read stats and rename a client" --host unifi.local --methods GET,HEAD,POST,PUT --ttl 10m""",
+    "sudo": """usage: asb sudo -- command [args...]
+       asb sudo NAME -- command [args...]
+
+With no NAME: run the command as root through the installed root helper (asb-root-exec). The helper
+asks the broker, you approve the exact command on your phone, and only then does it run. No password
+exists anywhere. The command runs with a clean environment and a fixed PATH, in the current directory;
+the file it runs must be root-owned and not writable by others. A denial or timeout is final: stop and
+tell the human what you needed. Exit codes: the command's own, or 2 usage, 3 broker, 4 denied, 5 expired,
+10 refused locally (unsafe file, config or directory), 11 approved but could not start.
+
+With a NAME: run the command under `sudo -A`, with the sudo password supplied by the broker. NAME is a
+credential whose single variable holds the password (store it with `asb store NAME --hosts ...`,
+or ask the human with `asb request-credential`). Waits for approval; the approver sees
+`sudo command args...`. The password reaches sudo through a private askpass helper, never your
+terminal, and is masked in the command's output. Each use is approved separately (a cached sudo
+timestamp is ignored). Exits with the command's code; 4 denied, 5 expired, 3 broker error.
+example: asb sudo homesudo -- systemctl restart nginx""",
     "run": """usage: asb NAME[,NAME] -- command [args...]
 
 Run a command with the credential's variables in its environment. Waits for
@@ -544,9 +563,12 @@ def config():
     return url.rstrip("/"), key
 
 
+USER_AGENT = "asb/1 (+https://github.com/rgregg/agent-secret-broker)"     # not urllib's default: Cloudflare blocks that
+
+
 def call(base, key, path, body=None, timeout=40):
     req = urllib.request.Request(
-        base + path, headers={"X-Client-Key": key, "Content-Type": "application/json"},
+        base + path, headers={"X-Client-Key": key, "Content-Type": "application/json", "User-Agent": USER_AGENT},
         data=json.dumps(body).encode() if body is not None else None)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -2905,6 +2927,79 @@ def run_plan(argv):
 # ---- plan mode (END) --------------------------------------------------------------------------
 
 
+def env_payload(names, cmd):
+    """The env-mode request for running `cmd`, and the script entries it carries."""
+    payload = {"mode": "env", "names": names, "argv": cmd}
+    try:
+        cwd = os.getcwd()
+        if cwd.startswith("/") and len(cwd) <= 300 and not re.search(r"[\x00-\x1f\x7f]", cwd):
+            payload["cwd"] = cwd        # lets the broker resolve relative script operands
+    except OSError:
+        pass
+    try:
+        scripts = find_scripts(cmd)
+    except Exception:  # noqa: BLE001  (script detection is a courtesy; it never blocks a request)
+        scripts = []
+    if scripts:
+        payload["scripts"] = scripts
+    return payload, scripts
+
+
+ROOT_EXEC = "/usr/local/sbin/asb-root-exec"
+
+
+def run_root_exec(cmd):
+    """`asb sudo -- command...`: the root helper asks the broker, and runs the command only if the
+    human approves. No password anywhere; sudo's one passwordless rule names the helper. The helper
+    prints its own progress and the command's output goes straight through (nothing secret to mask)."""
+    helper = os.environ.get("ASB_ROOT_EXEC") or ROOT_EXEC     # sudoers allows only the installed path, so this cannot escalate
+    try:
+        return subprocess.run(["sudo", "-n", helper, "--"] + cmd).returncode
+    except FileNotFoundError:
+        die("sudo is not installed on this machine")
+
+
+def run_sudo(argv):
+    """`asb sudo -- command...` (root helper, no password) or `asb sudo NAME -- command...` (a stored
+    sudo password credential, fed to sudo through askpass)."""
+    if argv[:1] == ["--"] and len(argv) > 1:
+        return run_root_exec(argv[1:])
+    if len(argv) < 3 or argv[1] != "--":
+        die(HELP["sudo"])
+    name, cmd = check_name(argv[0]), argv[2:]
+    if "," in name:
+        die("asb sudo uses exactly one credential")
+    # The broker is shown (and risk-rates) the command as sudo will run it; it already unwraps `sudo`.
+    payload, scripts = env_payload([name], ["sudo"] + cmd)
+    env = obtain(payload, "waiting for approval to run under sudo...")["env"]
+    if len(env) != 1:
+        die(f"credential {name!r} must have exactly one variable (the sudo password), it has {len(env)}",
+            EXIT_BROKER)
+    password = next(iter(env.values())).rstrip("\r\n")
+    moved = changed_script(scripts)
+    if moved:
+        die(f"script {moved} changed after it was reviewed", EXIT_SCRIPT_CHANGED)
+    tmp = tempfile.mkdtemp(prefix="asb-sudo-")      # 0700; holds only the helper, never the password
+    try:
+        helper = os.path.join(tmp, "askpass")
+        with open(helper, "w") as f:
+            f.write("#!/bin/sh\nprintf '%s\\n' \"$ASB_SUDO_PASSWORD\"\n")
+        os.chmod(helper, 0o700)
+        child_env = {**os.environ, "SUDO_ASKPASS": helper, "ASB_SUDO_PASSWORD": password}
+        # -A: ask through the helper (no tty needed). -k: ignore a cached sudo timestamp, so every
+        # use is approved here rather than riding on an earlier one.
+        try:
+            p = subprocess.run(["sudo", "-A", "-k", "--"] + cmd, env=child_env, stdin=subprocess.DEVNULL,
+                               capture_output=True, text=True)
+        except FileNotFoundError:
+            die("sudo is not installed on this machine")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    sys.stdout.write(mask(p.stdout, [password]))
+    sys.stderr.write(mask(p.stderr, [password]))
+    return p.returncode
+
+
 def main(argv):
     if not argv or argv[0] in ("-h", "--help"):
         print(__doc__)
@@ -2929,6 +3024,8 @@ def main(argv):
         # Flags are never credential names or values: --help anywhere before an
         # http body/header value, or anywhere for the commands without free text.
         scan = argv[1:4] if argv[0] == "http" else argv[1:]
+        if argv[0] == "sudo" and "--" in argv:
+            scan = argv[1:argv.index("--")]       # the command's own --help is the command's
         if any(a in ("-h", "--help") for a in scan):
             print(HELP[argv[0]])
             return 0
@@ -2975,6 +3072,9 @@ def main(argv):
 
     if argv[0] == "ws":
         return run_ws(argv[1:])
+
+    if argv[0] == "sudo":
+        return run_sudo(argv[1:])
 
     if argv[0] == "enroll":
         return run_enroll(argv[1:])
@@ -3125,7 +3225,7 @@ def main(argv):
         return 0 if r["status"] < 400 else EXIT_HTTP_ERROR
 
     if "--" not in argv:
-        die(f"unknown command {argv[0]!r}.\ncommands: list, which, status, audit, http, session, ws, plan, store, update, "
+        die(f"unknown command {argv[0]!r}.\ncommands: list, which, status, audit, http, session, ws, plan, sudo, store, update, "
             "request-credential, guidance, enroll, ssh-agent, fingerprint, help, guide; or: asb NAME -- command\n"
             "start with `asb guide`")
     i = argv.index("--")
@@ -3134,19 +3234,7 @@ def main(argv):
         die(HELP["run"])
     for n in names:
         check_name(n)
-    payload = {"mode": "env", "names": names, "argv": cmd}
-    try:
-        cwd = os.getcwd()
-        if cwd.startswith("/") and len(cwd) <= 300 and not re.search(r"[\x00-\x1f\x7f]", cwd):
-            payload["cwd"] = cwd        # lets the broker resolve relative script operands
-    except OSError:
-        pass
-    try:
-        scripts = find_scripts(cmd)
-    except Exception:  # noqa: BLE001  (script detection is a courtesy; it never blocks a request)
-        scripts = []
-    if scripts:
-        payload["scripts"] = scripts
+    payload, scripts = env_payload(names, cmd)
     env = obtain(payload)["env"]
     moved = changed_script(scripts)
     if moved:
