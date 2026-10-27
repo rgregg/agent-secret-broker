@@ -549,6 +549,16 @@ class WsSession(S.Session):
             self.cond.notify_all()
         self.conn.t.close()
 
+    def _finish_unless_reader_does(self, label, grace=0.25):
+        """A writer that finds the connection gone knows the consequence ("I could not write"); the reader knows
+        the cause (a limit, a protocol error, the peer closing). Without this the two threads race and whichever
+        gets here first names the reason: a session that hit its byte cap could be reported as merely "closed".
+        Give the reader a moment to say which, and only then say it for it (a stalled reader, for example one held
+        by backpressure, never answers, so after `grace` the writer finishes the session as it always did)."""
+        with self.cond:
+            self.cond.wait_for(lambda: self.finished is not None or self.dead, grace)
+        self._finish(label)
+
     def _stopped(self, mid=False):
         if self.dead or self.finished is not None:
             return True
@@ -1060,7 +1070,7 @@ class WsMixin:
         try:
             s.conn.write(wsproto.OP_TEXT, data)
         except wsproto.WsError as e:
-            s._finish(e.label)
+            s._finish_unless_reader_does(e.label)
             with s.lock:                            # closed under us by a revoke, close or deadline: say that
                 if s.dead:
                     raise S.SessionError(*S.ENDED[s.end_reason if s.end_reason in S.ENDED else "unknown"]) from None
