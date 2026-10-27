@@ -398,7 +398,11 @@ the file it runs must be root-owned and not writable by others. A denial or time
 tell the human what you needed. Exit codes: the command's own, or 2 usage, 3 broker, 4 denied, 5 expired,
 10 refused locally (unsafe file, config or directory), 11 approved but could not start.
 
-With a NAME: run the command under `sudo -A`, with the sudo password supplied by the broker. NAME is a
+With a NAME (fallback; prefer the form above): run the command under `sudo -A`, with the sudo password
+supplied by the broker. WARNING: the password is released to this machine and handed to sudo's askpass helper,
+which runs as your own user, so anything running as you can effectively read it. The broker cannot protect it
+once released; the approval only gates when it is handed out. Use it only where the root helper cannot be
+installed. NAME is a
 credential whose single variable holds the password (store it with `asb store NAME --hosts ...`,
 or ask the human with `asb request-credential`). Waits for approval; the approver sees
 `sudo command args...`. The password reaches sudo through a private askpass helper, never your

@@ -100,7 +100,10 @@ Check it:
   it refuses: [root-exec.md](root-exec.md). `asb sudo NAME -- command` is the password variant below.
 - `asb sudo NAME -- command` runs `sudo -A -k -- command` with the password from credential `NAME`
   (one variable holding the sudo password; store it with `asb store`, or let the agent ask with
-  `asb request-credential --mode env`). It is an env-mode request, so you approve on your phone and
+  `asb request-credential --mode env`). **This is a fallback with a real cost: the password is released to the
+  agent's machine and handed to sudo's askpass helper, which runs as the agent's own user, so anything running as
+  that user can effectively read it.** Prefer `asb sudo -- command` above, which never releases a password. It is
+  an env-mode request, so you approve on your phone and
   see `sudo command...` (the broker already unwraps `sudo` to judge the inner command). The password
   reaches sudo through a private askpass helper (`SUDO_ASKPASS`, a 0700 temp directory removed
   afterwards) and is masked in the command's output; it is never on the agent's terminal or in an
