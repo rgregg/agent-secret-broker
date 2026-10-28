@@ -47,9 +47,9 @@ ever ported too. Not a rewrite for its own sake: behaviour does not change.
 | 2 `session` `plan` `agent-setup` | done (`agent-setup`'s dry-run diff is Python's `difflib`, ported and held to 30 golden cases) |
 | 3 env mode `NAME -- command` and the script analyser | not started |
 | 4a `ws` (with the line pipe) | done |
-| 4b `ssh-agent`, `fingerprint` | not started |
+| 4b `ssh-agent`, `fingerprint` | done (the claimed-destination parser is held to 2,757 golden cases from Python; `tests/test_ssh_agent_wire.py` drives the agent socket of either client) |
 
-`tests/rust_cli_known_gaps.txt` lists what still fails against the Rust binary (13 tests, all from stages 3 and 4b);
+`tests/rust_cli_known_gaps.txt` lists what still fails against the Rust binary (6 tests, all of them env mode);
 `tests/rust_cli_python_internal.txt` lists the 29 tests that import Python functions and can never pass against a
 binary (their Rust side is the unit tests and golden vectors). CI runs the parity suite on every change.
 
@@ -61,7 +61,7 @@ binary (their Rust side is the unit tests and golden vectors). CI runs the parit
 | 1 | `http`, `store`, `update`, `request-credential`, `guidance`, `audit`, `sudo`, `enroll` | all share the "ask a human, wait" flow |
 | 2 | `session`, `plan`, `agent-setup` | state machines and file editing, big test counts |
 | 3 | `NAME -- command` (env mode) with the script analyser | the hard one: must match the broker's rules exactly |
-| 4 | `ws` (with the line pipe), `ssh-agent`, `fingerprint` | protocol servers and raw TLS |
+| 4 | `ws` (with the line pipe), `ssh-agent`, `fingerprint` | protocol servers and raw TLS (done before stage 3: the analyser is the riskiest piece and goes last) |
 
 Each stage removes its tests from `tests/rust_cli_known_gaps.txt` in the same commit.
 

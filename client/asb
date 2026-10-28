@@ -1273,8 +1273,8 @@ def _strings(b, n):
 _SSH_VAL = set("BbcDEeFIiJLlmOopQRSWw")             # ssh options that take an argument
 _SCP_VAL = set("cDFiJloPS")
 _SFTP_VAL = set("BbcDFiJloPRSs")
-_HOST_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]*$|^[0-9A-Fa-f:.]*:[0-9A-Fa-f:.]*$")
-_USER_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]*$")
+_HOST_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]*\Z|^[0-9A-Fa-f:.]*:[0-9A-Fa-f:.]*\Z")     # \Z: "$" would let "h\n" through
+_USER_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]*\Z")
 
 
 def _walk(args, val_opts):

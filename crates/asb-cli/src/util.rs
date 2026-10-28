@@ -222,9 +222,59 @@ fn prompt_hidden(prompt: &str) -> String {
     line
 }
 
+/// Python's `base64.b64decode(text)`: characters outside the alphabet are skipped, and the padding must come out
+/// right. `None` where Python raises.
+pub fn base64_decode(text: &str) -> Option<Vec<u8>> {
+    let value = |c: u8| match c {
+        b'A'..=b'Z' => Some(c - b'A'),
+        b'a'..=b'z' => Some(c - b'a' + 26),
+        b'0'..=b'9' => Some(c - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    };
+    let bytes = text.as_bytes();
+    let end = bytes.iter().position(|&b| b == b'=').unwrap_or(bytes.len());
+    let digits: Vec<u8> = bytes[..end].iter().filter_map(|&b| value(b)).collect();
+    let pads = bytes[end..].iter().filter(|&&b| b == b'=').count();
+    if digits.len() % 4 == 1
+        || (pads > 0 && (digits.len() + pads) & 3 != 0)
+        || (pads == 0 && digits.len() & 3 != 0)
+    {
+        return None;
+    }
+    let mut out = Vec::new();
+    for chunk in digits.chunks(4) {
+        let n = chunk.iter().fold(0u32, |acc, &d| acc << 6 | d as u32) << (6 * (4 - chunk.len()));
+        let take = chunk.len() * 6 / 8;
+        out.extend_from_slice(&n.to_be_bytes()[1..1 + take]);
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn base64_decode_round_trips_and_is_as_forgiving_as_python() {
+        for data in [
+            &b""[..],
+            b"f",
+            b"fo",
+            b"foo",
+            b"foob",
+            b"\x00\xff\xfe binary \x80",
+        ] {
+            assert_eq!(base64_decode(&base64(data)).as_deref(), Some(data));
+        }
+        // b64decode skips characters outside the alphabet (a line break, a space) but insists on the padding
+        assert_eq!(base64_decode("Zm9v\nYmFy").as_deref(), Some(&b"foobar"[..]));
+        assert_eq!(base64_decode("Zg").as_deref(), None);
+        assert_eq!(base64_decode("Z").as_deref(), None);
+        assert_eq!(base64_decode("Zg=").as_deref(), None);
+        assert_eq!(base64_decode("Zg==").as_deref(), Some(&b"f"[..]));
+    }
 
     #[test]
     fn base64_matches_the_standard_alphabet() {

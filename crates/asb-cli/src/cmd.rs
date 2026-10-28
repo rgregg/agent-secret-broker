@@ -6,8 +6,8 @@ use crate::pyfmt::{json_dumps, py_str, quote, repr, truthy};
 use crate::text_gen::{self, DOC, GUIDE, HELP_TOPICS};
 use crate::util::{check_name, die_help};
 use crate::{
-    cmd_agent_setup, cmd_audit, cmd_enroll, cmd_guidance, cmd_http, cmd_plan, cmd_session,
-    cmd_store, cmd_sudo, cmd_ws,
+    cmd_agent_setup, cmd_audit, cmd_enroll, cmd_fingerprint, cmd_guidance, cmd_http, cmd_plan,
+    cmd_session, cmd_ssh_agent, cmd_store, cmd_sudo, cmd_ws,
 };
 use serde_json::Value;
 
@@ -58,13 +58,15 @@ fn dispatch(argv: &[String]) -> R {
         "plan" => cmd_plan::run(&argv[1..]),
         "session" => cmd_session::run(&argv[1..]),
         "ws" => cmd_ws::run(&argv[1..]),
+        "ssh-agent" => cmd_ssh_agent::run(&argv[1..]),
+        "fingerprint" => cmd_fingerprint::run(&argv[1..]),
         "audit" => cmd_audit::run(&argv[1..]),
         "guidance" => cmd_guidance::run(&argv[1..]),
         "sudo" => cmd_sudo::run(&argv[1..]),
         "enroll" => cmd_enroll::run(&argv[1..]),
         "store" | "update" => cmd_store::store_or_update(argv),
         "request-credential" => cmd_store::request_credential(&argv[1..]),
-        _ if argv.iter().any(|a| a == "--") || is_known(cmd) => unported(cmd),
+        _ if argv.iter().any(|a| a == "--") => unported(),
         _ => Err(die(
             format!(
                 "unknown command {}.\ncommands: list, which, status, audit, http, session, ws, plan, sudo, store, update, request-credential, guidance, enroll, ssh-agent, fingerprint, help, guide; or: asb NAME -- command\nstart with `asb guide`",
@@ -75,19 +77,11 @@ fn dispatch(argv: &[String]) -> R {
     }
 }
 
-fn is_known(cmd: &str) -> bool {
-    ["agent-setup", "plan", "ssh-agent", "session", "fingerprint"].contains(&cmd)
-}
-
-/// A command the Rust CLI has not taken over yet (see docs/proposals/rust-cli.md for the order).
-fn unported(cmd: &str) -> R {
-    let what = if is_known(cmd) {
-        format!("`asb {cmd}`")
-    } else {
-        "running a command with a credential".to_string()
-    };
+/// Env mode (`asb NAME -- command`) is the one command the Rust CLI has not taken over yet (see
+/// docs/proposals/rust-cli.md).
+fn unported() -> R {
     Err(die(
-        format!("{what} is not in the Rust CLI yet; use the Python client/asb"),
+        "running a command with a credential is not in the Rust CLI yet; use the Python client/asb",
         USAGE,
     ))
 }

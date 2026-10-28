@@ -332,6 +332,7 @@ impl Shared {
 /// line. Leaves after `linger` seconds without a frame in either direction once stdin has ended, or when the
 /// server closes the connection.
 fn pipe(sid: &str, linger: f64, close_at_end: bool) -> R {
+    broker::ignore_sigpipe();
     let client = Arc::new(broker::client()?);
     let st = Arc::new(Shared {
         rc: AtomicI32::new(0),

@@ -41,6 +41,16 @@ pub fn client() -> Result<Client, Die> {
     Ok(Client::with_user_agent(config()?, USER_AGENT))
 }
 
+static SIGPIPE_IGNORED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// From now on a write to a socket the peer has closed is an error to report, not a signal that ends the process.
+/// (`main` leaves SIGPIPE at its default so `asb list | head` stops quietly; sockets must not inherit that.)
+pub fn ignore_sigpipe() {
+    // SAFETY: setting a signal to "ignore" has no preconditions.
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) };
+    SIGPIPE_IGNORED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// One call to the broker. A GET when `body` is `None`, else a POST. `Err` (after saying why) if the broker cannot
 /// be reached; otherwise the HTTP status and parsed body, whatever the status.
 pub fn call(
@@ -49,12 +59,19 @@ pub fn call(
     body: Option<&Value>,
     timeout_s: u64,
 ) -> Result<(u16, Value), Die> {
-    client
-        .json(path, body, Duration::from_secs(timeout_s))
-        .map_err(|e| match e {
-            Error::Unreachable(m) => die(format!("cannot reach broker: {m}"), BROKER),
-            other => die(format!("cannot reach broker: {other}"), BROKER),
-        })
+    // For the length of the call only, unless a long-running command has already made it permanent.
+    let restore = (!SIGPIPE_IGNORED.load(std::sync::atomic::Ordering::SeqCst))
+        // SAFETY: as above.
+        .then(|| unsafe { libc::signal(libc::SIGPIPE, libc::SIG_IGN) });
+    let result = client.json(path, body, Duration::from_secs(timeout_s));
+    if let Some(previous) = restore {
+        // SAFETY: `previous` is the handler this process had a moment ago.
+        unsafe { libc::signal(libc::SIGPIPE, previous) };
+    }
+    result.map_err(|e| match e {
+        Error::Unreachable(m) => die(format!("cannot reach broker: {m}"), BROKER),
+        other => die(format!("cannot reach broker: {other}"), BROKER),
+    })
 }
 
 /// The `error` text of a broker answer, cleaned for a terminal; `fallback` if it has none.

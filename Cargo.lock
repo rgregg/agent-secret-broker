@@ -9,6 +9,7 @@ dependencies = [
  "asb-client",
  "asb-proto",
  "libc",
+ "rustls",
  "serde_json",
  "sha2",
 ]
