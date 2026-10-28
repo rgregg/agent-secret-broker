@@ -242,7 +242,7 @@ fn abspath(p: &str) -> PathBuf {
     out
 }
 
-fn exit_code(status: std::process::ExitStatus) -> i32 {
+pub(crate) fn exit_code(status: std::process::ExitStatus) -> i32 {
     use std::os::unix::process::ExitStatusExt;
     match (status.code(), status.signal()) {
         (Some(c), _) => c,

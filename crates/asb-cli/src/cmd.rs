@@ -6,8 +6,8 @@ use crate::pyfmt::{json_dumps, py_str, quote, repr, truthy};
 use crate::text_gen::{self, DOC, GUIDE, HELP_TOPICS};
 use crate::util::{check_name, die_help};
 use crate::{
-    cmd_agent_setup, cmd_audit, cmd_enroll, cmd_fingerprint, cmd_guidance, cmd_http, cmd_plan,
-    cmd_session, cmd_ssh_agent, cmd_store, cmd_sudo, cmd_ws,
+    cmd_agent_setup, cmd_audit, cmd_enroll, cmd_env, cmd_fingerprint, cmd_guidance, cmd_http,
+    cmd_plan, cmd_session, cmd_ssh_agent, cmd_store, cmd_sudo, cmd_ws,
 };
 use serde_json::Value;
 
@@ -66,7 +66,7 @@ fn dispatch(argv: &[String]) -> R {
         "enroll" => cmd_enroll::run(&argv[1..]),
         "store" | "update" => cmd_store::store_or_update(argv),
         "request-credential" => cmd_store::request_credential(&argv[1..]),
-        _ if argv.iter().any(|a| a == "--") => unported(),
+        _ if argv.iter().any(|a| a == "--") => cmd_env::run(argv),
         _ => Err(die(
             format!(
                 "unknown command {}.\ncommands: list, which, status, audit, http, session, ws, plan, sudo, store, update, request-credential, guidance, enroll, ssh-agent, fingerprint, help, guide; or: asb NAME -- command\nstart with `asb guide`",
@@ -75,15 +75,6 @@ fn dispatch(argv: &[String]) -> R {
             USAGE,
         )),
     }
-}
-
-/// Env mode (`asb NAME -- command`) is the one command the Rust CLI has not taken over yet (see
-/// docs/proposals/rust-cli.md).
-fn unported() -> R {
-    Err(die(
-        "running a command with a credential is not in the Rust CLI yet; use the Python client/asb",
-        USAGE,
-    ))
 }
 
 fn help(topic: Option<&str>) -> R {

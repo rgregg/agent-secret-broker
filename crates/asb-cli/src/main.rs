@@ -4,12 +4,14 @@
 //! sends the same requests, and tools/run_tests_against_rust_cli.py runs the existing test-suite against this binary.
 //! See docs/proposals/rust-cli.md for the order the commands move over in.
 
+mod analyse;
 mod approval;
 mod broker;
 mod cmd;
 mod cmd_agent_setup;
 mod cmd_audit;
 mod cmd_enroll;
+mod cmd_env;
 mod cmd_fingerprint;
 mod cmd_guidance;
 mod cmd_http;

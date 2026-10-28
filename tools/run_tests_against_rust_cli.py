@@ -57,6 +57,8 @@ def main():
         shutil.copytree(ROOT, tree, ignore=shutil.ignore_patterns(".git", "target", "__pycache__", "*.pyc", ".superpowers"))
         # needs the real client/asb's text, which the shim replaces; it is checked in the normal suite
         os.remove(os.path.join(tree, "tests", "test_cli_text_sync.py"))
+        # tests that compare the CLI with the Python functions load the original from here
+        shutil.copy(os.path.join(tree, "client", "asb"), os.path.join(tree, "client", "asb_python"))
         with open(os.path.join(tree, "client", "asb"), "w") as f:
             f.write(SHIM.format(rust=rust))
         cmd = [sys.executable, os.path.join("tests", "run_tests.py"), "-j8"] + (["-k", k] if k else [])

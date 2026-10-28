@@ -2,9 +2,3 @@
 # Each is waiting for its command to be ported (docs/proposals/rust-cli.md). The runner fails on a failure that is not
 # listed here AND on a listed test that now passes, so this list can only shrink; when you port a command, delete its
 # tests from here. One module.Class.test per line; lines starting with # are ignored.
-test_e2e.Cli.test_env_mode_masks_output
-test_e2e.Cli.test_every_command_has_help_and_flags_are_never_names
-test_scripts.Integrity.test_changed_after_approval_exits_6_and_runs_nothing
-test_scripts.Integrity.test_deleted_script_counts_as_changed
-test_scripts.Integrity.test_no_scripts_key_for_plain_commands
-test_scripts.Integrity.test_unchanged_script_runs_and_is_sent

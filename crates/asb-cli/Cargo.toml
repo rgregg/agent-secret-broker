@@ -18,3 +18,5 @@ serde_json = { workspace = true, features = ["preserve_order"] }
 sha2 = "0.10"
 # the certificate fetch for `asb fingerprint`: a handshake that records what the server presents and trusts nothing
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# the script analyser (env mode) is a port of Python `re` patterns
+regex = { version = "1", default-features = false, features = ["std", "unicode-perl"] }

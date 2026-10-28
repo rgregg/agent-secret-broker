@@ -155,7 +155,7 @@ fn apply_block(text: &str, remove: bool) -> Result<(String, String), String> {
 /// `os.path.realpath`: symlinks resolved as far as they exist, the rest kept as written. Unlike Python's, it FAILS
 /// when it cannot finish (a link loop or too many hops, an unreadable link): a path-safety check must not go on
 /// with a half-resolved path.
-fn realpath(path: &Path) -> Result<PathBuf, String> {
+pub(crate) fn realpath(path: &Path) -> Result<PathBuf, String> {
     let mut pending: VecDeque<OsString> = VecDeque::new();
     let mut result = if path.is_absolute() {
         PathBuf::from("/")

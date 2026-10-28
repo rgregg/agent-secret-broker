@@ -36,7 +36,8 @@ ever ported too. Not a rewrite for its own sake: behaviour does not change.
 ## Crates
 
 `asb-cli` (binary `asb`) on top of `asb-client` (config-free HTTP and approval polling, shared with the root helper) and
-`asb-proto`. No new heavy dependencies: `ureq`+rustls, `serde_json`, `libc`.
+`asb-proto`. Small dependencies only: `ureq`+rustls, `serde_json`, `libc`, `sha2`, and `regex` (the script analyser is a port
+of Python `re` patterns).
 
 ## Progress
 
@@ -45,11 +46,11 @@ ever ported too. Not a rewrite for its own sake: behaviour does not change.
 | 0 plumbing, `help`/`guide`/`list`/`which`/`status` | done |
 | 1 `http` `store` `update` `request-credential` `guidance` `audit` `sudo` `enroll` | done |
 | 2 `session` `plan` `agent-setup` | done (`agent-setup`'s dry-run diff is Python's `difflib`, ported and held to 30 golden cases) |
-| 3 env mode `NAME -- command` and the script analyser | not started |
+| 3 env mode `NAME -- command` and the script analyser | done (the analyser is held to 13,294 golden cases from Python, whose copy the broker shares; `tests/test_env_scripts_wire.py` compares the script entries the CLI sends with `find_scripts`) |
 | 4a `ws` (with the line pipe) | done |
 | 4b `ssh-agent`, `fingerprint` | done (the claimed-destination parser is held to 2,757 golden cases from Python; `tests/test_ssh_agent_wire.py` drives the agent socket of either client) |
 
-`tests/rust_cli_known_gaps.txt` lists what still fails against the Rust binary (6 tests, all of them env mode);
+`tests/rust_cli_known_gaps.txt` is empty: every command is ported and the suite passes against the Rust binary;
 `tests/rust_cli_python_internal.txt` lists the 29 tests that import Python functions and can never pass against a
 binary (their Rust side is the unit tests and golden vectors). CI runs the parity suite on every change.
 
@@ -67,6 +68,6 @@ Each stage removes its tests from `tests/rust_cli_known_gaps.txt` in the same co
 
 ## Switching over
 
-When the gaps list is empty and the golden vectors pass: release `asb` binaries from CI, point the install docs at them,
+The gaps list is empty and the golden vectors pass, so what remains is a decision, not code: release `asb` binaries from CI, point the install docs at them,
 keep `client/asb` as a deprecated single-file fallback for platforms without a binary, and make the extracted text the
 source of truth. Retiring the Python client is a separate decision.

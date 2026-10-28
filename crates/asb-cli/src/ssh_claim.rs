@@ -323,7 +323,7 @@ fn remote_operand(a: &str) -> Option<Target> {
 }
 
 /// Python's `shlex.split` (POSIX mode, no comments). `None` where it raises `ValueError`.
-fn shlex_split(s: &str) -> Option<Vec<String>> {
+pub fn shlex_split(s: &str) -> Option<Vec<String>> {
     let chars: Vec<char> = s.chars().collect();
     let (mut words, mut i) = (Vec::new(), 0);
     loop {
