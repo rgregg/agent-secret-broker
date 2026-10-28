@@ -7,7 +7,7 @@ use crate::text_gen::{self, DOC, GUIDE, HELP_TOPICS};
 use crate::util::{check_name, die_help};
 use crate::{
     cmd_agent_setup, cmd_audit, cmd_enroll, cmd_guidance, cmd_http, cmd_plan, cmd_session,
-    cmd_store, cmd_sudo,
+    cmd_store, cmd_sudo, cmd_ws,
 };
 use serde_json::Value;
 
@@ -57,6 +57,7 @@ fn dispatch(argv: &[String]) -> R {
         "agent-setup" => cmd_agent_setup::run(&argv[1..]),
         "plan" => cmd_plan::run(&argv[1..]),
         "session" => cmd_session::run(&argv[1..]),
+        "ws" => cmd_ws::run(&argv[1..]),
         "audit" => cmd_audit::run(&argv[1..]),
         "guidance" => cmd_guidance::run(&argv[1..]),
         "sudo" => cmd_sudo::run(&argv[1..]),
@@ -75,15 +76,7 @@ fn dispatch(argv: &[String]) -> R {
 }
 
 fn is_known(cmd: &str) -> bool {
-    [
-        "agent-setup",
-        "plan",
-        "ssh-agent",
-        "session",
-        "ws",
-        "fingerprint",
-    ]
-    .contains(&cmd)
+    ["agent-setup", "plan", "ssh-agent", "session", "fingerprint"].contains(&cmd)
 }
 
 /// A command the Rust CLI has not taken over yet (see docs/proposals/rust-cli.md for the order).

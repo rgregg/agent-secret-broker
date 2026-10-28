@@ -16,6 +16,7 @@ mod cmd_plan;
 mod cmd_session;
 mod cmd_store;
 mod cmd_sudo;
+mod cmd_ws;
 mod difflib;
 mod exit;
 mod pyfmt;

@@ -11,7 +11,7 @@ use serde_json::{json, Map, Value};
 const SESSION_METHODS: [&str; 7] = ["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"];
 
 /// `^[0-9]{1,6}[smh]$` to seconds.
-fn parse_ttl(text: &str) -> Result<u64, crate::exit::Die> {
+pub fn parse_ttl(text: &str) -> Result<u64, crate::exit::Die> {
     let bad = || die("--ttl must be a number with a unit: 90s, 15m or 1h", USAGE);
     let unit = text.chars().last().ok_or_else(bad)?;
     let digits = &text[..text.len() - 1];
