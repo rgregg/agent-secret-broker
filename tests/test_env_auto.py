@@ -4,13 +4,14 @@ not visible always prompts."""
 import _fast  # noqa: F401  (test-only: prompt server shutdown, fake-clock helpers)
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from test_e2e import SECRET, Harness, _Stub, req  # noqa: E402
+from test_e2e import CLI, KEY, SECRET, Harness, _Stub, req  # noqa: E402
 from secret_broker import destguard as _destguard  # noqa: E402
 _destguard.allow_loopback_for_tests()   # test stubs live on 127.0.0.1; no config key does this
 from secret_broker import risk as risk_mod  # noqa: E402
@@ -62,6 +63,14 @@ class EnvAutoBase(Harness):
 class AutoUnderCeiling(EnvAutoBase):
     def test_low_env_auto_approves_and_releases(self):
         self.assertAuto(self.env())
+
+    def test_the_cli_does_not_say_it_is_waiting_for_a_phone_when_policy_approved_it(self):
+        env = dict(os.environ, SECRET_BROKER_URL=self.base, SECRET_BROKER_KEY=KEY)
+        p = subprocess.run([sys.executable, "-I", CLI, "svc", "--", "sh", "-c", "echo ok"], env=env,
+                           capture_output=True, text=True, timeout=30)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertNotIn("waiting for approval", p.stderr)
+        self.assertEqual(self.notifier.sent, [])
 
     def test_visible_script_auto_approves(self):
         self.assertAuto(self.env([VISIBLE]))

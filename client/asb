@@ -607,7 +607,8 @@ def obtain(payload, waiting="waiting for approval on your phone..."):
         die(_srv(r.get("error", f"broker returned {code}")), EXIT_BROKER)
     if r["status"] in ("denied", "expired", "failed"):
         die(_srv(r.get("error") or r["status"]), status_exit(r["status"]))
-    print(f"asb: {waiting}", file=sys.stderr)
+    if r["status"] != "approved":      # a request the broker approved by policy is not waiting for anyone
+        print(f"asb: {waiting}", file=sys.stderr)
     deadline = time.time() + r["expires_in"] + 15
     while time.time() < deadline:
         code, r2 = call(base, key, f"/v1/requests/{r['id']}?wait=25")

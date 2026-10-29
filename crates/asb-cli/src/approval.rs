@@ -52,7 +52,10 @@ pub fn obtain_with(
         let why = broker::error_text(&r, &status);
         return Err(die(why, status_exit(&status)));
     }
-    eprintln!("asb: {waiting}");
+    if status != "approved" {
+        // a request the broker approved by policy is not waiting for anyone
+        eprintln!("asb: {waiting}");
+    }
     let expires = r["expires_in"].as_f64().unwrap_or(0.0).max(0.0);
     let deadline = Instant::now() + Duration::from_secs_f64(expires + 15.0);
     let id = py_str(&r["id"]);
