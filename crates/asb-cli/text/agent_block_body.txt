@@ -1,0 +1,12 @@
+## Credentials (asb)
+
+Use the secret broker CLI `asb` (on PATH) for any credential. Never read credential
+files or hunt for API keys, and never ask for a secret in chat.
+- `asb which HOST|URL` / `asb list` find the credential and its {{VAR}} names (no approval).
+- `asb http NAME METHOD URL -H 'Authorization: Bearer {{VAR}}'` makes the call; the value
+  never reaches you.
+- No credential covers the service: run `asb request-credential`. The human enters the
+  value; you never see it.
+- Every use asks the human to approve. A denial or timeout is final: stop and tell them
+  what you needed.
+- Run `asb guide` for the full manual.

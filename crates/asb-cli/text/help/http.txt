@@ -1,0 +1,15 @@
+usage: asb http NAME[,NAME] METHOD URL [-H 'K: V']... [-d BODY | -d @file | -d @-]
+                [--session ID | $ASB_SESSION | --plan ID | $ASB_PLAN] [--capture NAME=header:X|cookie:N|json:$.a.b]...
+
+The broker makes the HTTP call itself and replaces {{VAR}} in the URL, headers and
+body with the credential. Waits for the human's approval (up to ~5 min).
+Prints "HTTP <status>" on stderr and the response body on stdout; exit 22 if status >= 400.
+With --session ID the call runs inside an approved session (see `asb help session`): no new prompt,
+the broker keeps cookies, --capture saves a response value as {{session.NAME}}. One credential only.
+Preferred: export ASB_SESSION=ID once (it keeps the id out of the process list); the flag overrides it.
+Unset ASB_SESSION when the flow is over: while it is set every `asb http` is a session call.
+--plan ID (or ASB_PLAN=ID) makes the call under an approved plan instead (see `asb help plan`): no prompt if it
+matches a rule, refused (exit 8) if not, exit 7 if the plan is not usable, exit 9 to slow down. A call uses a
+session or a plan, never both.
+example: asb http grafana GET https://grafana.example.com/api/health \
+             -H 'Authorization: Bearer {{GRAFANA_TOKEN}}'

@@ -1,0 +1,6 @@
+usage: asb list [--json]
+
+List every credential the broker knows: NAME, the VAR placeholders it provides,
+and the hosts it may be used against. No approval needed, no values shown.
+--json gives [{"name", "vars", "allowed_hosts"}] for scripts.
+example: asb list --json

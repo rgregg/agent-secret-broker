@@ -1,0 +1,4 @@
+usage: asb update NAME [--var V]   < value
+
+Replace the value of an existing credential (asks for approval). Value on stdin.
+example: printf '%s' "$NEW" | asb update myapi

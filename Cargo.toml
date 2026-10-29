@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/asb-proto", "crates/asb-client", "crates/asb-root-exec"]
+members = ["crates/asb-proto", "crates/asb-client", "crates/asb-root-exec", "crates/asb-cli"]
 
 [workspace.package]
 version = "0.1.0"

@@ -1684,7 +1684,10 @@ class Masking(WsBase):
         sid = self.wopen()
         for piece in ("x HA-TOK", "EN-CANA", "RY-31337 y"):
             self.wsend(sid, "ECHO:" + piece)
-        blob = "".join(f["data"] for f in self.frames_until(sid, 1))
+        blob = ""
+        end = time.time() + 5
+        while "y" not in blob and time.time() < end:      # the broker may deliver "x " and "*** y" separately
+            blob += "".join(f["data"] for f in self.wrecv(sid, wait=1)[1]["frames"])
         self.assertEqual(blob, "x *** y")
 
     def test_a_secret_split_at_any_point_is_masked(self):

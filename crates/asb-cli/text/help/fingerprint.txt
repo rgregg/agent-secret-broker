@@ -1,0 +1,5 @@
+usage: asb fingerprint HOST[:PORT]
+
+Print a server certificate's sha256 (default port 443), for tls_fingerprint in a
+credential's metadata. Check it is the device you mean before trusting it.
+example: asb fingerprint 10.0.0.1:8443

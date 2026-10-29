@@ -1,0 +1,16 @@
+usage: asb guidance propose FILE|-
+       asb guidance propose --from-dir DIR
+       asb guidance status ID
+
+Propose per-credential risk guidance for the human to review. Guidance can lower
+the risk rating of requests made with a credential, so you can never set it: the
+human sees each entry beside the current text, ticks the ones to apply, and only
+those change. FILE is JSON, a list of {"name": ..., "text": ...} or
+{"entries": [...]} (- reads stdin); --from-dir reads DIR/NAME.txt, one file per
+credential. 1-25 entries, text up to 2000 characters, empty text proposes removing
+the guidance. Waits for the decision (the proposal lives about an hour), then prints
+"applied: ...", "denied: ..." and "failed: ..." (names only). Exit 0 if at least one
+entry was applied, 4 denied, 5 expired, 3 broker problem, 2 usage.
+`status ID` prints the same for a proposal you already sent (no approval); "pending"
+while the human has not decided. There is no command to read current guidance.
+example: asb guidance propose --from-dir ./guidance

@@ -200,7 +200,7 @@ class Claims(unittest.TestCase):
             self.assertEqual(asb.claimed_destination(shlex.split(cmd)), want, cmd)
 
     def test_control_characters_in_a_host_give_no_claim(self):
-        for host in ("h\nevil", "h\x1b[2J", "h<b>", "h;x", "h x", "-oFoo=bar", "h" * 1 + "\u202e"):
+        for host in ("h\nevil", "h\x1b[2J", "h<b>", "h;x", "h x", "-oFoo=bar", "h" * 1 + "\u202e", "h\n", "::1\n"):
             self.assertIsNone(asb.claimed_destination(["ssh", host]), repr(host))
 
     def test_garbage_does_not_raise(self):

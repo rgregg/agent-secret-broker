@@ -1,0 +1,15 @@
+usage: asb audit [--request ID] [--event E[,E]] [--secret NAME] [--since T]
+                 [--until T] [--source S] [--limit N] [--before SEQ | --after SEQ]
+                 [--json] [--tail]
+       asb audit verify
+
+Read the broker's audit log, redacted: events for your requests (requested,
+approved, denied, expired, failed, secret_read, http_executed, delivered, ...)
+with who decided and how it ended. Never shows risk, approval policy or values.
+No approval needed. T is ISO-8601 (2026-10-18T01:02:03Z) or relative: 90s 15m 2h 3d.
+--request ID shows one request's whole timeline. --limit defaults to 100 (max 500).
+--tail prints recent events then polls every 2s until Ctrl-C. --json prints the
+broker's response. `verify` checks the log's hash chain (exit 1 if it is broken).
+Exit 1 when nothing matches, 2 usage, 3 broker unreachable or refused.
+example: asb audit --request AbC123
+         asb audit --event failed --since 1h

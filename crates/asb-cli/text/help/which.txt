@@ -1,0 +1,5 @@
+usage: asb which HOST|URL
+
+Is a credential available for this host? Prints NAME <tab> VAR,VAR per match.
+No approval needed. Exit 1 (and a note on stderr) when nothing matches.
+example: asb which https://grafana.example.com/api/health

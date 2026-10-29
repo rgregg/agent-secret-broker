@@ -1,0 +1,4 @@
+# Tests that are EXPECTED to fail when the suite runs against the Rust `asb` (tools/run_tests_against_rust_cli.py).
+# Each is waiting for its command to be ported (docs/proposals/rust-cli.md). The runner fails on a failure that is not
+# listed here AND on a listed test that now passes, so this list can only shrink; when you port a command, delete its
+# tests from here. One module.Class.test per line; lines starting with # are ignored.
