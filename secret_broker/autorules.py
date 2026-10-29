@@ -30,6 +30,7 @@ What a rule can and cannot do:
 import re
 import urllib.parse
 
+from . import clients as clients_mod
 from . import sshrules
 from . import scripts as scripts_mod
 
@@ -39,7 +40,7 @@ MAX_RULES = 200
 MAX_NAME = 80
 KEYS = {
     "ssh_sign": {"name", "mode", "secret", "secrets", "clients", "host", "host_fp", "account"},
-    "http": {"name", "mode", "secret", "secrets", "clients", "host", "methods", "path_prefix"},
+    "http": {"name", "mode", "secret", "secrets", "clients", "scheme", "host", "methods", "path_prefix"},
     "env": {"name", "mode", "secret", "secrets", "clients", "argv"},
 }
 _SECRET = re.compile(r"[A-Za-z0-9_.-]{1,64}")
@@ -97,8 +98,11 @@ def parse(raw, field="auto_approve"):
         secrets = secrets or _strings(r, "secrets", where, max_n=20, max_len=64, required=True)
         if not all(_SECRET.fullmatch(s) for s in secrets):
             raise ValueError(f"{where}: secret names are letters, digits, '.', '_' and '-'")
-        rule = {"name": name, "mode": mode, "secrets": frozenset(secrets),
-                "clients": frozenset(_strings(r, "clients", where, max_n=50, max_len=64) or ())}
+        clients = _strings(r, "clients", where, max_n=50, max_len=64) or []
+        if not all(clients_mod.ID_RE.fullmatch(c) for c in clients):
+            raise ValueError(f"{where}.clients are client ids such as c-1a2b3c4d (see the Clients tab): "
+                             "a name can be reused by another client, an id cannot")
+        rule = {"name": name, "mode": mode, "secrets": frozenset(secrets), "clients": frozenset(clients)}
         if mode == "ssh_sign":
             host, fp = r.get("host"), r.get("host_fp")
             if (host is None) == (fp is None):
@@ -115,6 +119,9 @@ def parse(raw, field="auto_approve"):
             host = r.get("host")
             if not isinstance(host, str) or not _HOST.fullmatch(host.lower()):
                 raise ValueError(f"{where}.host is required (a host name, no scheme or port)")
+            scheme = r.get("scheme", "https")
+            if scheme not in ("https", "http"):
+                raise ValueError(f"{where}.scheme must be \"https\" (the default) or \"http\"")
             methods = _strings(r, "methods", where, max_n=10, max_len=10) or ["GET", "HEAD"]
             if not all(_METHOD.fullmatch(m) for m in methods):
                 raise ValueError(f"{where}.methods must be upper-case HTTP methods such as GET")
@@ -122,7 +129,7 @@ def parse(raw, field="auto_approve"):
             if not isinstance(prefix, str) or not prefix.startswith("/") or len(prefix) > 255 or "?" in prefix \
                     or re.search(r"[\x00-\x20\x7f]", prefix) or ".." in prefix.split("/"):
                 raise ValueError(f"{where}.path_prefix must start with '/' (a path, no query, no '..')")
-            rule.update(host=host.lower(), methods=frozenset(methods), path_prefix=prefix)
+            rule.update(host=host.lower(), scheme=scheme, methods=frozenset(methods), path_prefix=prefix)
         else:
             argv = r.get("argv")
             if (not isinstance(argv, list) or not argv or len(argv) > 64
@@ -145,7 +152,7 @@ def _client_ok(rule, client):
         return not (client or {}).get("legacy")
     if (client or {}).get("legacy"):
         return False
-    return (client or {}).get("id") in rule["clients"] or (client or {}).get("name") in rule["clients"]
+    return (client or {}).get("id") in rule["clients"]
 
 
 def _ssh_ok(rule, spec):
@@ -158,17 +165,32 @@ def _ssh_ok(rule, spec):
     return rule["host"] in names
 
 
+OVERRIDE_HEADERS = ("x-http-method-override", "x-method-override", "x-http-method")
+
+
 def _http_ok(rule, spec):
+    """Host, scheme, method and path are compared on the raw request as the broker will send it. Anything that
+    could make the server read a different method or path than the rule saw never matches: method-override
+    headers or parameters, a body on a read, and any percent-escape, `;` parameter, backslash or dot segment in
+    the path (a rule's path is plain text, so a plain path is all it matches)."""
     try:
         u = urllib.parse.urlsplit(spec["url"])
         host = (u.hostname or "").lower()
     except (KeyError, ValueError):
         return False
     method = str(spec.get("method") or "GET").upper()
-    path = urllib.parse.unquote(u.path or "/")
-    if ".." in path.split("/") or "\\" in path:      # dot segments could walk out of the prefix once the server resolves them
+    path = u.path or "/"
+    if u.scheme != rule["scheme"] or host != rule["host"] or method not in rule["methods"]:
         return False
-    return host == rule["host"] and method in rule["methods"] and _path_ok(path, rule["path_prefix"])
+    if re.search(r"[%;\\\x00-\x20\x7f]", path) or any(seg in (".", "..") for seg in path.split("/")):
+        return False
+    if any(str(h).lower() in OVERRIDE_HEADERS for h in (spec.get("headers") or {})):
+        return False
+    if re.search(r"(^|&)_method=", u.query, re.I):
+        return False
+    if method in ("GET", "HEAD") and (spec.get("body") or spec.get("body_b64")):
+        return False
+    return _path_ok(path, rule["path_prefix"])
 
 
 def _env_ok(rule, spec):

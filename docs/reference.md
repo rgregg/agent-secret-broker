@@ -1536,11 +1536,11 @@ by whoever runs the broker, that approve exactly the requests they describe:
 
     "auto_approve": [
       {"name": "reach openclaw", "mode": "ssh_sign", "secret": "agent-ssh",
-       "host": "openclaw-linux.lan", "account": "ryan", "clients": ["sheridan-dev-box"]},
+       "host": "openclaw-linux.lan", "account": "ryan", "clients": ["c-1a2b3c4d"]},
       {"name": "read komodo", "mode": "http", "secret": "komodo",
        "host": "komodo.local.dibbleapps.com", "methods": ["POST"], "path_prefix": "/read"},
       {"name": "nightly report", "mode": "env", "secret": "reports",
-       "argv": ["python3", "report.py"], "clients": ["batch-box"]}
+       "argv": ["python3", "report.py"], "clients": ["c-5e6f7a8b"]}
     ]
 
 A request that matches a rule is released at once, at any risk level and whatever the secret's `approval`
@@ -1558,12 +1558,13 @@ guess, and the message names the field, such as `auto_approve[2].host`):
 | `name` | all | Required, unique. What the audit log and the history show. |
 | `mode` | all | `ssh_sign`, `http` or `env`. |
 | `secret` or `secrets` | all | The credential name(s) the rule covers. A request naming anything else does not match. |
-| `clients` | all | Optional list of client names or ids. Leave it out for any enrolled client. The legacy shared key never matches. |
+| `clients` | all | Optional list of client **ids** (`c-1a2b3c4d`, shown in the Clients tab). Ids only: a name can be reused by another client, an id cannot. Leave it out for any enrolled client. The legacy shared key never matches. |
 | `host` / `host_fp` | ssh_sign | Exactly one. The server: a name the key's `ssh_hosts.known_hosts` gives the server's **verified** host key, or the `SHA256:` fingerprint itself. |
 | `account` | ssh_sign | Required. The login name. |
 | `host` | http | Required. The exact host name (no scheme or port). |
+| `scheme` | http | `https` (the default) or `http`. A request to the other scheme never matches. |
 | `methods` | http | Upper-case methods, default `["GET", "HEAD"]`. |
-| `path_prefix` | http | Default `/`. Matches that path and what is below it (`/v1` matches `/v1/x`, not `/v10`); a `..` segment never matches. |
+| `path_prefix` | http | Default `/`. Matches that path and what is below it (`/v1` matches `/v1/x`, not `/v10`). Compared on the raw path: a path with any `%` escape, `;`, backslash or `.`/`..` segment never matches. A request with a method-override header (`X-HTTP-Method-Override` and friends) or a `_method=` parameter, or a GET/HEAD with a body, never matches either. |
 | `argv` | env | The exact command as a list of words. A script whose text the broker could not read never matches. |
 
 What a rule will not do:

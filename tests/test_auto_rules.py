@@ -42,6 +42,9 @@ def ssh_rule(**kw):
     return {"name": "r", "mode": "ssh_sign", "secret": "deploy", "host": "web.example.com", "account": "deploy", **kw}
 
 
+BOX = "c-0a0b0c0d"
+
+
 class Parse(unittest.TestCase):
     def test_nothing_means_no_rules(self):
         self.assertEqual(autorules.parse(None), [])
@@ -49,7 +52,7 @@ class Parse(unittest.TestCase):
 
     def test_a_full_set_parses(self):
         rules = autorules.parse([
-            ssh_rule(clients=["box"]),
+            ssh_rule(clients=[BOX]),
             {"name": "h", "mode": "http", "secrets": ["a", "b"], "host": "API.Example.com", "methods": ["GET"],
              "path_prefix": "/v1"},
             {"name": "e", "mode": "env", "secret": "svc", "argv": ["python3", "send.py"]},
@@ -76,6 +79,10 @@ class Parse(unittest.TestCase):
             "not a list": ("auto_approve", {"name": "x"}),
             "not an object": ("auto_approve[0]", ["x"]),
             "no name": ("auto_approve[0].name", {"mode": "env", "secret": "a", "argv": ["x"]}),
+            "client by name": ("auto_approve[0].clients", {"name": "x", "mode": "env", "secret": "a", "argv": ["x"],
+                                                          "clients": ["sheridan-dev-box"]}),
+            "http bad scheme": ("auto_approve[0].scheme", {"name": "x", "mode": "http", "secret": "a",
+                                                           "host": "h.example.com", "scheme": "ftp"}),
             "unknown key": ("auto_approve[0].path", {"name": "x", "mode": "env", "secret": "a", "argv": ["x"],
                                                      "path": "/"}),
             "both secret forms": ("auto_approve[0]", {"name": "x", "mode": "env", "secret": "a", "secrets": ["a"],
@@ -112,7 +119,7 @@ class Parse(unittest.TestCase):
 
 
 class Match(unittest.TestCase):
-    CLIENT = {"id": "c-1", "name": "box", "legacy": False}
+    CLIENT = {"id": BOX, "name": "box", "legacy": False}
 
     def rules(self, *r):
         return autorules.parse(list(r))
@@ -120,14 +127,23 @@ class Match(unittest.TestCase):
     def test_http_matches_host_method_and_path_prefix_exactly(self):
         rules = self.rules({"name": "h", "mode": "http", "secret": "a", "host": "api.example.com",
                             "methods": ["GET", "POST"], "path_prefix": "/v1"})
-        find = lambda method, url, names=("a",): autorules.find(  # noqa: E731
-            rules, "http", list(names), {"method": method, "url": url}, self.CLIENT)
+        find = lambda method, url, names=("a",), **spec: autorules.find(  # noqa: E731
+            rules, "http", list(names), {"method": method, "url": url, **spec}, self.CLIENT)
         self.assertIsNotNone(find("GET", "https://API.example.com/v1"))
         self.assertIsNotNone(find("POST", "https://api.example.com/v1/things?x=1"))
         self.assertIsNone(find("DELETE", "https://api.example.com/v1/things"))
         self.assertIsNone(find("GET", "https://api.example.com/v10"))          # not a path-segment prefix
         self.assertIsNone(find("GET", "https://api.example.com/v1/../admin"))
         self.assertIsNone(find("GET", "https://api.example.com/v1/%2e%2e/admin"))
+        self.assertIsNone(find("GET", "https://api.example.com/v1/a%2fb"))        # any escape: the plain path only
+        self.assertIsNone(find("GET", "https://api.example.com/v1;x=1/y"))
+        self.assertIsNone(find("GET", "https://api.example.com/v1/./y"))
+        self.assertIsNone(find("GET", "https://api.example.com/v1\\..\\admin"))
+        self.assertIsNone(find("GET", "http://api.example.com/v1"))               # plain http: the rule says https
+        self.assertIsNone(find("POST", "https://api.example.com/v1", headers={"X-HTTP-Method-Override": "DELETE"}))
+        self.assertIsNone(find("POST", "https://api.example.com/v1?_method=DELETE"))
+        self.assertIsNone(find("GET", "https://api.example.com/v1", body="x"))    # a read with a body is not a read
+        self.assertIsNotNone(find("POST", "https://api.example.com/v1", body="x"))
         self.assertIsNone(find("GET", "https://other.example.com/v1"))
         self.assertIsNone(find("GET", "https://api.example.com.evil.net/v1"))
         self.assertIsNone(find("GET", "https://api.example.com/v1", names=("a", "b")))   # b is not covered
@@ -144,13 +160,16 @@ class Match(unittest.TestCase):
     def test_clients_limit_a_rule_and_the_legacy_key_never_matches(self):
         spec = {"argv": ["echo"]}
         open_rule = self.rules({"name": "e", "mode": "env", "secret": "a", "argv": ["echo"]})
-        scoped = self.rules({"name": "e", "mode": "env", "secret": "a", "argv": ["echo"], "clients": ["box", "c-9"]})
+        scoped = self.rules({"name": "e", "mode": "env", "secret": "a", "argv": ["echo"],
+                             "clients": [BOX, "c-99999999"]})
         legacy = {"id": "legacy", "name": "legacy", "legacy": True}
         self.assertIsNotNone(autorules.find(open_rule, "env", ["a"], spec, self.CLIENT))
         self.assertIsNone(autorules.find(open_rule, "env", ["a"], spec, legacy))
         self.assertIsNotNone(autorules.find(scoped, "env", ["a"], spec, self.CLIENT))
-        self.assertIsNotNone(autorules.find(scoped, "env", ["a"], spec, {"id": "c-9", "name": "z", "legacy": False}))
-        self.assertIsNone(autorules.find(scoped, "env", ["a"], spec, {"id": "c-2", "name": "other", "legacy": False}))
+        self.assertIsNotNone(autorules.find(scoped, "env", ["a"], spec,
+                                            {"id": "c-99999999", "name": "z", "legacy": False}))
+        self.assertIsNone(autorules.find(scoped, "env", ["a"], spec,
+                                         {"id": "c-22222222", "name": "box", "legacy": False}))   # same name, other id
         self.assertIsNone(autorules.find(scoped, "env", ["a"], spec, legacy))
 
 
@@ -247,7 +266,8 @@ class HttpRules(Enrolled, t.Harness):
         super().setUp()
         self.port = self.up.server_address[1]
         self.broker.auto_rules = autorules.parse([
-            {"name": "reads", "mode": "http", "secret": "svc", "host": "127.0.0.1", "path_prefix": "/x"}])
+            {"name": "reads", "mode": "http", "secret": "svc", "scheme": "http", "host": "127.0.0.1",
+             "path_prefix": "/x", "clients": [self.client.id]}])
 
     def call(self, method="GET", path="/x"):
         code, body = self.api("POST", "/v1/requests", {
