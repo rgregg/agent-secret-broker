@@ -173,13 +173,10 @@ OVERRIDE_HEADERS = ("x-http-method-override", "x-method-override", "x-http-metho
 
 
 def _names_a_method_override(text):
-    """True when a query string or form body carries a `_method` parameter (frameworks read it as the method),
-    however it is escaped or separated (`&` or `;`)."""
-    for part in re.split(r"[&;]", text):
-        name = urllib.parse.unquote_plus(part.split("=", 1)[0]).strip().strip('"').lower()
-        if name == "_method":
-            return True
-    return "_method" in urllib.parse.unquote_plus(text).lower()
+    """True when a query string or body mentions "method" at all once decoded. Frameworks read `_method`,
+    `.method`, `[method]` and similar as the HTTP method, in spellings no list of tricks keeps up with, so a
+    rule-matched request does not mention it anywhere: a rule cannot vouch for it, and a person decides."""
+    return "method" in urllib.parse.unquote_plus(text).lower()
 
 
 def _not_plain(text):
@@ -210,6 +207,9 @@ def _http_ok(rule, spec):
         return False
     if any(str(h).lower() in ("content-encoding", "transfer-encoding") for h in (spec.get("headers") or {})):
         return False                    # a body the broker cannot read as sent
+    if any(str(h).lower() == "content-type" and "multipart" in str(v).lower()
+           for h, v in (spec.get("headers") or {}).items()):
+        return False                    # parts with their own headers and names: not something a rule can read
     if _names_a_method_override(u.query) or _not_plain(u.query):
         return False
     body = spec.get("body")

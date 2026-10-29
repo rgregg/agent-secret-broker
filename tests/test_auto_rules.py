@@ -156,6 +156,13 @@ class Match(unittest.TestCase):
         self.assertIsNone(find("POST", "https://api.example.com/v1?%255fmethod=DELETE"))
         self.assertIsNone(find("POST", "https://api.example.com/v1", body="caf\u00e9"))                    # not plain ASCII
         self.assertIsNone(find("POST", "https://api.example.com/v1", headers={"Content-Encoding": "gzip"}, body="x"))
+        for text in ("x.method=DELETE", "x[method]=DELETE", "METHOD=DELETE", "%5F%4Dethod=DELETE"):
+            self.assertIsNone(find("POST", "https://api.example.com/v1", body=text), text)
+            self.assertIsNone(find("POST", "https://api.example.com/v1?" + text), text)
+        self.assertIsNone(find("POST", "https://api.example.com/v1", body="x",
+                               headers={"Content-Type": "multipart/form-data; boundary=zz"}))
+        self.assertIsNotNone(find("POST", "https://api.example.com/v1?q=a%20b", body="a=1&b=2",
+                                  headers={"Content-Type": "application/x-www-form-urlencoded"}))
         self.assertIsNotNone(find("POST", "https://api.example.com/v1?q=a%20b", body="a=1&b=2"))   # ordinary escapes are fine
         self.assertIsNone(find("GET", "https://api.example.com/v1", body="x"))    # a read with a body is not a read
         self.assertIsNotNone(find("POST", "https://api.example.com/v1", body="x"))
