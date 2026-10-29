@@ -1,8 +1,8 @@
 """Request mode `sudo`: a root helper asks the broker before running a command as root.
 
-The properties: off by default and only for clients on `sudo.clients`; always HIGH by code with
-no model call; decided only by a human on the approval page (never a policy, grant, Always or
-notification button); the approval carries no value, only {"approved": true}, delivered once;
+The properties: off by default and only for clients on `sudo.clients`; always HIGH by code
+whatever a model says about its description; decided only by a human on the approval page (never a policy, grant,
+Always or notification button); the approval carries no value, only {"approved": true}, delivered once;
 the audit log keeps the command's words and nothing else.
 """
 import _fast  # noqa: F401  (test-only: prompt server shutdown, fake-clock helpers)
@@ -28,11 +28,13 @@ from secret_broker.notify import FakeNotifier  # noqa: E402
 ARGV = ["/usr/bin/systemctl", "restart", "nginx"]
 
 
-class NoModel:
-    """An analyzer that must never be asked about a root command."""
+class LowRatingModel:
+    """An analyzer that describes the command and rates it LOW: the description is kept, the rating is not."""
 
-    def analyze(self, *a, **k):
-        raise AssertionError("a sudo request must not reach a model")
+    def analyze(self, mode, names, spec, guidance=None):
+        self.modes = getattr(self, "modes", []) + [mode]
+        return {"summary": "Restarts the nginx service", "risk": "low", "cost": None, "summary_source": "model",
+                "summary_reason": None, "summary_rule": None, "summary_model": "test-model"}
 
     summarize = analyze
 
@@ -44,7 +46,7 @@ class SudoBase(ClientMixin, tg.Base):
         super().setUp()
         self.helper = self.mk("root-helper")
         self.other = self.mk("someone-else")
-        self.broker.summarizer = NoModel()
+        self.broker.summarizer = LowRatingModel()
         self.enable()
 
     def enable(self, **kw):
@@ -88,12 +90,12 @@ class Sudo(SudoBase):
         self.assertEqual(self.notifier.sent, [])
         self.assertTrue(self.events("rejected"))
 
-    def test_high_risk_no_model_and_no_auto_approval(self):
+    def test_high_risk_whatever_the_model_says_and_no_auto_approval(self):
         rid = self.pending()
         self.assertEqual(self.result_now(rid)["status"], "pending")
         a = self.events("assessed")[-1]
         self.assertEqual(a["risk"], "high")
-        self.assertIsNone(a["model"])
+        self.assertEqual(a["model"], "low")
         self.assertEqual(self.events("approved"), [])
         self.assertEqual(len(self.notifier.sent), 1)
 
@@ -101,6 +103,7 @@ class Sudo(SudoBase):
         self.pending()
         n = self.notifier.notifications[0]
         self.assertIn("systemctl restart nginx", n.text)
+        self.assertIn("Restarts the nginx service (unverified)", n.text)
         self.assertEqual(n.actions, [])
         self.assertIsNone(n.action_token)
 
