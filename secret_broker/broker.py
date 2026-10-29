@@ -2097,7 +2097,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             msg = f"{what}\nOpen the approval page to read the plan and approve or deny it."
             title = "Plan requested"
         elif req.mode == "sudo":        # the command is the point; the card has the rest. No buttons below.
-            msg = f"{head}{what}\nFrom {req.source}. Open the approval page to read it and approve or deny."
+            msg = f"{what}\n{head}From {req.source}. Open the approval page to read it and approve or deny."
             title = "Root command requested [HIGH]"
         elif req.mode == "session":     # no purpose (untrusted agent text); the card has everything
             msg = f"{what}\nFrom {req.source}. Open the approval page to review and approve or deny."

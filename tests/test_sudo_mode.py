@@ -104,6 +104,7 @@ class Sudo(SudoBase):
         n = self.notifier.notifications[0]
         self.assertIn("systemctl restart nginx", n.text)
         self.assertIn("Restarts the nginx service (unverified)", n.text)
+        self.assertLess(n.text.index("systemctl restart nginx"), n.text.index("Restarts the nginx"))   # command first
         self.assertEqual(n.actions, [])
         self.assertIsNone(n.action_token)
 
