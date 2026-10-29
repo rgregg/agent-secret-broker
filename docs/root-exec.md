@@ -1,7 +1,7 @@
 # Running commands as root with approval (`asb sudo`, `asb-root-exec`)
 
 An agent that needs root runs `asb sudo -- COMMAND ARGS...`. A small compiled helper, `asb-root-exec`,
-asks the broker; you read the exact command on your phone; only if you approve does the helper run it.
+asks the broker; you read the exact command; only if you approve does the helper run it.
 No account password exists anywhere. The design and what it does not protect against are in
 [proposals/root-exec.md](proposals/root-exec.md); the broker's side (request mode `sudo`) is in
 [reference.md](reference.md#root-commands-request-mode-sudo-proposal-docsproposalsroot-execmd).
@@ -77,15 +77,15 @@ own request or replay an old one. If the broker is down, denies, or does not ans
    This is the only passwordless rule needed. Do not add `SETENV`, and do not allow arguments to be
    edited by wildcards: the helper takes the whole command after `--`.
 
-5. **Try it.** With `/usr/bin/id` in `allow`, `asb sudo -- /usr/bin/id` should send a card to your phone;
+5. **Try it.** With `/usr/bin/id` in `allow`, `asb sudo -- /usr/bin/id` should send an approval card;
    approve it and it prints `uid=0(root)...`; deny it and it exits 4. A program that is not allowed is refused
-   at once (exit 10) without sending anything to your phone.
+   at once (exit 10) without sending anything for approval.
 
 ## What the helper does and refuses
 
 - Runs only programs the admin allowed (`allow` in `/etc/secret-broker/root-exec.json`, or `"mode": "allow_all"`).
   The check is on the resolved real file and happens before the broker is asked, so a disallowed command never
-  reaches your phone.
+  reaches the approver.
 - Resolves the command's first word before asking, and shows you the **file that will actually run**:
   symlinks are followed first, so a link in a place the agent can write (`~/ls` pointing at `/bin/rm`)
   appears as `/bin/rm`, never as `ls`. That path is also the process's `argv[0]`, so multi-call binaries
@@ -152,9 +152,9 @@ but the command could not be started.
 
 `tests/e2e_root_exec/run.sh` builds a throwaway container (Debian, real root and sudo, an unprivileged `agent` user),
 installs the helper root-owned with the one sudoers rule, starts the real broker in it, and drives the real `asb`
-client as `agent`. The "phone" approves or denies through the approval page's HTTP endpoint. It checks, among other
+client as `agent`. A simulated approver approves or denies through the approval page's HTTP endpoint. It checks, among other
 things, that an approved command runs as uid 0, a denial runs nothing, a program not on the allow-list never reaches
-the phone, the agent cannot read the helper's key or use sudo for anything else, and a script the agent wrote is
+the approver, the agent cannot read the helper's key or use sudo for anything else, and a script the agent wrote is
 refused. Nothing on your machine changes: no host mounts, not privileged, no Docker socket, and the container is
 removed afterwards. CI runs the same driver on a disposable runner. The driver edits `/etc` and creates a user, so
 it refuses to start unless `ASB_E2E_DISPOSABLE=1`, which only the container and CI set.

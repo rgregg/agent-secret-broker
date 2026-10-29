@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""asb: ask the broker for a secret, wait for phone approval, use it.
+"""asb: ask the broker for a secret, wait for approval, use it.
 
   asb NAME[,NAME2] -- command args...         run with secrets in the env
   asb sudo -- command args...                 run as root through the root helper; a human approves the exact command
@@ -73,7 +73,7 @@ GUIDE = """asb guide (for agents)
 
 Use this instead of reading credential files. Real values never reach you: the
 broker adds them to the call, and output is masked (set-cookie headers are removed; use a session for cookie flows). Every use asks the human to
-approve on their phone (a few secrets are pre-approved; low-risk ones may be too).
+approve it (a few secrets are pre-approved; low-risk ones may be too).
 
 No credential for it yet? If `asb which HOST` / `asb list` show nothing that covers the
 service, do NOT ask the human to paste a secret into chat, look for one on disk, or
@@ -197,7 +197,7 @@ Asking the human for a credential you do not have (you never see the value)
   asb request-credential myapi --kind token --for "read the Example API for the report" \\
       --host api.example.com
   asb request-credential mysite --kind login --for "log in to the admin portal" --host admin.example.com
-  The human gets a card on the approval page (and a phone notification with just the name),
+  The human gets a card on the approval page (and a notification with just the name),
   types the secret there, can edit the name, hosts, variable and mode, and presses Store.
   The broker stores it with approval on every use. You get only the stored name; then use it
   as usual (asb list shows its variables): asb http NAME GET https://... -H 'Authorization: Bearer {{VAR}}'.
@@ -392,7 +392,7 @@ example: asb session open unifi --for "read stats and rename a client" --host un
 
 Run a command as root through the installed root helper (asb-root-exec). The helper only runs programs its
 admin put on its allow-list (refused at once, exit 10, otherwise). It asks the broker, you approve the exact
-command on your phone, and only then does it run. No password exists anywhere. The command runs with a clean
+command, and only then does it run. No password exists anywhere. The command runs with a clean
 environment and a fixed PATH, in the current directory; the file it runs must be root-owned and not writable by
 others. For an interpreter (bash, python3, perl, ...) only two forms are accepted: `bash SCRIPT [args]` with
 SCRIPT first and root-owned (a script in your home directory is refused: copy it somewhere root owns), or

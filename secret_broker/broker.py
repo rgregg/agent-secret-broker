@@ -7,7 +7,7 @@ The approval nonce exists only in the push URL. It is never returned to the
 client, which gets an opaque request id to poll with.
 
 Per-secret policy (`approval` in config):
-  prompt  every use needs a phone approval (default)
+  prompt  every use needs an approval (default)
   allow   released without a prompt, but only for modes in `auto_modes`
           (default `risk.auto_modes`, ["http", "env"]; an SSH key defaults to
           ["ssh_sign"]). An env request whose script text is not visible always prompts.
@@ -1474,7 +1474,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         self._retain_details(req)
         if mode == "sudo":
             return self._sudo_pending(req)      # no vault, no model, no policy: a human decides
-        # unlock while the human is reaching for their phone (a backend that cannot
+        # unlock while the human is reaching to approve (a backend that cannot
         # or should not do this does not declare "warm")
         self.warm_backend()
         if mode == "guidance":
@@ -2203,7 +2203,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             req.action_hash = None
         self._finish(req, "failed", error="could not notify")
 
-    # -- presence: hold phone notifications while an approval page is open ----
+    # -- presence: hold push notifications while an approval page is open ----
     # Every request is treated alike (SSH signing and high risk included): while
     # the approver is looking at the page, a buzz adds nothing. A held
     # notification is released when presence lapses or `fallback_s` after the

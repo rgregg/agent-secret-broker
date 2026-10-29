@@ -547,7 +547,7 @@ chooses.
 
 Per secret in the broker config:
 
-    "approval": "prompt"        # default: every use needs a phone approval
+    "approval": "prompt"        # default: every use needs an approval
     "approval": "allow"         # no prompt for web and run-with-secret (env) requests; see auto_modes
     "allowed_hosts": ["api.example.com"]
 
@@ -932,13 +932,13 @@ own authentication (SSO header, CSRF/origin, `X-Requested-With`):
 
 ### Home Assistant action buttons (`ha_hook`)
 
-Approve/Deny buttons on the iPhone `ticker.notify` notification (Home Assistant
+Approve/Deny buttons on the `ticker.notify` push notification (Home Assistant
 companion app actionable notifications). Tapping one makes Home Assistant call
 the broker, so nothing is opened. Config:
 
     "ha_hook": {
       "key_file": "/run/secrets/asb_hook_key",   // or "key": "..." (tests); >= 32 chars
-      "allowed_devices": ["phone-1"]             // optional
+      "allowed_devices": ["device-1"]             // optional
     }
 
 - Without `ha_hook` the endpoint answers 404 and the ticker transport carries
@@ -974,7 +974,7 @@ Endpoint, on the client listener (the port agents use):
 
     POST /v1/hooks/ha/decide
     Authorization: Bearer <hook key>
-    {"rid": "...", "token": "...", "decision": "approve|deny", "device": "phone-1"}
+    {"rid": "...", "token": "...", "decision": "approve|deny", "device": "device-1"}
 
 `device` is optional (empty = absent), max 64 chars of `A-Za-z0-9_.:-`. Body cap 2 KB. Status:
 200 `{"ok": true, "decision": ...}` decided; 400 malformed; 403 bad or missing
@@ -1087,7 +1087,7 @@ the usual rules allow it, an **Automatically approve...** row of **5 min / 15 mi
 confirmation first), and below it the most recent decisions as a list. A
 history row opens a pop-over with everything recorded for that request (see
 [Request history](#request-history)); **Search and filter all history** expands
-the same list in place. It is for when the phone is out of reach: open the site, sign in
+the same list in place. It is for when you cannot approve from a notification: open the site, sign in
 through your SSO, decide. New requests appear within a few seconds, the tab
 title shows how many are waiting, and with scripting disabled the same forms
 still work as ordinary page loads.
@@ -1256,7 +1256,7 @@ the same panel; **Send a test push** checks the whole path.
   in `requirements.txt` and installed in the image).
 - A push can only reach a browser that is running. With the browser fully quit
   the push service holds the message (until its TTL, 5 minutes) and delivers it
-  when the browser next starts. For "nothing is running", keep a phone transport
+  when the browser next starts. For "nothing is running", keep a second transport
   such as the Home Assistant ticker configured alongside. To receive pushes with
   no window open, let the browser run in the background (Chrome: Settings >
   System > "Continue running background apps when Google Chrome is closed") and
@@ -1327,7 +1327,7 @@ and rely on the audit log: every push decision is recorded with the SSO user.
 
 ### Holding notifications while a page is open (`notify_presence`)
 
-If you are looking at an approval page, a phone buzz adds nothing. While at least
+If you are looking at an approval page, a push notification adds nothing. While at least
 one approval tab is visible, the broker holds the configured transports back and
 the request simply appears on the page (cards refresh as usual).
 
@@ -1430,7 +1430,7 @@ state is kept in the URL (`/?view=all&q=...`), and the live poll refreshes the
 list with it. `/history` redirects to `/?view=all`.
 
 Each row is a button. Selecting it (click, Enter or Space) opens a modal
-pop-over (a bottom sheet on phones; Escape, the backdrop or **Close** dismisses
+pop-over (a bottom sheet on small screens; Escape, the backdrop or **Close** dismisses
 it and focus returns to the row) loaded from `GET /request/<id>?fragment=1`
 (same SSO gate and identity check as the other pages). It shows the request id,
 secrets, mode, the request as recorded (URL without query, the env command
@@ -1830,7 +1830,7 @@ entry (open for up to 5 entries, collapsed beyond that):
 
 - the credential name, the character count and flag pills in the summary;
 - the **current** guidance (or "none") and the **proposed** text side by side on a wide
-  screen, stacked on a phone, with a deterministic line diff (removed lines red, added
+  screen, stacked on a small screen, with a deterministic line diff (removed lines red, added
   lines green, unchanged lines plain), all HTML-escaped;
 - a visible **Flagged:** note when the proposed text contains a phrase that looks like
   lowering a rating or steering the classifier (case-insensitive, whole words): `always low`,
@@ -1981,7 +1981,7 @@ the whole result.
 
 ## Plans (task-scoped grants for unattended jobs)
 
-An unattended or long job (an overnight sync, a multi-step task while nobody is at the phone) can make
+An unattended or long job (an overnight sync, a multi-step task while nobody is there to approve) can make
 exactly the calls it declared up front, after a human approved the whole list once. The alternative is
 one tap per call, or `approval: allow`, where the risk model is the only gate and the model reads text the
 agent controls. A plan replaces that with a **deterministic match against a manifest a human read**. No
@@ -2536,7 +2536,7 @@ The vault is not kept open (the local backend drops its decrypted contents after
 kept for `idle_timeout` seconds (default 300) after its last use, then logged
 out (`backend_closed` in the audit log). With `prewarm` (default true) it is
 unlocked when a request is *created*, so the slow login/unlock overlaps with the
-human picking up their phone; a run of approvals within the window is fast.
+human reaching to approve; a run of approvals within the window is fast.
 Nothing is released before approval either way.
 
 Mount a persistent directory for the CLI's state (`BITWARDENCLI_APPDATA_DIR`,
@@ -2614,7 +2614,7 @@ asks `"name" in backend.capabilities` (it never probes attributes).
 | `set_meta` | `set_meta` works | Always-allow, standing approvals, SSH rules and hosts, guidance edits. |
 | `create_login` | `create_login(item, username, password, uri=None, notes=None, meta=None)` | `restructure` (real username/password/URL fields). |
 | `edit_item` | `edit_item(item, new_name=None, meta=None, drop_meta=False)` | `restructure`; rename or replace/remove metadata. |
-| `warm` | `warm()` | Unlock ahead of the first read, in the background, while a human picks up the phone. A backend whose `prewarm` setting is off omits it. |
+| `warm` | `warm()` | Unlock ahead of the first read, in the background, while a human reaches to approve. A backend whose `prewarm` setting is off omits it. |
 | `on_event` | `backend.on_event = fn` | Audit hook `fn(name, **fields)`; fields are names, counts and reasons only. A raising callback is ignored. |
 | `adopts` | `catalog()` returns adopted rows | Items without metadata become credentials with safe defaults. |
 | `export_items` | `export_items() -> list[Item]` | Migration: every login/note/ssh_key in scope WITH values (treat as secret). |

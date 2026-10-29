@@ -1,4 +1,4 @@
-"""Approver presence: hold phone notifications while an approval page is open.
+"""Approver presence: hold push notifications while an approval page is open.
 
 The approval pages send a small heartbeat (`POST /presence`) while the tab is
 visible. This module keeps the last-seen state per user and per tab, in

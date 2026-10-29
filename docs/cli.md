@@ -92,11 +92,11 @@ Check it:
 - `NAME -- command` (env mode) hands the value to a command on the agent's host.
   The broker cannot check what the command does with it. If the credential is
   `approval: allow` (and not limited to `auto_modes: ["http"]`) and the request
-  rates within `risk.auto_approve_max`, it runs without a phone prompt, and the
+  rates within `risk.auto_approve_max`, it runs without a prompt, and the
   plaintext value is released to this machine; a script that cannot be read or
   comes from stdin always asks. A standing approval (Always or timed) can cover it too.
 - `asb sudo -- command` runs the command as root through the compiled helper `asb-root-exec`, which asks the
-  broker itself. You approve the exact command on your phone, the helper runs only programs its admin put on its
+  broker itself. You approve the exact command, the helper runs only programs its admin put on its
   allow-list, and no password exists anywhere. Install, the allow-list and what it refuses:
   [root-exec.md](root-exec.md).
 - **Scripts are shown to you.** For `NAME -- command`, `asb` looks for the script
@@ -200,7 +200,7 @@ A plan approves an exact list of calls for an unattended job; a session (below) 
     asb plan list [--json]                  this client's plans
     asb plan close ID                       abandon your own plan early
 
-For a job that runs with nobody at the phone: the agent writes a manifest of the calls it will make, you
+For a job that runs with nobody there to approve: the agent writes a manifest of the calls it will make, you
 read a rendering of every rule once and approve the whole plan (for a duration you may shorten), and calls
 that match a rule then run with no prompt until the deadline. A call that does not match is **refused**
 (exit 8, with a reason class such as `no_rule` and `why: path`), never turned into a prompt; making it
