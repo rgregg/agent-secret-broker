@@ -1564,7 +1564,7 @@ guess, and the message names the field, such as `auto_approve[2].host`):
 | `host` | http | Required. The exact host name (no scheme or port). |
 | `scheme` | http | `https` (the default) or `http`. A request to the other scheme never matches. |
 | `methods` | http | Upper-case methods, default `["GET", "HEAD"]`. |
-| `path_prefix` | http | Default `/`. Matches that path and what is below it (`/v1` matches `/v1/x`, not `/v10`). Compared on the raw path: a path with any `%` escape, `;`, backslash or `.`/`..` segment never matches. A request with a method-override header (`X-HTTP-Method-Override` and friends) or a `_method=` parameter, or a GET/HEAD with a body, never matches either. |
+| `path_prefix` | http | Default `/`. Matches that path and what is below it (`/v1` matches `/v1/x`, not `/v10`). Compared on the raw path: a path with any `%` escape, `;`, backslash or `.`/`..` segment never matches. A request with a method-override header (`X-HTTP-Method-Override` and friends) or a `_method=` parameter, or a GET/HEAD with a body, never matches either; the same goes for the path-rewrite headers (`X-Original-URL`, `X-Rewrite-URL`, ...) and a `_method` parameter in the query or the body. These are best-effort: no list of tricks is complete, so keep an http rule to the narrowest host, methods and path the job needs (reads where you can). |
 | `argv` | env | The exact command as a list of words. A script whose text the broker could not read never matches. |
 
 What a rule will not do:

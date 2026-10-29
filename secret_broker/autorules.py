@@ -27,6 +27,7 @@ What a rule can and cannot do:
     fingerprint, or by a name the key's `known_hosts` gives that verified fingerprint), never by what the client
     claimed; an env request whose script text nobody could read never matches.
 """
+import base64
 import re
 import urllib.parse
 
@@ -165,7 +166,20 @@ def _ssh_ok(rule, spec):
     return rule["host"] in names
 
 
-OVERRIDE_HEADERS = ("x-http-method-override", "x-method-override", "x-http-method")
+OVERRIDE_HEADERS = ("x-http-method-override", "x-method-override", "x-http-method", "x-original-method",
+                    "x-forwarded-method",                       # a different method than the one the rule saw
+                    "x-original-url", "x-rewrite-url", "x-original-uri", "x-forwarded-uri",
+                    "x-forwarded-path")                         # a different path than the one the rule saw
+
+
+def _names_a_method_override(text):
+    """True when a query string or form body carries a `_method` parameter (frameworks read it as the method),
+    however it is escaped or separated (`&` or `;`)."""
+    for part in re.split(r"[&;]", text):
+        name = urllib.parse.unquote_plus(part.split("=", 1)[0]).strip().strip('"').lower()
+        if name == "_method":
+            return True
+    return "_method" in urllib.parse.unquote_plus(text).lower()
 
 
 def _http_ok(rule, spec):
@@ -186,7 +200,15 @@ def _http_ok(rule, spec):
         return False
     if any(str(h).lower() in OVERRIDE_HEADERS for h in (spec.get("headers") or {})):
         return False
-    if re.search(r"(^|&)_method=", u.query, re.I):
+    if _names_a_method_override(u.query):
+        return False
+    body = spec.get("body")
+    if spec.get("body_b64"):
+        try:
+            body = base64.b64decode(spec["body_b64"], validate=True).decode("latin-1")
+        except (ValueError, TypeError):
+            return False                # a body that cannot be read cannot be shown to be free of an override
+    if isinstance(body, str) and _names_a_method_override(body):
         return False
     if method in ("GET", "HEAD") and (spec.get("body") or spec.get("body_b64")):
         return False

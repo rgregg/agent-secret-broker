@@ -143,6 +143,15 @@ class Match(unittest.TestCase):
         self.assertIsNone(find("GET", "http://api.example.com/v1"))               # plain http: the rule says https
         self.assertIsNone(find("POST", "https://api.example.com/v1", headers={"X-HTTP-Method-Override": "DELETE"}))
         self.assertIsNone(find("POST", "https://api.example.com/v1?_method=DELETE"))
+        self.assertIsNone(find("POST", "https://api.example.com/v1?a=1;_method=DELETE"))
+        self.assertIsNone(find("POST", "https://api.example.com/v1?%5Fmethod=DELETE"))
+        self.assertIsNone(find("POST", "https://api.example.com/v1", body="a=1&_method=DELETE"))
+        self.assertIsNone(find("POST", "https://api.example.com/v1", body='{"_method": "DELETE"}'))
+        self.assertIsNone(find("POST", "https://api.example.com/v1", body_b64="X21ldGhvZD1ERUxFVEU="))   # _method=DELETE
+        self.assertIsNone(find("POST", "https://api.example.com/v1", body_b64="***not base64***"))
+        for h in ("X-Original-URL", "X-Rewrite-URL", "x-forwarded-path", "X-Forwarded-Method"):
+            self.assertIsNone(find("POST", "https://api.example.com/v1", headers={h: "/admin"}), h)
+        self.assertIsNotNone(find("POST", "https://api.example.com/v1?q=a%20b", body="a=1&b=2"))   # ordinary escapes are fine
         self.assertIsNone(find("GET", "https://api.example.com/v1", body="x"))    # a read with a body is not a read
         self.assertIsNotNone(find("POST", "https://api.example.com/v1", body="x"))
         self.assertIsNone(find("GET", "https://other.example.com/v1"))
