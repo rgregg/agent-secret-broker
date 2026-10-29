@@ -83,6 +83,45 @@ jobs:
           sudo env "PATH=$PATH" ASB_E2E_DISPOSABLE=1 ASB_E2E_HELPER="$PWD/target/release/asb-root-exec"
           "$(which python)" tests/e2e_root_exec/driver.py
 
+  # Release builds of the `asb` binary, one native build per platform (no cross-compiling: each runner builds and
+  # smoke-runs its own binary). Each artifact is a tar.gz with a .sha256 beside it. Windows is not here: the CLI uses
+  # Unix sockets, termios and file modes, so it does not build there yet.
+  cli-binaries:
+    name: asb (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-amd64, runner: ubuntu-latest }
+          - { name: linux-arm64, runner: ubuntu-24.04-arm }
+          - { name: macos-arm64, runner: macos-latest }
+          - { name: macos-amd64, runner: macos-13 }
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-cli-${{ matrix.name }}-${{ hashFiles('Cargo.lock') }}
+      - run: cargo build --release --locked -p asb-cli
+      - name: smoke test
+        run: ./target/release/asb help > /dev/null
+      - name: package
+        run: |
+          mkdir -p dist
+          tar -C target/release -czf "dist/asb-${{ matrix.name }}.tar.gz" asb
+          cd dist && { sha256sum "asb-${{ matrix.name }}.tar.gz" 2>/dev/null || shasum -a 256 "asb-${{ matrix.name }}.tar.gz"; } > "asb-${{ matrix.name }}.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: asb-${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+
   # The existing test-suite, unmodified, against the Rust `asb` (see docs/proposals/rust-cli.md). It fails on a failing
   # test that is not in tests/rust_cli_known_gaps.txt, and on a listed test that now passes, so the list only shrinks.
   rust-cli-parity:
