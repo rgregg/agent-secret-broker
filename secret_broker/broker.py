@@ -53,6 +53,7 @@ from . import guidance as guidance_mod
 from . import proposals as proposals_mod
 from . import credreq as credreq_mod
 from . import sudomode as sudo_mod
+from . import autorules as autorules_mod
 from . import clients as clients_mod
 from . import clock as clock_mod
 from . import plans as plans_mod
@@ -307,6 +308,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         self.proposals_cfg = proposals_mod.parse_config(config.get("guidance_proposals"))
         self.credreq_cfg = credreq_mod.parse_config(config.get("credential_requests"))
         self.sudo_cfg = sudo_mod.parse_config(config.get("sudo"))
+        self.auto_rules = autorules_mod.parse(config.get("auto_approve"))
         # guidance applies: vault writes are serialized and spaced; transient errors are retried.
         # The clock, sleep and jitter are attributes so tests can drive them.
         self._gwrite_lock = threading.Lock()
@@ -937,7 +939,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             rec.update(sudo_mod.audit_fields(req.spec))     # the command's first words; never an environment
         elif req.mode == "ssh_sign":
             sp = req.spec
-            rec.update(ssh_kind=sp["ssh"]["kind"], ssh_what=sp["ssh"]["text"],
+            rec.update(ssh_kind=sp["ssh"]["kind"], ssh_what=sp["ssh"]["text"], ssh_headline=sp["ssh"].get("headline"),
                        ssh_fingerprint=sp.get("fingerprint"), sign_bytes=sp.get("data_bytes"),
                        **self._host_audit(sp.get("host")))
         else:
@@ -1505,6 +1507,8 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         never = self.client_never_auto(cid)
         if not never and self._ssh_rule_claim(req):   # standing per-host rule: explicit policy, any risk limit
             return req
+        if not never and self._config_rule_claim(req):   # `auto_approve` rule in the config: same standing, any risk
+            return req
         auto = self._auto_allowed(mode, names, spec, cid)
         if never and auto:
             self.audit("escalated", req, auto_max="none", reason="this client is set to never auto-approve")
@@ -1536,6 +1540,27 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         except Exception:  # noqa: BLE001 -- a request must always settle; the notify error text is never kept
             self._finish(req, "failed", error="could not notify")
         return req
+
+    def _config_rule_claim(self, req):
+        """Approve `req` from a matching `auto_approve` rule of the broker's configuration (see autorules.py).
+        Called from create() after the assessment, beside the standing SSH rules. Returns True when the request
+        was finished here."""
+        rule = autorules_mod.find(self.auto_rules, req.mode, req.names, req.spec, req.client)
+        if rule is None:
+            return False
+        with self._lock:                # a human decision and a rule never both act
+            if req.status != "pending":
+                return False
+            req.status = "deciding"
+        self.audit("auto_rule_used", req, rule_name=rule["name"])
+        extra = dict(decision_source="config_rule", rule_name=rule["name"])
+        try:
+            result = self._release(req)
+        except Exception as e:  # noqa: BLE001 -- the request must always settle; a fixed label only
+            self._finish(req, "failed", error=errclass.release_text(e), via="policy", **extra)
+        else:
+            self._finish(req, "approved", result=result, via="policy", **extra)
+        return True
 
     def details_view(self, req):
         """The masked headers/body view of an http request, built once from the spec that
@@ -1923,6 +1948,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         spec["host"] = host = self._ssh_host(data, spec.get("binds"), spec.get("claimed_dest"), sc,
                                   spec.get("bind_overflow"))
         spec["ssh"] = sshkey.describe_data(data, host_known=bool(host and host.get("fp")))
+        spec["ssh"]["headline"] = sshkey.headline(spec["ssh"], host)
         spec.pop("binds", None)
         spec.pop("bind_overflow", None)
 
@@ -2079,13 +2105,18 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         elif req.mode == "sudo":
             what = sudo_mod.push_text(req.spec)
         elif req.mode == "ssh_sign":
-            what = "\n".join([f"SSH key {req.spec['fingerprint']}: {req.spec['ssh']['text']}"]
+            what = "\n".join([req.spec["ssh"].get("headline") or req.spec["ssh"]["text"],
+                              f"SSH key {req.spec['fingerprint']}: {req.spec['ssh']['text']}"]
                              + sshkey.host_lines(req.spec.get("host")))
         else:
             what = "run: " + " ".join(req.spec.get("argv") or [])[:200]
-        head = f"{req.summary} (unverified)\n" if req.summary else ""
+        head = f"{req.summary} (unverified)\n" if req.summary and req.mode != "ssh_sign" else ""
+        if req.mode == "ssh_sign":      # the summary IS the headline (built by code, not a model): lead with it once
+            msg_lead, what = what.split("\n", 1)[0] + "\n", what.split("\n", 1)[1]
+        else:
+            msg_lead = ""
         why = f"\nWhy: {'; '.join(req.risk['reasons'][:3])}" if req.risk and req.risk["reasons"] else ""
-        msg = f"{head}{', '.join(req.names)} from {req.source}\n{what}{why}"
+        msg = f"{msg_lead}{head}{', '.join(req.names)} from {req.source}\n{what}{why}"
         title = f"Secret request [{req.risk['level'].upper()}]" if req.risk else "Secret request"
         if req.mode == "guidance":      # names only: no proposal text, no model-written summary
             msg = f"{what}\nFrom {req.source}. Review each entry on the approval page."
@@ -4757,8 +4788,9 @@ def _describe(req):
         return sudo_mod.describe_html(req)
     if req.mode == "ssh_sign":
         host = "".join("<br>" + html.escape(x) for x in sshkey.host_lines(req.spec.get("host")))
-        return (f"SSH signature with key <code>{html.escape(req.spec['fingerprint'])}</code><br>"
-                f"{html.escape(req.spec['ssh']['text'])}{host}",
+        return (f"<strong>{html.escape(req.spec['ssh'].get('headline') or req.spec['ssh']['text'])}</strong>"
+                f"<br><small class=muted>Technical details: key <code>{html.escape(req.spec['fingerprint'])}</code>; "
+                f"{html.escape(req.spec['ssh']['text'])}{host}</small>",
                 "The private key stays in the broker; only the signature goes back. "
                 "Advisory: the request text is what the client sent. A verified server means "
                 "the other end holds that host key for this session, not that it is the host "
@@ -5111,7 +5143,9 @@ def _detail_html(r, evs, retained=""):
             + (f", {e(_says(n))}" if n in outc else "") for i, n in enumerate(ens)), True)
         add("Proposal text", "not retained after the decision")
     else:
-        add("Signing", r.get("ssh_what"))
+        if r.get("ssh_headline"):
+            add("Connection", f"<strong>{e(r['ssh_headline'])}</strong>", True)
+        add("Technical details" if r.get("ssh_headline") else "Signing", r.get("ssh_what"))
         add("Key fingerprint", (first("ssh_signed") or {}).get("ssh_fingerprint"))
         ev = first("requested") or {}
         for line in ev.get("host_lines") or []:
@@ -5139,6 +5173,8 @@ def _detail_html(r, evs, retained=""):
         add("Decided by", "standing SSH rule (auto-approved): "
             f"{used.get('account') or '?'}@{used.get('rule_host') or sshrules_mod.short_fp(used.get('host_fp')) or '?'}"
             f", rule {str(r['rule_id'])[:16]}")
+    elif r["via"] == "policy" and r.get("rule_name"):
+        add("Decided by", f"configuration rule \"{e(str(r['rule_name']))}\" (auto-approved)", True)
     elif r["via"] == "policy" and r.get("plan_id"):
         left = r.get("plan_left_s")
         add("Decided by", f"plan {str(r['plan_id'])[:8]} (auto-approved)"
@@ -5750,7 +5786,7 @@ def approval_handler(broker):
                 elif r["mode"] == "store":
                     what = f"{r['op'] or 'store'} credential"
                 elif r["mode"] == "ssh_sign":
-                    what = r.get("ssh_what") or "ssh signature"
+                    what = r.get("ssh_headline") or r.get("ssh_what") or "ssh signature"
                 elif r["mode"] == "credential":
                     what = "credential request"
                 elif r["mode"] == "sudo":
