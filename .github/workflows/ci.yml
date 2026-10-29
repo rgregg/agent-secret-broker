@@ -97,7 +97,7 @@ jobs:
           - { name: linux-amd64, runner: ubuntu-latest }
           - { name: linux-arm64, runner: ubuntu-24.04-arm }
           - { name: macos-arm64, runner: macos-latest }
-          - { name: macos-amd64, runner: macos-13 }
+          - { name: macos-amd64, runner: macos-15-intel }
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install stable --profile minimal
