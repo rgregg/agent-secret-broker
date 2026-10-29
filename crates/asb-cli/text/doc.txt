@@ -1,4 +1,4 @@
-asb: ask the broker for a secret, wait for phone approval, use it.
+asb: ask the broker for a secret, wait for approval, use it.
 
   asb NAME[,NAME2] -- command args...         run with secrets in the env
   asb sudo -- command args...                 run as root through the root helper; a human approves the exact command

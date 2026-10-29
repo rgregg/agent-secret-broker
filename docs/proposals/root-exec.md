@@ -14,7 +14,7 @@ see and approve the exact command.
 
 ## Goals
 
-- The human approves each root command on their phone, seeing the exact argv. No account password
+- The human approves each root command, seeing the exact argv. No account password
   exists anywhere: not in the vault, not in a file, not in an environment.
 - The agent cannot reach root without that approval, even by calling the helper directly.
 - A compiled, small, auditable helper (Rust, one static binary, few dependencies).
@@ -30,7 +30,7 @@ see and approve the exact command.
     agent --> asb sudo -- CMD...
                  `--> sudo -n /usr/local/sbin/asb-root-exec -- CMD...     (one NOPASSWD sudoers line)
                           `--> broker: env-mode request, argv = ["sudo", CMD...]   (root-only client key)
-                                 human approves on the phone (card shows the command)
+                                 human approves (card shows the command)
                           `--> helper execs CMD as root, clean environment, no shell
 
 - **Sudoers.** `RYAN ALL=(root) NOPASSWD: /usr/local/sbin/asb-root-exec` is the only passwordless

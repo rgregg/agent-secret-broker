@@ -8,7 +8,7 @@ decisions below. The v1 code is secret_broker/plans.py, secret_broker/planflow.p
 ## Goal
 
 Let an unattended or long-running agent job (an overnight sync, a multi-step task that runs while
-nobody is at the phone) make exactly the calls it declared up front, and nothing else, after a
+nobody is there to approve) make exactly the calls it declared up front, and nothing else, after a
 human approved the whole list once. Today the options are one tap per call, or `approval: allow`,
 where the risk model is the only gate. The model reads text the agent controls, so it is a weak
 gate at 3am. A plan replaces it with a **deterministic match against a manifest a human read**.

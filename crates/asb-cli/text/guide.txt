@@ -2,7 +2,7 @@ asb guide (for agents)
 
 Use this instead of reading credential files. Real values never reach you: the
 broker adds them to the call, and output is masked (set-cookie headers are removed; use a session for cookie flows). Every use asks the human to
-approve on their phone (a few secrets are pre-approved; low-risk ones may be too).
+approve it (a few secrets are pre-approved; low-risk ones may be too).
 
 No credential for it yet? If `asb which HOST` / `asb list` show nothing that covers the
 service, do NOT ask the human to paste a secret into chat, look for one on disk, or
@@ -122,7 +122,7 @@ Asking the human for a credential you do not have (you never see the value)
   asb request-credential myapi --kind token --for "read the Example API for the report" \
       --host api.example.com
   asb request-credential mysite --kind login --for "log in to the admin portal" --host admin.example.com
-  The human gets a card on the approval page (and a phone notification with just the name),
+  The human gets a card on the approval page (and a notification with just the name),
   types the secret there, can edit the name, hosts, variable and mode, and presses Store.
   The broker stores it with approval on every use. You get only the stored name; then use it
   as usual (asb list shows its variables): asb http NAME GET https://... -H 'Authorization: Bearer {{VAR}}'.

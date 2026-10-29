@@ -11,7 +11,7 @@ Offline, with scripted replies from a local server (no key, no network):
 
     python -m tools.describe_eval.run --stub --models a/one,b/two
 
-Live, through the broker so the key never reaches the agent (one phone tap per run):
+Live, through the broker so the key never reaches the agent (one approval per run):
 
     asb openrouter -- python -m tools.describe_eval.run \
         --models openai/gpt-5-mini,google/gemini-2.5-flash-lite --timeout 30 --json /tmp/eval.json

@@ -374,7 +374,7 @@ pub fn run(argv: &[String]) -> R {
         check_name(n, "NAME")?;
     }
     let (payload, scripts) = env_payload(&names, cmd);
-    let answer = obtain(payload, "waiting for approval on your phone...")?;
+    let answer = obtain(payload, "waiting for approval...")?;
     let env: Vec<(String, String)> = answer["env"]
         .as_object()
         .map(|o| {

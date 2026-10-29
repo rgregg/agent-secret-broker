@@ -139,7 +139,7 @@ Add transports under `notify`; a request counts as delivered if any one works.
   go to **Settings**, click **Enable on this device**. Works with the browser
   running and no tab open. Chrome tip: allow it to keep running in the
   background. Safari on iOS needs the site added to the home screen first.
-- **Home Assistant** (phone push): `{"type": "ticker", "ha_url": "...", "ha_token_file": "...", "category": "general"}`
+- **Home Assistant** (mobile push): `{"type": "ticker", "ha_url": "...", "ha_token_file": "...", "category": "general"}`
   (needs the Ticker integration).
 - **Telegram**: `{"type": "telegram", "bot_token_file": "...", "chat_id": "..."}`.
 
@@ -147,7 +147,7 @@ While you have an approval page open and visible, notifications are held back an
 if you leave or after 60 s (`notify_presence`; see the reference). To always send immediately
 set `"notify_presence": {"enabled": false}`; to never send as a fallback set `"fallback_s": null`.
 
-Use Web Push *and* a phone transport if you can: a browser that is fully quit
+Use Web Push *and* a second transport (Home Assistant or Telegram) if you can: a browser that is fully quit
 cannot receive a push until it starts again.
 
 ### Using it as an iOS home-screen app
@@ -312,7 +312,7 @@ Then request it:
     asb http grafana GET https://grafana.example.com/api/health \
         -H 'Authorization: Bearer {{GRAFANA_TOKEN}}'
 
-Your phone or browser notifies you; approve; the call returns.
+You are notified; approve; the call returns.
 
 ### Optional: tie an SSH key to servers
 

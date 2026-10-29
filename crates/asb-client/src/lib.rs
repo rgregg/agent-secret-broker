@@ -250,7 +250,7 @@ impl Client {
                 )))
             }
         }
-        note("waiting for approval on your phone...");
+        note("waiting for approval...");
         let deadline = Instant::now()
             + Duration::from_secs((created.expires_in.max(0) + EXPIRY_SLACK_S) as u64);
         let path = format!("/v1/requests/{}?wait={}", created.id, POLL_WAIT_S);

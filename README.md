@@ -59,14 +59,14 @@ Then:
     asb which api.example.com
     asb http example GET https://api.example.com/v1/things \
         -H 'Authorization: Bearer {{EXAMPLE_TOKEN}}'
-    # your phone or browser asks; you approve; the response comes back
+    # you are notified and approve; the response comes back
 
 ## The web app
 
 `https://<your approval site>/` has three tabs: **Requests** (what is waiting, and
 recent history), **Policies** (active plans and standing approvals, each with Revoke), and
 **Settings** (browser and push notifications). It follows your system light or
-dark setting and works on a phone.
+dark setting and works on small screens.
 
 ## Documentation
 

@@ -158,7 +158,7 @@ fn answer(client: &Client, msg: &[u8], conn: &mut Conn) -> Option<Vec<u8>> {
                 req.insert("claimed_dest".into(), json!(c));
             }
             // a denial or timeout is said on stderr by `obtain`, and the answer is a plain failure
-            let r = obtain_with(client, req, "waiting for approval on your phone...").ok()?;
+            let r = obtain_with(client, req, "waiting for approval...").ok()?;
             let sig = base64_decode(r.get("ssh_signature")?.as_str()?)?;
             let mut out = vec![AGENT_SIGN_RESPONSE];
             out.extend(s(&sig));
