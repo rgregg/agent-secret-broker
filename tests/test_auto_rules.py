@@ -14,6 +14,7 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import test_e2e as t  # noqa: E402
+import test_grants as tg  # noqa: E402
 import test_ssh_host as th  # noqa: E402
 from secret_broker import audit_api, autorules  # noqa: E402
 from test_client_rules import ClientMixin  # noqa: E402
@@ -156,6 +157,16 @@ class Match(unittest.TestCase):
         self.assertIsNone(find(["echo", "hi", "there"]))
         self.assertIsNone(find(["echo"]))
         self.assertIsNone(find(["echo", "hi;", "rm"]))
+
+    def test_a_request_for_several_secrets_needs_a_rule_that_covers_all_of_them(self):
+        both = self.rules({"name": "both", "mode": "env", "secrets": ["a", "b"], "argv": ["echo"]})
+        one = self.rules({"name": "one", "mode": "env", "secret": "a", "argv": ["echo"]})
+        spec = {"argv": ["echo"]}
+        self.assertIsNotNone(autorules.find(both, "env", ["a", "b"], spec, self.CLIENT))
+        self.assertIsNotNone(autorules.find(both, "env", ["b", "a"], spec, self.CLIENT))     # order does not matter
+        self.assertIsNotNone(autorules.find(both, "env", ["a"], spec, self.CLIENT))          # fewer is still covered
+        self.assertIsNone(autorules.find(one, "env", ["a", "b"], spec, self.CLIENT))         # b is not covered
+        self.assertIsNone(autorules.find(both, "env", ["a", "b", "c"], spec, self.CLIENT))   # neither is c
 
     def test_clients_limit_a_rule_and_the_legacy_key_never_matches(self):
         spec = {"argv": ["echo"]}
@@ -310,6 +321,31 @@ class EnvRules(Enrolled, t.Harness):
         self.assertEqual(self.notifier.sent, [])
         self.env(["echo", "hi", "there"])
         self.assertEqual(len(self.notifier.sent), 1)
+
+
+class MultiSecretRules(Enrolled, tg.Base):
+    """A request that names two credentials (a script that needs both) is approved by one rule listing both."""
+
+    def env(self, names):
+        code, body = self.api("POST", "/v1/requests", {"mode": "env", "names": names, "argv": ["echo", "hi"]})
+        self.assertEqual(code, 202, body)
+        return json.loads(body)["id"]
+
+    def test_one_rule_covers_the_pair_and_nothing_wider(self):
+        self.broker.auto_rules = autorules.parse([
+            {"name": "pair", "mode": "env", "secrets": ["svc", "other"], "argv": ["echo", "hi"]}])
+        rid = self.env(["svc", "other"])
+        _, b = self.api("GET", f"/v1/requests/{rid}?wait=3")
+        self.assertEqual(sorted(json.loads(b)["env"]), ["OTHER_TOKEN", "SVC_TOKEN"])
+        self.assertEqual(self.notifier.sent, [])
+        self.assertEqual(self.events("approved")[-1]["rule_name"], "pair")
+
+    def test_a_rule_for_one_of_them_does_not_cover_the_pair(self):
+        self.broker.auto_rules = autorules.parse([
+            {"name": "just svc", "mode": "env", "secret": "svc", "argv": ["echo", "hi"]}])
+        self.env(["svc", "other"])
+        self.assertEqual(len(self.notifier.sent), 1)
+        self.assertEqual(self.events("auto_rule_used"), [])
 
 
 class AgentCannotSeeRules(unittest.TestCase):

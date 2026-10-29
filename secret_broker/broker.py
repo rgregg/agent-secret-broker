@@ -1003,7 +1003,8 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         if req.mode not in ("http", "env"):
             return False, "only web and run-with-secret requests can be always-allowed"
         if len(req.names) != 1:
-            return False, "this request involves several secrets"
+            return False, ("this request involves several secrets; an Always approval covers one credential "
+                           "(to auto-approve this combination, add an auto_approve rule that lists them)")
         name = req.names[0]
         sc = self.cfg["secrets"][name]
         if sc.get("approval", "prompt") == "allow":

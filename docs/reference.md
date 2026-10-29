@@ -1557,7 +1557,7 @@ guess, and the message names the field, such as `auto_approve[2].host`):
 |---|---|---|
 | `name` | all | Required, unique. What the audit log and the history show. |
 | `mode` | all | `ssh_sign`, `http` or `env`. |
-| `secret` or `secrets` | all | The credential name(s) the rule covers. A request naming anything else does not match. |
+| `secret` or `secrets` | all | The credential name(s) the rule covers. A request that names several credentials (`asb a,b -- cmd`, or two placeholders in one call) is matched only by a rule that lists **all** of them; a rule for one of them does not cover the pair. A rule listing `[a, b]` also covers a request for just `a`. |
 | `clients` | all | Optional list of client **ids** (`c-1a2b3c4d`, shown in the Clients tab). Ids only: a name can be reused by another client, an id cannot. Leave it out for any enrolled client. The legacy shared key never matches. |
 | `host` / `host_fp` | ssh_sign | Exactly one. The server: a name the key's `ssh_hosts.known_hosts` gives the server's **verified** host key, or the `SHA256:` fingerprint itself. |
 | `account` | ssh_sign | Required. The login name. |
