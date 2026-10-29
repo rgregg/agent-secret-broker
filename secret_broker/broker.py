@@ -1682,13 +1682,23 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         return req
 
     def _sudo_pending(self, req):
-        """Hand a validated root-command request to the human. High by code with no model call,
-        never auto-approved (no policy, grant or standing rule reaches this mode), and no
-        notification button can decide it: only the approval page can."""
-        a = risk_mod.assess("sudo", req.names, {}, None)
-        req.risk = {k: a[k] for k in ("level", "model", "reasons")}
-        self.audit("assessed", req, model=None, reasons=a["reasons"], summary_source=None,
-                   summary_reason=None)
+        """Hand a validated root-command request to the human. The description comes from the same
+        analyzer as any command's, but the level is high by code (see risk.assess); never
+        auto-approved (no policy, grant or standing rule reaches this mode), and no notification
+        button can decide it: only the approval page can."""
+        a = risk_mod.assess("sudo", req.names, req.spec, self.summarizer)
+        req.summary, req.risk = a["summary"], {k: a[k] for k in ("level", "model", "reasons")}
+        req.summary_model = a.get("summary_model") if a.get("summary_source") != "deterministic" else None
+        req.summary_source = a.get("summary_source")
+        req.summary_reason, req.summary_rule = a.get("summary_reason"), a.get("summary_rule")
+        req.summary_pending = bool(a.get("summary_pending"))
+        if not req.summary_pending:
+            self._count_description(req)
+        self.audit("assessed", req, model=a["model"], reasons=a["reasons"],
+                   summary_source=a.get("summary_source"), summary_reason=a.get("summary_reason"),
+                   summary_rule=a.get("summary_rule"))
+        if a.get("summary_late") is not None:    # display only, as for any command
+            a["summary_late"].add_done_callback(lambda f, r=req: self._description_arrived(r, f))
         try:
             self._push(req)
         except Exception:  # noqa: BLE001 -- a request must always settle; the notify error text is never kept
@@ -2087,7 +2097,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             msg = f"{what}\nOpen the approval page to read the plan and approve or deny it."
             title = "Plan requested"
         elif req.mode == "sudo":        # the command is the point; the card has the rest. No buttons below.
-            msg = f"{what}\nFrom {req.source}. Open the approval page to read it and approve or deny."
+            msg = f"{what}\n{head}From {req.source}. Open the approval page to read it and approve or deny."
             title = "Root command requested [HIGH]"
         elif req.mode == "session":     # no purpose (untrusted agent text); the card has everything
             msg = f"{what}\nFrom {req.source}. Open the approval page to review and approve or deny."

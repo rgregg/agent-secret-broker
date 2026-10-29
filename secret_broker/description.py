@@ -351,7 +351,7 @@ def is_mutating(mode, spec, read_endpoints=()):
             argv = [a for a in argv if scripts_mod.basename(a) not in names
                     and scripts_mod.basename(a) not in ("sh", "bash", "zsh", "dash", "ksh")]
         return bool(_CMD_WRITE_RE.search(" ".join(argv)))
-    return mode in ("store", "ssh_sign")
+    return mode in ("store", "ssh_sign", "sudo")   # a root command is treated as changing things
 
 
 def consistency_rule(text, mode, spec, read_endpoints=()):

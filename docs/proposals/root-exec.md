@@ -55,7 +55,9 @@ see and approve the exact command.
     helper's own enrolled client) that may create one; any other client is refused.
   * *Approval:* every request prompts. It is never auto-approved, never covered by a standing or timed
     grant, and has no one-tap action on a notification (open the approval page, read the command, decide).
-  * *Risk:* always HIGH, rated without a model call, like `ssh_sign`.
+  * *Risk:* always HIGH by code, whatever a model says. The command is described like any other (the same
+    "AI summary" line on the card and in the notification, marked unverified); the exact command is still
+    shown first and is what you approve.
   * *Card and audit:* the card shows the exact argv, cwd and target user; the audit log records the argv
     (first 50 words, as env mode does) and the client, never environment values.
   * *Delivery:* once, like env values; a second poll says `released`.
