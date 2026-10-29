@@ -151,6 +151,11 @@ class Match(unittest.TestCase):
         self.assertIsNone(find("POST", "https://api.example.com/v1", body_b64="***not base64***"))
         for h in ("X-Original-URL", "X-Rewrite-URL", "x-forwarded-path", "X-Forwarded-Method"):
             self.assertIsNone(find("POST", "https://api.example.com/v1", headers={h: "/admin"}), h)
+        self.assertIsNone(find("POST", "https://api.example.com/v1", body='{"\\u005fmethod": "DELETE"}'))   # JSON escape
+        self.assertIsNone(find("POST", "https://api.example.com/v1", body="%255fmethod=DELETE"))          # double encoding
+        self.assertIsNone(find("POST", "https://api.example.com/v1?%255fmethod=DELETE"))
+        self.assertIsNone(find("POST", "https://api.example.com/v1", body="caf\u00e9"))                    # not plain ASCII
+        self.assertIsNone(find("POST", "https://api.example.com/v1", headers={"Content-Encoding": "gzip"}, body="x"))
         self.assertIsNotNone(find("POST", "https://api.example.com/v1?q=a%20b", body="a=1&b=2"))   # ordinary escapes are fine
         self.assertIsNone(find("GET", "https://api.example.com/v1", body="x"))    # a read with a body is not a read
         self.assertIsNotNone(find("POST", "https://api.example.com/v1", body="x"))

@@ -182,6 +182,14 @@ def _names_a_method_override(text):
     return "_method" in urllib.parse.unquote_plus(text).lower()
 
 
+def _not_plain(text):
+    """True for text a rule cannot reason about, so the request never matches: it still changes when decoded a
+    second time (`%255f`), carries a JSON or unicode escape (`\\u005f`), or is not plain printable ASCII."""
+    once = urllib.parse.unquote_plus(text)
+    return (once != text and urllib.parse.unquote_plus(once) != once) or "\\u" in text.lower() \
+        or not all(c in "\t\r\n" or " " <= c <= "~" for c in text)
+
+
 def _http_ok(rule, spec):
     """Host, scheme, method and path are compared on the raw request as the broker will send it. Anything that
     could make the server read a different method or path than the rule saw never matches: method-override
@@ -200,7 +208,9 @@ def _http_ok(rule, spec):
         return False
     if any(str(h).lower() in OVERRIDE_HEADERS for h in (spec.get("headers") or {})):
         return False
-    if _names_a_method_override(u.query):
+    if any(str(h).lower() in ("content-encoding", "transfer-encoding") for h in (spec.get("headers") or {})):
+        return False                    # a body the broker cannot read as sent
+    if _names_a_method_override(u.query) or _not_plain(u.query):
         return False
     body = spec.get("body")
     if spec.get("body_b64"):
@@ -208,7 +218,7 @@ def _http_ok(rule, spec):
             body = base64.b64decode(spec["body_b64"], validate=True).decode("latin-1")
         except (ValueError, TypeError):
             return False                # a body that cannot be read cannot be shown to be free of an override
-    if isinstance(body, str) and _names_a_method_override(body):
+    if isinstance(body, str) and (_names_a_method_override(body) or _not_plain(body)):
         return False
     if method in ("GET", "HEAD") and (spec.get("body") or spec.get("body_b64")):
         return False
