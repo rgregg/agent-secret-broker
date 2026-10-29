@@ -163,6 +163,8 @@ class Match(unittest.TestCase):
             self.assertIsNotNone(find("POST", "https://api.example.com/v1?" + ok, body=ok), ok)
         self.assertIsNotNone(find("POST", "https://api.example.com/v1", body='{"payment_method": "card", "n": "method"}'))
         self.assertIsNone(find("POST", "https://api.example.com/v1", body='{"x": {"method": "DELETE"}}'))
+        for text in ("x_method_override=DELETE", "verb=DELETE", "_HTTP-Verb=PUT"):
+            self.assertIsNone(find("POST", "https://api.example.com/v1", body=text), text)
         self.assertIsNone(find("POST", "https://api.example.com/v1", body="x",
                                headers={"Content-Type": "multipart/form-data; boundary=zz"}))
         self.assertIsNotNone(find("POST", "https://api.example.com/v1?q=a%20b", body="a=1&b=2",

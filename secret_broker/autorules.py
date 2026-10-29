@@ -173,7 +173,8 @@ OVERRIDE_HEADERS = ("x-http-method-override", "x-method-override", "x-http-metho
 
 
 _OVERRIDE_NAMES = frozenset({"method", "httpmethod", "xhttpmethod", "requestmethod", "methodoverride",
-                             "httpmethodoverride", "xhttpmethodoverride", "overridemethod"})
+                             "httpmethodoverride", "xhttpmethodoverride", "overridemethod", "xmethod",
+                             "xmethodoverride", "verb", "httpverb", "xhttpverb"})
 
 
 def _names_a_method_override(text):
