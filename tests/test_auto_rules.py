@@ -159,11 +159,11 @@ class Match(unittest.TestCase):
         for text in ("x.method=DELETE", "x[method]=DELETE", "METHOD=DELETE", "%5F%4Dethod=DELETE"):
             self.assertIsNone(find("POST", "https://api.example.com/v1", body=text), text)
             self.assertIsNone(find("POST", "https://api.example.com/v1?" + text), text)
-        for ok in ("payment_method=card", "q=method", "note=the+method+works", "a=1&b=%7Bmethod%7D"):
+        for ok in ("verb=run", "payment_method=card", "q=method", "note=the+method+works", "a=1&b=%7Bmethod%7D"):
             self.assertIsNotNone(find("POST", "https://api.example.com/v1?" + ok, body=ok), ok)
         self.assertIsNotNone(find("POST", "https://api.example.com/v1", body='{"payment_method": "card", "n": "method"}'))
         self.assertIsNone(find("POST", "https://api.example.com/v1", body='{"x": {"method": "DELETE"}}'))
-        for text in ("x_method_override=DELETE", "verb=DELETE", "_HTTP-Verb=PUT"):
+        for text in ("x_method_override=DELETE", "http_verb=DELETE", "_HTTP-Verb=PUT"):
             self.assertIsNone(find("POST", "https://api.example.com/v1", body=text), text)
         self.assertIsNone(find("POST", "https://api.example.com/v1", body="x",
                                headers={"Content-Type": "multipart/form-data; boundary=zz"}))
