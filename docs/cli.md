@@ -154,7 +154,7 @@ Check it:
 Risk guidance tells the classifier how to rate a credential's requests and can lower ratings,
 so an agent cannot set it; it can only **propose** it. `propose` sends 1 to 25 entries (text up
 to 2000 characters, empty text proposes removing the guidance; the whole request is limited to
-100 KB), prints `asb: proposal ID sent`, waits ("waiting for approval on your phone... review
+100 KB), prints `asb: proposal ID sent`, waits ("waiting for approval... review
 each entry on the approval page") and then prints the outcome, names only:
 
     applied: komodo

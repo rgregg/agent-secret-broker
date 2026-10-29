@@ -932,7 +932,7 @@ class Cli(Base):
         rc, out, err, rid = self.run_propose([f], decide=lambda rid: self.decide(rid, "approve", apply=(0,)))
         self.assertEqual(rc, 0, err)
         self.assertEqual(out.splitlines(), ["applied: alpha", "denied: beta", "failed: -"])
-        self.assertIn("waiting for approval on your phone", err)
+        self.assertIn("waiting for approval", err)
         self.assertIn("review each entry on the approval page", err)
         self.assertIn(rid, err)
         self.assertEqual(self.guid("alpha"), "A1")

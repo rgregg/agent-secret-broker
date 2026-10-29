@@ -60,7 +60,7 @@ pub fn store_or_update(argv: &[String]) -> R {
         let list: Vec<&str> = hosts.split(',').filter(|h| !h.is_empty()).collect();
         payload.insert("allowed_hosts".into(), json!(list));
     }
-    let r = obtain(payload, "waiting for approval on your phone...")?;
+    let r = obtain(payload, "waiting for approval...")?;
     let s = &r["stored"];
     println!(
         "stored: {} ({}) -> item {} field {}",

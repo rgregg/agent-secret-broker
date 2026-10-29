@@ -598,7 +598,7 @@ def session_die(r):
         die(_srv(r.get("error") or "session call refused"), EXIT_SESSION_REFUSED)
 
 
-def obtain(payload, waiting="waiting for approval on your phone..."):
+def obtain(payload, waiting="waiting for approval..."):
     base, key = config()
     payload["source"] = f"{os.environ.get('USER', '?')}@{socket.gethostname()}"
     code, r = call(base, key, "/v1/requests", payload)
@@ -695,7 +695,7 @@ def run_guidance(argv):
     print(f"asb: proposal {r['id']} sent", file=sys.stderr)
     if r["status"] in ("denied", "expired", "failed"):
         die(_srv(r.get("error") or r["status"]), status_exit(r["status"]))
-    print("asb: waiting for approval on your phone... review each entry on the approval page "
+    print("asb: waiting for approval... review each entry on the approval page "
           "(the human ticks the ones to apply)", file=sys.stderr)
     deadline = time.time() + r["expires_in"] + 15
     while time.time() < deadline:

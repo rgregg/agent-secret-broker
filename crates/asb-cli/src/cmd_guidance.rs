@@ -174,7 +174,7 @@ pub fn run(argv: &[String]) -> R {
             .unwrap_or_else(|| srv(&status, 160));
         return Err(die(why, status_exit(&status)));
     }
-    eprintln!("asb: waiting for approval on your phone... review each entry on the approval page (the human ticks the ones to apply)");
+    eprintln!("asb: waiting for approval... review each entry on the approval page (the human ticks the ones to apply)");
     let deadline = Instant::now()
         + Duration::from_secs_f64(r["expires_in"].as_f64().unwrap_or(0.0).max(0.0) + 15.0);
     let id = py_str(&r["id"]);
