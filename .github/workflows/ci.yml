@@ -152,6 +152,43 @@ jobs:
           test "${{ needs.root-e2e.result }}" = "success" || { echo "root-e2e: ${{ needs.root-e2e.result }}"; exit 1; }
           test "${{ needs.rust-cli-parity.result }}" = "success" || { echo "rust-cli-parity: ${{ needs.rust-cli-parity.result }}"; exit 1; }
 
+  # A pushed v* tag publishes the binaries as a GitHub release (archives + checksums + the rendered Homebrew formula).
+  # With the HOMEBREW_TAP_TOKEN secret set (a token that can push to rgregg/homebrew-tap) it also updates the tap, so
+  # `brew install rgregg/tap/asb` and `brew upgrade asb` follow each release.
+  release:
+    name: release
+    needs: [test, cli-binaries]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ github.ref_name }}
+      TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: asb-*
+          path: dist
+          merge-multiple: true
+      - name: render the Homebrew formula
+        run: python3 tools/render_homebrew_formula.py "$TAG" dist > dist/asb.rb
+      - name: publish the release
+        run: |
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "$TAG" --generate-notes
+          gh release upload "$TAG" dist/* --clobber
+      - name: update the Homebrew tap
+        if: env.TAP_TOKEN != ''
+        run: |
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/rgregg/homebrew-tap.git" tap
+          mkdir -p tap/Formula && cp dist/asb.rb tap/Formula/asb.rb
+          cd tap
+          git config user.name "github-actions[bot]" && git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/asb.rb
+          git diff --cached --quiet || { git commit -m "asb ${TAG}" && git push; }
+
   image:
     needs: test
     # main and v* tags publish on push; any branch can be built on demand with
