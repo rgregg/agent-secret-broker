@@ -172,11 +172,23 @@ OVERRIDE_HEADERS = ("x-http-method-override", "x-method-override", "x-http-metho
                     "x-forwarded-path")                         # a different path than the one the rule saw
 
 
+_OVERRIDE_NAMES = frozenset({"method", "httpmethod", "xhttpmethod", "requestmethod", "methodoverride",
+                             "httpmethodoverride", "xhttpmethodoverride", "overridemethod"})
+
+
 def _names_a_method_override(text):
-    """True when a query string or body mentions "method" at all once decoded. Frameworks read `_method`,
-    `.method`, `[method]` and similar as the HTTP method, in spellings no list of tricks keeps up with, so a
-    rule-matched request does not mention it anywhere: a rule cannot vouch for it, and a person decides."""
-    return "method" in urllib.parse.unquote_plus(text).lower()
+    """True when a query string or body has a parameter or JSON key that frameworks read as the HTTP method:
+    `method` or `_method` (any case, any `.`/`[]` nesting such as `x.method` or `x[method]`) and the usual
+    `http_method` / `method_override` spellings. Only names count: a value, or a name like `payment_method`,
+    that merely contains the word is ordinary data and does not stop a rule matching."""
+    once = urllib.parse.unquote_plus(text)
+    names = [part.split("=", 1)[0] for part in re.split(r"[&;]", once)]
+    names += re.findall(r'"([^"]*)"\s*:', once)           # JSON object keys
+    for name in names:
+        for seg in re.split(r"[.\[\]]", name.strip().lower()):
+            if re.sub(r"[^a-z0-9]", "", seg) in _OVERRIDE_NAMES:
+                return True
+    return False
 
 
 def _not_plain(text):
