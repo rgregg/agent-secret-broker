@@ -6,7 +6,7 @@
   asb list [--json]                           what credentials exist? (no approval)
   asb store NAME --hosts H[,H] [--field F] [--item I] [--var V]  < value
   asb store NAME --ssh < private_key          move an SSH private key into the broker
-  asb update NAME [--var V]                   < value
+  asb update NAME [--var V]                   < value   (or --add-host H / --remove-host H, no value)
   asb request-credential NAME --kind token|login --for "purpose" [--host H]... [--var V] [--mode http|env]
                                               ask the human to enter a NEW credential (you never see it)
   asb which HOST|URL                          is a credential available? (no approval)
@@ -227,7 +227,8 @@ Giving this machine its own credential
 Storing and rotating (value ONLY on stdin, never as an argument)
   printf '%s' "$VALUE" | asb store NAME --hosts a.example.com[,b] [--field F] [--item I] [--var V]
   printf '%s' "$VALUE" | asb update NAME [--var V]
-  store creates a credential without a tap; update asks for approval.
+  asb update NAME [--add-host H[,H]] [--remove-host H[,H]]     (change the allowed hosts)
+  store creates a credential without a tap; update asks for approval, and a host change is always a human decision.
 
 Checking the broker (after a deploy)
   asb status           version (git sha), uptime, catalog count/invalid/adopted, backend ok
@@ -431,9 +432,14 @@ Waits for the human (about 15 minutes), then prints "stored: NAME". Exit 0 store
 put a secret in an argument.
 example: asb request-credential myapi --kind token --for "read the Example API" --host api.example.com""",
     "update": """usage: asb update NAME [--var V]   < value
+       asb update NAME [--add-host H[,H]] [--remove-host H[,H]]
 
 Replace the value of an existing credential (asks for approval). Value on stdin.
-example: printf '%s' "$NEW" | asb update myapi""",
+With --add-host / --remove-host it instead changes which hosts the credential may be used
+against (no value is read; the human always approves, and never by a rule). The change and
+a new value are separate updates. A credential keeps at least one host.
+example: printf '%s' "$NEW" | asb update myapi
+example: asb update myapi --add-host api2.example.com""",
     "ssh-agent": """usage: asb ssh-agent [--socket PATH] [-- command [args...]]
 
 Serve the ssh-agent protocol on a private local socket. ssh, git and scp that
@@ -3011,8 +3017,16 @@ def main(argv):
         name, op = check_name(argv[1]), "create" if argv[0] == "store" else "update"
         allowed = {"--field": "field", "--item": "item", "--var": "var", "--hosts": "hosts"}
         if op == "update":
-            allowed = {"--var": "var"}
+            allowed = {"--var": "var", "--add-host": "add_host", "--remove-host": "remove_host"}
         f = parse_flags(argv[2:], allowed)
+        change = [[h for h in (f.get(k) or "").split(",") if h] for k in ("add_host", "remove_host")]
+        if op == "update" and ("add_host" in f or "remove_host" in f):
+            if f.get("var") or not (change[0] or change[1]):
+                die(HELP["update"])
+            r = obtain({"mode": "store", "names": [name], "op": "update",
+                        "add_hosts": change[0], "remove_hosts": change[1]})["stored"]
+            print(f"updated: {r['name']} may now be used against {', '.join(r.get('hosts') or [])}")
+            return 0
         payload = {"mode": "store", "names": [name], "op": op, "value": read_value()}
         if ssh:
             payload["ssh"] = True

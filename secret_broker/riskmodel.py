@@ -263,6 +263,9 @@ def request_fields(mode, names, spec, max_content_chars=400, send_content=True,
                  value=f"<{len(spec.get('value') or '')} chars, not shown>")
         if spec.get("allowed_hosts"):
             f["usable_for_hosts"] = list(spec["allowed_hosts"])
+        if spec.get("hosts_after") is not None:
+            f["operation"] = "change which hosts a stored credential may be used against"
+            f["hosts_added"], f["hosts_removed"] = list(spec["add_hosts"]), list(spec["remove_hosts"])
     elif mode == "ssh_sign":
         f["operation"] = "sign data with an SSH key: " + str((spec.get("ssh") or {}).get("text", ""))
         host = spec.get("host") or {}

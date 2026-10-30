@@ -23,7 +23,11 @@ pub fn store_or_update(argv: &[String]) -> R {
         "update"
     };
     let allowed: &[(&str, &str)] = if op == "update" {
-        &[("--var", "var")]
+        &[
+            ("--var", "var"),
+            ("--add-host", "add_host"),
+            ("--remove-host", "remove_host"),
+        ]
     } else {
         &[
             ("--field", "field"),
@@ -33,6 +37,33 @@ pub fn store_or_update(argv: &[String]) -> R {
         ]
     };
     let f = parse_flags(&argv[2..], allowed)?;
+    if op == "update" && (flag(&f, "add_host").is_some() || flag(&f, "remove_host").is_some()) {
+        let list = |k: &str| -> Vec<String> {
+            flag(&f, k)
+                .unwrap_or("")
+                .split(',')
+                .filter(|h| !h.is_empty())
+                .map(String::from)
+                .collect()
+        };
+        let (add, remove) = (list("add_host"), list("remove_host"));
+        if flag(&f, "var").is_some() || (add.is_empty() && remove.is_empty()) {
+            return Err(die_help("update"));
+        }
+        let payload = json!({"mode": "store", "names": [argv[1]], "op": "update",
+                             "add_hosts": add, "remove_hosts": remove});
+        let r = obtain(payload.as_object().cloned().unwrap_or_default(), "waiting for approval...")?;
+        let hosts: Vec<String> = r["stored"]["hosts"]
+            .as_array()
+            .map(|a| a.iter().map(py_str).collect())
+            .unwrap_or_default();
+        println!(
+            "updated: {} may now be used against {}",
+            py_str(&r["stored"]["name"]),
+            hosts.join(", ")
+        );
+        return Ok(0);
+    }
     let mut payload = Map::new();
     payload.insert("mode".into(), json!("store"));
     payload.insert("names".into(), json!([argv[1]]));

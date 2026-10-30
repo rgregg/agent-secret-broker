@@ -3,7 +3,7 @@ persists. For tests and embedding, and as the worked example for third-party
 backends: it passes tests/backend_contract.py in about 150 lines."""
 import threading
 
-from .base import (AUTO_ALIASES, as_uris, CAP_ADOPTS, CAP_CREATE_LOGIN, CAP_EDIT_ITEM, CAP_EXPORT_ITEMS,
+from .base import (AUTO_ALIASES, as_uris, merge_uri_hosts, CAP_ADOPTS, CAP_CREATE_LOGIN, CAP_EDIT_ITEM, CAP_EXPORT_ITEMS,
                    CAP_IMPORT_ITEMS, CAP_SET_META, LOGIN, META_FIELD, NOTE, PREVIOUS_FIELDS,
                    RESERVED_FIELDS, SSH_KEY, BackendConflict, BackendInvalid, BackendNotFound,
                    Item, VaultBackend, BackendSpec, auto_shape, check_item_args, clean_meta,
@@ -125,7 +125,7 @@ class MemoryBackend(VaultBackend):
             self._items[item] = Item(item, LOGIN, username, password, notes or None,
                                      as_uris(uri), meta=clean_meta(meta) if meta else None)
 
-    def edit_item(self, item, new_name=None, meta=None, drop_meta=False):
+    def edit_item(self, item, new_name=None, meta=None, drop_meta=False, add_hosts=None, remove_hosts=None):
         with self._lock:
             it = self._items[self._find(item)]
             if new_name:
@@ -137,6 +137,8 @@ class MemoryBackend(VaultBackend):
                 it.meta = None
             if meta is not None:
                 it.meta = clean_meta(meta)
+            if (add_hosts or remove_hosts) and it.kind == LOGIN:
+                it.uris = merge_uri_hosts(it.uris, add_hosts, remove_hosts)
 
     def export_items(self):
         with self._lock:

@@ -5,7 +5,7 @@ including `broker` metadata and adoption of items without it. See
 docs/reference.md ("Local encrypted backend")."""
 import copy
 
-from .base import (AUTO_ALIASES, as_uris, CAP_ADOPTS, CAP_CREATE_LOGIN, CAP_EDIT_ITEM, CAP_EXPORT_ITEMS,
+from .base import (AUTO_ALIASES, as_uris, merge_uri_hosts, CAP_ADOPTS, CAP_CREATE_LOGIN, CAP_EDIT_ITEM, CAP_EXPORT_ITEMS,
                    CAP_IMPORT_ITEMS, CAP_ON_EVENT, CAP_SET_META, CAP_WARM, LOGIN, META_FIELD, NOTE,
                    PREVIOUS_FIELDS, RESERVED_FIELDS, SSH_KEY, BackendConfigError, BackendConflict,
                    BackendInvalid, BackendNotFound, BackendSpec, Item, VaultBackend, auto_field_for,
@@ -174,7 +174,7 @@ class LocalBackend(VaultBackend):
             items[item] = new
         self._store.mutate(apply)
 
-    def edit_item(self, item, new_name=None, meta=None, drop_meta=False):
+    def edit_item(self, item, new_name=None, meta=None, drop_meta=False, add_hosts=None, remove_hosts=None):
         check_item_args(item)
         meta = clean_meta(meta) if meta is not None else None
 
@@ -191,6 +191,8 @@ class LocalBackend(VaultBackend):
                 it.pop(META_FIELD, None)
             if meta is not None:
                 it[META_FIELD] = meta
+            if (add_hosts or remove_hosts) and it.get("type") == LOGIN:
+                it["uris"] = merge_uri_hosts(it.get("uris"), add_hosts, remove_hosts)
         self._store.mutate(apply)
 
     def delete(self, item):

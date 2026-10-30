@@ -5,7 +5,7 @@ asb: ask the broker for a secret, wait for approval, use it.
   asb list [--json]                           what credentials exist? (no approval)
   asb store NAME --hosts H[,H] [--field F] [--item I] [--var V]  < value
   asb store NAME --ssh < private_key          move an SSH private key into the broker
-  asb update NAME [--var V]                   < value
+  asb update NAME [--var V]                   < value   (or --add-host H / --remove-host H, no value)
   asb request-credential NAME --kind token|login --for "purpose" [--host H]... [--var V] [--mode http|env]
                                               ask the human to enter a NEW credential (you never see it)
   asb which HOST|URL                          is a credential available? (no approval)

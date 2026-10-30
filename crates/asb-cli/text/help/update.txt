@@ -1,4 +1,9 @@
 usage: asb update NAME [--var V]   < value
+       asb update NAME [--add-host H[,H]] [--remove-host H[,H]]
 
 Replace the value of an existing credential (asks for approval). Value on stdin.
+With --add-host / --remove-host it instead changes which hosts the credential may be used
+against (no value is read; the human always approves, and never by a rule). The change and
+a new value are separate updates. A credential keeps at least one host.
 example: printf '%s' "$NEW" | asb update myapi
+example: asb update myapi --add-host api2.example.com

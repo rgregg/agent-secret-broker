@@ -31,6 +31,7 @@ import abc
 import dataclasses
 import json
 import time
+import urllib.parse
 from typing import Any, Dict, List, Optional, TypedDict
 
 
@@ -119,6 +120,19 @@ AUTO_ALIASES = (None, "", "auto")
 # -- capabilities ---------------------------------------------------------------
 CAP_SET_META = "set_meta"           # set_meta persists (policy edits, standing approvals...)
 CAP_CREATE_LOGIN = "create_login"
+
+
+def merge_uri_hosts(current, add_hosts=None, remove_hosts=None):
+    """A Login's website list after hosts are added or removed: every URL whose host[:port] is a removed
+    host goes, and `https://HOST` is appended for each added host no URL already names. URLs for other
+    hosts (kept by a person in a vault client) are left alone."""
+    def netloc(u):
+        return urllib.parse.urlsplit(u if "//" in u else "//" + u).netloc.lower()
+    drop = {h.lower() for h in remove_hosts or []}
+    out = [u for u in current or [] if netloc(u) not in drop]
+    have = {netloc(u) for u in out}
+    out += [f"https://{h}" for h in add_hosts or [] if h.lower() not in have]
+    return out
 
 
 def as_uris(uri):
@@ -390,9 +404,10 @@ class VaultBackend(abc.ABC):
         BackendConflict if the item exists."""
         raise NotSupported("this backend cannot create logins")
 
-    def edit_item(self, item, new_name=None, meta=None, drop_meta=False):
+    def edit_item(self, item, new_name=None, meta=None, drop_meta=False, add_hosts=None, remove_hosts=None):
         """["edit_item"] Rename an item and/or replace (`meta`) or remove
-        (`drop_meta`) its metadata. BackendConflict if `new_name` exists,
+        (`drop_meta`) its metadata, and, for a Login, add or remove websites by host
+        (`add_hosts`, `remove_hosts`: see merge_uri_hosts; ignored for other item types). BackendConflict if `new_name` exists,
         BackendNotFound if `item` does not."""
         raise NotSupported("this backend cannot edit items")
 

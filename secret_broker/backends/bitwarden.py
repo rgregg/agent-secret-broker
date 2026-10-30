@@ -16,7 +16,7 @@ import urllib.request
 from .. import destguard
 
 from .. import sshkey
-from .base import (as_uris, CAP_ADOPTS, CAP_CREATE_LOGIN, CAP_EDIT_ITEM, CAP_EXPORT_ITEMS, CAP_ON_EVENT,
+from .base import (as_uris, merge_uri_hosts, CAP_ADOPTS, CAP_CREATE_LOGIN, CAP_EDIT_ITEM, CAP_EXPORT_ITEMS, CAP_ON_EVENT,
                    CAP_SET_META, CAP_WARM, LOGIN, META_FIELD, NOTE, RESERVED_FIELDS, SSH_KEY,
                    BackendConfigError, BackendConflict, BackendError, BackendInvalid,
                    BackendNotFound, BackendRateLimited, BackendSpec, BackendUnavailable, Item,
@@ -414,7 +414,7 @@ class BwBackend(VaultBackend):
             self._synced = 0.0
             self._touch()
 
-    def edit_item(self, item, new_name=None, meta=None, drop_meta=False):
+    def edit_item(self, item, new_name=None, meta=None, drop_meta=False, add_hosts=None, remove_hosts=None):
         """Rename an item and/or replace or remove its broker metadata."""
         with self._lock:
             existing = self._find(item)
@@ -429,6 +429,12 @@ class BwBackend(VaultBackend):
                                       if f.get("name") != META_FIELD]
             if meta is not None:
                 BwBackend._with_meta(existing, meta)
+            if (add_hosts or remove_hosts) and existing.get("login") is not None:
+                login = existing["login"]
+                keep = merge_uri_hosts([u.get("uri") or "" for u in login.get("uris") or []],
+                                       add_hosts, remove_hosts)
+                old = {u.get("uri"): u for u in login.get("uris") or []}
+                login["uris"] = [old.get(u) or {"match": None, "uri": u} for u in keep]
             self._submit("edit", existing, existing["id"])
             self._synced = 0.0
             self._touch()
