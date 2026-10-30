@@ -16,7 +16,7 @@ import urllib.request
 from .. import destguard
 
 from .. import sshkey
-from .base import (CAP_ADOPTS, CAP_CREATE_LOGIN, CAP_EDIT_ITEM, CAP_EXPORT_ITEMS, CAP_ON_EVENT,
+from .base import (as_uris, CAP_ADOPTS, CAP_CREATE_LOGIN, CAP_EDIT_ITEM, CAP_EXPORT_ITEMS, CAP_ON_EVENT,
                    CAP_SET_META, CAP_WARM, LOGIN, META_FIELD, NOTE, RESERVED_FIELDS, SSH_KEY,
                    BackendConfigError, BackendConflict, BackendError, BackendInvalid,
                    BackendNotFound, BackendRateLimited, BackendSpec, BackendUnavailable, Item,
@@ -406,7 +406,7 @@ class BwBackend(VaultBackend):
             org, coll = self._resolve_target()
             obj = BwBackend._template_base(item, "password", password, org, coll)
             obj["login"]["username"] = username
-            obj["login"]["uris"] = [{"match": None, "uri": uri}] if uri else []
+            obj["login"]["uris"] = [{"match": None, "uri": u} for u in as_uris(uri)]
             obj["notes"] = notes or None
             if meta is not None:
                 BwBackend._with_meta(obj, meta)

@@ -1133,6 +1133,7 @@ class MemoryBackendFlow(H):
         self.assertEqual(self.submit(r2["id"], name="site", username=USR, password=PW, token="")[0], 200)
         self.assertEqual(self.vault_value("site", "username"), USR)    # a real Login, not a JSON note
         self.assertEqual(self.vault_value("site", "password"), PW)
+        self.assertEqual(self.broker.backend._items["site"].uris, ["https://127.0.0.1"])   # hosts = the Login's websites
 
 
 class BitwardenFakeFlow(H):

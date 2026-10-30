@@ -119,6 +119,11 @@ AUTO_ALIASES = (None, "", "auto")
 # -- capabilities ---------------------------------------------------------------
 CAP_SET_META = "set_meta"           # set_meta persists (policy edits, standing approvals...)
 CAP_CREATE_LOGIN = "create_login"
+
+
+def as_uris(uri):
+    """create_login's `uri`: None, one URL, or a list of them -> a list of URLs."""
+    return [u for u in ([uri] if isinstance(uri, str) else uri or []) if u]
 CAP_EDIT_ITEM = "edit_item"
 CAP_WARM = "warm"
 CAP_ON_EVENT = "on_event"
@@ -380,7 +385,8 @@ class VaultBackend(abc.ABC):
 
     # -- optional, declared in `capabilities` ---------------------------------------
     def create_login(self, item, username, password, uri=None, notes=None, meta=None):
-        """["create_login"] Create a login with real username, password and URL.
+        """["create_login"] Create a login with real username, password and URL(s):
+        `uri` is one URL or a list (a Login's websites).
         BackendConflict if the item exists."""
         raise NotSupported("this backend cannot create logins")
 

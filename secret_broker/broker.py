@@ -3401,7 +3401,9 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                                          ("cred_mode", fin["cred_mode"] == req.spec["cred_mode"])) if not same),
                    value_bytes=len(value.encode()), **{k: v for k, v in who.items() if k == "channel"})
         if fin.get("real_login"):
-            self.backend.create_login(fin["item"], sec["username"], sec["password"], meta=meta)
+            # the allowed hosts are the Login's websites, so they show (and can be edited) in a vault client
+            self.backend.create_login(fin["item"], sec["username"], sec["password"],
+                                      uri=[f"https://{h}" for h in fin["hosts"]], meta=meta)
             fin["field"] = "password"
         else:
             self.backend.put(fin["item"], fin["field"], value, create=True, meta=meta)

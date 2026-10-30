@@ -5,7 +5,7 @@ including `broker` metadata and adoption of items without it. See
 docs/reference.md ("Local encrypted backend")."""
 import copy
 
-from .base import (AUTO_ALIASES, CAP_ADOPTS, CAP_CREATE_LOGIN, CAP_EDIT_ITEM, CAP_EXPORT_ITEMS,
+from .base import (AUTO_ALIASES, as_uris, CAP_ADOPTS, CAP_CREATE_LOGIN, CAP_EDIT_ITEM, CAP_EXPORT_ITEMS,
                    CAP_IMPORT_ITEMS, CAP_ON_EVENT, CAP_SET_META, CAP_WARM, LOGIN, META_FIELD, NOTE,
                    PREVIOUS_FIELDS, RESERVED_FIELDS, SSH_KEY, BackendConfigError, BackendConflict,
                    BackendInvalid, BackendNotFound, BackendSpec, Item, VaultBackend, auto_field_for,
@@ -168,7 +168,7 @@ class LocalBackend(VaultBackend):
             if self._find(items, item) is not None:
                 raise BackendConflict(f"item {item!r} already exists")
             new = {"type": LOGIN, "username": username, "password": password,
-                   "notes": notes or None, "uris": [uri] if uri else [], "fields": {}}
+                   "notes": notes or None, "uris": as_uris(uri), "fields": {}}
             if meta is not None:
                 new[META_FIELD] = meta
             items[item] = new

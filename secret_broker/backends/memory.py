@@ -3,7 +3,7 @@ persists. For tests and embedding, and as the worked example for third-party
 backends: it passes tests/backend_contract.py in about 150 lines."""
 import threading
 
-from .base import (AUTO_ALIASES, CAP_ADOPTS, CAP_CREATE_LOGIN, CAP_EDIT_ITEM, CAP_EXPORT_ITEMS,
+from .base import (AUTO_ALIASES, as_uris, CAP_ADOPTS, CAP_CREATE_LOGIN, CAP_EDIT_ITEM, CAP_EXPORT_ITEMS,
                    CAP_IMPORT_ITEMS, CAP_SET_META, LOGIN, META_FIELD, NOTE, PREVIOUS_FIELDS,
                    RESERVED_FIELDS, SSH_KEY, BackendConflict, BackendInvalid, BackendNotFound,
                    Item, VaultBackend, BackendSpec, auto_shape, check_item_args, clean_meta,
@@ -123,7 +123,7 @@ class MemoryBackend(VaultBackend):
             if lookup_name(self._items, item) is not None:
                 raise BackendConflict(f"item {item!r} already exists")
             self._items[item] = Item(item, LOGIN, username, password, notes or None,
-                                     [uri] if uri else [], meta=clean_meta(meta) if meta else None)
+                                     as_uris(uri), meta=clean_meta(meta) if meta else None)
 
     def edit_item(self, item, new_name=None, meta=None, drop_meta=False):
         with self._lock:
