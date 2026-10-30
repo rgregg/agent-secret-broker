@@ -1805,7 +1805,8 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                     break
         final = {"name": name, "item": item, "field": "notes", "kind": kind, "cred_mode": mode,
                  "hosts": hosts, "no_hosts": bool(no_hosts and not hosts), "vars": vars_,
-                 "var_input": var}
+                 "var_input": var,
+                 "real_login": kind == "login" and backend_base.CAP_CREATE_LOGIN in self.backend.capabilities}
         if not errs:
             # dry-run the metadata exactly as the catalog will read it back
             try:
@@ -1820,8 +1821,12 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
     def _credential_meta(final, by):
         """The broker metadata for a new credential-request item (the catalog entry)."""
         field = final["field"]
-        vars_ = ({v: {"field": field, "key": role} for role, v in final["vars"].items()}
-                 if final["kind"] == "login" else {v: {"field": field} for v in final["vars"].values()})
+        if final.get("real_login"):     # a Login item: each variable is one of its own fields
+            vars_ = {v: {"field": role} for role, v in final["vars"].items()}
+        elif final["kind"] == "login":
+            vars_ = {v: {"field": field, "key": role} for role, v in final["vars"].items()}
+        else:
+            vars_ = {v: {"field": field} for v in final["vars"].values()}
         return {"name": final["name"], "vars": vars_, "allowed_hosts": final["hosts"], "approval": "prompt",
                 "created": {"by": by, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}}
 
@@ -3376,8 +3381,9 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
 
     def _credential_store(self, req, who):
         """Create the vault item for a credential request: ONE atomic backend create holding
-        the value and its broker metadata, then the live catalog entry. A login keeps its
-        two values as one JSON note (see structured.py), exposed as two variables by key."""
+        the value and its broker metadata, then the live catalog entry. A login becomes a real
+        Login item (username and password fields) where the backend can create one; otherwise it
+        keeps its two values as one JSON note (see structured.py), exposed as two variables by key."""
         fin, sec = req.spec["final"], req.spec["secret"]
         name = fin["name"]
         by = req.approver or "unknown"
@@ -3394,7 +3400,11 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                                          ("hosts", fin["hosts"] == req.spec.get("hosts")),
                                          ("cred_mode", fin["cred_mode"] == req.spec["cred_mode"])) if not same),
                    value_bytes=len(value.encode()), **{k: v for k, v in who.items() if k == "channel"})
-        self.backend.put(fin["item"], fin["field"], value, create=True, meta=meta)
+        if fin.get("real_login"):
+            self.backend.create_login(fin["item"], sec["username"], sec["password"], meta=meta)
+            fin["field"] = "password"
+        else:
+            self.backend.put(fin["item"], fin["field"], value, create=True, meta=meta)
         _, entry = self._entry(fin["item"], meta)
         with self._cfg_lock:
             self.cfg["secrets"][name] = entry

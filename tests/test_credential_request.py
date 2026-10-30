@@ -249,7 +249,7 @@ class Happy(H):
         self.submit(r["id"], name="my-svc2")
         self.assertEqual(set(self.broker.cfg["secrets"]["my-svc2"]["vars"]), {"MY_SVC2_TOKEN"})
 
-    def test_login_is_stored_as_one_json_note_with_two_variables(self):
+    def test_login_on_a_backend_without_logins_is_one_json_note_with_two_variables(self):
         r = self.ask("site", kind="login", hosts=["127.0.0.1"])
         _, form, _ = self.get(f"/credential/{r['id']}")
         self.assertIn("type=text name=username", form)
@@ -1102,7 +1102,7 @@ class LocalBackendFlow(H):
         self.assertEqual(set(sc["vars"]), {"PERSIST_USERNAME", "PERSIST_PASSWORD"})
         self.assertEqual(sc["allowed_hosts"], ["127.0.0.1"])
         self.assertEqual(sc["approval"], "prompt")
-        self.assertEqual(json.loads(t0.get("persist", "notes")), {"username": USR, "password": PW})
+        self.assertEqual((t0.get("persist", "username"), t0.get("persist", "password")), (USR, PW))
         # the store file holds no plaintext secret
         data = open(self.store, "rb").read()
         for c in ALL_CANARIES:
@@ -1131,7 +1131,8 @@ class MemoryBackendFlow(H):
         self.assertEqual(self.http_with("newapi", "NEWAPI_TOKEN")["http"]["status"], 200)
         r2 = self.ask("site", kind="login")
         self.assertEqual(self.submit(r2["id"], name="site", username=USR, password=PW, token="")[0], 200)
-        self.assertEqual(json.loads(self.vault_value("site"))["username"], USR)
+        self.assertEqual(self.vault_value("site", "username"), USR)    # a real Login, not a JSON note
+        self.assertEqual(self.vault_value("site", "password"), PW)
 
 
 class BitwardenFakeFlow(H):
@@ -1157,7 +1158,8 @@ class BitwardenFakeFlow(H):
         self.assertEqual(self.http_with("newapi", "NEWAPI_TOKEN")["http"]["status"], 200)
         r2 = self.ask("site", kind="login")
         self.assertEqual(self.submit(r2["id"], name="site", username=USR, password=PW, token="")[0], 200)
-        self.assertEqual(json.loads(self.vault_value("site")), {"username": USR, "password": PW})
+        self.assertEqual(self.vault_value("site", "username"), USR)
+        self.assertEqual(self.vault_value("site", "password"), PW)
         self.assertEqual(set(self.broker.cfg["secrets"]["site"]["vars"]), {"SITE_USERNAME", "SITE_PASSWORD"})
         self.assertTrue(self.broker.cfg["secrets"]["newapi"]["allowed_hosts"])
         with open(self.state) as f:
