@@ -80,7 +80,7 @@ class BwBackend(VaultBackend):
 
     kind = "bw"
 
-    def __init__(self, server_url, master_password_file, bw="bw", sync_interval=300,
+    def __init__(self, server_url, master_password_file, bw="bw", sync_interval=60,
                  idle_timeout=300, organization=None, collection=None, prewarm=True):
         caps = {CAP_SET_META, CAP_CREATE_LOGIN, CAP_EDIT_ITEM, CAP_ON_EVENT, CAP_EXPORT_ITEMS}
         if prewarm:
@@ -483,6 +483,16 @@ class BwBackend(VaultBackend):
         return out
 
     # -- public -----------------------------------------------------------
+    def sync(self, min_age=0):
+        """Pull changes made in a Bitwarden client now (not only every `sync_interval`)."""
+        with self._lock:
+            if time.time() - self._synced < min_age:
+                return
+            if self._session is None:
+                self._unlock()
+            self._sync()
+            self._touch()
+
     def warm(self):
         """Unlock and sync ahead of a likely read; extends the idle window."""
         with self._lock:
@@ -709,6 +719,9 @@ def validate(b):
     idle = b.get("idle_timeout", 300)
     if isinstance(idle, bool) or not isinstance(idle, (int, float)) or idle < 0:
         raise BackendConfigError("backend.idle_timeout: must be a number of seconds >= 0")
+    sync = b.get("sync_interval", 60)
+    if isinstance(sync, bool) or not isinstance(sync, (int, float)) or sync < 0:
+        raise BackendConfigError("backend.sync_interval: must be a number of seconds >= 0")
     for k in ("serve", "prewarm"):
         if k in b and not isinstance(b[k], bool):
             raise BackendConfigError(f"backend.{k}: must be true or false")
@@ -717,7 +730,7 @@ def validate(b):
 def build(b):
     bw_class = BwServeBackend if b.get("serve") else BwBackend
     return bw_class(b["server_url"], b["master_password_file"],
-                    idle_timeout=b.get("idle_timeout", 300),
+                    idle_timeout=b.get("idle_timeout", 300), sync_interval=b.get("sync_interval", 60),
                     organization=b.get("organization"), collection=b.get("collection"),
                     prewarm=b.get("prewarm", True))
 
@@ -726,4 +739,4 @@ SPEC = BackendSpec(
     name="bw", build=build, validate=validate,
     doc="Bitwarden / Vaultwarden through the bw CLI (serve: true keeps one bw serve). "
         "Keys: server_url, master_password_file, organization, collection, serve, "
-        "idle_timeout, prewarm.")
+        "idle_timeout, prewarm, sync_interval.")

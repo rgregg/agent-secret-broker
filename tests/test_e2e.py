@@ -1308,6 +1308,14 @@ esac
         after = self.calls()[len(before):]
         self.assertEqual(after, ["get", "get"])          # no status/login/unlock/sync
 
+    def test_sync_now_unless_it_just_happened(self):
+        b = BwBackend("https://v.example", self.pw, bw=self.bw)
+        b.sync()
+        b.sync(min_age=30)                  # just synced: nothing to do
+        self.assertEqual(self.calls().count("sync"), 1)
+        b.sync()                            # no age limit: always
+        self.assertEqual(self.calls().count("sync"), 2)
+
     def test_resync_after_interval(self):
         b = BwBackend("https://v.example", self.pw, bw=self.bw, sync_interval=0)
         b.get("T", "notes")
