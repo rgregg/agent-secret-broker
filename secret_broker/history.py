@@ -24,7 +24,7 @@ _EV_KEYS = ("reason", "reasons", "model", "risk", "error", "via", "channel", "de
             "item", "field", "key", "hosts", "grant_id", "scope", "secrets", "grant_minutes",
             "grant_left_s", "expires_at", "created_by", "max_risk", "risk_level",
             "host_bound", "host_fp", "host_type", "host_name", "claimed_dest", "forwarding", "host_lines",
-            "late_level", "rule_id", "account", "rule_host", "ssh_rule_requested", "decision_source",
+            "late_level", "rule_id", "rule_name", "account", "rule_host", "ssh_rule_requested", "decision_source",
             # guidance proposals: names, counts, lengths and hash prefixes; never text
             "entry_names", "entry_lengths", "entry_sha256", "applied", "denied", "failed",
             "applied_names", "denied_names", "failed_names", "failed_classes", "count", "retry",
@@ -147,11 +147,11 @@ class History:
                 "id": rid, "ts": rec["ts"], "time": rec["time"], "names": rec.get("names") or [],
                 "mode": rec.get("mode"), "source": rec.get("source"), "outcome": "pending",
                 "via": None, "approver": None, "risk": None, "summary": None, "summary_model": None, "summary_source": None, "summary_reason": None, "summary_rule": None, "late_rating": None, "error": None,
-                "latency_ms": None, "grant_id": None, "rule_id": None, "plan_id": None, "plan_left_s": None, "delivered": False, "escalated": False,
+                "latency_ms": None, "grant_id": None, "rule_id": None, "rule_name": None, "plan_id": None, "plan_left_s": None, "delivered": False, "escalated": False,
                 "method": rec.get("method"), "url": _short_url(rec.get("url")),
                 "op": rec.get("op"), "item": rec.get("item"), "field": rec.get("field"),
                 "key": rec.get("key"), "hosts": rec.get("hosts"), "final_seq": -1,
-                "ssh_what": rec.get("ssh_what"), "peer": rec.get("peer"),
+                "ssh_what": rec.get("ssh_what"), "ssh_headline": rec.get("ssh_headline"), "peer": rec.get("peer"),
                 "client_id": rec.get("client_id"), "client_name": rec.get("client_name"),
                 "argv": _clean_argv(rec.get("argv")), "scripts": _scripts(rec), "risk_reasons": None, "risk_model": None,
             }
@@ -199,6 +199,7 @@ class History:
             row["latency_ms"] = rec.get("latency_ms")
             row["grant_id"] = rec.get("grant_id")
             row["rule_id"] = rec.get("rule_id")
+            row["rule_name"] = rec.get("rule_name")
             row["plan_id"] = rec.get("plan_id")
             row["plan_left_s"] = rec.get("plan_left_s")
             if ev == "approved" and row["via"] == "policy":
@@ -239,7 +240,7 @@ class History:
             q = q.lower()
             rows = [r for r in rows if q in " ".join(
                 str(x) for x in (r["id"], ", ".join(r["names"]), r["method"], r["url"], r["source"],
-                                 r["summary"], r["approver"], r["error"], r["ssh_what"], r["op"],
+                                 r["summary"], r["approver"], r["error"], r["ssh_what"], r["ssh_headline"], r["op"],
                                  r["mode"], r.get("client_name"), " ".join(r["argv"] or ()))
                 if x).lower()]
         return rows

@@ -152,7 +152,7 @@ HIDDEN = frozenset({
     "notify_held", "notify_released", "notify_dropped",
     # standing per-host SSH rules are approval policy: a rule-approved request shows as plain "approved",
     # and the agent must never learn which servers have rules
-    "ssh_rule_created", "ssh_rule_used", "ssh_rule_revoked", "ssh_rule_expired", "ssh_rule_refused",
+    "auto_rule_used", "ssh_rule_created", "ssh_rule_used", "ssh_rule_revoked", "ssh_rule_expired", "ssh_rule_refused",
     "ssh_rule_change_failed", "ssh_rules_state_corrupt", "ssh_rules_state_write_failed",
     # per-client credentials: enrolling, renaming and revoking clients is approver activity, and an
     # authentication failure can name a revoked client; none of it is the agent's business

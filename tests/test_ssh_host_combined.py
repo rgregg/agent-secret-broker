@@ -50,8 +50,7 @@ class Combined(Base):
         r = self.broker._by_id[json.loads(body)["id"]]
         self.assertEqual(r.risk["level"], "high")
         self.assertEqual(rec.calls, [])                       # no model call, so no guidance either
-        self.assertIn("server web.example.com", r.summary)
-        self.assertIn("destination (claimed) deploy@web.example.com:22", r.summary)
+        self.assertEqual(r.summary, "auto: Log in to web.example.com as 'deploy'")   # the claim agrees: nothing to add
         _, page = self.get("/")
         self.assertIn(HOST.fp, page)
         self.assertIn("Destination (claimed by the client): deploy@web.example.com:22", page)

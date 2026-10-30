@@ -291,6 +291,8 @@ def deterministic_summary(mode, names, spec):
             s = f"{f['method']} {f['host']}{f['path']}"
         elif mode == "store":
             s = f"{f['operation']} ({f['vault_item']})"
+        elif mode == "ssh_sign" and (spec.get("ssh") or {}).get("headline"):
+            s = spec["ssh"]["headline"]
         elif mode == "ssh_sign":
             s = f["operation"]
             if "server" in f:

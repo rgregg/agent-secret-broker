@@ -126,6 +126,32 @@ class HostBound(unittest.TestCase):
             self.assertIn(f"to server {h.fp} ({h.type})", d["text"])
             self.assertNotIn("host not shown", d["text"])
 
+    def test_headline_names_the_machine_and_says_how_sure_it_is(self):
+        h = Host()
+        ua = sshkey.describe_data(hostbound(SID_A, h, user="bob"))
+        fp = h.fp
+        named = {"fp": fp, "names": ["web.example.com", "10.0.0.5"]}
+        self.assertEqual(sshkey.headline(ua, named), "Log in to web.example.com (10.0.0.5) as 'bob'")
+        self.assertEqual(sshkey.headline(ua, {"fp": fp, "names": ["10.0.0.5"]}), "Log in to 10.0.0.5 as 'bob'")
+        # a destination only the client claimed is labelled as such, never presented as the server's name
+        claimed = sshkey.headline(ua, {"fp": fp, "names": [], "claimed": "evil.example.com"})
+        self.assertIn("Log in to evil.example.com as 'bob' (name given by the client, not verified", claimed)
+        unnamed = sshkey.headline(ua, {"fp": fp, "names": []})
+        self.assertIn("a server this key has no name for", unnamed)
+        self.assertIn(fp[:22], unnamed)
+        self.assertEqual(sshkey.headline(ua, None), "Log in as 'bob'; the broker could not verify which server this is")
+        self.assertIn("agent forwarding", sshkey.headline(ua, dict(named, forwarding=True)))
+        # a claim that agrees with the verified server adds nothing; one that does not is called out
+        self.assertEqual(sshkey.headline(ua, dict(named, claimed="deploy@web.example.com:22")),
+                         "Log in to web.example.com (10.0.0.5) as 'bob'")
+        self.assertIn("the client says it is connecting to db.example.com:22, which does not match",
+                      sshkey.headline(ua, dict(named, claimed="db.example.com:22")))
+        sig = sshkey.describe_data(b"SSHSIG" + struct.pack(">I", 3) + b"git")
+        self.assertTrue(sshkey.headline(sig, None).startswith("Sign a message"))
+        self.assertEqual(sshkey.headline({"kind": "unknown"}, None), "Sign unrecognised data (not an SSH login)")
+        # names come from the key's known hosts for the VERIFIED fingerprint only: no verified fp, no name
+        self.assertNotIn("web.example.com", sshkey.headline(ua, {"names": ["web.example.com"]}))
+
     def test_plain_publickey_is_unchanged(self):
         d = sshkey.describe_data(login(SID_A))
         self.assertIsNone(d["hostkey"])
@@ -289,6 +315,10 @@ class Verified(HostBase):
         self.assertIn(want, card.replace("&#x27;", "'"))
         self.assertIn("Destination (claimed by the client): deploy@web.example.com:22", card)
         self.assertIn("log in over SSH as", card)
+        # the first thing an approver reads is which machine, by name, then the account
+        self.assertIn("Log in to web.example.com (10.0.0.5) as &#x27;deploy&#x27;", card)
+        self.assertTrue(self.notifier.sent[0]["message"].startswith("Log in to web.example.com (10.0.0.5) as 'deploy'"))
+        self.assertIn("Technical details", card)
         self.assertNotIn("host not shown", card)
         self.assertNotIn("Agent forwarding", card)
         self.assertIn(want, self.notifier.sent[0]["message"])
@@ -363,7 +393,7 @@ class Verified(HostBase):
                     "host": {"bound": True, "fp": "SHA256:<b>", "type": "t<i>", "names": ["<u>x"],
                              "claimed": "<script>1</script>", "forwarding": True}}
         what, _ = _describe(R)
-        for tag in ("<script", "<b>", "<i>", "<u>"):   # `what` has no markup of its own
+        for tag in ("<script", "<b>", "<i>", "<u>"):   # `what` has only our own <strong> and <small>
             self.assertNotIn(tag, what)
         self.assertIn("&lt;script&gt;", what)
 

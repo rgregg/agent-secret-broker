@@ -110,7 +110,11 @@ socket, and every signature ssh asks for becomes a broker request (mode
     replayed from another connection) is refused (`ssh_sign_refused`, reason
     `session_mismatch`). The card reads `Server: SHA256:... (ssh-ed25519)`, plus
     `known as host1, host2` when the key's `ssh_hosts.known_hosts` lists that
-    fingerprint. What this proves: the other end of that session holds that host
+    fingerprint. The first line of the card, the notification and the request history is a plain
+    sentence built from those facts: "Log in to openclaw-linux.lan (192.168.42.127) as 'ryan'" (the
+    machine's names come only from `known_hosts` for the verified host key; a destination the client merely
+    claimed is labelled "name given by the client, not verified", and a server with no known name says so). The
+    fingerprints and the signed text sit below it under "Technical details". What this proves: the other end of that session holds that host
     key. It does not prove the login is going to the host you expected. git over
     ssh binds too.
     If any bind in the chain has `is_forwarding` set, the key is being used from a
@@ -1524,6 +1528,58 @@ retained (the cards still show the section).
 approver pages (the SSO listener), never by an agent-facing endpoint; the
 `request_details_store_error` event is hidden from the audit API.
 
+## Approving by configuration rule: `auto_approve`
+
+Some jobs have to run with nobody there to approve (an agent that reaches another machine overnight, a
+report that calls an API every hour). `auto_approve` is a list of rules in the broker's own configuration, written
+by whoever runs the broker, that approve exactly the requests they describe:
+
+    "auto_approve": [
+      {"name": "reach openclaw", "mode": "ssh_sign", "secret": "agent-ssh",
+       "host": "openclaw-linux.lan", "account": "ryan", "clients": ["c-1a2b3c4d"]},
+      {"name": "read komodo", "mode": "http", "secret": "komodo",
+       "host": "komodo.local.dibbleapps.com", "methods": ["POST"], "path_prefix": "/read"},
+      {"name": "nightly report", "mode": "env", "secret": "reports",
+       "argv": ["python3", "report.py"], "clients": ["c-5e6f7a8b"]}
+    ]
+
+A request that matches a rule is released at once, at any risk level and whatever the secret's `approval`
+setting says: the rule is the approval. It is audited as an ordinary approval (`via: policy`) with
+`decision_source: config_rule` and the rule's `rule_name`, preceded by an `auto_rule_used` event, and the request
+history says "configuration rule "name" (auto-approved)". The agent sees a plain approval; rule names and the
+`auto_rule_used` event are hidden from the agent audit API. The rules are read when the broker starts: change them
+in the configuration and redeploy.
+
+Fields (a field a mode does not take is an error, and so is any mistake: the broker refuses to start rather than
+guess, and the message names the field, such as `auto_approve[2].host`):
+
+| Field | Modes | Meaning |
+|---|---|---|
+| `name` | all | Required, unique. What the audit log and the history show. |
+| `mode` | all | `ssh_sign`, `http` or `env`. |
+| `secret` or `secrets` | all | The credential name(s) the rule covers. A request that names several credentials (`asb a,b -- cmd`, or two placeholders in one call) is matched only by a rule that lists **all** of them; a rule for one of them does not cover the pair. A rule listing `[a, b]` also covers a request for just `a`. |
+| `clients` | all | Optional list of client **ids** (`c-1a2b3c4d`, shown in the Clients tab). Ids only: a name can be reused by another client, an id cannot. Leave it out for any enrolled client. The legacy shared key never matches. |
+| `host` / `host_fp` | ssh_sign | Exactly one. The server: a name the key's `ssh_hosts.known_hosts` gives the server's **verified** host key, or the `SHA256:` fingerprint itself. |
+| `account` | ssh_sign | Required. The login name. |
+| `host` | http | Required. The exact host name (no scheme or port). |
+| `scheme` | http | `https` (the default) or `http`. A request to the other scheme never matches. |
+| `methods` | http | Upper-case methods, default `["GET", "HEAD"]`. |
+| `path_prefix` | http | Default `/`. Matches that path and what is below it (`/v1` matches `/v1/x`, not `/v10`). Compared on the raw path: a path with any `%` escape, `;`, backslash or `.`/`..` segment never matches. A request with a method-override header (`X-HTTP-Method-Override` and friends) or a `_method=` parameter, or a GET/HEAD with a body, never matches either; the same goes for the path-rewrite headers (`X-Original-URL`, `X-Rewrite-URL`, ...) and a query or body parameter (or JSON key) named `method`, `_method`, `x.method`, `x[method]`, `http_method`, `method_override` or `http_verb` (frameworks read these as the HTTP method; only the name counts, so `payment_method=card` or a value containing the word is fine), and a multipart body. A query or body that needs more than one decoding pass, uses JSON or unicode escapes, or is not plain ASCII, and any `Content-Encoding`/`Transfer-Encoding` header, also never match (the broker cannot show it is free of an override). These are best-effort: no list of tricks is complete, so keep an http rule to the narrowest host, methods and path the job needs (reads where you can). |
+| `argv` | env | The exact command as a list of words. A script whose text the broker could not read never matches. |
+
+What a rule will not do:
+
+- **Human-only modes.** Root commands (`sudo`), credential requests, guidance proposals, plans, sessions and
+  credential stores are decided by a person by design; a rule with one of those modes is refused at load.
+- **Match loosely.** There is no "any host" or "any command". An SSH rule needs an account and one server; an SSH
+  server is matched on what the broker verified (the host key behind the session), never on a destination the
+  client merely claimed, and not at all for forwarded or unverified connections.
+- **Override a client set to never auto-approve**, or anything that is refused before a request exists
+  (`ssh_hosts`, the vault item's allowed hosts, the destination guard).
+
+A rule is stronger than `approval: allow` because it ignores the risk ceiling, so keep each one as narrow as the
+job needs.
+
 ## Standing approvals (Always and time-boxed)
 
 A **standing approval** lets later requests for a secret through without a tap.
@@ -1596,7 +1652,8 @@ values are `approve_grant_<minutes>` and `approve_always`.
 
 ### Evaluation order
 
-For each new request, after assessment and after an SSH host rule claim:
+For each new request, after assessment, after an SSH host rule claim and after the `auto_approve`
+configuration rules (next section):
 
 1. The legacy credential-wide `approval: allow` policy (see
    "What `approval: allow` covers"): `auto_modes` / `risk.auto_modes`, with the

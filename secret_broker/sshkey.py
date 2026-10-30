@@ -8,6 +8,7 @@ Only unencrypted OpenSSH-format keys are accepted: the broker is the thing
 protecting the key, so a passphrase would have nowhere to come from.
 """
 import base64
+import ipaddress
 import re
 import struct
 
@@ -185,7 +186,7 @@ def describe_data(data, host_known=False):
             text += f" to server {fingerprint(ua['hostkey'])} ({_blob_type(ua['hostkey'])})"
         elif not host_known:
             text += "; host not shown by SSH"
-        return {"kind": "userauth", "text": text, "hostkey": ua["hostkey"]}
+        return {"kind": "userauth", "text": text, "hostkey": ua["hostkey"], "user": user}
     hint = ""
     if len(data) > 4 and struct.unpack(">I", data[:4])[0] == len(data) - 4:
         hint = ", one length-prefixed string"
@@ -329,4 +330,53 @@ def host_lines(host):
         out.append(f"Destination (claimed by the client): {host['claimed']}")
     if host.get("forwarding"):
         out.append("Agent forwarding: this key may be used from the remote host")
+    return out
+
+
+def _is_ip(name):
+    try:
+        ipaddress.ip_address(name)
+        return True
+    except ValueError:
+        return False
+
+
+def headline(ssh, host):
+    """One plain sentence for an approver: what is being signed for and, above all, WHICH machine.
+
+    `ssh` is the request's spec["ssh"] and `host` its spec["host"] (either may be None/empty). The server
+    is named only from what the broker verified (its host key fingerprint, looked up in the key's known
+    hosts); a destination the client merely claimed is labelled as such. The technical text (service name,
+    fingerprints) stays in `ssh["text"]` and `host_lines`; this is the line to read first."""
+    ssh = ssh or {}
+    kind = ssh.get("kind")
+    if kind == "sshsig":
+        text = ssh.get("text") or "sign a message"
+        return text[:1].upper() + text[1:]
+    if kind != "userauth":
+        return "Sign unrecognised data (not an SSH login)"
+    user = ssh.get("user") or "an unknown account"
+    host = host or {}
+    names = list(host.get("names") or []) if host.get("fp") else []
+    if names:
+        plain = [n for n in names if not _is_ip(n)]
+        ips = [n for n in names if _is_ip(n)]
+        target = ", ".join(plain or ips)
+        if plain and ips:
+            target += f" ({', '.join(ips)})"
+        out = f"Log in to {target} as {user}"
+        claimed = host.get("claimed")
+        if claimed:     # worth a line only when the client says it is going somewhere else than the verified server
+            cname = claimed.rsplit("@", 1)[-1].rsplit(":", 1)[0].strip("[]").lower()
+            if cname not in {n.lower() for n in names}:
+                out += f"; the client says it is connecting to {claimed}, which does not match"
+    elif host.get("claimed"):
+        out = (f"Log in to {host['claimed']} as {user} (name given by the client, not verified"
+               + ("" if not host.get("fp") else "; this server's key is not in the key's known hosts") + ")")
+    elif host.get("fp"):
+        out = f"Log in as {user} to a server this key has no name for (host key {host['fp'][:22]}...)"
+    else:
+        out = f"Log in as {user}; the broker could not verify which server this is"
+    if host.get("forwarding"):
+        out += "; agent forwarding: the key can be used from that machine"
     return out
