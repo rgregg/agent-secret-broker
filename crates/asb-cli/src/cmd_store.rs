@@ -52,7 +52,10 @@ pub fn store_or_update(argv: &[String]) -> R {
         }
         let payload = json!({"mode": "store", "names": [argv[1]], "op": "update",
                              "add_hosts": add, "remove_hosts": remove});
-        let r = obtain(payload.as_object().cloned().unwrap_or_default(), "waiting for approval...")?;
+        let r = obtain(
+            payload.as_object().cloned().unwrap_or_default(),
+            "waiting for approval...",
+        )?;
         let hosts: Vec<String> = r["stored"]["hosts"]
             .as_array()
             .map(|a| a.iter().map(py_str).collect())
