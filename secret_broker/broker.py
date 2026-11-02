@@ -920,6 +920,9 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             sp = req.spec
             rec.update(op=sp.get("op"), item=sp.get("item"), field=sp.get("field"), key=sp.get("key"),
                        hosts=sp.get("allowed_hosts"), value_bytes=sp.get("value_bytes"))
+            if sp.get("hosts_after") is not None:
+                rec.update(hosts_added=sp["add_hosts"], hosts_removed=sp["remove_hosts"],
+                           hosts=sp["hosts_after"])
         elif req.mode == "guidance":
             pass                # names and mode only; the proposal text is never logged
         elif req.mode == "credential":
@@ -1813,7 +1816,8 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                     break
         final = {"name": name, "item": item, "field": "notes", "kind": kind, "cred_mode": mode,
                  "hosts": hosts, "no_hosts": bool(no_hosts and not hosts), "vars": vars_,
-                 "var_input": var}
+                 "var_input": var,
+                 "real_login": kind == "login" and backend_base.CAP_CREATE_LOGIN in self.backend.capabilities}
         if not errs:
             # dry-run the metadata exactly as the catalog will read it back
             try:
@@ -1828,8 +1832,12 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
     def _credential_meta(final, by):
         """The broker metadata for a new credential-request item (the catalog entry)."""
         field = final["field"]
-        vars_ = ({v: {"field": field, "key": role} for role, v in final["vars"].items()}
-                 if final["kind"] == "login" else {v: {"field": field} for v in final["vars"].values()})
+        if final.get("real_login"):     # a Login item: each variable is one of its own fields
+            vars_ = {v: {"field": role} for role, v in final["vars"].items()}
+        elif final["kind"] == "login":
+            vars_ = {v: {"field": field, "key": role} for role, v in final["vars"].items()}
+        else:
+            vars_ = {v: {"field": field} for v in final["vars"].values()}
         return {"name": final["name"], "vars": vars_, "allowed_hosts": final["hosts"], "approval": "prompt",
                 "created": {"by": by, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}}
 
@@ -1863,6 +1871,11 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         if len(names) != 1 or not _NAME_RE.match(names[0]):
             raise ValueError("secret name must be 1-41 chars of a-z 0-9 _ - ")
         name, op = names[0], spec.get("op")
+        add, rem = spec.pop("add_hosts", None), spec.pop("remove_hosts", None)
+        if op == "update" and (add or rem):
+            return self._validate_host_change(name, spec, add, rem)
+        if add or rem:
+            raise ValueError("add_hosts and remove_hosts apply to an update")
         value = spec.get("value")
         if not isinstance(value, str) or not value or "\x00" in value:
             raise ValueError("value must be a non-empty string")
@@ -1937,6 +1950,45 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             spec["key"] = ref.get("key")
         else:
             raise ValueError("op must be create or update")
+
+    def _validate_host_change(self, name, spec, add, rem):
+        """An update that changes which hosts a credential may be used against, and nothing else. It never
+        carries a value (rotate the value in a separate update), always needs a human, and is rated high:
+        the allowed hosts are what keeps a credential from being sent to a server an agent picked."""
+        secrets_cfg = self.cfg["secrets"]
+        if name not in secrets_cfg or name in self._internal_secrets()[0]:
+            raise ValueError("unknown secret name")
+        sc = secrets_cfg[name]
+        if sc.get("ssh"):
+            raise ValueError("an ssh key's hosts are not changed this way")
+        if spec.get("value") is not None or spec.get("var") or spec.get("field") or spec.get("item") \
+                or spec.get("allowed_hosts") or spec.get("ssh"):
+            raise ValueError("a host change carries only add_hosts / remove_hosts, no value or other field")
+        lists = {}
+        for label, hosts in (("add_hosts", add), ("remove_hosts", rem)):
+            hosts = hosts or []
+            if (not isinstance(hosts, list) or len(hosts) > 10
+                    or not all(isinstance(h, str) and _HOST_ENTRY_RE.match(h) for h in hosts)):
+                raise ValueError(f"{label} must be up to 10 plain hostnames")
+            lists[label] = sorted({h.lower() for h in hosts})
+        add, rem = lists["add_hosts"], lists["remove_hosts"]
+        if set(add) & set(rem):
+            raise ValueError("a host cannot be both added and removed")
+        before = list(sc.get("allowed_hosts") or [])
+        if set(rem) - set(before):
+            raise ValueError(f"{', '.join(sorted(set(rem) - set(before)))} is not an allowed host of {name}")
+        if set(add) & set(before):
+            raise ValueError(f"{', '.join(sorted(set(add) & set(before)))} is already an allowed host of {name}")
+        self._hosts_problem(add)
+        after = sorted((set(before) - set(rem)) | set(add))
+        if not after:
+            raise ValueError("a credential keeps at least one allowed host")
+        if len(after) > 10:
+            raise ValueError("a credential has at most 10 allowed hosts")
+        ref = next(iter(sc["vars"].values()))
+        spec.clear()
+        spec.update(op="update", add_hosts=add, remove_hosts=rem, hosts_before=sorted(before), hosts_after=after,
+                    item=sc["_item"], field=ref.get("field") or "auto", value=None, value_bytes=0)
 
     def _validate_ssh_sign(self, names, spec):
         if len(names) != 1 or not self.cfg["secrets"][names[0]].get("ssh"):
@@ -2091,9 +2143,12 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             what = f"{req.spec['method']} {req.spec['url']}"
         elif req.mode == "store":
             sp = req.spec
-            what = (f"{sp['op']} credential: item {sp['item']!r} field {sp['field']}"
-                    f"{' key ' + sp['key'] if sp.get('key') else ''} "
-                    f"({sp['value_bytes']} bytes, value not shown)")
+            if sp.get("hosts_after") is not None:
+                what = f"change allowed hosts of {req.names[0]}{_host_change_text(sp)}"
+            else:
+                what = (f"{sp['op']} credential: item {sp['item']!r} field {sp['field']}"
+                        f"{' key ' + sp['key'] if sp.get('key') else ''} "
+                        f"({sp['value_bytes']} bytes, value not shown)")
         elif req.mode == "guidance":
             k = len(req.names)
             what = f"Guidance change proposed for {k} credential{'' if k == 1 else 's'}"
@@ -3361,6 +3416,8 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             _, entry = self._entry(sp["item"], meta)
             with self._cfg_lock:
                 self.cfg["secrets"][name] = entry
+        elif sp.get("hosts_after") is not None:
+            return self._store_hosts(req)
         else:
             value = sp["value"]
             if sp.get("key"):                       # one key of a multi-value field
@@ -3373,6 +3430,35 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         self.audit("stored", req, duration_ms=int((time.time() - t0) * 1000))
         return {"stored": {"name": name, "op": sp["op"], "item": sp["item"], "field": sp["field"]}}
 
+    def _store_hosts(self, req):
+        """Apply an approved host change: the credential's metadata and, for a Login, its websites."""
+        sp = req.spec
+        name, by = req.names[0], req.approver or "unknown"
+        t0 = time.time()
+        with self._cfg_lock:
+            sc = self.cfg["secrets"].get(name)
+            if sc is None or sorted(sc.get("allowed_hosts") or []) != sp["hosts_before"]:
+                raise BackendError("the credential's hosts changed since this was requested; ask again")
+            meta = {**sc["_meta"], "name": name, "allowed_hosts": sp["hosts_after"],
+                    "hosts_changed": {"by": by, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}}
+            _, entry = self._entry(sc["_item"], meta)        # refuse a result the catalog would not accept
+            if self._backend_can("edit_item"):
+                self.backend.edit_item(sc["_item"], meta=meta, add_hosts=sp["add_hosts"],
+                                       remove_hosts=sp["remove_hosts"])
+            else:
+                self.backend.set_meta(sc["_item"], meta)
+            entry["approval_changed"] = sc.get("approval_changed")
+            for k in ("approval_changed", "standing"):
+                if sc.get(k) is None:
+                    entry.pop(k, None)
+                else:
+                    entry[k] = sc[k]
+            self.cfg["secrets"][name] = entry
+        self.audit("stored", req, duration_ms=int((time.time() - t0) * 1000), hosts_added=sp["add_hosts"],
+                   hosts_removed=sp["remove_hosts"], hosts=sp["hosts_after"])
+        return {"stored": {"name": name, "op": "update", "item": sp["item"], "field": sp["field"],
+                           "hosts": sp["hosts_after"]}}
+
     @staticmethod
     def _credential_error(exc):
         """The ONLY failure text a credential request ever carries (agent, approval page, history,
@@ -3384,8 +3470,9 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
 
     def _credential_store(self, req, who):
         """Create the vault item for a credential request: ONE atomic backend create holding
-        the value and its broker metadata, then the live catalog entry. A login keeps its
-        two values as one JSON note (see structured.py), exposed as two variables by key."""
+        the value and its broker metadata, then the live catalog entry. A login becomes a real
+        Login item (username and password fields) where the backend can create one; otherwise it
+        keeps its two values as one JSON note (see structured.py), exposed as two variables by key."""
         fin, sec = req.spec["final"], req.spec["secret"]
         name = fin["name"]
         by = req.approver or "unknown"
@@ -3402,7 +3489,13 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                                          ("hosts", fin["hosts"] == req.spec.get("hosts")),
                                          ("cred_mode", fin["cred_mode"] == req.spec["cred_mode"])) if not same),
                    value_bytes=len(value.encode()), **{k: v for k, v in who.items() if k == "channel"})
-        self.backend.put(fin["item"], fin["field"], value, create=True, meta=meta)
+        if fin.get("real_login"):
+            # the allowed hosts are the Login's websites, so they show (and can be edited) in a vault client
+            self.backend.create_login(fin["item"], sec["username"], sec["password"],
+                                      uri=[f"https://{h}" for h in fin["hosts"]], meta=meta)
+            fin["field"] = "password"
+        else:
+            self.backend.put(fin["item"], fin["field"], value, create=True, meta=meta)
         _, entry = self._entry(fin["item"], meta)
         with self._cfg_lock:
             self.cfg["secrets"][name] = entry
@@ -4770,6 +4863,13 @@ def _page(h, code, body, wide=False, nav=True, script=None, tab=None, badge=0, u
     h.wfile.write(raw)
 
 
+def _host_change_text(sp):
+    """": add a.com, b.com; remove c.com" for a host-change update (plain text, hosts are validated names)."""
+    parts = [f"{verb} {', '.join(sp[key])}" for verb, key in (("add", "add_hosts"), ("remove", "remove_hosts"))
+             if sp.get(key)]
+    return ": " + "; ".join(parts)
+
+
 def _describe(req):
     """(what_html, note_html) for a request, escaped."""
     if req.mode == "http":
@@ -4777,6 +4877,12 @@ def _describe(req):
                 "The broker will make this call itself; the secret never leaves it.")
     if req.mode == "store":
         sp = req.spec
+        if sp.get("hosts_after") is not None:
+            return (f"<b>CHANGE ALLOWED HOSTS</b> of {html.escape(req.names[0])}<br>"
+                    f"{html.escape(_host_change_text(sp)[2:])}<br>"
+                    f"Allowed after: {html.escape(', '.join(sp['hosts_after']))}",
+                    "The agent will be able to send this credential to the hosts added and no longer to "
+                    "the hosts removed. The value does not change. This will not run without your approval.")
         hosts = (f"<br>Usable only for: {html.escape(', '.join(sp['allowed_hosts']))}"
                  if sp.get("allowed_hosts") else "<br>Hosts and mapping stay unchanged")
         key = f", key: {html.escape(sp['key'])}" if sp.get("key") else ""
@@ -5075,6 +5181,8 @@ def _detail_html(r, evs, retained=""):
         add("Field", r["field"])
         add("Key", r["key"])
         add("Allowed hosts", ", ".join(r["hosts"] or []))
+        add("Hosts added", ", ".join(r.get("hosts_added") or []))
+        add("Hosts removed", ", ".join(r.get("hosts_removed") or []))
         if (last("stored") or {}).get("value_bytes") is not None:
             add("Value size", f"{last('stored')['value_bytes']} bytes (never recorded)")
     elif r["mode"] == "sudo":
@@ -5446,6 +5554,7 @@ def client_handler(broker, client_key):
                     spec = {"op": body.get("op"), "value": body.get("value"),
                             "field": body.get("field"), "item": body.get("item"),
                             "var": body.get("var"), "allowed_hosts": body.get("allowed_hosts"),
+                            "add_hosts": body.get("add_hosts"), "remove_hosts": body.get("remove_hosts"),
                             "ssh": body.get("ssh") is True}
                 elif mode == "credential":
                     if any(k in body for k in credreq_mod.FORBIDDEN_KEYS):
@@ -5793,7 +5902,8 @@ def approval_handler(broker):
                 if r["mode"] == "http":
                     what = f"{r['method'] or ''} {r['url'] or ''}".strip()
                 elif r["mode"] == "store":
-                    what = f"{r['op'] or 'store'} credential"
+                    what = ("change allowed hosts" if r.get("hosts_added") or r.get("hosts_removed")
+                            else f"{r['op'] or 'store'} credential")
                 elif r["mode"] == "ssh_sign":
                     what = r.get("ssh_headline") or r.get("ssh_what") or "ssh signature"
                 elif r["mode"] == "credential":

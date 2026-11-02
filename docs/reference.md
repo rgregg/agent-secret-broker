@@ -1053,9 +1053,19 @@ creating a new one does not unless `store.create` is `prompt` (below):
   approval page (which shows only its size) or the config.
 - **`store` creates** a vault item in the configured organization/collection, with
   the hosts you pass in its `broker` metadata (`approval: prompt`). There is no separate list to keep in sync.
-- **`update` replaces** the value of an existing secret's field. Hosts and
-  mapping cannot change, and the replaced value is kept in the item's
-  `previous_value` field for rollback.
+- **`update` replaces** the value of an existing secret's field. The replaced
+  value is kept in the item's `previous_value` field for rollback.
+- **`update --add-host H[,H]` / `--remove-host H[,H]` changes the allowed hosts**
+  of an existing credential and nothing else (no value is sent; rotate the value
+  in a separate update). It is always a human decision: never auto-approved,
+  whatever the credential's `approval` says, never covered by an `auto_approve`
+  rule or an Always button, and always rated high. The card shows the hosts
+  added, the hosts removed and the list after. A credential keeps at least one
+  host (at most 10), the new hosts pass the same destination checks as `store`,
+  and an SSH key's hosts are not changed this way. The change applies only if
+  the credential's hosts are still what they were when the agent asked. For a
+  Login item the vault item's websites follow: removed hosts' URLs go, `https://HOST`
+  is added for each new host, and URLs for other hosts are left alone.
 - **Item types:** `--field password` creates a Login item and `--field notes`
   (the default) a Secure Note; any other name is a hidden custom field. In
   the item's metadata a var may omit `field` (or say `"auto"`): reads and updates then

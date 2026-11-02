@@ -73,6 +73,9 @@ def assess(mode, names, spec, analyzer=None, guidance=None):
         # always approves it, so it is low whatever the model thinks
         return {"level": "low", "model": model_risk, **out,
                 "reasons": ["adds a new credential (it cannot read or change an existing one)"]}
+    if mode == "store" and spec.get("hosts_after") is not None:
+        return {"level": "high", "model": model_risk, **out,
+                "reasons": ["changes which hosts a credential may be sent to; always high, a human decides"]}
     if mode == "sudo":
         # a root command is described like any other command, but its level is set by code: whatever the
         # model rates it, a human reads the exact command and decides (nothing auto-approves this mode)

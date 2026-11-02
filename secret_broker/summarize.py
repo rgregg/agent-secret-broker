@@ -55,6 +55,9 @@ def describe(mode, names, spec, max_content_chars=300, send_content=True):
         lines.append(f"vault item: {spec.get('item')} field: {spec.get('field')}")
         if spec.get("allowed_hosts"):
             lines.append("usable for hosts: " + ", ".join(spec["allowed_hosts"]))
+        if spec.get("hosts_after") is not None:
+            lines.append("adds hosts: " + (", ".join(spec["add_hosts"]) or "none"))
+            lines.append("removes hosts: " + (", ".join(spec["remove_hosts"]) or "none"))
         lines.append(f"value: <{len(spec.get('value') or '')} chars, not shown>")
     elif mode == "ssh_sign":
         lines.append(f"operation: sign with an SSH key ({spec['ssh']['text']})")

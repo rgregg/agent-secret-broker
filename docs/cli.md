@@ -48,6 +48,7 @@ Check it:
 
     printf '%s' "$VALUE" | asb store NAME --hosts a.example.com   # add a credential
     printf '%s' "$VALUE" | asb update NAME                        # rotate one (needs approval)
+    asb update NAME --add-host H[,H] --remove-host H[,H]          # change its allowed hosts (a human always decides)
     asb ssh-agent [-- command args...]    # use broker-held SSH keys with ssh/git (see reference.md)
 
 - `asb status` asks the broker what it is running (`GET /v1/status`): the build
