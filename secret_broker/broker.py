@@ -2830,7 +2830,9 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         if decision not in ("approve", "deny"):
             raise ValueError("decision must be approve or deny")
         approve = decision == "approve"
-        always = bool(always and approve and ch.may_create_always)
+        always = (always if approve and ch.may_create_always else False) or False
+        if always not in (False, True, "script"):
+            always = True
         grant_minutes = grant_minutes if (approve and ch.may_create_grant) else None
         if grant_minutes is not None and not self.grant_minutes_ok(grant_minutes):
             return 400, None            # unknown duration: nothing is claimed or changed
@@ -2965,13 +2967,14 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         # The decision itself is recorded and announced immediately.
         if ssh_rule is not None:
             who["ssh_rule_requested"] = True
-        self.audit("decided", req, decision=decision, always_requested=always, **who)
+        self.audit("decided", req, decision=decision, always_requested=bool(always),
+                   **({"always_bound": "script"} if always == "script" else {}), **who)
         if not approve:
             self._finish(req, "denied", **who)
             return 200, req
         rscope = "any" if rule_scope == "any" else "client"
         if always:
-            self._always_create(req, actor, channel, who, rscope)
+            self._always_create(req, actor, channel, who, rscope, bound=always == "script")
         if grant_minutes is not None:
             self._grant_create(req, grant_minutes, actor, channel, who, rscope)
         if ssh_rule is not None:
@@ -3053,7 +3056,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                 off = e["mode"] not in self._effective_auto_modes(sc, e.get("client") if e.get("client", clients_mod.ANY) != clients_mod.ANY
                                                                    else None)
                 rows.append({"kind": "always", "id": e["id"], "secrets": [name + internal_tag(name)], "mode": e["mode"],
-                             "client": e.get("client", clients_mod.ANY), "scope": e["scope"], "covers": standing_mod.covers_label(e["mode"], e["scope"])
+                             "client": e.get("client", clients_mod.ANY), "scope": e["scope"], "covers": standing_mod.covers_label(e["mode"], e["scope"], e.get("scripts"))
                              + (" (not active: mode not enabled)" if off else ""),
                              "expires_at": None, "left_s": None, "created_by": e["created_by"],
                              "created_at": e["created_at"].replace("T", " ").replace("Z", " UTC")})
@@ -3087,7 +3090,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         else:
             sc.pop("standing", None)
 
-    def _add_always(self, name, mode, scope, by, client=clients_mod.ANY):
+    def _add_always(self, name, mode, scope, by, client=clients_mod.ANY, scripts=None):
         """Create (or find) an Always approval for one client (or `*` = any client). Returns
         (status, entry): created | exists | cap | backend | failed. One entry per (credential,
         mode, client): a broader method scope replaces a narrower one; a narrower one is
@@ -3097,10 +3100,14 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             entries = [dict(e) for e in sc.get("standing") or []]
             for e in entries:
                 if (e["mode"] == mode and (e["scope"] == "any" or e["scope"] == scope)
-                        and e.get("client", clients_mod.ANY) in (client, clients_mod.ANY)):
+                        and e.get("client", clients_mod.ANY) in (client, clients_mod.ANY)
+                        and e.get("scripts") in (None, scripts)):   # an unbound one covers a bound one
                     return "exists", e
+            # a new rule replaces the same client's rules it covers: all of them when it is
+            # unbound, only the one bound to the same scripts when it is bound
             kept = [e for e in entries if not (e["mode"] == mode
-                                               and e.get("client", clients_mod.ANY) == client)]
+                                               and e.get("client", clients_mod.ANY) == client
+                                               and (scripts is None or e.get("scripts") == scripts))]
             if len(kept) >= standing_mod.MAX_STANDING:
                 return "cap", None
             if not self._backend_can("set_meta"):
@@ -3113,6 +3120,8 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                      "created_by": by, "created_at": standing_mod.iso(time.time())}
             if client != clients_mod.ANY:
                 entry["client"] = client
+            if scripts is not None:
+                entry["scripts"] = scripts
             try:
                 self._persist_standing(name, kept + [entry], by)
             except (OSError, ValueError, KeyError, BackendError):
@@ -3124,7 +3133,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         client unless the approver explicitly chose any client."""
         return clients_mod.ANY if rule_scope == "any" else req.client["id"]
 
-    def _always_create(self, req, actor, channel, who, rule_scope="client"):
+    def _always_create(self, req, actor, channel, who, rule_scope="client", bound=False):
         """Create the Always approval a human asked for on this request's card. Never
         raises; sets req.always: applied | exists | not applied: <why>. The request
         itself is approved whatever happens here."""
@@ -3135,12 +3144,21 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             return
         scope = grants_mod.scope_for(req.mode, req.spec)
         rc = self._rule_client(req, rule_scope)
-        status, e = self._add_always(req.names[0], req.mode, scope, actor, rc)
+        scripts = None
+        if bound:
+            scripts = standing_mod.script_binding(req.spec) if req.mode == "env" else None
+            if scripts is None:
+                req.always = "not applied: this request has no script text to bind to"
+                self.audit("policy_change_refused", req, reason="no_script_to_bind", **who)
+                return
+        status, e = self._add_always(req.names[0], req.mode, scope, actor, rc, scripts)
         if status == "created":
             req.always = "applied"
             self.audit("grant_created", req, kind="always", grant_id=e["id"], scope=scope, rule_client=rc,
                        grant_mode=req.mode, expires_at=None, created_by=actor, channel=channel,
-                       approver_peer=who.get("approver_peer"), approver_ip=who.get("approver_ip"))
+                       approver_peer=who.get("approver_peer"), approver_ip=who.get("approver_ip"),
+                       **({"script_sha256": scripts["sha256"], "script_command": scripts["command"]}
+                          if scripts else {}))
         elif status == "exists":
             req.always = "exists"
         elif status == "failed":
@@ -3190,7 +3208,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                         self.cfg["secrets"][req.names[0]], cid):
                     skip = "auto_modes"
                 elif not grants_mod.covers(g, req.mode, req.spec):
-                    skip = "method"
+                    skip = "script" if g.get("scripts") is not None else "method"
                 elif not risk_mod.auto_ok(level, ceiling):
                     skip = "risk"
                 elif req.status != "pending":
@@ -4933,6 +4951,19 @@ def _approve_actions(broker, req):
             f"<div class=confirm><span>{e(ask)}</span>"
             "<button class='btn sm approve' name=decision value=approve_always>Confirm</button>"
             "<span class=muted>Click Always again to cancel.</span></div></details>")
+        if req.mode == "env" and standing_mod.script_binding(req.spec):
+            b = standing_mod.script_binding(req.spec)
+            btip = (f"Approve this request and approve future runs of {b['command']} over exactly this script "
+                    f"text (sha256 {b['sha256'][0][:12]}) without asking, when the request is rated {mx} or "
+                    "lower. A changed script asks again. Applies to the client chosen above. "
+                    "Revoke any time under Policies.")
+            chips.append(
+                f"<details class=alw><summary class='chip always' data-tip='{e(btip)}' "
+                f"aria-label='Always approve this script: {e(btip)}'>Always, this script</summary>"
+                f"<div class=confirm><span>Always approve {e(b['command'])} for {e(req.names[0])} while the "
+                f"script is unchanged (sha256 {e(b['sha256'][0][:12])})? Any change to the script asks again.</span>"
+                "<button class='btn sm approve' name=decision value=approve_always_script>Confirm</button>"
+                "<span class=muted>Click again to cancel.</span></div></details>")
     elif mins:
         tip = f"Always not offered: {why}."
         chips.append(f"<span class='chip off' tabindex=0 role=img data-tip='{e(tip)}' "
@@ -4985,6 +5016,8 @@ def _parse_decision(decision):
         return decision, False, None
     if decision == "approve_always":
         return "approve", True, None
+    if decision == "approve_always_script":
+        return "approve", "script", None
     if decision.startswith("approve_grant_") and decision[14:].isascii() and decision[14:].isdigit() and len(decision) < 22:
         return "approve", False, int(decision[14:])
     return None

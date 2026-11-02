@@ -281,6 +281,17 @@ allow` or a rule would each release a request, the audit shows the rule.
 Everything else (other servers, other accounts, other keys) still prompts or is
 released by grants / `auto_approve_max` as before.
 
+**Always, for one script (run-with-secret).** An env request that runs a readable
+script offers a second chip, "Always, this script", next to Always. Plain Always
+covers every command that uses the credential; the script-bound one stores
+`scripts: {sha256: [...], command: "sh"}` in the standing entry and covers a later
+env request only when it runs the same program (argv[0] base name) over exactly
+those script texts. A changed script, another program, or a request with no
+readable script (`bash -c ...`) is not covered and asks again (audited as
+`grant_skipped` with `reason: script`). The risk ceiling still applies. The
+Policies page shows the program and the first 12 hex digits of the hash.
+Arguments to the script are not part of the binding.
+
 **Creating a rule from the approval card.** For a pending SSH login that is eligible
 (verified direct server with a fingerprint and a readable account, no forwarding, no
 invalid bind, a vault backend that can write metadata, fewer than 100 rules, and the

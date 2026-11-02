@@ -21,6 +21,8 @@ approvals are approval policy context. The `grant_*` events, `grant_id` and
 `kind` describe them; show a standing-approved request as a plain "approved" and
 never reveal which secrets have one.
 """
+import hashlib
+import os
 import re
 import time
 
@@ -28,7 +30,7 @@ from . import clients as clients_mod
 from . import grants as grants_mod
 
 MAX_STANDING = 50                       # Always approvals per credential
-KEYS = ("id", "secrets", "mode", "scope", "expires_at", "created_by", "created_at", "client")
+KEYS = ("id", "secrets", "mode", "scope", "expires_at", "created_by", "created_at", "client", "scripts")
 ALWAYS_MODES = ("http", "env")          # SSH keeps its own per-host rules (sshrules.py)
 _ID = re.compile(r"[A-Za-z0-9_-]{4,16}")
 _TIME = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ")
@@ -82,10 +84,17 @@ def parse(raw, name, field="standing"):
         if not isinstance(when, str) or not _TIME.fullmatch(when):
             raise ValueError(f"{at}.created_at must be a UTC time like 2026-10-19T12:00:00Z")
         client = clients_mod.parse_scope(r.get("client"), f"{at}.client")
+        scripts = None
+        if r.get("scripts") is not None:
+            scripts = parse_scripts(r["scripts"], f"{at}.scripts")
+            if r["mode"] != "env":
+                raise ValueError(f"{at}.scripts is only for env approvals")
         entry = {"id": sid, "secrets": [name], "mode": r["mode"], "scope": r["scope"],
                  "expires_at": None, "created_by": _CTRL.sub(" ", by).strip(), "created_at": when}
         if client != clients_mod.ANY:       # a global rule has exactly the shape it always had
             entry["client"] = client
+        if scripts is not None:
+            entry["scripts"] = scripts
         out.append(entry)
     return out
 
@@ -97,15 +106,49 @@ def serialize(entries):
     out = []
     for e in entries:
         d = {k: v for k, v in e.items() if k != "client"}
+        if e.get("scripts") is None:
+            d.pop("scripts", None)
         if e.get("client", clients_mod.ANY) != clients_mod.ANY:
             d["client"] = e["client"]
         out.append(d)
     return out
 
 
-def covers_label(mode, scope):
+_SHA = re.compile(r"[0-9a-f]{64}")
+
+
+def parse_scripts(raw, at="scripts"):
+    """The script binding of an env approval: {"sha256": [sorted unique hex digests],
+    "command": the program name (argv[0] base name)}. It covers a request only when
+    the request runs that program over exactly those script texts."""
+    if (not isinstance(raw, dict) or set(raw) != {"sha256", "command"}
+            or not isinstance(raw["sha256"], list) or not 1 <= len(raw["sha256"]) <= 5
+            or not all(isinstance(h, str) and _SHA.fullmatch(h) for h in raw["sha256"])
+            or not isinstance(raw["command"], str) or not raw["command"].strip() or len(raw["command"]) > 120):
+        raise ValueError(f"{at} must be {{sha256: [1-5 hex digests], command: program name}}")
+    return {"sha256": sorted(set(raw["sha256"])), "command": _CTRL.sub(" ", raw["command"]).strip()}
+
+
+def script_binding(spec):
+    """The binding a request would create, or None when it has no script text to bind
+    (an inline `bash -c` string, or a script that is not a readable file)."""
+    argv = (spec or {}).get("argv") or []
+    entries = [s for s in (spec or {}).get("scripts") or [] if s.get("sha256")]
+    # the hash is recomputed from the text the approver saw, never taken on the client's word
+    if any(s.get("truncated") or "text" not in s
+           or hashlib.sha256(s["text"].encode()).hexdigest() != s["sha256"] for s in entries):
+        return None
+    shas = sorted({s["sha256"] for s in entries})
+    if not argv or not shas or len(shas) > 5:
+        return None
+    return {"sha256": shas, "command": os.path.basename(str(argv[0])) or str(argv[0])}
+
+
+def covers_label(mode, scope, scripts=None):
     """Short phrase for what a standing approval covers."""
     if mode == "env":
+        if scripts:
+            return f"run-with-secret, only {scripts['command']} on script {scripts['sha256'][0][:12]}"
         return "run-with-secret"
     if mode == "ssh_sign":
         return "ssh"

@@ -1485,6 +1485,45 @@ class AlwaysAllow(Harness):
         self.assertEqual([(e["mode"], e["scope"]) for e in self.disk()["secrets"]["svc"]["standing"]],
                          [("env", "any")])
 
+    def create_script_env(self, text, path="/srv/job.sh", argv0="sh"):
+        import hashlib
+        sha = hashlib.sha256(text.encode()).hexdigest()
+        return self.api("POST", "/v1/requests", {
+            "mode": "env", "names": ["svc"], "argv": [argv0, path],
+            "scripts": [{"path": path, "size": len(text), "sha256": sha, "text": text, "truncated": False}]})
+
+    def test_always_for_this_script_binds_to_the_hash(self):
+        self.create_script_env("echo one\n")
+        self.assertIn("value=approve_always_script", self.page())
+        status, body = self.post(f"/a/{self.nonce()}", decision="approve_always_script")
+        self.assertEqual(status, 200)
+        self.assertIn("Always allow saved", body)
+        self.finish()
+        st = self.disk()["secrets"]["svc"]["standing"]
+        self.assertEqual([(e["mode"], e["scripts"]["command"], len(e["scripts"]["sha256"])) for e in st],
+                         [("env", "sh", 1)])
+        self.assertEqual(self.events("decided")[0]["always_bound"], "script")
+        pushes = len(self.notifier.sent)
+        _, b = self.create_script_env("echo one\n")                 # same text: no prompt
+        self.assertEqual(len(self.notifier.sent), pushes)
+        _, r = self.api("GET", f"/v1/requests/{json.loads(b)['id']}?wait=3")
+        self.assertEqual(json.loads(r)["status"], "approved")
+        self.create_script_env("echo two\n")                        # changed text: asks again
+        self.assertEqual(len(self.notifier.sent), pushes + 1)
+        self.assertEqual(self.events("grant_skipped")[-1]["reason"], "script")
+        self.create_script_env("echo one\n", argv0="bash")           # same text, other program: asks
+        self.assertEqual(len(self.notifier.sent), pushes + 2)
+        self.create_env()                                           # no script text at all: asks
+        self.assertEqual(len(self.notifier.sent), pushes + 3)
+
+    def test_script_bound_chip_needs_script_text(self):
+        self.create_env()
+        self.assertNotIn("approve_always_script", self.page())
+        self.post(f"/a/{self.nonce()}", decision="approve_always_script")
+        self.finish()
+        self.assertEqual(self.disk()["secrets"]["svc"].get("standing"), None)
+        self.assertEqual(self.events("policy_change_refused")[0]["reason"], "no_script_to_bind")
+
     def test_high_risk_request_cannot_establish_standing_allow(self):
         self.broker.summarizer = _Stub("Deletes things", "high")
         self.http_req("DELETE")
