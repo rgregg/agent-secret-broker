@@ -378,6 +378,10 @@ class VaultBackend(abc.ABC):
     def delete(self, item):
         """Permanently remove the item. Deleting a missing item is not an error."""
 
+    def sync(self, min_age=0):
+        """Pull the latest state from a remote vault now, unless that was done within the last `min_age`
+        seconds. Backends that always read current state (a file, the local store) have nothing to do."""
+
     # -- optional, declared in `capabilities` ---------------------------------------
     def create_login(self, item, username, password, uri=None, notes=None, meta=None):
         """["create_login"] Create a login with real username, password and URL.

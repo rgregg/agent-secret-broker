@@ -2596,6 +2596,13 @@ unlocked when a request is *created*, so the slow login/unlock overlaps with the
 human reaching to approve; a run of approvals within the window is fast.
 Nothing is released before approval either way.
 
+**Changes made in a Bitwarden client.** The broker pulls the vault (`bw sync`) at
+most every `sync_interval` seconds (default 60; `0` = before every read), so an
+edit, a rotated value or a new item appears within about a minute. Naming a
+credential the catalog does not have also pulls the latest first (at most every
+10 seconds), so asking for something you just added needs no wait. A pull that fails
+is logged (`vault_sync_failed`) and the broker keeps serving what it has.
+
 Mount a persistent directory for the CLI's state (`BITWARDENCLI_APPDATA_DIR`,
 see `deploy/compose.yaml`). The CLI keeps its device identifier there across
 logouts; without it, every login from a fresh container is a *new device* and

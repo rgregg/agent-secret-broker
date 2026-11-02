@@ -378,7 +378,8 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
 
     # -- catalog (the vault is the source of truth) ---------------------------
     CATALOG_TTL = 60            # a request refreshes if the catalog is older than this
-    CATALOG_BG_TTL = 300        # discovery serves the cache and refreshes in the background
+    CATALOG_BG_TTL = 60         # discovery serves the cache and refreshes in the background
+    FORCED_SYNC_MIN_AGE = 10    # a request that misses a name re-syncs a remote vault, at most this often
 
     @staticmethod
     def _entry(item, meta):
@@ -573,9 +574,16 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                          secret=name, host=h[:100])
         entry["allowed_hosts"] = keep
 
-    def refresh_catalog(self):
+    def refresh_catalog(self, fresh=False):
         """Rebuild the secret catalog from the vault's items. Raises if the vault
-        cannot be read, leaving the previous catalog in place."""
+        cannot be read, leaving the previous catalog in place. `fresh` first pulls the
+        latest from a remote vault (a request named something the catalog lacks, so a
+        change made in the vault's own client should be seen now, not at the next sync)."""
+        if fresh:
+            try:
+                self.backend.sync(min_age=self.FORCED_SYNC_MIN_AGE)
+            except BackendError as e:
+                self.log("vault_sync_failed", error=type(e).__name__)   # the catalog read below reports a real outage
         rows = self.backend.catalog()
         out, bad, owners, autos = {}, [], {}, []
         for row in rows:
@@ -872,7 +880,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             return
         try:
             if time.time() - self._catalog_at > stale_after:
-                self.refresh_catalog()
+                self.refresh_catalog(fresh=True) if stale_after == 0 else self.refresh_catalog()
         except Exception as e:  # noqa: BLE001 -- keep serving the last good catalog
             self._backend_ok = False
             self.log("catalog_error", error=str(e)[:200])
