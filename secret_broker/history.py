@@ -24,7 +24,7 @@ _EV_KEYS = ("reason", "reasons", "model", "risk", "error", "via", "channel", "de
             "item", "field", "key", "hosts", "hosts_added", "hosts_removed", "grant_id", "scope", "secrets", "grant_minutes",
             "grant_left_s", "expires_at", "created_by", "max_risk", "risk_level",
             "host_bound", "host_fp", "host_type", "host_name", "claimed_dest", "forwarding", "host_lines",
-            "late_level", "rule_id", "rule_name", "account", "rule_host", "ssh_rule_requested", "decision_source",
+            "always_bound", "script_command", "late_level", "rule_id", "rule_name", "account", "rule_host", "ssh_rule_requested", "decision_source",
             # guidance proposals: names, counts, lengths and hash prefixes; never text
             "entry_names", "entry_lengths", "entry_sha256", "applied", "denied", "failed",
             "applied_names", "denied_names", "failed_names", "failed_classes", "count", "retry",

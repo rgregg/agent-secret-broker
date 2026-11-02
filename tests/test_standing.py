@@ -231,7 +231,7 @@ class Persistence(Base):
         self.always_it(mode="env")
         d = self.disk_standing()
         self.assertEqual(sorted((e["mode"], e["scope"]) for e in d), [("env", "any"), ("http", "read")])
-        self.assertEqual(set(d[0]), set(standing_mod.KEYS))
+        self.assertEqual(set(d[0]), set(standing_mod.KEYS) - {"scripts"})   # scripts only when bound
         self.assertEqual(self.disk()["secrets"]["svc"]["standing_changed"]["by"], "alice")
         self.assertEqual(self.disk()["secrets"]["svc"]["allowed_hosts"], ["127.0.0.1"])
         b = self.reload()
@@ -696,3 +696,32 @@ class SshUnaffected(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ScriptBoundParse(unittest.TestCase):
+    ENTRY = {"id": "abcd1234", "mode": "env", "scope": "any", "created_by": "alice",
+             "created_at": "2026-11-02T00:00:00Z"}
+
+    def test_round_trip_and_rejections(self):
+        b = {"sha256": ["b" * 64, "a" * 64, "a" * 64], "command": "sh"}
+        [e] = standing_mod.parse([{**self.ENTRY, "scripts": b}], "svc")
+        self.assertEqual(e["scripts"], {"sha256": ["a" * 64, "b" * 64], "command": "sh"})
+        self.assertEqual(standing_mod.serialize([e])[0]["scripts"], e["scripts"])
+        for bad in ({"sha256": [], "command": "sh"}, {"sha256": ["zz"], "command": "sh"},
+                    {"sha256": ["a" * 64], "command": ""}, {"sha256": ["a" * 64]}, "x"):
+            with self.assertRaises(ValueError):
+                standing_mod.parse([{**self.ENTRY, "scripts": bad}], "svc")
+        with self.assertRaises(ValueError):     # web approvals cannot be script-bound
+            standing_mod.parse([{**self.ENTRY, "mode": "http", "scripts": b}], "svc")
+
+    def test_binding_ignores_requests_without_script_text(self):
+        self.assertIsNone(standing_mod.script_binding({"argv": ["bash", "-c", "ls"], "scripts": []}))
+        import hashlib
+        sha = hashlib.sha256(b"echo\n").hexdigest()
+        ent = {"path": "x.sh", "sha256": sha, "text": "echo\n", "truncated": False}
+        spec = {"argv": ["/bin/sh", "x.sh"], "scripts": [ent]}
+        self.assertEqual(standing_mod.script_binding(spec), {"sha256": [sha], "command": "sh"})
+        for bad in ({**ent, "sha256": "c" * 64}, {**ent, "truncated": True}):    # claimed hash must match the text
+            self.assertIsNone(standing_mod.script_binding({"argv": ["sh", "x.sh"], "scripts": [bad]}))
+        self.assertFalse(grants_mod.covers({"scope": "any", "mode": "env", "scripts": {"sha256": ["d" * 64], "command": "sh"}},
+                                           "env", spec))

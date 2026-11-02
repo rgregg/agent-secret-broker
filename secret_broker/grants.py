@@ -46,10 +46,17 @@ def scope_for(mode, spec):
     return "any"
 
 
+def _binding(spec):
+    from . import standing
+    return standing.script_binding(spec)
+
+
 def covers(grant, mode, spec):
     """True when `grant` (by scope) may approve a later request."""
     if mode == "env" and grant.get("mode") != "env":
         return False
+    if grant.get("scripts") is not None and (mode != "env" or grant["scripts"] != _binding(spec)):
+        return False        # bound to one script's exact text: anything else asks
     if grant["scope"] == "any":
         return True
     return mode == "http" and str((spec or {}).get("method", "")).upper() in READ_METHODS
