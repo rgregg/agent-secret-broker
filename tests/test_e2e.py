@@ -570,8 +570,10 @@ class CatalogFromVault(unittest.TestCase):
         b.create("env", ["one"], {}, "test")                # each alone is fine
 
     def test_disabled_metadata_hides_an_item(self):
-        b = self.adopt([], [{"item": "Hidden", "meta": {"disabled": True}}])
-        self.assertEqual(b.cfg["secrets"], {})
+        meta = {"vars": {"V_TOKEN": {"field": "notes"}}, "allowed_hosts": ["h.example"]}
+        b = self.adopt([], [{"item": "Hidden", "meta": {"disabled": True}}, {"item": "Shown", "meta": meta}])
+        self.assertEqual(list(b.cfg["secrets"]), ["shown"])     # the other item loads, so the catalog was read
+        self.assertEqual(b._catalog_stats["invalid"], 0)        # hidden on purpose, not rejected as malformed
 
     def test_bw_backend_adopts_only_its_own_collection(self):
         from secret_broker.backends import BwBackend
@@ -689,6 +691,7 @@ class AuditTrail(Harness):
 
     def test_tampering_is_detected(self):
         self.create_env()
+        self.assertTrue(audit_mod.verify(self.audit)[0])          # the untouched log verifies
         with open(self.audit) as f:
             lines = f.read().splitlines()
         edited = [l.replace('"approved"', '"denied__"') if '"event": "approved"' in l else l for l in lines]

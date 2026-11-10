@@ -760,6 +760,7 @@ class Persistence(CBase):
 
     def test_pending_enrollments_do_not_survive_a_restart(self):
         self.enr("laptop")
+        self.assertEqual(len(self.broker.clients.pending()), 1)          # it really was pending
         self.assertEqual(self.restart().clients.pending(), [])
 
     def test_corrupt_file_fails_closed_and_is_left_alone(self):
