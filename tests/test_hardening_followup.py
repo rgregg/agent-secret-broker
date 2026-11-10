@@ -327,11 +327,6 @@ class GuardRanges(unittest.TestCase):
                    os.path.join(tempfile.mkdtemp(), "a.jsonl"))
         self.assertTrue({8800, 8801} <= b.dest_guard.own_ports)
 
-    def test_serve_registers_the_real_bound_ports(self):
-        # (StrictHarness does not register them by hand any more)
-        pass
-
-
 class BoundPorts(tdg.StrictHarness):
     def test_the_real_ports_are_own_ports(self):
         self.assertTrue({self.a.server_address[1], self.c.server_address[1]} <= self.guard.own_ports)
