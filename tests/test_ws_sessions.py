@@ -290,7 +290,8 @@ class Proto(unittest.TestCase):
         p.conn.write(wsproto.OP_TEXT, b"a")
         p.conn.write(wsproto.OP_TEXT, b"a")
         raw = p.peer.recv(100)
-        self.assertNotEqual(raw[2:6], raw[8:12])
+        self.assertEqual(len(raw), 14)                  # two frames of 2 header + 4 mask + 1 payload bytes
+        self.assertNotEqual(raw[2:6], raw[9:13])        # the two masks, each at its own frame's offset
 
 
 class Handshake(unittest.TestCase):
@@ -1136,8 +1137,10 @@ class Upgrade(WsBase):
     def test_a_redirect_is_not_followed(self):
         other = self.mkstub()
         st = self.mkstub(mode="redirect")
+        st.location = f"http://127.0.0.1:{other.port}/api/websocket"      # a redirect that could be followed
         self.failed(st)
-        self.assertEqual(other.requests, [])
+        self.assertEqual(len(st.requests), 1)                              # the redirect was served...
+        self.assertEqual(other.requests, [])                               # ...and not followed
 
     def test_a_wrong_token_fails_closed_and_the_servers_words_are_not_repeated(self):
         st = self.mkstub(token="something-else-entirely")

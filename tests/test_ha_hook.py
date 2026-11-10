@@ -294,8 +294,11 @@ class HookEndpoint(Hook):
 
     def test_token_never_in_audit_or_history(self):
         rid, n = self.asked()
-        self.hook(self.good(rid, n))
-        self.hook({**self.good(rid, n), "token": "S" * 22})
+        # the wrong token goes first, while the request is pending, so the refusal path is the one audited
+        self.assertEqual(self.hook({**self.good(rid, n), "token": "S" * 22})[0], 403)
+        self.assertEqual(len(self.events("ha_decide_refused")), 1)
+        self.assertEqual(self.hook(self.good(rid, n))[0], 200)
+        self.assertTrue(self.events("decided"))
         self.result(rid)
         with open(self.audit) as f:
             self.assertNotIn(n.action_token, f.read())
