@@ -223,6 +223,8 @@ class Failures(Base):
         self.assertIsNone(kp.get())
         kp.wait()
         self.assertIsNone(kp.get())
+        # a failure inside get() itself (here the clock) is swallowed too, not just a reader failure
+        self.assertIsNone(keyprovider.VaultKey("x", "Y", clock=lambda: 1 / 0).get())
 
     def test_failure_line_is_rate_limited_and_quiet(self):
         self.put("")
