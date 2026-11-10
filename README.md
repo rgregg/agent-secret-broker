@@ -96,6 +96,7 @@ remove them. Details in [docs/reference.md](docs/reference.md#threat-model-hones
 
 Tests never sleep for a timeout: time-bounded behavior (request ttls, idle locks, expiry) is driven with
 fake clocks or by expiring the request directly (`tests/_fast.py`).
+See `AGENTS.md` ("Writing tests") before adding tests: it covers how to avoid tests that cannot fail.
 
 Python 3.12. Runtime dependency: `pywebpush` (pinned in `requirements.txt`). The
 CLI (`client/asb`) has no dependencies.
