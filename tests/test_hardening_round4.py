@@ -171,7 +171,7 @@ class StraddlingSessions(ts.SBase):
         cut = 2000
         pre = masking.get_masker([ts.USER, secret])
         want = cut + pre.margin + 4096
-        n = 4800 // (len(secret) + 1) + 20                     # enough replacements to shrink the text below the cut
+        n = (want - cut) // (len(secret) - 3) + 20             # enough replacements to shrink the text below the cut
         with mock.patch("secret_broker.sessions.READ_LIMIT", cut):
             for adj in range(0, len(secret) + 3):
                 body = ((secret + " ") * n).encode()
@@ -179,6 +179,7 @@ class StraddlingSessions(ts.SBase):
                 fo = hf.FakeOpener(lambda req, b=body: hf.Resp(b))
                 with hf.patched(fo):
                     code, r = self.call(sid, "GET", "/echo")
+                self.assertLess(len(r["http"]["body"]), cut, adj)      # the premise: nothing was cut, the tail is kept
                 self.assertNotIn(secret[:4], r["http"]["body"], adj)
 
 
