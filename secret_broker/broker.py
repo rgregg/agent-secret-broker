@@ -58,6 +58,7 @@ from . import clients as clients_mod
 from . import clock as clock_mod
 from . import plans as plans_mod
 from . import planflow
+from . import placeholders as placeholders_mod
 from . import sessions as sessions_mod
 from . import wssessions as ws_mod
 from . import sshhosts as sshhosts_mod
@@ -3688,16 +3689,8 @@ def parse_ip_safe(a):
 
 
 def _placeholders(text):
-    out, i = [], 0
-    while True:
-        a = text.find("{{", i)
-        if a < 0:
-            return out
-        b = text.find("}}", a)
-        if b < 0:
-            return out
-        out.append(text[a + 2:b].strip())
-        i = b + 2
+    """The {{NAME}} names in `text`; any other {{...}} is literal text (see placeholders.py)."""
+    return [p[1] for p in placeholders_mod.scan(text) if p[0] == placeholders_mod.PH]
 
 
 def _mask(text, values):
@@ -3723,19 +3716,9 @@ def _opener_for(tls, guard, entries=None):
 
 
 def _fill(text, env):
-    """Substitute {{NAME}} / {{ NAME }} in ONE pass: a substituted value is never scanned again."""
-    out, i = [], 0
-    while True:
-        a = text.find("{{", i)
-        b = text.find("}}", a + 2) if a >= 0 else -1
-        if a < 0 or b < 0:
-            out.append(text[i:])
-            return "".join(out)
-        raw = text[a + 2:b]
-        var = raw.strip()
-        out.append(text[i:a])
-        out.append(env[var] if raw in (var, " " + var + " ") and var in env else text[a:b + 2])
-        i = b + 2
+    """Substitute {{NAME}} in ONE pass: a substituted value is never scanned again. A name the credential
+    does not have stays as written (the request was checked against it when it was made)."""
+    return "".join(p[1] if p[0] == placeholders_mod.LIT else env.get(p[1], p[2]) for p in placeholders_mod.scan(text))
 
 
 def _do_http(spec, env, tls=None, guard=None, entries=None):

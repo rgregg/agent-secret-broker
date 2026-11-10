@@ -49,6 +49,7 @@ from email.utils import parsedate_to_datetime
 
 from .backends import BackendError
 from . import destguard
+from . import placeholders as placeholders_mod
 from . import httpcheck
 from . import masking
 from . import clients as clients_mod
@@ -428,37 +429,24 @@ def coarse_class(exc):
 
 
 def placeholders(text):
-    """The {{NAME}} names in `text`, by a linear scan (no regex: a hostile string must not cost more
-    than its length). A name longer than MAX_PLACEHOLDER_NAME is returned as a marker that no
-    credential or capture can match. ValueError when there are more than MAX_PLACEHOLDERS."""
-    out, i, text = [], 0, text or ""
-    while True:
-        a = text.find("{{", i)
-        if a < 0:
-            return out
-        b = text.find("}}", a + 2)
-        if b < 0:
-            return out
-        name = text[a + 2:b].strip()
-        out.append(name if len(name) <= MAX_PLACEHOLDER_NAME else "\0toolong")
-        if len(out) > MAX_PLACEHOLDERS:
-            raise ValueError("too many placeholders")
-        i = b + 2
+    """The {{NAME}} names in `text` (see placeholders.py for what counts; everything else is literal text).
+    A name longer than MAX_PLACEHOLDER_NAME is returned as a marker that no credential or capture can match.
+    ValueError when there are more than MAX_PLACEHOLDERS."""
+    out = []
+    for piece in placeholders_mod.scan(text):
+        if piece[0] == placeholders_mod.PH:
+            name = piece[1]
+            out.append(name if len(name) <= MAX_PLACEHOLDER_NAME else "\0toolong")
+            if len(out) > MAX_PLACEHOLDERS:
+                raise ValueError("too many placeholders")
+    return out
 
 
 def fill(text, values):
     """Substitute {{NAME}} in one pass (a substituted value is never scanned again, so an
     upstream-supplied value cannot smuggle in another placeholder). Linear. KeyError for an unknown name."""
-    out, i = [], 0
-    while True:
-        a = text.find("{{", i)
-        b = text.find("}}", a + 2) if a >= 0 else -1
-        if a < 0 or b < 0:
-            out.append(text[i:])
-            return "".join(out)
-        out.append(text[i:a])
-        out.append(values[text[a + 2:b].strip()])
-        i = b + 2
+    return "".join(piece[1] if piece[0] == placeholders_mod.LIT else values[piece[1]]
+                   for piece in placeholders_mod.scan(text))
 
 
 def mask_values(text, values):
@@ -583,18 +571,10 @@ def header_problem(headers):
 
 def neutralize(text, values=None):
     """`text` with every {{NAME}} replaced by `values[NAME]` when given, else by the neutral token P. Linear.
-    Used so that scans of the agent's own text never depend on a credential's secret content."""
-    out, i = [], 0
-    while True:
-        a = text.find("{{", i)
-        b = text.find("}}", a + 2) if a >= 0 else -1
-        if a < 0 or b < 0:
-            out.append(text[i:])
-            return "".join(out)
-        out.append(text[i:a])
-        name = text[a + 2:b].strip()
-        out.append((values or {}).get(name, "P"))
-        i = b + 2
+    Used so that scans of the agent's own text never depend on a credential's secret content. Reads the text
+    through the same scanner as fill(), so what a scan sees is what is sent."""
+    return "".join(piece[1] if piece[0] == placeholders_mod.LIT else (values or {}).get(piece[1], "P")
+                   for piece in placeholders_mod.scan(text))
 
 
 def override_problem(methods, url, headers, body, binary=False):
