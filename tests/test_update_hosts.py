@@ -148,8 +148,9 @@ class NeverAuto(Base):
 
     def test_the_always_button_is_not_offered(self):
         _, r = self.ask(add_hosts=["c.example.com"])
-        ok, _ = self.broker.always_allow_eligibility(self.broker._by_id[r["id"]])
+        ok, why = self.broker.always_allow_eligibility(self.broker._by_id[r["id"]])
         self.assertFalse(ok)
+        self.assertIn("storing a credential", why)      # refused for being a store request, not for the setUp's approval=allow
 
 
 class Websites(unittest.TestCase):

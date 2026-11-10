@@ -255,7 +255,7 @@ class SessionCut(ts.SBase):
 
 class PlanCut(pb.PBase):
     def test_padded_echo_at_every_offset(self):
-        pid = self.approve(self.manifest([self.read_rule()]))
+        pid = self.approve(self.manifest([self.read_rule(max_uses=100)]))     # one use per offset: never exhausted
         cut = 3000
         secret = pb.SVC_VALUE
         with mock.patch("secret_broker.broker.MAX_RESPONSE_BYTES", cut):
@@ -263,6 +263,8 @@ class PlanCut(pb.PBase):
                 fo = FakeOpener(lambda req, k=k: Resp(b"A" * (cut - k) + secret.encode() + b"B" * 40))
                 with patched(fo):
                     code, r = self.call(pid, "svc", "GET", "/v1/accounts/1")
+                self.assertEqual(r.get("status"), "approved", (k, r))           # the upstream body really came back
+                self.assertTrue(r["http"]["body"].startswith("AAAA"), k)
                 self.assertNotIn(secret[:4], json.dumps(r), k)
 
     def test_set_cookie_not_returned(self):

@@ -169,6 +169,8 @@ class AlwaysScope(Base):
             r.action_hash = hashlib.sha256(b"t").digest()
             r.offered = frozenset(("approve", "deny"))
             self.broker.decide_via(ch, rid, "approve", "alice", token="t", always=True)
+            self.broker._by_id[rid].done.wait(10)
+            self.assertEqual(self.status_of(rid), "approved", ch)       # the approval itself went through
         self.assertEqual(self.standing(), [])
 
     def test_ssh_has_no_always_and_creates_none(self):
@@ -217,9 +219,14 @@ class ChipText(Base):
 
     def test_chip_not_offered_for_several_secrets_or_invisible_scripts(self):
         rid = self.http(("svc", "other"))
-        self.assertNotIn("value=approve_always", self.card(rid))
+        page = self.card(rid)
+        self.assertIn("name=decision value=approve>", page)             # the card has its decision buttons
+        self.assertIn("Always not offered: this request involves several secrets", page)
+        self.assertNotIn("value=approve_always", page)
         rid = self.env(scripts=[{"stdin": True}])
-        self.assertNotIn("value=approve_always", self.card(rid))
+        page = self.card(rid)
+        self.assertIn("name=decision value=approve>", page)
+        self.assertNotIn("value=approve_always", page)
 
 
 class Persistence(Base):
