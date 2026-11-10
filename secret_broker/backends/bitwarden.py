@@ -81,15 +81,18 @@ class BwBackend(VaultBackend):
     kind = "bw"
 
     def __init__(self, server_url, master_password_file, bw="bw", sync_interval=60,
-                 idle_timeout=300, organization=None, collection=None, prewarm=True):
+                 idle_timeout=300, organization=None, collection=None, prewarm=True, personal=False):
         caps = {CAP_SET_META, CAP_CREATE_LOGIN, CAP_EDIT_ITEM, CAP_ON_EVENT, CAP_EXPORT_ITEMS}
         if prewarm:
             caps.add(CAP_WARM)              # `backend.prewarm: false` turns request-time unlock off
-        if organization and collection:
+        if personal and (organization or collection):
+            raise BackendInvalid("personal cannot be combined with organization or collection")
+        if personal or (organization and collection):
             caps.add(CAP_ADOPTS)            # cannot scope adoption without both: adopt nothing
         self.capabilities = frozenset(caps)
         self._bw = bw
         self._org_want, self._coll_want = organization, collection
+        self._personal = personal       # items live in the account's own vault, not an organization
         self._target_ids = None
         self._server_url = server_url
         with open(master_password_file) as f:
@@ -206,7 +209,10 @@ class BwBackend(VaultBackend):
                 self._session, self._synced = None, 0.0
 
     def _resolve_target(self):
-        """(organization id, collection id) that new items are created in."""
+        """(organization id, collection id) that new items are created in;
+        (None, None) in personal mode: the account's own vault."""
+        if self._personal:
+            return (None, None)
         if self._target_ids:
             return self._target_ids
         orgs = self._list_orgs()
@@ -224,6 +230,14 @@ class BwBackend(VaultBackend):
         return self._target_ids
 
     @staticmethod
+    def _in_target(it, target):
+        """Whether a vault item belongs to the broker's own scope: its collection, or in
+        personal mode the account's own vault (no organization). Nothing else is adopted."""
+        if target == (None, None):
+            return not it.get("organizationId")
+        return it.get("organizationId") == target[0] and target[1] in (it.get("collectionIds") or [])
+
+    @staticmethod
     def _template(item, field, value, org, coll, meta=None):
         obj = BwBackend._template_base(item, field, value, org, coll, meta)
         if meta is not None:
@@ -238,7 +252,7 @@ class BwBackend(VaultBackend):
 
     @staticmethod
     def _template_base(item, field, value, org, coll, meta=None):
-        base = {"organizationId": org, "collectionIds": [coll], "folderId": None,
+        base = {"organizationId": org, "collectionIds": [coll] if coll else [], "folderId": None,
                 "favorite": False, "name": item, "reprompt": 0}
         if field == "private_key":
             # a real Bitwarden SSH key item (type 5), so the Bitwarden apps and
@@ -366,7 +380,7 @@ class BwBackend(VaultBackend):
                         raise
                     self._session, self._synced = None, 0.0
             target = None
-            if self._org_want and self._coll_want:       # cannot scope without both: adopt nothing
+            if self._personal or (self._org_want and self._coll_want):   # cannot scope without both: adopt nothing
                 try:
                     target = self._resolve_target()
                 except BackendError:
@@ -378,8 +392,7 @@ class BwBackend(VaultBackend):
                         if f.get("name") == META_FIELD), None)
             if raw:
                 rows.extend(catalog_rows([(it["name"], raw)]))
-            elif (target and it.get("organizationId") == target[0]
-                  and target[1] in (it.get("collectionIds") or [])):
+            elif target and self._in_target(it, target):
                 info = _auto_info(it)
                 if info:
                     rows.append({"item": it["name"], "meta": None, "auto": info})
@@ -466,13 +479,13 @@ class BwBackend(VaultBackend):
                     if attempt == 2:
                         raise
                     self._session, self._synced = None, 0.0
-            org, coll = self._resolve_target()
+            target = self._resolve_target()
             self._touch()
         out = []
         for it in items:
             raw = next((f.get("value") for f in it.get("fields") or []
                         if f.get("name") == META_FIELD), None)
-            in_scope = it.get("organizationId") == org and coll in (it.get("collectionIds") or [])
+            in_scope = self._in_target(it, target)
             if not raw and not in_scope:
                 continue
             item = _to_item(it)
@@ -722,6 +735,10 @@ def validate(b):
             raise BackendConfigError(f"backend.{k}: required (a non-empty string)")
     _opt_str(b, "organization")
     _opt_str(b, "collection")
+    if "personal" in b and not isinstance(b["personal"], bool):
+        raise BackendConfigError("backend.personal: must be true or false")
+    if b.get("personal") and (b.get("organization") or b.get("collection")):
+        raise BackendConfigError("backend.personal: cannot be combined with organization or collection")
     idle = b.get("idle_timeout", 300)
     if isinstance(idle, bool) or not isinstance(idle, (int, float)) or idle < 0:
         raise BackendConfigError("backend.idle_timeout: must be a number of seconds >= 0")
@@ -738,11 +755,11 @@ def build(b):
     return bw_class(b["server_url"], b["master_password_file"],
                     idle_timeout=b.get("idle_timeout", 300), sync_interval=b.get("sync_interval", 60),
                     organization=b.get("organization"), collection=b.get("collection"),
-                    prewarm=b.get("prewarm", True))
+                    prewarm=b.get("prewarm", True), personal=b.get("personal", False))
 
 
 SPEC = BackendSpec(
     name="bw", build=build, validate=validate,
     doc="Bitwarden / Vaultwarden through the bw CLI (serve: true keeps one bw serve). "
-        "Keys: server_url, master_password_file, organization, collection, serve, "
+        "Keys: server_url, master_password_file, organization, collection, personal, serve, "
         "idle_timeout, prewarm, sync_interval.")

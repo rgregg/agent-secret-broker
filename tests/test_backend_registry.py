@@ -82,6 +82,20 @@ class Registry(unittest.TestCase):
         both = build_backend({"backend": {**cfg, "organization": "O", "collection": "C"}})
         self.assertIn("adopts", both.capabilities)
 
+    def test_bw_personal_mode_is_a_complete_scope_and_excludes_org_settings(self):
+        pw = os.path.join(tempfile.mkdtemp(), "pw")
+        open(pw, "w").write("x")
+        cfg = {"type": "bw", "server_url": "u", "master_password_file": pw}
+        personal = build_backend({"backend": {**cfg, "personal": True}})
+        self.assertIn("adopts", personal.capabilities)
+        self.assertNotIn("adopts", build_backend({"backend": {**cfg, "personal": False}}).capabilities)
+        for patch, field in (({"personal": "yes"}, "personal"),
+                             ({"personal": True, "organization": "O"}, "personal"),
+                             ({"personal": True, "collection": "C"}, "personal")):
+            with self.assertRaises(BackendConfigError) as cm:
+                build_backend({"backend": {**cfg, **patch}})
+            self.assertIn(f"backend.{field}", str(cm.exception))
+
     def test_register_a_third_party_backend(self):
         built = []
 
