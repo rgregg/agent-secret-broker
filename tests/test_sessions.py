@@ -576,6 +576,17 @@ class Flow(SBase):
         self.assertEqual(self.st["seen"][-1]["body"], "{{UNIFI_PASSWORD}} " + USER)
         self.assertNotIn(PASSWORD, json.dumps(r))
 
+    def test_a_template_body_is_sent_literally_and_an_escape_is_unescaped(self):       # issue #55
+        sid = self.open()
+        tpl = '{"template": "{{ states(\'sensor.x\') }} {{ now }} {{ 1 + 1 }}"}'
+        code, r = self.call(sid, "POST", "/echo", body=tpl)
+        self.assertEqual((code, r["http"]["status"]), (200, 200))
+        self.assertEqual(self.st["seen"][-1]["body"], tpl)
+        code, r = self.call(sid, "POST", "/echo", body="{{{{UNIFI_PASSWORD}} {{ UNIFI_USERNAME }}")
+        self.assertEqual(code, 200)
+        self.assertEqual(self.st["seen"][-1]["body"], "{{UNIFI_PASSWORD}} " + USER)
+        self.assertNotIn(PASSWORD, json.dumps(r))
+
     def test_redirects_are_never_followed(self):
         sid = self.open(hosts=[self.hp(), self.hp("localhost")])
         self.login(sid)
@@ -1527,7 +1538,7 @@ class Hardening(SBase):
         self.assertEqual(self.call(sid, "GET", "/", headers={f"H{i}": "v" for i in range(S.MAX_HEADERS + 1)})[0], 400)
         self.assertEqual(self.call(sid, "GET", "/", headers={"X": "v" * 9000})[0], 400)
         self.assertEqual(self.call(sid, "GET", "/", headers={"X" * 300: "v"})[0], 400)
-        code, r = self.call(sid, "POST", "/echo", body="{{" + "p" * 100 + "}}")        # a long placeholder name
+        code, r = self.call(sid, "POST", "/echo", body="{{" + "P" * 100 + "}}")        # a long placeholder name
         self.assertEqual((code, r["code"]), (403, "session_refused"))
         code, r = self.call(sid, "POST", "/echo", body="{{A}}" * (S.MAX_PLACEHOLDERS + 1))
         self.assertEqual((code, r["code"]), (403, "session_refused"))

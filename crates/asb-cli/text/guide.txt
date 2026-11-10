@@ -18,6 +18,9 @@ Workflow
          -H 'Authorization: Bearer {{VAR}}'
      {{VAR}} is replaced by the broker in the URL, headers and body. Use -d BODY,
      -d @file or -d @- (stdin) for a request body.
+     Only {{UPPER_SNAKE}} credential names and {{session.NAME}} are placeholders; any other {{ ... }}
+     (a Jinja/Handlebars template) is sent as written. To send a pair that looks like a
+     placeholder, write {{{{ for a literal {{ (so {{{{TOKEN}} is sent as {{TOKEN}}).
      The broker only sends the credential to the hosts it is allowed for.
   3. Or run a local command with the value in its environment (output is masked):
      asb NAME -- curl -sH "Authorization: Bearer $VAR" https://api.example.com/
