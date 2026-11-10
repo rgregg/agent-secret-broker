@@ -96,6 +96,7 @@ class WsStub:
 
     def __init__(self, token="HA-TOKEN-CANARY-31337", auth=True, mode="ok", tls=None, handler=None):
         self.token, self.auth, self.mode, self.handler = token, auth, mode, handler
+        self.location = "http://127.0.0.1:1/x"      # where `redirect` mode points
         self.requests = []          # one dict per handshake: {"line", "headers", "raw"}
         self.received = []          # (opcode, payload) of every frame after the handshake, in order
         self.auth_msgs = []
@@ -156,7 +157,7 @@ class WsStub:
             key = hdr.get("sec-websocket-key", "").encode()
             m = self.mode
             if m == "redirect":
-                return c.send(b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/x\r\nContent-Length: 0\r\n\r\n")
+                return c.send(f"HTTP/1.1 302 Found\r\nLocation: {self.location}\r\nContent-Length: 0\r\n\r\n".encode())
             if m == "http200":
                 return c.send(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
             acc = accept_of(key)
