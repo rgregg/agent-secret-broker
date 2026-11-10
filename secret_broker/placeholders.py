@@ -51,7 +51,7 @@ def scan(text):
             yield LIT, text[i:a + 2]
             i = a + 2
             continue
-        name = _name(text[a + 2:b])
+        name = _name(text[a + 2:b]) if b - a - 2 <= _MAX_CANDIDATE else None   # never copy a long span
         if name is None:
             yield LIT, text[i:a + 2]
             i = a + 2

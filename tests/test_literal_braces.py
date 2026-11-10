@@ -8,7 +8,6 @@ send can never disagree about what is a placeholder.
 import json
 import os
 import sys
-import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -77,22 +76,38 @@ class Scanner(unittest.TestCase):
         self.assertEqual(S.placeholders("{{" + "P" * 100 + "}}"), ["\0toolong"])
 
     def test_scans_stay_linear(self):
+        """Counts the characters the scanner reads or copies instead of timing it (a wall-clock bound flakes on a
+        slow runner). A quadratic scan, one that re-searches for `}}` or copies the span per opener, blows the budget."""
+        from secret_broker import placeholders as P
+
+        class Counted(str):
+            work = 0
+
+            def find(self, sub, start=0, *a):
+                r = str.find(self, sub, start, *a)
+                Counted.work += (len(self) if r < 0 else r) - start + 1
+                return r
+
+            def __getitem__(self, k):
+                if isinstance(k, slice):
+                    Counted.work += len(range(*k.indices(len(self))))
+                return str.__getitem__(self, k)
+
         nasty = ["{{ " * 80000 + "}}", "{{" * 100000, "{{{{" * 50000, "{{" + "A" * 200000 + "}}", "}}" * 100000,
                  "{{ x " * 50000 + "}}"]
-        t0 = time.time()
         for text in nasty:
-            S.neutralize(text)
-            try:
-                S.placeholders(text)
-            except ValueError:
-                pass
-            try:
-                S.fill(text, {})
-            except KeyError:
-                pass
-            B._placeholders(text)
-            B._fill(text, {})
-        self.assertLess(time.time() - t0, 3.0)
+            with self.subTest(head=text[:12]):
+                Counted.work = 0
+                pieces = list(P.scan(Counted(text)))
+                self.assertTrue(pieces)                                  # it really scanned something
+                self.assertLess(Counted.work, 8 * len(text))
+
+        # the control: the same counter does catch a quadratic scan
+        Counted.work = 0
+        text = Counted("{{ " * 2000 + "}}")
+        for i in range(0, len(text), 3):
+            text.find("}}", i)
+        self.assertGreater(Counted.work, 8 * len(text))
 
 
 class PlainHttp(t.Harness):
