@@ -342,6 +342,13 @@ class ActionPolicyAtDecision(Hook):
         self.assertEqual(self.hook(self.good(rid, n, "deny"))[0], 200)       # token still works
         self.assertEqual(self.result(rid)["status"], "denied")
 
+    def test_always_allow_from_the_dashboard_follows_the_same_rules(self):
+        # overrides the Dashboard test this class inherits: the request here is rated high, and an Always
+        # standing approval is never offered for (or created from) a high-risk request
+        rid, n = self.asked()
+        self.assertNotIn("approve_always", self.get()[1])
+        self.assertEqual(self.broker._by_id[rid].status, "pending")
+
     def test_dashboard_approve_unaffected(self):
         rid, n = self.asked()
         self.assertEqual(self.broker.decide_via("dashboard", rid, "approve", "alice")[0], 200)

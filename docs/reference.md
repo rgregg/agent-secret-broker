@@ -18,7 +18,9 @@ How the broker works, in detail. For installing and configuring it see
 - **`http` (enforced).** The broker makes the call itself, only to the secret's
   `allowed_hosts`, never follows redirects, and masks the secret in the response.
   `{{VAR}}` placeholders are substituted inside the broker in the URL, headers
-  and body. The value never leaves the broker.
+  and body. The value never leaves the broker. Only `{{UPPER_SNAKE}}` credential
+  variables and `{{session.NAME}}` are placeholders; any other `{{ ... }}` (a Jinja
+  template, say) is sent as written, and `{{{{` writes a literal `{{`.
 - **env (advisory).** The value is released to the requesting host and injected
   into the command's environment. The command shown in the prompt is what the
   client *said* it would run; approve it only if it looks right.

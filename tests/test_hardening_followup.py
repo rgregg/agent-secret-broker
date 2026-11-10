@@ -199,12 +199,19 @@ class HeaderRules(tdg.StrictHarness):
     def test_error_text_is_clipped_and_ascii(self):
         code, body = self.api("POST", "/v1/requests", {
             "mode": "http", "names": ["svc"], "method": "POST", "url": "http://lan.example/x", "headers": {},
-            "body": "{{" + "\x1b[31m‮" + "Z" * 500 + "}}"})
+            "body": "{{" + "Z" * 200 + "}}"})                 # a placeholder-shaped name the credential lacks
         self.assertEqual(code, 400)
         err = json.loads(body)["error"]
         self.assertTrue(err.isascii() and err.isprintable() and len(err) <= 200, err)
         rej = self.events("rejected")[-1]["reason"]
         self.assertTrue(rej.isascii() and rej.isprintable() and len(rej) <= 200, rej)
+
+    def test_control_characters_inside_braces_are_literal_text_not_a_name(self):
+        # not a placeholder (issue #55), so it is body text like any other: accepted, and never echoed in an error
+        code, body = self.api("POST", "/v1/requests", {
+            "mode": "http", "names": ["svc"], "method": "POST", "url": "http://lan.example/x", "headers": {},
+            "body": "{{" + "\x1b[31m‮" + "Z" * 500 + "}}"})
+        self.assertEqual(code, 202, body)
 
 
 class SessionAndPlanHostHeader(ts.SBase):
