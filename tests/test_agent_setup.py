@@ -255,6 +255,7 @@ class Content(Base):
 
     def test_new_file_has_no_backup(self):
         self.asb("--agent", "claude")
+        self.assertTrue(os.path.exists(self.p(".claude", "CLAUDE.md")))     # the file was written, with no backup
         self.assertEqual(self.backups(self.p(".claude")), [])
 
 
@@ -413,6 +414,7 @@ class SymlinkSafety(Base):
     def test_no_temp_files_left(self):
         self.write(self.p(".claude", "CLAUDE.md"), "x\n")
         self.asb("--agent", "claude")
+        self.assertRegex(self.read(self.p(".claude", "CLAUDE.md"), "r"), BEGIN)     # the write happened
         self.assertEqual([n for n in os.listdir(self.p(".claude")) if ".asb-tmp-" in n], [])
 
 
@@ -451,7 +453,8 @@ class DryRunAndRemove(Base):
 
     def test_dry_run_autodetect_creates_nothing(self):
         os.makedirs(self.p(".codex"))
-        self.asb("--dry-run")
+        r = self.asb("--dry-run")
+        self.assertIn("dry run", r.stdout)                  # it detected codex and planned the write
         self.assertEqual(os.listdir(self.p(".codex")), [])
 
     def test_remove_restores_original_text(self):

@@ -543,6 +543,8 @@ class Events(Base):
         b = LocalBackend(self.path, ls.FileKeySource(self.keyfile))
         b.on_event = mock.Mock(side_effect=RuntimeError("boom"))
         b.put("A", "notes", "1", create=True)
+        self.assertTrue(b.on_event.called)                        # the hook did run (and raise)...
+        self.assertEqual(b.get("A", "notes"), "1")                # ...and the write still went through
 
 
 class IdleLock(Base):

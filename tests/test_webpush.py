@@ -67,8 +67,11 @@ class Store(unittest.TestCase):
         self.assertEqual(s.devices(), [])
 
     def test_extra_hosts_can_be_configured(self):
+        with self.assertRaises(ValueError):                       # refused unless it is configured
+            make_store().add("alice", "https://push.internal.example/x", P256DH, AUTH)
         s = make_store(extra_hosts=("push.internal.example",))
         s.add("alice", "https://push.internal.example/x", P256DH, AUTH)
+        self.assertEqual(len(s.devices()), 1)
 
     def test_devices_never_expose_endpoint_or_keys(self):
         s = make_store()

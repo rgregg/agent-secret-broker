@@ -197,7 +197,9 @@ class CardChip(Base):
             "sshsig": (SSHSIG, None),
             "two hops": (login(SID_A), [OTHER.bind(SID_B), HOST.bind(SID_A)]),
             "chain mismatch": (login(SID_A), [HOST.bind(SID_A), OTHER.bind(SID_B)]),
-            "no account (non-ssh-connection service)": (ts.userauth_blob(service="ssh-userauth"), None),
+            # verified by a bind, so only the missing account rules it out
+            "no account (non-ssh-connection service)": (ts.userauth_blob(service="ssh-userauth"),
+                                                        [HOST.bind(b"S" * 32)]),
         }
         for label, (data, binds) in cases.items():
             rid = self.ask_ok(data, binds)
@@ -675,12 +677,17 @@ class Validation(unittest.TestCase):
         self.assertIn("ssh_rules only applies to an ssh key", str(cm.exception))
 
     def test_invalid_rules_make_the_secret_invalid_in_the_catalog(self):
-        class Rows(MemoryBackend):
-            def catalog(self):
-                m = Validation.meta(Validation(), ssh_rules=[{"id": "x"}])
-                return [{"item": "Item", "meta": m, "auto": {}}]
-        b = Broker({"approve_base_url": "https://s.example"}, Rows(), FakeNotifier(), None)
+        def catalog_of(rules):
+            class Rows(MemoryBackend):
+                def catalog(self):
+                    m = Validation.meta(Validation(), ssh_rules=rules)
+                    return [{"item": "Item", "meta": m, "auto": None}]     # an explicit entry, not an adopted one
+            return Broker({"approve_base_url": "https://s.example"}, Rows(), FakeNotifier(), None)
+        good = catalog_of([Validation.good(Validation())])
+        self.assertIn("k", good.cfg["secrets"])                            # the same item loads with valid rules
+        b = catalog_of([{"id": "x"}])
         self.assertNotIn("k", b.cfg["secrets"])
+        self.assertEqual(b._catalog_stats["invalid"], 1)
 
 
 # ------------------------------------------------------------------ Policies tab

@@ -220,7 +220,9 @@ class HiddenChars(Base):
 
     def test_ascii_text_has_no_non_ascii_pill(self):
         self.one("plain text")
-        self.assertNotIn("Non-ASCII characters", self.get("/")[1])
+        page = self.get("/")[1]
+        self.assertIn("plain text", page)               # the card is on the page, so the pill's absence means something
+        self.assertNotIn("Non-ASCII characters", page)
 
     def test_homoglyph_cannot_hide(self):
         self.one("p\u0430ssword")          # Cyrillic a
@@ -230,6 +232,7 @@ class HiddenChars(Base):
 
     def test_audit_never_has_the_text(self):
         self.one("caf\u00e9 " + CANARY)
+        self.assertIn("guidance_proposed", self.all_text())     # the proposal was audited: only the text is absent
         self.assertNotIn("caf\u00e9", self.all_text())
         self.assertNotIn(CANARY, self.all_text())
 
@@ -494,6 +497,7 @@ class ForcedReview(Base):
     def test_decision_refused_is_audited_for_token_channels_only_without_text(self):
         rid = self.one()
         self.broker.decide_via("push", rid, "approve", "u", token="zzz")
+        self.assertEqual(len(self.events("push_decide_refused")), 1)    # the refusal was recorded
         self.assertNotIn(CANARY, self.all_text())
 
     def test_presence_hold_applies_and_fallback_releases(self):
@@ -514,6 +518,7 @@ class ForcedReview(Base):
     def test_dashboard_card_has_no_always_or_grant_chips(self):
         rid = self.one()
         for page in (self.get("/")[1], self.get(f"/a/{self.broker._by_id[rid].nonce}")[1]):
+            self.assertIn("Apply selected", page)       # the guidance card's own buttons are rendered
             for bad in ("approve_always", "approve_grant_", "Always", "Automatically approve", "approve_ssh",
                         "value=approve>Approve"):
                 self.assertNotIn(bad, page)
@@ -637,7 +642,8 @@ class Card(Base):
         self.assertIn("b.disabled=!f.querySelector('input[data-gapply]:checked')", page)
 
     def test_history_card_not_shown_after_decision(self):
-        rid, _ = self.card([{"name": "alpha", "text": CANARY}])
+        rid, page = self.card([{"name": "alpha", "text": CANARY}])
+        self.assertIn(CANARY, page)                     # shown while pending, so its absence below is the change
         self.decide(rid, "deny")
         self.settle(rid)
         self.assertNotIn(CANARY, self.get("/")[1])
@@ -827,10 +833,14 @@ class Surfaces(Base):
         agent.append(self.api("GET", f"/v1/requests/{rid}?wait=0")[1])
         agent.append(self.api("GET", f"/v1/audit?request={rid}")[1])
         agent.append(self.api("GET", "/v1/audit?limit=500")[1])
+        self.assertIn(rid, agent[5])                    # the agent's audit view is non-empty (names/mode only)
+        self.assertIn("applied", agent[6])              # ...and so is the settled result
         for body in agent:
             for secret in (CANARY, CURRENT.split("\n")[0], "BETA-CURRENT", "CURRENT-GUIDANCE"):
                 self.assertNotIn(secret, body)
         # the whole audit log, the history page, the pop-over and the notifications
+        self.assertIn("guidance_proposal_result", self.all_text())      # these surfaces are populated
+        self.assertIn("Guidance change proposed", json.dumps(self.notifier.sent))
         self.assertNotIn(CANARY, self.all_text())
         self.assertNotIn("CURRENT-GUIDANCE", self.all_text())
         self.assertNotIn("BETA-CURRENT", self.all_text())
@@ -838,6 +848,7 @@ class Surfaces(Base):
         dash = self.get("/?view=all")[1]
         detail = self.get(f"/request/{rid}")[1]
         for page in (dash, detail):
+            self.assertIn(rid, page)
             self.assertNotIn(CANARY, page)
             self.assertNotIn("CURRENT-GUIDANCE", page)
 

@@ -81,6 +81,9 @@ class AuditScope(ClientMixin, tg.Base):
         for args in (["audit", "--json"], ["audit", "--request", self.rb, "--json"],
                      ["audit", "--event", "requested"]):
             p = subprocess.run([t.CLI, *args], env=env, capture_output=True, text=True, timeout=30)
+            if "--request" not in args:                        # A's own events do show (the call worked)
+                self.assertEqual(p.returncode, 0, p.stderr)
+                self.assertIn(self.ra[:8], p.stdout, args)
             for needle in needles:
                 self.assertNotIn(needle, p.stdout + p.stderr, args)
         # `--tail` never ends by itself: read its first batch, then make new events for BOTH clients and wait

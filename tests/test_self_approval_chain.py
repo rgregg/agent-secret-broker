@@ -76,6 +76,10 @@ class ChainEndsAtTheDestination(Strict):
         if code != 202:
             return                  # refused at creation: the chain is already broken
         rid = json.loads(body)["id"]
+        # the human taps approve: the strict harness's phone does nothing, so decide in-process (as the other
+        # strict tests do); without this the request just stays pending and the checks below hold vacuously
+        self.broker.decide_via("dashboard", rid, "approve", "alice")
+        self.broker._by_id[rid].done.wait(10)
         _, got = self.api("GET", f"/v1/requests/{rid}?wait=5")
         got = json.loads(got)
         self.assertNotEqual(got["status"], "approved", got)

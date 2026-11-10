@@ -431,12 +431,16 @@ class Disabled(Base):
     def test_persisted_grants_ignored(self):
         path = os.path.join(os.path.dirname(self.audit), "grants.json")
         with open(path, "w") as f:
-            json.dump({"version": 1, "grants": [{
-                "id": "ab", "secret": "svc", "minutes": 5, "created_at": time.time(),
+            json.dump({"version": 4, "grants": [{
+                "id": "ab", "secrets": ["svc"], "scope": "read", "minutes": 5, "created_at": time.time(),
                 "expires_at": time.time() + 300, "created_by": "alice"}]}, f)
+        on = Broker(dict(self.broker.cfg, timed_grants={"enabled": True}), self.broker.backend,
+                    FakeNotifier(), self.audit)
+        self.assertEqual([g["secrets"] for g in on.active_grants()], [["svc"]])   # the file is well formed
         b = Broker(dict(self.broker.cfg, timed_grants={"enabled": False}), self.broker.backend,
                    FakeNotifier(), self.audit)
         self.assertEqual(b.active_grants(), [])
+        self.assertEqual(b.grants.active(), [])                 # and never loaded into the store
 
 
 class Persistence(Base):
@@ -481,11 +485,16 @@ class Persistence(Base):
         self.assertEqual(len(self.events("grants_file_corrupt")), 1)
 
     def test_implausible_deadline_dropped(self):
-        with open(self.path(), "w") as f:
-            json.dump({"version": 1, "grants": [{
-                "id": "ab", "secret": "svc", "minutes": 5, "created_at": time.time(),
-                "expires_at": time.time() + 86400, "created_by": "x"}]}, f)
+        def write(deadline):
+            with open(self.path(), "w") as f:
+                json.dump({"version": 4, "grants": [{
+                    "id": "ab", "secrets": ["svc"], "scope": "read", "minutes": 5, "created_at": time.time(),
+                    "expires_at": deadline, "created_by": "x"}]}, f)
+        write(time.time() + 300)                                   # the same entry with a sane deadline loads
+        self.assertEqual([g["secrets"] for g in self.reload().active_grants()], [["svc"]])
+        write(time.time() + 86400)
         self.assertEqual(self.reload().active_grants(), [])
+        self.assertEqual(len(self.events("grant_dropped")), 1)     # dropped for the deadline, not as malformed
 
     def test_revoke_persists(self):
         self.grant_it()
