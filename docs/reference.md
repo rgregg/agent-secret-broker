@@ -521,7 +521,7 @@ defaults (next section). The object looks like this:
   `<NAME>_PASSWORD`; a secure note gives `<NAME>_NOTE`; each custom field gives
   `<NAME>_<FIELD>`. `allowed_hosts` come from the login's URLs (no URL means env
   mode only, never `http`), and `approval` is `prompt`. Only the broker's own
-  collection is ever adopted, and only logins and secure notes (cards and
+  collection (or, with `backend.personal`, the account's own vault) is ever adopted, and only logins and secure notes (cards and
   identities are ignored). Add the `broker` field to change any default (for
   example a TLS fingerprint for a self-signed device), or give it
   `{"disabled": true}` to hide an item from the broker. If an item's metadata
@@ -1102,7 +1102,10 @@ creating a new one does not unless `store.create` is `prompt` (below):
   new vault item is removed again.
 - Needs a vault account that can edit the target collection, and (when the
   vault has several) `backend.organization` / `backend.collection` to say where
-  new items go. Use TLS in front of the client API: the value crosses it.
+  new items go. With `backend.personal: true` (Bitwarden/Vaultwarden) new items are
+  created in the account's own vault instead, with no organization or collection;
+  adoption is scoped to items that have no organization, and the setting cannot be
+  combined with `organization` or `collection`. Use TLS in front of the client API: the value crosses it.
 
 ## Approving from the web UI
 

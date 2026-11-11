@@ -594,6 +594,24 @@ class CatalogFromVault(unittest.TestCase):
         bw._org_want = None                                   # cannot scope: adopt nothing
         self.assertEqual([r["item"] for r in bw.catalog()], ["Tagged"])
 
+    def test_bw_personal_mode_adopts_only_personal_items(self):
+        from secret_broker.backends import BwBackend
+        from secret_broker.backends.base import CAP_ADOPTS
+        bw = BwBackend("https://v.example", "/dev/null", personal=True)
+        self.assertIn(CAP_ADOPTS, bw.capabilities)            # personal scope is a complete scope
+        login = {"type": 1, "name": "Personal", "organizationId": None, "collectionIds": [],
+                 "login": {"username": "u", "password": "p", "uris": [{"uri": "https://x.example"}]}}
+        absent = {k: v for k, v in login.items() if k != "organizationId"}
+        absent["name"] = "No org key"
+        shared = {**login, "name": "In an org", "organizationId": "o1", "collectionIds": ["c1"]}
+        bw._session, bw._synced = "s", time.time()
+        bw._list_items = lambda: [login, absent, shared]
+        rows = bw.catalog()
+        self.assertEqual(sorted(r["item"] for r in rows), ["No org key", "Personal"])
+        self.assertTrue(next(r for r in rows if r["item"] == "Personal")["auto"]["password"])
+        bw._sync = lambda: None
+        self.assertEqual(sorted(i.name for i in bw.export_items()), ["No org key", "Personal"])
+
     def test_invalid_metadata_is_skipped_and_audited_fail_closed(self):
         b, audit = self.make({
             "Bad approval": {"notes": "x", "broker": self.meta(approval="sometimes")},
@@ -1734,6 +1752,20 @@ class BwBackendWrites(unittest.TestCase):
         for k in "ABC":
             self.assertEqual((it[k]["organizationId"], it[k]["collectionIds"]), ("org1", ["col1"]))
         self.assertEqual(self.b.get("C", "api_key"), "c-val")           # readable straight away
+
+    def test_personal_mode_creates_items_outside_any_organization(self):
+        self.b._org_want = self.b._coll_want = None
+        self.b._personal = True
+        self.b._target_ids = None
+        self.b.put("A", "notes", "n-val", create=True)
+        self.b.put("B", "password", "p-val", create=True)
+        self.b.create_login("L", "user", "pw")
+        it = self.items()
+        self.assertEqual(sorted(it), ["A", "B", "L"])         # premise: all three were created
+        for k in "ABL":
+            self.assertIsNone(it[k]["organizationId"])
+            self.assertEqual(it[k]["collectionIds"], [])
+        self.assertEqual(self.b.get("A", "notes"), "n-val")   # and are readable straight away
 
     def test_auto_field_follows_item_type(self):
         self.b.put("Note", "notes", "n-val", create=True)

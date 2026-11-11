@@ -55,6 +55,13 @@ The steps below describe `bw`; the local store has its own quick start after ste
 Only that collection is visible to the broker: every login and secure note in it
 becomes a credential (see "The vault is the catalog" in [reference.md](reference.md)).
 
+**Prefer the account's own vault?** Skip the organization and collection, and set
+`"personal": true` in `backend` instead (it cannot be combined with `organization` or
+`collection`). New items are then created in the broker account's personal vault, shared
+with nobody, and every login and secure note in that personal vault becomes a credential.
+Items in organizations the account belongs to are not adopted. Items that already exist in
+a collection are not moved: copy them across in the vault app.
+
 ## 2. Lay out the stack
 
 On the Docker host:
