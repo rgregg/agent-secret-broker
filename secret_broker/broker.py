@@ -932,6 +932,9 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                          ("purpose_length", len(sp["purpose"])),
                          ("purpose_sha256", credreq_mod.purpose_digest(sp["purpose"]))):
                 rec.setdefault(k, v)    # an event's own extra fields (the final hosts) win
+            if sp.get("replace"):
+                rec.setdefault("replace", True)
+                rec.setdefault("var", sp.get("var"))
         elif req.mode == "plan":
             sp = req.spec       # counts, hashes and lengths only; never the task, description or any rule text
             rec.update(plan_id=req.plan_id, plan_rules=len(sp["rules"]), plan_tier=sp["tier"],
@@ -1680,8 +1683,15 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         name = names[0]
         if _UUID_RE.match(name):
             raise ValueError("secret name must be 1-41 chars of a-z 0-9 _ - ")
+        replace = spec.get("replace")
+        if replace is not None and not isinstance(replace, bool):
+            raise ValueError("replace must be true or false")
+        if replace:
+            return self._validate_replacement(name, spec)
+        spec.pop("replace", None)
         if name in self.cfg["secrets"]:
-            raise ValueError(f"{name} already exists; to replace its value use `asb update {name}`")
+            raise ValueError(f"{name} already exists; to replace its value use `asb update {name}`, or ask "
+                             f"the human for a new one with `asb request-credential {name} --replace`")
         kind = spec.get("kind")
         if kind not in credreq_mod.KINDS:
             raise ValueError("kind must be token or login")
@@ -1704,6 +1714,42 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         spec.clear()
         spec.update(kind=kind, cred_mode=mode, purpose=purpose,
                     hosts=sorted(set(h.lower() for h in hosts)), var=var)
+
+    def _validate_replacement(self, name, spec):
+        """An agent's request for a NEW VALUE of an existing credential (it expired, was revoked or
+        rotated). Only the purpose and, for a credential with several variables, which one. Like an
+        update it changes one value and nothing else: the item, field and key come from the
+        credential's own metadata, never from the request, and the allowed hosts and approval policy
+        are not touched. The human types the value on the approval page, as for a new credential."""
+        if any(spec.get(k) not in (None, [], "") for k in ("kind", "hosts", "cred_mode")):
+            raise ValueError("a replacement takes only a purpose and, for a credential with several "
+                             "variables, var: the hosts, kind and mode stay as they are")
+        secrets_cfg = self.cfg["secrets"]
+        if name not in secrets_cfg or name in self._internal_secrets()[0]:
+            if not self._backend_ok:
+                raise ValueError("unknown secret name, but the credential backend is not "
+                                 "healthy (the catalog may be empty or stale): ask the "
+                                 "operator to check `asb status` and the store key")
+            raise ValueError("unknown secret name")
+        sc = secrets_cfg[name]
+        if sc.get("ssh"):
+            raise ValueError("an SSH key cannot be replaced this way; store the new key as a new credential")
+        purpose = credreq_mod.validate_purpose(spec.get("purpose"))
+        vars_ = sc["vars"]
+        var = spec.get("var")
+        if var is not None and (not isinstance(var, str) or not _VAR_RE.match(var)):
+            raise ValueError("variable must look like MY_TOKEN")
+        if var is None:
+            if len(vars_) != 1:
+                raise ValueError("this secret has several variables; say which with var")
+            var = next(iter(vars_))
+        if var not in vars_:
+            raise ValueError(f"{name} has no variable {var}")
+        ref = vars_[var]
+        spec.clear()
+        spec.update(replace=True, kind="token", cred_mode=None, purpose=purpose, var=var,
+                    hosts=list(sc.get("allowed_hosts") or []), item=ref["item"],
+                    field=ref.get("field") or "auto", key=ref.get("key"))
 
     def _credential_pending(self, req):
         """Hand a validated request to the human. High by code with no model call, never
@@ -1750,6 +1796,8 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         vars, kind, mode); `secret` is {"token": ..} or {"username": .., "password": ..}."""
         errs, sp = [], req.spec
         one = lambda k: form.get(k) if isinstance(form.get(k), str) else ""  # noqa: E731
+        if sp.get("replace"):
+            return self._replacement_check(req, one)
         name = one("name").strip()
         if not _NAME_RE.match(name) or _UUID_RE.match(name):
             errs.append("name must be 1-41 chars of a-z 0-9 _ -")
@@ -1828,6 +1876,21 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         values = {"name": name, "hosts": ", ".join(hosts), "var": one("var").strip(),
                   "cred_mode": mode, "no_hosts": "1" if no_hosts else ""}
         return final, secret, errs, values
+
+    def _replacement_check(self, req, one):
+        """The human's submission for a replacement: one value, and nothing else is read from the form
+        (the name, hosts, mode and variable cannot be changed here). Same return shape as
+        _credential_check."""
+        sp, errs = req.spec, []
+        tok = one("token").strip()
+        if not tok:
+            errs.append("enter the new value")
+        if "\x00" in tok or len(tok) > credreq_mod.MAX_SECRET_CHARS or re.search(r"[\x00-\x1f\x7f]", tok):
+            errs.append("the value is too long or contains control characters")
+            tok = ""
+        final = {"replace": True, "name": req.names[0], "item": sp["item"], "field": sp["field"],
+                 "key": sp.get("key"), "var": sp["var"], "kind": "token", "hosts": sp["hosts"]}
+        return final, {"token": tok}, errs, {}
 
     @staticmethod
     def _credential_meta(final, by):
@@ -2154,7 +2217,8 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             k = len(req.names)
             what = f"Guidance change proposed for {k} credential{'' if k == 1 else 's'}"
         elif req.mode == "credential":
-            what = f"Credential requested: {req.names[0]}"
+            what = (f"Credential replacement requested: {req.names[0]}" if req.spec.get("replace")
+                    else f"Credential requested: {req.names[0]}")
         elif req.mode == "plan":
             k = len(req.spec["rules"])
             what = (f"Plan requested: {req.client['name']}, {k} rule{'' if k == 1 else 's'}: "
@@ -2188,7 +2252,8 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             title = "Guidance proposal [HIGH]"
         elif req.mode == "credential":  # name only: no purpose (untrusted agent text), never a value
             msg = f"{what}\nFrom {req.source}. Open the approval page to enter the value or deny."
-            title = "Credential requested [HIGH]"
+            title = ("Credential replacement requested [HIGH]" if req.spec.get("replace")
+                     else "Credential requested [HIGH]")
         elif req.mode == "plan":        # names only: never the task, description or any rule text
             msg = f"{what}\nOpen the approval page to read the plan and approve or deny it."
             title = "Plan requested"
@@ -3493,6 +3558,8 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         Login item (username and password fields) where the backend can create one; otherwise it
         keeps its two values as one JSON note (see structured.py), exposed as two variables by key."""
         fin, sec = req.spec["final"], req.spec["secret"]
+        if fin.get("replace"):
+            return self._credential_replace(req, fin, sec, who)
         name = fin["name"]
         by = req.approver or "unknown"
         t0 = time.time()
@@ -3522,6 +3589,37 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         self.audit("stored", req, op="create", item=fin["item"], field=fin["field"], hosts=fin["hosts"],
                    value_bytes=len(value.encode()), duration_ms=int((time.time() - t0) * 1000))
         return {"stored": {"name": name, "op": "create", "item": fin["item"], "field": fin["field"]}}
+
+    def _credential_replace(self, req, fin, sec, who):
+        """Write the human's new value over ONE existing value, as an approved update does: the old
+        value is kept as previous_value, and nothing else about the credential changes. It runs only
+        if the credential still maps that variable to the same item, field and key the card showed."""
+        name, var, value = fin["name"], fin["var"], sec["token"]
+        by = req.approver or "unknown"
+        t0 = time.time()
+        internal = self._internal_secrets()[0]
+        with self._cfg_lock:
+            sc = self.cfg["secrets"].get(name)
+            ref = (sc or {}).get("vars", {}).get(var)
+            moved = (sc is None or ref is None or name in internal or sc.get("ssh")
+                     or (ref["item"], ref.get("field") or "auto", ref.get("key")) !=
+                     (fin["item"], fin["field"], fin["key"]))
+        if moved:
+            raise BackendError("the credential changed since this was requested; ask again")
+        if len(value.encode()) > MAX_STORE_VALUE:
+            raise ValueError(f"value is larger than {MAX_STORE_VALUE} bytes")
+        self.audit("credential_provided", req, approver=by, replace=True, var_names=[var],
+                   requested_name=name, value_bytes=len(value.encode()),
+                   **{k: v for k, v in who.items() if k == "channel"})
+        if fin["key"]:                              # one key of a multi-value field
+            try:
+                value = structured.set_key(self.backend.get(fin["item"], fin["field"]), fin["key"], value)
+            except structured.StructuredError as e:
+                raise BackendError(str(e)) from None
+        self.backend.put(fin["item"], fin["field"], value, create=False, keep_previous=True)
+        self.audit("stored", req, op="replace", item=fin["item"], field=fin["field"], hosts=fin["hosts"],
+                   value_bytes=len(sec["token"].encode()), duration_ms=int((time.time() - t0) * 1000))
+        return {"stored": {"name": name, "op": "replace", "item": fin["item"], "field": fin["field"]}}
 
     def _release(self, req):
         if not self.clients.is_active(req.client["id"]):
@@ -5215,8 +5313,10 @@ def _detail_html(r, evs, retained=""):
     elif r["mode"] == "credential":
         # kind, hosts, variable names and sizes only: the purpose text and the value are not retained
         req_ev, prov, st = first("requested") or {}, last("credential_provided") or {}, last("stored") or {}
-        add("Operation", "credential request (agent asked, a human supplied the value)")
-        add("Kind", req_ev.get("cred_kind"))
+        add("Operation", "replacement value for an existing credential (agent asked, a human supplied the value)"
+            if req_ev.get("replace") else "credential request (agent asked, a human supplied the value)")
+        add("Kind", None if req_ev.get("replace") else req_ev.get("cred_kind"))
+        add("Variable", req_ev.get("var") if req_ev.get("replace") else None)
         add("Requested name", prov.get("requested_name") or (r["names"][0] if r["names"] else None))
         add("Stored as", ", ".join(r["names"]) if st else None)
         add("Purpose", f"not retained ({req_ev.get('purpose_length', '?')} characters, sha256 "
@@ -5579,7 +5679,7 @@ def client_handler(broker, client_key):
                                          "it on the approval page")
                     spec = {"kind": body.get("kind"), "purpose": body.get("purpose"),
                             "hosts": body.get("hosts"), "var": body.get("var"),
-                            "cred_mode": body.get("cred_mode")}
+                            "cred_mode": body.get("cred_mode"), "replace": body.get("replace")}
                 elif mode == "sudo":
                     if body.get("names"):
                         raise ValueError("a sudo request names no credential")

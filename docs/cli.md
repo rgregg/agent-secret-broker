@@ -175,6 +175,7 @@ to read current guidance: the client never sees it. The review flow and its safe
 ### Asking the human for a credential
 
     asb request-credential NAME --kind token|login --for "purpose" [--host H[,H]]... [--var VAR] [--mode http|env]
+    asb request-credential NAME --replace --for "purpose" [--var VAR]
 
 When the agent needs a service the broker does not know, it runs this instead of asking in chat or
 reading a secret itself. A card appears on the approval site (and a notification that names only the
@@ -185,8 +186,17 @@ unverified claim. `--host` may repeat or be comma separated; `--mode http` (defa
 `--mode env` may have none. `--var` suggests the placeholder (for a login, the prefix of `NAME_USERNAME` and
 `NAME_PASSWORD`). The request waits about 15 minutes (`credential_requests.ttl_s`).
 
-Exit codes: 0 stored, 4 denied, 5 expired, 3 the broker refused it (the name exists: use `asb update`; invalid name;
-too many pending; disabled) or the vault write failed, 2 usage errors. After it succeeds the agent uses the
+**`--replace` asks for a new value of a credential that already exists**: a token that expired or was
+rotated, which the agent cannot supply itself (`asb update` needs the value on stdin, and the agent does not
+have it). The card says it is a replacement and the form has one secret field and nothing else: the
+credential keeps its hosts, variables and approval policy, the old value is kept as `previous_value`, and
+nothing can change where the value goes. `--var` picks the variable when the credential has several (a
+login's password, say; the value goes to that one only). It takes no `--kind`, `--host` or `--mode`, and
+`asb` prints `replaced: NAME`. An SSH key cannot be replaced this way.
+
+Exit codes: 0 stored, 4 denied, 5 expired, 3 the broker refused it (the name exists: use `--replace`, or
+`asb update` if you hold the value; invalid name; too many pending; disabled; with `--replace`, no such
+credential or an SSH key) or the vault write failed, 2 usage errors. After it succeeds the agent uses the
 credential through the normal flow, which still asks you on every use. Details, the safeguards and the
 prompt-injection stance are in
 [reference.md](reference.md#credential-requests-the-agent-asks-the-human-supplies-the-value).
