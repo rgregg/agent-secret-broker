@@ -1993,6 +1993,32 @@ Request (client API, agent key): `POST /v1/requests` with
   would catch. To investigate a failed store, reproduce it against the backend (for example with
   `asb store` of a throwaway value, or the backend's own tooling).
 
+### Replacing the value of an existing credential
+
+A token that expired, was revoked or was rotated cannot be fixed by the agent: `asb update` needs the new value
+on stdin and the agent has none. `asb request-credential NAME --replace --for "..." [--var VAR]` asks the human
+for it, the same way as for a new credential:
+
+    {"mode": "credential", "names": ["NAME"], "replace": true, "purpose": "...", "var": "MY_TOKEN"}
+
+- The credential must exist, must not be internal, and must not be an SSH key (400, the same "unknown secret
+  name" as `update`). A request without `replace` for an existing name is still refused, with a hint to both.
+- The body takes only `purpose` and `var`. `kind`, `hosts` and `cred_mode` are refused (400): the hosts, the
+  mapping and the approval policy are not touched, so a replacement cannot widen where a credential may be
+  sent. `var` is required when the credential has several variables, as for `update`; the item, field and key
+  the value goes to come from the credential's own metadata, never from the request.
+- Same rules as `update`: always a human decision, never auto-approved, never covered by Always, a timed grant,
+  an `auto_approve` rule or an SSH rule (the checks above apply unchanged), always HIGH by code with no model
+  call. The old value is kept in the item's `previous_value` field.
+- The card says **Replacement value requested** and names the credential and variable. The entry page
+  (`/credential/<id>`) has one `type=password` field and Replace value / Deny; a name, hosts, mode or variable
+  posted to it anyway is ignored.
+- Nothing is written if, when the human submits, the credential is gone or maps the variable somewhere else
+  than the card showed (the request fails: ask again).
+- Result: `{"status": "approved", "stored": {"name", "op": "replace", "item", "field"}}`; `asb` prints
+  `replaced: NAME`. Audit: `requested` carries `replace: true` and `var`; `credential_provided` and `stored`
+  (`op: replace`) record names and the value size only, never the value or the purpose.
+
 ### What the human sees and does
 
 The card (dashboard, and the approval link the notification opens) shows the name, kind, purpose and the

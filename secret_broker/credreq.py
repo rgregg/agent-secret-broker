@@ -46,6 +46,10 @@ REASON = "credential requests always need a human to supply the value; always hi
 WARNING = ("The requesting agent asked for this credential. Its purpose text is the agent's own claim "
            "and is not verified. Enter a secret only if you meant to give this service access. "
            "The agent never sees the value you type.")
+REPLACE_WARNING = ("The requesting agent asked for a new value for a credential that already exists. Its "
+                   "purpose text is the agent's own claim and is not verified. Enter a new value only if you "
+                   "meant to replace it; this overwrites the current value in the vault. The agent never sees "
+                   "the value you type.")
 # keys a client request must never carry: the value is entered by the human, on the approval page
 FORBIDDEN_KEYS = ("value", "secret", "token", "password", "username", "credential", "values", "data",
                   "field_values")
@@ -137,6 +141,14 @@ def describe_html(req):
     """(what_html, note_html) for the card header: name, kind, purpose, suggestions. The
     purpose is shown escaped and marked as the agent's claim."""
     sp, e = req.spec, html.escape
+    if sp.get("replace"):
+        na = guidance_mod.non_ascii_count(sp["purpose"])
+        flag = (f" <span class='pill warn'>Non-ASCII characters: {na} (shown as U+XXXX)</span>" if na else "")
+        return (f"<b>Replacement value requested</b> for the existing credential {e(req.names[0])} "
+                f"(variable {e(sp['var'])})<br>"
+                f"Purpose, as the agent put it (unverified):<div class=crpurpose>{_esc(sp['purpose'])}</div>{flag}"
+                f"Stays as it is: allowed hosts ({e(', '.join(sp['hosts']) or 'none')}), approval policy and "
+                "variables. Only the value changes; the old value is kept as previous_value.", REPLACE_WARNING)
     hosts = ", ".join(sp.get("hosts") or []) or "none suggested"
     na = guidance_mod.non_ascii_count(sp["purpose"])
     flag = (f" <span class='pill warn'>Non-ASCII characters: {na} (shown as U+XXXX)</span>" if na else "")
@@ -150,7 +162,7 @@ def card_actions_html(req):
     """The dashboard card controls: open the entry page, or Deny. No value field here (the
     dashboard refreshes itself and must never hold a half-typed secret)."""
     return (f"<div class=decide-row><a class='btn approve' href='/credential/{html.escape(req.id)}'>"
-            "Review and enter value</a>"
+            f"Review and enter {'new ' if req.spec.get('replace') else ''}value</a>"
             "<button class='btn deny' name=decision value=deny>Deny</button></div>"
             "<p class=scope><small class=muted>Nothing is stored unless you enter a value and press "
             "Store. No standing approval can cover a credential request.</small></p>")
@@ -161,6 +173,8 @@ def form_html(req, csrf, values=None, errors=()):
     buttons. `values` re-populates the editable fields after an error; the secret fields are
     NEVER filled in."""
     sp, e = req.spec, html.escape
+    if sp.get("replace"):
+        return _replace_form_html(req, csrf, errors)
     v = {"name": req.names[0], "hosts": ", ".join(sp.get("hosts") or []), "var": sp.get("var") or "",
          "cred_mode": sp["cred_mode"], "no_hosts": ""}
     v.update(values or {})
@@ -220,3 +234,36 @@ def form_html(req, csrf, values=None, errors=()):
         "<p><small class=muted>Stored with approval on every use: no standing approval, grant or Always "
         "applies to it unless you add one later under Policies. The value is sent only to this page's "
         "broker and is not logged.</small></p>")
+
+
+def _replace_form_html(req, csrf, errors=()):
+    """The entry page for a replacement: the request, ONE secret input and the two buttons. There is
+    no name, hosts, mode or variable field: a replacement changes the value and nothing else."""
+    e = html.escape
+    what, note = describe_html(req)
+    errs = ""
+    if errors:
+        errs = ("<div class=crerr role=alert><b>Nothing was stored.</b> Fix this and enter the value again "
+                "(the secret field is always cleared):<ul>"
+                + "".join(f"<li>{e(m)}</li>" for m in errors) + "</ul></div>")
+    return (
+        "<h1>Replacement credential value</h1>"
+        f"<div class=box>{clients_mod.from_html(req)}<br>{what}</div>"
+        f"<p><small>{e(note)}</small></p>"
+        f"<p><small>Expires in {max(0, int(req.expires - time.time()))}s</small></p>"
+        f"{errs}"
+        "<form method=post action='/credential' id=f autocomplete=off class=cr>"
+        f"<input type=hidden name=id value='{e(req.id)}'>"
+        f"<input type=hidden name=csrf value='{e(csrf)}'>"
+        f"<fieldset class=vault><legend>The new value for {e(req.names[0])}</legend>"
+        "<label for=token>New value<span class=hint>Paste the new token or key. It replaces the current "
+        "value and is never shown again.</span></label>"
+        "<input id=token type=password name=token autocomplete=new-password required "
+        "spellcheck=false autocapitalize=off></fieldset>"
+        "<div class=crbtns><button class='btn approve' type=submit name=decision value=approve>"
+        "Replace value</button>"
+        "<button class='btn deny' type=submit name=decision value=deny formnovalidate>Deny</button></div>"
+        "</form>"
+        "<p><small class=muted>The credential keeps its hosts and approval policy. The old value is kept "
+        "as previous_value so it can be rolled back. The value is sent only to this page's broker and is "
+        "not logged.</small></p>")

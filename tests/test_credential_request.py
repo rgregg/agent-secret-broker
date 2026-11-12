@@ -941,6 +941,188 @@ class SecretNeverLeaks(H):
         self.assertNotIn(TOK, buf.getvalue())
 
 
+class Replace(H):
+    """`asb request-credential NAME --replace`: the agent asks the human for a NEW VALUE of an
+    existing credential (an expired or rotated token). Same rules as `update`: one variable, the old
+    value kept as previous_value, never auto-approved, and nothing but the value changes."""
+    OLD = "existing-svc-value"
+
+    def make_backend(self, d):
+        path = os.path.join(d, "vault.json")
+        with open(path, "w") as f:
+            json.dump({
+                "Svc": {"token": self.OLD, "broker": json.dumps(
+                    {"name": "svc", "allowed_hosts": ["127.0.0.1"], "approval": "prompt",
+                     "vars": {"SVC_TOKEN": {"field": "token"}}})},
+                "Multi": {"a": "multi-a-old", "b": "multi-b-old", "broker": json.dumps(
+                    {"name": "multi", "allowed_hosts": ["127.0.0.1"],
+                     "vars": {"MULTI_A": {"field": "a"}, "MULTI_B": {"field": "b"}}})}}, f)
+        return FileBackend(path)
+
+    def extra_cfg(self, cfg):
+        cfg["risk"] = {"auto_approve_max": "high", "auto_modes": ["http", "env"]}
+        cfg["timed_grants"] = {"enabled": True}
+
+    def replace(self, name="svc", expect=202, purpose=PURPOSE, **extra):
+        body = {"mode": "credential", "names": [name], "replace": True, "purpose": purpose, **extra}
+        code, text = self.api("POST", "/v1/requests", body)
+        self.assertEqual(code, expect, text)
+        return json.loads(text)
+
+    def test_the_human_enters_the_new_value_and_only_the_value_changes(self):
+        self.assertEqual(self.vault_value("Svc", "token"), self.OLD)            # premise
+        before = json.dumps(self.broker.cfg["secrets"]["svc"], sort_keys=True)
+        r = self.replace()
+        self.assertEqual(r["status"], "pending")
+        status, form, _ = self.get(f"/credential/{r['id']}")
+        self.assertEqual(status, 200)
+        self.assertIn("Replacement", form)
+        self.assertIn("type=password name=token", form)
+        for gone in ("name=name", "name=hosts", "name=cred_mode", "name=var", "name=no_hosts"):
+            self.assertNotIn(gone, form)            # nothing but the value is editable
+        status, body, _ = self.submit(r["id"], token=TOK)
+        self.assertEqual(status, 200, body)
+        self.assertNotIn(TOK, body)
+        res = self.result(r["id"])
+        self.assertEqual(res["status"], "approved")
+        self.assertEqual(res["stored"], {"name": "svc", "op": "replace", "item": "Svc", "field": "token"})
+        self.assertEqual(self.vault_value("Svc", "token"), TOK)
+        self.assertEqual(self.vault_value("Svc", "previous_value"), self.OLD)   # rollback copy
+        self.assertEqual(json.dumps(self.broker.cfg["secrets"]["svc"], sort_keys=True), before)
+
+    def test_high_by_code_with_no_model_call_and_never_auto_approved(self):
+        r = self.replace()
+        req = self.broker._by_id[r["id"]]
+        self.assertEqual((req.status, req.risk["level"], req.risk["model"]), ("pending", "high", None))
+        self.assertEqual(self.stub.calls, [])
+        for kw in ({"always": True}, {"grant_minutes": 15}, {}):
+            code, got = self.broker.decide_via("dashboard", r["id"], "approve", "alice", **kw)
+            self.assertEqual((code, got), (400, None))
+        for decision in ("approve", "approve_always", "approve_grant_15"):
+            self.assertEqual(self.post("/decide", {"id": r["id"], "decision": decision,
+                                                   "csrf": self.csrf()})[0], 303)
+        self.assertEqual(self.pending_ids(), [r["id"]])
+        self.assertEqual(self.vault_value("Svc", "token"), self.OLD)
+        self.assertFalse({"grant_created", "grant_used", "escalated"} & {e["event"] for e in self.records()})
+
+    def test_the_request_names_the_replacement_and_keeps_the_purpose_out_of_the_audit_log(self):
+        r = self.replace()
+        ev = self.events("requested")[0]
+        self.assertEqual((ev["mode"], ev["names"]), ("credential", ["svc"]))
+        self.assertTrue(ev["replace"])
+        self.assertNotIn(PURPOSE, open(self.audit).read())
+        _, card, _ = self.get("/")
+        self.assertIn("replacement", card.lower())
+        self.assertIn(f"/credential/{r['id']}", card)
+        self.assertIn("Credential replacement requested: svc", json.dumps(self.notifier.sent))
+
+    def test_unknown_internal_and_ssh_credentials_are_refused(self):
+        self.assertIn("unknown secret name", self.replace("nope", expect=400)["error"])
+        self.broker.cfg["secrets"]["svc"]["ssh"] = True             # premise below: it is now an SSH key
+        self.assertIn("SSH key", self.replace("svc", expect=400)["error"])
+        self.assertEqual(self.pending_ids(), [])
+
+    def test_several_variables_need_var_and_the_value_goes_to_that_one(self):
+        self.assertIn("several variables", self.replace("multi", expect=400)["error"])
+        self.assertIn("no variable", self.replace("multi", var="NOPE", expect=400)["error"])
+        r = self.replace("multi", var="MULTI_B")
+        self.assertEqual(self.submit(r["id"], token=TOK)[0], 200)
+        self.assertEqual(self.result(r["id"])["stored"]["field"], "b")
+        self.assertEqual(self.vault_value("Multi", "b"), TOK)
+        self.assertEqual(self.vault_value("Multi", "a"), "multi-a-old")          # the other is untouched
+
+    def test_a_replacement_request_takes_a_purpose_and_a_variable_only(self):
+        for extra in ({"kind": "token"}, {"hosts": ["evil.example.com"]}, {"cred_mode": "env"},
+                      {"value": TOK}, {"token": TOK}, {"password": PW}):
+            r = self.replace(expect=400, **extra)
+            self.assertNotIn(TOK, json.dumps(r))
+        r = self.replace(expect=400, replace="yes")
+        self.assertEqual(self.pending_ids(), [])
+
+    def test_a_non_replacement_request_for_an_existing_name_points_at_replace(self):
+        r = self.ask(name="svc", expect=400)
+        self.assertIn("--replace", r["error"])
+        self.assertIn("asb update svc", r["error"])
+
+    def test_the_form_cannot_change_where_the_value_goes(self):
+        r = self.replace()
+        # name, hosts, mode and variable posted anyway are ignored: they are not part of this form
+        status, body, _ = self.submit(r["id"], name="other", hosts="evil.example.com", cred_mode="env",
+                                      var="EVIL", token=TOK)
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.vault_value("Svc", "token"), TOK)
+        self.assertNotIn("other", self.broker.cfg["secrets"])
+        self.assertEqual(self.broker.cfg["secrets"]["svc"]["allowed_hosts"], ["127.0.0.1"])
+        self.assertEqual(set(self.broker.cfg["secrets"]["svc"]["vars"]), {"SVC_TOKEN"})
+
+    def test_an_empty_or_malformed_value_stores_nothing_and_the_request_stays_pending(self):
+        r = self.replace()
+        for bad in ("", "  ", "a\x01b", "x" * (credreq.MAX_SECRET_CHARS + 1)):
+            status, body, _ = self.submit(r["id"], token=bad)
+            self.assertEqual(status, 422)
+            self.assertNotRegex(body, r"name=token[^>]*value=")
+        self.assertEqual(self.pending_ids(), [r["id"]])
+        self.assertEqual(self.vault_value("Svc", "token"), self.OLD)
+
+    def test_a_credential_that_moved_while_waiting_is_not_written(self):
+        r = self.replace()
+        self.broker.cfg["secrets"]["svc"]["vars"]["SVC_TOKEN"]["field"] = "other"      # remapped meanwhile
+        with mock.patch.object(self.broker.backend, "put") as put:
+            self.assertEqual(self.submit(r["id"], token=TOK)[0], 500)  # the human is told it did not apply
+            put.assert_not_called()                                    # refused by the check, not by the backend
+        res = self.result(r["id"])
+        self.assertEqual(res["status"], "failed")
+        self.assertNotIn(TOK, json.dumps(res))
+        self.assertEqual(self.vault_value("Svc", "token"), self.OLD)
+        gone = self.replace("multi", var="MULTI_A")
+        del self.broker.cfg["secrets"]["multi"]
+        with mock.patch.object(self.broker.backend, "put") as put:
+            self.assertEqual(self.submit(gone["id"], token=TOK)[0], 500)
+            put.assert_not_called()
+        self.assertEqual(self.result(gone["id"])["status"], "failed")
+        self.assertEqual(self.vault_value("Multi", "a"), "multi-a-old")
+
+    def test_denied_and_failed_replacements_change_nothing_and_leak_nothing(self):
+        a = self.replace()
+        self.submit(a["id"], decision="deny", token=TOK)
+        self.assertEqual(self.result(a["id"])["status"], "denied")
+        self.broker._denied_at.clear()
+        b = self.replace()
+        with mock.patch.object(self.broker.backend, "put", side_effect=RuntimeError(f"nope {TOK}")):
+            self.submit(b["id"], token=TOK)
+        self.assertEqual(self.result(b["id"])["status"], "failed")
+        self.assertEqual(self.vault_value("Svc", "token"), self.OLD)
+        self.broker.flush_notifications(10)
+        blob = open(self.audit).read() + "\n".join(self.seen) + json.dumps(self.notifier.sent)
+        self.assertNotIn(TOK, blob)
+
+    def test_the_new_value_leaks_nowhere_and_is_dropped_after_the_write(self):
+        r = self.replace()
+        self.submit(r["id"], token=TOK)
+        req = self.settle(r["id"])
+        self.assertNotIn("secret", req.spec)
+        self.assertNotIn(TOK, repr(req.spec) + repr(req.result))
+        for path in ("/", "/?view=all", f"/request/{r['id']}", f"/request/{r['id']}?fragment=1"):
+            self.get(path)
+        self.api("GET", "/v1/audit?limit=500")
+        self.broker.flush_notifications(10)
+        ev = self.events("stored")[-1]
+        self.assertEqual(ev["op"], "replace")
+        blob = (open(self.audit).read() + "\n".join(self.seen) + json.dumps(self.notifier.sent)
+                + json.dumps(self.broker.history.rows(), default=str))
+        self.assertNotIn(TOK, blob)
+        self.assertIn("replace", blob)              # positive control: the events were there to scan
+
+    def test_the_old_value_still_works_until_the_human_acts_and_the_new_one_after(self):
+        r = self.replace()
+        self.assertEqual(self.vault_value("Svc", "token"), self.OLD)
+        self.submit(r["id"], token=TOK)
+        self.result(r["id"])
+        out = self.http_with("svc", "SVC_TOKEN")
+        self.assertEqual(out["status"], "approved")
+        self.assertEqual(Rec.seen, ["Bearer " + TOK])
+
+
 class CliFlow(H):
     """The real client/asb against the throwaway broker, in a scratch HOME. The human is simulated
     by posting to the approval page; the CLI is never given a value and never reads stdin."""
@@ -1001,6 +1183,26 @@ class CliFlow(H):
         e = self.events("requested")[0]
         self.assertEqual(e["hosts"], ["a.example.com", "b.example.com", "c.example.com"])
         self.assertEqual(self.broker.cfg["secrets"]["portal"]["vars"].keys(), {"PORTAL_USERNAME", "PORTAL_PASSWORD"})
+
+    def test_replace_prints_replaced_and_nothing_secret(self):
+        rc, out, err = self.run_cli(
+            "request-credential", "svc", "--replace", "--for", PURPOSE,
+            human=lambda rid: self.submit(rid, token=TOK), stdin=PW)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(out.strip(), "replaced: svc")
+        for c in ALL_CANARIES:
+            self.assertNotIn(c, out + err)
+        self.assertEqual(self.vault_value("Svc", "token"), TOK)
+        self.assertTrue(self.events("requested")[0]["replace"])
+
+    def test_replace_usage_errors_exit_2_and_send_nothing(self):
+        for args in (("--replace", "--kind", "token", "--for", "x"), ("--replace", "--host", "a.example.com", "--for", "x"),
+                     ("--replace", "--mode", "env", "--for", "x"), ("--replace",),
+                     ("--replace", "--replace", "--for", "x")):
+            rc, out, err = self.run_cli("request-credential", "svc", *args)
+            self.assertEqual(rc, 2, (args, err))
+            self.assertRegex(err, r"--replace (changes only the value|given twice)|--for .* is required", args)
+        self.assertEqual(self.events("requested"), [])
 
     def test_denied_exit_4(self):
         rc, out, err = self.run_cli(
