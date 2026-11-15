@@ -127,6 +127,8 @@ HIDDEN = frozenset({
     # the entry hashes and the per-entry outcome are approval context
     "guidance_proposed", "guidance_proposal_result", "guidance_ignored",
     "ssh_hosts_changed", "ssh_hosts_change_refused", "ssh_hosts_change_failed",
+    # the Credentials-tab editor: who changed a credential's policy is approval context
+    "credentials_viewed", "credential_changed", "credential_change_refused", "credential_change_failed",
     "ha_hook_any_device", "config_warning", "session_sweep_error",
     # destination guard and listener hardening: operator-side events about the broker's own network
     "dest_guard_config_error", "egress_marker_refused", "config_error", "config_info", "client_peer_refused", "client_peer_observed",
