@@ -53,6 +53,69 @@ def _lines(text, what):
     return [ln.strip() for ln in text.replace("\r\n", "\n").replace("\r", "\n").split("\n") if ln.strip()]
 
 
+def base_from_form(form, stored):
+    """The metadata the page showed (its hidden `advanced_orig`), the starting point for the form's
+    fields; the stored metadata when it is missing or not an object. Only ever a starting point: the
+    result is validated by the loader and diffed against `stored` before anything is written."""
+    try:
+        shown = json.loads(form.get("advanced_orig", "") or "null")
+    except ValueError:
+        shown = None
+    return shown if isinstance(shown, dict) else stored
+
+
+def norm_pin(fp):
+    return re.sub(r"^sha256:", "", str(fp).strip(), flags=re.I).replace(":", "").lower()
+
+
+def add_pin(meta, fp):
+    """`meta` switched to pin mode with `fp` (sha256:<hex>) added to its fingerprints (no duplicates)."""
+    pins = meta.get("tls_fingerprint")
+    pins = [] if pins is None else (list(pins) if isinstance(pins, list) else [pins])
+    if norm_pin(fp) not in {norm_pin(p) for p in pins}:
+        pins.append(fp)
+    out = {k: v for k, v in meta.items() if k != "tls_verify"}
+    out["tls_fingerprint"] = pins[0] if len(pins) == 1 else pins
+    return out
+
+
+def cert_details(der):
+    """What the human checks before trusting a certificate: its sha256 and, when it parses, subject,
+    issuer, names and validity. Values from the certificate are returned as text for the page to escape."""
+    out = {"fingerprint": "sha256:" + hashlib.sha256(der).hexdigest()}
+    try:
+        from cryptography import x509
+        c = x509.load_der_x509_certificate(der)
+        out["subject"] = c.subject.rfc4514_string()[:300]
+        out["issuer"] = c.issuer.rfc4514_string()[:300]
+        out["self_signed"] = c.subject == c.issuer
+        out["not_after"] = c.not_valid_after_utc.strftime("%Y-%m-%d %H:%M UTC")
+        try:
+            san = c.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+            out["names"] = [str(n.value)[:255] for n in san][:20]
+        except x509.ExtensionNotFound:
+            out["names"] = []
+    except Exception:  # noqa: BLE001 -- an unparsable certificate still has a fingerprint
+        out["unparsed"] = True
+    return out
+
+
+def fetched_html(entry, d):
+    e = html.escape
+    rows = [("Fingerprint", f"<code>{e(d['fingerprint'])}</code>")]
+    if d.get("unparsed"):
+        rows.append(("Certificate", "could not be parsed; check the fingerprint some other way"))
+    else:
+        rows += [("Subject", e(d["subject"])), ("Issuer", e(d["issuer"]) + (" (self-signed)" if d["self_signed"] else "")),
+                 ("Names", e(", ".join(d["names"])) or "<small class=muted>none</small>"),
+                 ("Expires", e(d["not_after"]))]
+    body = "".join(f"<dt>{k}</dt><dd>{v}</dd>" for k, v in rows)
+    return (f"<div class=flash><p><b>Certificate from {e(entry)}</b></p><dl class=kv>{body}</dl>"
+            f"<p><small class=muted>Added to the pinned fingerprints below. Check that this is the device you "
+            f"mean (compare it with its own console or a known value) before you save. A pin also expires "
+            f"with the certificate: a renewed certificate has a new fingerprint.</small></p></div>")
+
+
 def host_lines(text):
     """The allowed-hosts box -> a list of host entries (ValueError for control characters)."""
     return _lines(text, "allowed hosts")
@@ -232,7 +295,7 @@ def manage_section(name, token, sha, bindings, *, can_write, blocked=""):
 
 
 def edit_section(name, meta, token, stored, *, can_write, error="", preview=None, widen=(), conflict=False,
-                 extra=""):
+                 extra="", fetched=""):
     """The edit page. `stored`: the metadata the vault holds (what the diff is against and what the
     concurrency hash covers); `meta`: what the form fields show (the stored metadata, or the human's
     rejected candidate). `preview`: the candidate metadata on the confirm step (diff + save button)."""
@@ -257,12 +320,15 @@ def edit_section(name, meta, token, stored, *, can_write, error="", preview=None
     dis = "" if can_write else " disabled"
     form = (f"<form class=cred-form method=post action='/credentials/{e(name)}/preview'>"
             f"<input type=hidden name=csrf value='{e(token)}'><input type=hidden name=old_sha value='{e(sha)}'>"
-            f"<input type=hidden name=advanced_orig value='{e(pretty(stored))}'>"
+            f"<input type=hidden name=advanced_orig value='{e(shown)}'>"
             f"<label>Allowed hosts (one per line, <code>host</code> or <code>host:port</code>)</label>"
             f"<textarea name=allowed_hosts rows=4{dis}>{e(chr(10).join(meta.get('allowed_hosts') or []))}</textarea>"
             f"<label>TLS</label>{radios}"
             f"<label>Pinned fingerprints (one per line, <code>sha256:&lt;64 hex&gt;</code>)</label>"
             f"<textarea name=tls_fingerprint rows=3{dis}>{e(pin_text)}</textarea>"
+            f"<p><input type=text name=fp_host placeholder='host or host:port from the list above' "
+            f"autocomplete=off{dis}> <button type=submit formaction='/credentials/{e(name)}/fingerprint'{dis}>"
+            f"Fetch fingerprint</button></p>"
             f"<label>Approval</label><select name=approval{dis}>{sel}</select>"
             f"<label style='font-weight:400'><input type=checkbox name=plans value=1"
             f"{' checked' if meta.get('plans') else ''}{dis}> Allow plans</label>"
@@ -283,4 +349,4 @@ def edit_section(name, meta, token, stored, *, can_write, error="", preview=None
                 f"<input type=hidden name=csrf value='{e(token)}'><input type=hidden name=old_sha value='{e(sha)}'>"
                 f"<input type=hidden name=meta_json value='{e(json.dumps(preview, sort_keys=True))}'>"
                 f"{ticks}<p><button type=submit>Save</button> <a href='/credentials/{e(name)}'>Back</a></p></form>")
-    return f"<h1>Edit {e(name)}</h1>{err}{off}{form}{extra}"
+    return f"<h1>Edit {e(name)}</h1>{err}{off}{fetched}{form}{extra}"
