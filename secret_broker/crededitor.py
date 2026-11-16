@@ -225,24 +225,196 @@ def diff_html(old, new):
 
 CSS = """
 .df{white-space:pre-wrap}.df.add{background:rgba(40,160,80,.18)}.df.del{background:rgba(220,60,60,.18)}
-.diff{overflow:auto;max-height:24em;padding:.6em;border:1px solid rgba(128,128,128,.4);border-radius:8px}
+.diff{overflow:auto;max-height:24em;padding:.6em;border:1px solid var(--line);border-radius:.5rem;background:var(--card)}
 .cred-form label{display:block;margin:.8em 0 .2em;font-weight:600}
-.cred-form textarea{width:100%;font-family:monospace}
+.cred-form textarea,.cred-form input[type=text],.cred-form input[type=password],.cred-form select{font:inherit;width:100%;
+padding:.45rem .6rem;border:1px solid var(--line);border-radius:.5rem;background:var(--bg);color:var(--fg)}
+.cred-form textarea{font-family:ui-monospace,Menlo,monospace;font-size:.85rem}
+.cred-form input[type=checkbox],.cred-form input[type=radio]{width:auto}
+.chead2{display:flex;align-items:center;gap:.8rem;flex-wrap:wrap;margin:0 0 .9rem}.chead2 h1{margin:0;flex:1}
+.ctool{display:flex;gap:.6rem;align-items:center;flex-wrap:wrap;margin:0 0 .8rem}
+.ctool input{flex:1 1 16rem;font:inherit;min-height:2.5rem;padding:.3rem .75rem;border-radius:.5rem;
+border:1px solid var(--line);background:var(--card);color:var(--fg)}
+.ctool .n{color:var(--muted);font-size:.85rem;white-space:nowrap}
+.ctbl td{vertical-align:middle}.ctbl tr.r:hover td{background:var(--hov)}
+.ctbl tr[hidden]{display:none!important}
+.cname{display:flex;align-items:center;gap:.6rem}.cname a{font-weight:600;text-decoration:none;overflow-wrap:anywhere}
+.cname small{display:block;font-size:.78rem}
+.ci{display:inline-flex;align-items:center;justify-content:center;width:1.9rem;height:1.9rem;border-radius:.45rem;
+background:var(--hov);color:var(--muted);flex:none;cursor:default}
+.ci svg{width:1.05rem;height:1.05rem;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+.ci.ok{background:var(--okbg);color:var(--okfg)}.ci.warn{background:var(--wbg);color:var(--wfg)}
+.ci.bad{background:var(--badbg);color:var(--bad)}.ci.acc{color:var(--accent)}
+.ctbl th.ic,.ctbl td.ic{text-align:center;width:5rem;white-space:nowrap}
+.hchips{display:flex;flex-wrap:wrap;gap:.3rem}
+.hchip{font:.78rem/1.5 ui-monospace,Menlo,monospace;padding:0 .45rem;border:1px solid var(--line);border-radius:.35rem;
+background:var(--bg);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:22rem}
+.vh{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+.ckey{display:flex;flex-wrap:wrap;gap:.4rem 1.1rem;margin:.8rem 0 0;font-size:.8rem;color:var(--muted)}
+.ckey span{display:inline-flex;align-items:center;gap:.35rem}.ckey .ci{width:1.5rem;height:1.5rem}
+.ckey .ci svg{width:.85rem;height:.85rem}
+.ced{max-width:46rem}.ced .card h2{margin-bottom:.15rem}
+.ced .hint{font-size:.82rem;color:var(--muted);margin:.2rem 0 .55rem}
+.seg{display:grid;gap:.4rem}.seg label{display:flex;gap:.6rem;align-items:flex-start;margin:0;padding:.55rem .7rem;
+border:1px solid var(--line);border-radius:.55rem;cursor:pointer;font-weight:400}
+.seg label:has(input:checked){border-color:var(--accent);background:var(--hov)}
+.seg b{display:block}.seg small{display:block}
+.fprow{display:flex;gap:.5rem;flex-wrap:wrap;margin-top:.5rem}.fprow input{flex:1 1 14rem}
+.ced details{margin:0 0 .8rem}.ced summary{cursor:pointer;font-weight:600}
+.abar{position:sticky;bottom:.5rem;z-index:20;display:flex;gap:.6rem;align-items:center;flex-wrap:wrap;
+padding:.7rem 1rem;margin:1rem 0 0;background:var(--card);border:1px solid var(--line);border-radius:.7rem;
+box-shadow:0 4px 18px #0002}
+.abar .sp{flex:1}.abar .dirty{color:var(--wfg);font-size:.85rem;font-weight:600}
+.dzone{border-color:var(--badbg)}
+@media (max-width:42rem){.ctbl th.ic,.ctbl td.ic{text-align:left;width:100%}
+ .ctbl td .vh{position:static;width:auto;height:auto;clip:auto;align-self:center;font-size:.85rem}
+ .abar .btn,.abar button{flex:1 1 auto}}
 """
 
+# Feather-style line icons (24x24, stroked by CSS). Static markup: nothing from the metadata goes in them.
+_ICONS = {
+    "key": "<circle cx=7.5 cy=15.5 r=4.5 /><path d='M10.7 12.3 21 2m-5 5 3 3m-6-0 2 2'/>",
+    "user": "<path d='M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2'/><circle cx=12 cy=7 r=4 />",
+    "term": "<path d='m4 17 6-6-6-6m8 14h8'/>",
+    "phone": "<rect x=5 y=2 width=14 height=20 rx=2 /><path d='M12 18h.01'/>",
+    "zap": "<path d='M13 2 3 14h9l-1 8 10-12h-9z'/>",
+    "lock": "<rect x=3 y=11 width=18 height=11 rx=2 /><path d='M7 11V7a5 5 0 0 1 10 0v4'/>",
+    "pin": "<path d='M12 17v5M9 10.8V4h6v6.8l3 3.2v2H6v-2z'/>",
+    "unlock": "<rect x=3 y=11 width=18 height=11 rx=2 /><path d='M7 11V7a5 5 0 0 1 9.9-1'/>",
+    "list": "<path d='M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01'/>",
+}
 
-def list_section(secrets, flash=""):
+
+def icon(name, tone, label):
+    """A labelled icon: the label is the tooltip, the accessible name and (in the narrow layout) the text."""
+    t = html.escape(label, quote=True)
+    return (f"<span class='ci {tone}' title='{t}' role=img aria-label='{t}'><svg viewBox='0 0 24 24' "
+            f"aria-hidden=true>{_ICONS[name]}</svg></span><span class=vh>{t}</span>")
+
+
+def kind_of(sc):
+    """'ssh', 'login' or 'token', from the parsed catalog entry (a login's variables name username/password)."""
+    if sc.get("ssh"):
+        return "ssh"
+    for ref in (sc.get("vars") or {}).values():
+        if isinstance(ref, dict) and {ref.get("field"), ref.get("key")} & {"username", "password"}:
+            return "login"
+    return "token"
+
+
+KIND_ICON = {"ssh": ("term", "acc", "SSH key"), "login": ("user", "acc", "Login"), "token": ("key", "acc", "Token")}
+
+
+def _approval_icon(sc):
+    if sc.get("approval", "prompt") == "allow":
+        return icon("zap", "warn", "Approval: allowed without asking")
+    return icon("phone", "", "Approval: asks on your phone")
+
+
+def _tls_icon(meta):
+    mode = tls_mode(meta)
+    if mode == "pin":
+        return icon("pin", "ok", "TLS: " + tls_summary(meta))
+    if mode == "skip":
+        return icon("unlock", "bad", "TLS: NOT verified")
+    return icon("lock", "ok", "TLS: verified")
+
+
+def _search_text(name, sc):
+    meta = sc.get("_meta") or {}
+    words = [name, kind_of(sc), KIND_ICON[kind_of(sc)][2], sc.get("approval", "prompt"),
+             "tls " + tls_summary(meta), "unverified" if tls_mode(meta) == "skip" else "",
+             "plans" if sc.get("plans") else "", " ".join(sc.get("allowed_hosts") or []) or "env"]
+    return " ".join(str(w) for w in words if w).lower()
+
+
+def matches(text, q):
+    """Every whitespace-separated word of the query appears in `text` (the same rule the page's script uses)."""
+    return all(w in text for w in q.lower().split())
+
+
+MAX_CHIPS = 3
+
+
+def list_section(secrets, flash="", q=""):
     e = html.escape
-    rows = []
+    q = q[:200]
+    rows, shown = [], 0
     for name, sc in sorted(secrets.items()):
         meta = sc.get("_meta") or {}
-        hosts = ", ".join(e(h) for h in sc.get("allowed_hosts") or []) or "<small class=muted>none (env mode only)</small>"
-        kind = "ssh key" if sc.get("ssh") else "credential"
-        rows.append(f"<tr><td><a href='/credentials/{e(name)}'>{e(name)}</a></td><td>{kind}</td><td>{hosts}</td>"
-                    f"<td>{e(str(sc.get('approval', 'prompt')))}</td><td>{e(tls_summary(meta))}</td></tr>")
-    body = ("<table><tr><th>Name</th><th>Kind</th><th>Hosts</th><th>Approval</th><th>TLS</th></tr>"
-            + "".join(rows) + "</table>") if rows else "<p><small class=muted>No credentials.</small></p>"
-    return f"<h1>Credentials</h1>{flash}<p><a class=btn href='/credentials/new'>New credential</a></p>{body}"
+        hosts = sc.get("allowed_hosts") or []
+        chips = "".join(f"<code class=hchip title='{e(h)}'>{e(h)}</code>" for h in hosts[:MAX_CHIPS])
+        if len(hosts) > MAX_CHIPS:
+            rest = hosts[MAX_CHIPS:]
+            chips += f"<small class=muted title='{e(', '.join(rest))}'>+{len(rest)} more</small>"
+        hosts_html = f"<div class=hchips>{chips}</div>" if hosts else "<small class=muted>none: env mode only</small>"
+        ic, tone, label = KIND_ICON[kind_of(sc)]
+        nvars = len(sc.get("vars") or {})
+        s = _search_text(name, sc)
+        hit = matches(s, q)
+        shown += hit
+        plans = icon("list", "warn", "Plans allowed") if sc.get("plans") else "<small class=muted>-</small>"
+        rows.append(
+            f"<tr class=r data-s='{e(s)}'{'' if hit else ' hidden'}>"
+            f"<td data-label=Name><div class=cname>{icon(ic, tone, label)}<div><a href='/credentials/{e(name)}'>"
+            f"{e(name)}</a><small class=muted>{label} &middot; {nvars} variable{'s' if nvars != 1 else ''}</small>"
+            f"</div></div></td>"
+            f"<td data-label=Hosts>{hosts_html}</td>"
+            f"<td class=ic data-label=Approval>{_approval_icon(sc)}</td>"
+            f"<td class=ic data-label=TLS>{_tls_icon(meta)}</td>"
+            f"<td class=ic data-label=Plans>{plans}</td></tr>")
+    total = len(rows)
+    count = f"{shown} of {total} credentials" if q.strip() else f"{total} credential{'s' if total != 1 else ''}"
+    none = (f"<p id=cnone{'' if q.strip() and not shown else ' hidden'}><small class=muted>No credentials match "
+            f"the search.</small></p>")
+    tool = (f"<form class=ctool method=get action='/credentials' role=search>"
+            f"<input type=search id=cq name=q value='{e(q)}' autocomplete=off "
+            f"placeholder='Search by name, host or kind (ssh, login, allow, pinned...)' aria-label='Search credentials'>"
+            f"<span class=n id=cn aria-live=polite>{count}</span></form>")
+    table = ("<table class='tbl ctbl' id=ctbl><thead><tr><th>Name</th><th>Hosts</th><th class=ic>Approval</th>"
+             "<th class=ic>TLS</th><th class=ic>Plans</th></tr></thead><tbody>" + "".join(rows) + "</tbody></table>")
+    key = ("<div class=ckey>" + "".join(f"<span>{icon(n, t, l)}{l}</span>" for n, t, l in (
+        ("key", "acc", "Token"), ("user", "acc", "Login"), ("term", "acc", "SSH key"),
+        ("phone", "", "Asks on your phone"), ("zap", "warn", "Allowed without asking"),
+        ("lock", "ok", "TLS verified"), ("pin", "ok", "TLS pinned"), ("unlock", "bad", "TLS not verified"))) + "</div>")
+    body = (tool + table + none + key) if rows else "<p><small class=muted>No credentials.</small></p>"
+    head = ("<div class=chead2><h1>Credentials</h1><a class='btn approve' href='/credentials/new'>New credential</a></div>")
+    return head + flash + body
+
+
+JS = r"""
+(function(){
+  var q=document.getElementById('cq');
+  if(q){
+    var rows=[].slice.call(document.querySelectorAll('#ctbl tbody tr.r')),n=document.getElementById('cn'),
+        none=document.getElementById('cnone');
+    var f=function(){
+      var w=q.value.toLowerCase().split(/\s+/).filter(Boolean),shown=0;
+      rows.forEach(function(r){var s=r.getAttribute('data-s')||'';
+        var ok=w.every(function(x){return s.indexOf(x)>=0;});r.hidden=!ok;if(ok)shown++;});
+      if(n)n.textContent=w.length?shown+' of '+rows.length+' credentials':rows.length+' credential'+(rows.length===1?'':'s');
+      if(none)none.hidden=!(w.length&&!shown);
+      try{history.replaceState(null,'',q.value?'/credentials?q='+encodeURIComponent(q.value):'/credentials');}catch(x){}
+    };
+    q.addEventListener('input',f);
+    q.form.addEventListener('submit',function(e){e.preventDefault();f();});
+    document.addEventListener('keydown',function(e){var t=document.activeElement&&document.activeElement.tagName;
+      if(e.key==='/'&&t!=='INPUT'&&t!=='TEXTAREA'&&t!=='SELECT'){e.preventDefault();q.focus();}});
+  }
+  var fm=document.getElementById('cedit');
+  if(fm){
+    var dirty=fm.hasAttribute('data-dirty'),st=document.getElementById('cdirty'),pins=document.getElementById('cpins');
+    var mark=function(){dirty=true;if(st)st.hidden=false;};
+    var tls=function(){var m=fm.querySelector('input[name=tls]:checked');if(pins)pins.hidden=!(m&&m.value==='pin');};
+    fm.addEventListener('input',mark);
+    fm.addEventListener('change',function(){mark();tls();});
+    fm.addEventListener('submit',function(){dirty=false;});
+    tls();
+    var cl=document.getElementById('cclose');
+    if(cl)cl.addEventListener('click',function(e){if(dirty&&!confirm('Discard your unsaved changes?'))e.preventDefault();});
+  }
+})();
+"""
 
 
 def new_section(token, name="", hosts="", error="", can_write=True):
@@ -251,7 +423,7 @@ def new_section(token, name="", hosts="", error="", can_write=True):
     err = f"<p class=err>{e(error)}</p>" if error else ""
     off = "" if can_write else "<p class=err>This vault backend cannot store metadata, so credentials cannot be created here.</p>"
     dis = "" if can_write else " disabled"
-    return (f"<h1>New credential</h1>{err}{off}"
+    return (f"<div class=ced><h1>New credential</h1>{err}{off}<div class=card>"
             f"<form class=cred-form method=post action='/credentials/new' autocomplete=off>"
             f"<input type=hidden name=csrf value='{e(token)}'>"
             f"<label>Name (a-z, 0-9, _ and -, up to 41 characters)</label>"
@@ -263,7 +435,8 @@ def new_section(token, name="", hosts="", error="", can_write=True):
             f"<p><small class=muted>Created like <code>asb store</code>: a vault item with this name, the token in "
             f"its <code>notes</code> field and the variable <code>NAME_TOKEN</code>. Approval is "
             f"<code>prompt</code>. You can change everything but the name afterwards.</small></p>"
-            f"<p><button type=submit{dis}>Create</button> <a href='/credentials'>Cancel</a></p></form>")
+            f"<div class=abar><button type=submit class='btn approve'{dis}>Create</button><span class=sp></span>"
+            f"<a class=btn href='/credentials'>Cancel</a></div></form></div></div>")
 
 
 def manage_section(name, token, sha, bindings, *, can_write, blocked=""):
@@ -279,7 +452,7 @@ def manage_section(name, token, sha, bindings, *, can_write, blocked=""):
         note = (f"<p><small class=muted>Rename and delete are unavailable while this credential is in use "
                 f"({e(what)}). Revoke those on the Policies and Clients tabs first.</small></p>")
     dis = "" if (can_write and not blocked and not bound) else " disabled"
-    return (f"<h2 style='margin-top:1.6rem'>Rename or delete</h2>{note}"
+    return (f"<h2>Rename or delete</h2>{note}"
             f"<form class=cred-form method=post action='/credentials/{e(name)}/rename'>"
             f"<input type=hidden name=csrf value='{e(token)}'><input type=hidden name=old_sha value='{e(sha)}'>"
             f"<label>New name</label><input type=text name=new_name maxlength=41{dis}>"
@@ -291,7 +464,7 @@ def manage_section(name, token, sha, bindings, *, can_write, blocked=""):
             f"<label>Delete: type <code>{e(name)}</code> to confirm</label>"
             f"<input type=text name=typed autocomplete=off{dis}>"
             f"<p><small class=muted>This deletes the vault item and its value. It cannot be undone from here.</small></p>"
-            f"<p><button type=submit{dis}>Delete this credential</button></p></form>")
+            f"<p><button type=submit class='btn deny'{dis}>Delete this credential</button></p></form>")
 
 
 def edit_section(name, meta, token, stored, *, can_write, error="", preview=None, widen=(), conflict=False,
@@ -304,12 +477,10 @@ def edit_section(name, meta, token, stored, *, can_write, error="", preview=None
     pins = meta.get("tls_fingerprint")
     pin_text = "\n".join(pins if isinstance(pins, list) else [pins]) if pins is not None else ""
     mode = tls_mode(meta)
-    radios = "".join(
-        f"<label style='font-weight:400'><input type=radio name=tls value={m}{' checked' if mode == m else ''}> {t}</label> "
-        for m, t in (("verify", "Verify the certificate normally"), ("pin", "Trust only these fingerprints"),
-                     ("skip", "Do not verify (private hosts only)")))
     approval = meta.get("approval", "prompt")
-    sel = "".join(f"<option value={v}{' selected' if approval == v else ''}>{v}</option>" for v in ("prompt", "allow"))
+    sel = "".join(f"<option value={v}{' selected' if approval == v else ''}>{t}</option>"
+                  for v, t in (("prompt", "prompt: ask on my phone for each use"),
+                               ("allow", "allow: let requests through without asking")))
     shown = pretty(meta)
     err = f"<p class=err>{e(error)}</p>" if error else ""
     if conflict:
@@ -318,35 +489,61 @@ def edit_section(name, meta, token, stored, *, can_write, error="", preview=None
     off = "" if can_write else ("<p class=err>This vault backend cannot store metadata, so credentials cannot "
                                 "be edited here.</p>")
     dis = "" if can_write else " disabled"
-    form = (f"<form class=cred-form method=post action='/credentials/{e(name)}/preview'>"
-            f"<input type=hidden name=csrf value='{e(token)}'><input type=hidden name=old_sha value='{e(sha)}'>"
-            f"<input type=hidden name=advanced_orig value='{e(shown)}'>"
-            f"<label>Allowed hosts (one per line, <code>host</code> or <code>host:port</code>)</label>"
-            f"<textarea name=allowed_hosts rows=4{dis}>{e(chr(10).join(meta.get('allowed_hosts') or []))}</textarea>"
-            f"<label>TLS</label>{radios}"
-            f"<label>Pinned fingerprints (one per line, <code>sha256:&lt;64 hex&gt;</code>)</label>"
-            f"<textarea name=tls_fingerprint rows=3{dis}>{e(pin_text)}</textarea>"
-            f"<p><input type=text name=fp_host placeholder='host or host:port from the list above' "
-            f"autocomplete=off{dis}> <button type=submit formaction='/credentials/{e(name)}/fingerprint'{dis}>"
-            f"Fetch fingerprint</button></p>"
-            f"<label>Approval</label><select name=approval{dis}>{sel}</select>"
-            f"<label style='font-weight:400'><input type=checkbox name=plans value=1"
-            f"{' checked' if meta.get('plans') else ''}{dis}> Allow plans</label>"
-            f"<details><summary>Advanced: the whole metadata as JSON</summary>"
-            f"<p><small class=muted>Edit this only for keys the form does not cover. If you change it, it "
-            f"replaces the form's fields.</small></p>"
-            f"<textarea name=advanced rows=14{dis}>{e(shown)}</textarea></details>"
-            f"<p><button type=submit{dis}>Review changes</button> <a href='/credentials'>Cancel</a></p></form>")
+    close = f"<a class=btn id=cclose href='/credentials'>Close</a>"
     if preview is not None:
         ticks = ""
         if widen:
-            ticks = ("<p><strong>This change widens access:</strong></p><ul>"
+            ticks = ("<div class='card dzone'><p><strong>This change widens access:</strong></p><ul>"
                      + "".join(f"<li>{e(WIDEN_TEXT[w])}</li>" for w in widen)
                      + "</ul><label><input type=checkbox name=confirm_widen value=1> "
-                       "I understand this widens access</label>")
-        return (f"<h1>Review: {e(name)}</h1>{err}{diff_html(stored, preview)}"
+                       "I understand this widens access</label></div>")
+        return (f"<div class=ced><h1>Review changes to {e(name)}</h1>{err}"
+                f"<p class=hint>Lines marked <b>-</b> are removed and <b>+</b> are added. Nothing is saved until "
+                f"you press Save.</p>{diff_html(stored, preview)}"
                 f"<form method=post action='/credentials/{e(name)}/save'>"
                 f"<input type=hidden name=csrf value='{e(token)}'><input type=hidden name=old_sha value='{e(sha)}'>"
                 f"<input type=hidden name=meta_json value='{e(json.dumps(preview, sort_keys=True))}'>"
-                f"{ticks}<p><button type=submit>Save</button> <a href='/credentials/{e(name)}'>Back</a></p></form>")
-    return f"<h1>Edit {e(name)}</h1>{err}{off}{fetched}{form}{extra}"
+                f"{ticks}<div class=abar><button type=submit class='btn approve'>Save</button>"
+                f"<a class=btn href='/credentials/{e(name)}'>Back to editing</a><span class=sp></span>{close}"
+                f"</div></form></div>")
+    seg = "".join(
+        f"<label><input type=radio name=tls value={m}{' checked' if mode == m else ''}{dis}><span><b>{t}</b>"
+        f"<small class=muted>{h}</small></span></label>"
+        for m, t, h in (("verify", "Verify the certificate", "The normal check against trusted authorities."),
+                        ("pin", "Trust only pinned fingerprints", "For a self-signed device. A renewed "
+                         "certificate needs a new pin."),
+                        ("skip", "Do not verify", "Private hosts only: anyone in the path could read the traffic.")))
+    dirty = " data-dirty" if meta != stored else ""
+    form = (f"<form class=cred-form id=cedit method=post action='/credentials/{e(name)}/save'{dirty}>"
+            f"<input type=hidden name=csrf value='{e(token)}'><input type=hidden name=old_sha value='{e(sha)}'>"
+            f"<input type=hidden name=advanced_orig value='{e(shown)}'>"
+            f"<div class=card><h2>Allowed hosts</h2><p class=hint>Where the broker will send this credential. One "
+            f"per line, <code>host</code> or <code>host:port</code>.</p>"
+            f"<textarea name=allowed_hosts rows=4{dis}>"
+            f"{e(chr(10).join(meta.get('allowed_hosts') or []))}</textarea></div>"
+            f"<div class=card><h2>TLS</h2><p class=hint>How the broker checks the server's certificate.</p>"
+            f"<div class=seg>{seg}</div>"
+            f"<div id=cpins><label>Pinned fingerprints (one per line, <code>sha256:&lt;64 hex&gt;</code>)</label>"
+            f"<textarea name=tls_fingerprint rows=3{dis}>{e(pin_text)}</textarea>"
+            f"<div class=fprow><input type=text name=fp_host placeholder='host or host:port from the list above' "
+            f"aria-label='Host to fetch a certificate from' autocomplete=off{dis}>"
+            f"<button type=submit formaction='/credentials/{e(name)}/fingerprint'{dis}>Fetch fingerprint</button>"
+            f"</div></div></div>"
+            f"<div class=card><h2>Approval</h2><p class=hint>Whether each use waits for you.</p>"
+            f"<select name=approval aria-label=Approval{dis}>{sel}</select>"
+            f"<label style='font-weight:400'><input type=checkbox name=plans value=1"
+            f"{' checked' if meta.get('plans') else ''}{dis}> Allow plans (a batch of calls approved once)</label>"
+            f"</div>"
+            f"<details><summary>Advanced: the whole metadata as JSON</summary>"
+            f"<p class=hint>Edit this only for keys the form does not cover. If you change it, it "
+            f"replaces the form's fields.</p>"
+            f"<textarea name=advanced rows=14{dis}>{e(shown)}</textarea></details>"
+            f"<div class=abar><button type=submit class='btn approve'{dis}>Save</button>"
+            f"<button type=submit formaction='/credentials/{e(name)}/preview'{dis}>Review changes</button>"
+            f"<span class=dirty id=cdirty{'' if dirty else ' hidden'}>Unsaved changes</span>"
+            f"<span class=sp></span>{close}</div></form>"
+            f"<p class=hint>Save stores the change and returns to the list. A change that widens access (a new "
+            f"host, a TLS pin added or removed, checks turned off, approval or plans allowed) opens a review "
+            f"page first and needs your tick.</p>")
+    manage = f"<div class='card dzone'>{extra}</div>" if extra else ""
+    return f"<div class=ced><h1>Edit {e(name)}</h1>{err}{off}{fetched}{form}{manage}</div>"

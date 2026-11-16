@@ -82,7 +82,7 @@ class Pages(Base):
         code, body = self.get("/credentials")
         self.assertEqual(code, 200)
         self.assertIn("href='/credentials/svc'", body)
-        self.assertIn("127.0.0.1, localhost", body)
+        self.assertIn("<code class=hchip title='127.0.0.1'>127.0.0.1</code><code class=hchip title='localhost'>", body)
         self.assertIn("href='/credentials' class=on", body)
 
     def test_edit_page_shows_stored_values_and_hash(self):
@@ -743,7 +743,140 @@ class Secrecy(Base):
             self.assertIn(ev, audit_api.HIDDEN)
 
 
+class SaveFromForm(Base):
+    """The edit form's own Save button: posts the form fields to /save (no meta_json)."""
+
+    def direct(self, **over):
+        return self.post("/credentials/svc/save", **self.form(**over))
+
+    def test_the_edit_page_has_save_and_close(self):
+        code, body = self.get("/credentials/svc")
+        self.assertEqual(code, 200)
+        self.assertIn("<form class=cred-form id=cedit method=post action='/credentials/svc/save'>", body)
+        self.assertIn("<button type=submit class='btn approve'>Save</button>", body)
+        self.assertIn("formaction='/credentials/svc/preview'>Review changes</button>", body)
+        self.assertIn("<a class=btn id=cclose href='/credentials'>Close</a>", body)
+        self.assertRegex(body, r"<script nonce='[^']+'>\s*\(function\(\)\{\s*var q=document.getElementById\('cq'\)")
+
+    def test_a_narrowing_change_saves_and_returns_to_the_list(self):
+        code, body = self.direct(allowed_hosts="127.0.0.1")
+        self.assertEqual(code, 200)
+        self.assertIn("<div class=flash>Saved: svc</div>", body)
+        self.assertIn("id=ctbl", body)                                   # back on the list
+        self.assertEqual(self.stored()["allowed_hosts"], ["127.0.0.1"])
+        self.assertEqual(self.stored()["custom"], {"keep": "me"})
+        self.assertEqual(len(self.events("credential_changed")), 1)
+
+    def test_a_widening_change_goes_to_review_even_with_a_tick_in_the_form(self):
+        cases = {"host_added": dict(allowed_hosts="127.0.0.1\nlocalhost\n" + NEW_HOST),
+                 "approval_allow": dict(approval="allow"), "tls_unverified": dict(tls="skip")}
+        for label, over in cases.items():
+            with self.subTest(label):
+                before = self.stored()
+                code, body = self.direct(confirm_widen="1", **over)
+                self.assertEqual(code, 200)
+                self.assertIn("Review changes to svc", body)
+                self.assertIn("This change widens access", body)
+                self.assertIn(crededitor.WIDEN_TEXT[label], body)
+                self.assertIn("name=meta_json value=", body)
+                self.assertEqual(self.stored(), before)                  # nothing written from the form
+                self.assertEqual(self.events("credential_changed"), [])
+        # the review page's own Save, with the tick, does write (the path above was not simply broken)
+        self.assertEqual(self.save(confirm=True, approval="allow")[1], 200)
+        self.assertEqual(self.stored()["approval"], "allow")
+
+    def test_a_stale_form_is_refused(self):
+        opened = self.form(allowed_hosts="127.0.0.1")
+        self.reset_to({**self.stored(), "approval": "allow"})
+        theirs = self.stored()
+        code, body = self.post("/credentials/svc/save", **opened)
+        self.assertEqual(code, 409)
+        self.assertIn("changed in the vault after you opened it", body)
+        self.assertEqual(self.stored(), theirs)
+        self.assertEqual(self.events("credential_change_refused")[-1]["reason"], "conflict")
+
+    def test_invalid_form_input_is_refused(self):
+        before = self.stored()
+        code, body = self.direct(allowed_hosts="not a host!")
+        self.assertEqual(code, 400)
+        self.assertIn("allowed_hosts must be up to 10 plain hostnames", body)
+        self.assertEqual(self.stored(), before)
+
+    def test_no_change_is_reported(self):
+        code, body = self.direct()
+        self.assertEqual(code, 200)
+        self.assertIn("No changes: svc", body)
+        self.assertEqual(self.events("credential_changed"), [])
+
+
+class ListPage(Base):
+    def tweak(self, cfg):
+        super().tweak(cfg)
+        cfg["secrets"]["shell"] = {"vars": {"SHELL_KEY": {"item": "Shell", "field": "token"}},
+                                   "allowed_hosts": ["10.9.8.7"], "approval": "allow",
+                                   "tls_verify": False}
+        cfg["_vault"] = {"Shell": {"token": "S3CR3T-shell"}}
+
+    def visible(self, body):
+        return sorted(n for h, n in (
+            (m.group(1), m.group(2)) for m in re.finditer(
+                r"<tr class=r data-s='[^']*'( hidden)?>.*?href='/credentials/(\w+)'", body)) if not h)
+
+    def test_icons_say_what_each_credential_is(self):
+        code, body = self.get("/credentials")
+        self.assertEqual(code, 200)
+        self.assertEqual(self.visible(body), ["shell", "svc"])
+        shell = body[body.index("href='/credentials/shell'"):]
+        self.assertIn("aria-label='Approval: allowed without asking'", shell)
+        self.assertIn("aria-label='TLS: NOT verified'", shell)
+        svc = body[body.index("href='/credentials/svc'"):body.index("href='/credentials/shell'")] \
+            if body.index("href='/credentials/svc'") < body.index("href='/credentials/shell'") \
+            else body[body.index("href='/credentials/svc'"):]
+        self.assertIn("aria-label='Approval: asks on your phone'", svc)
+        self.assertIn("aria-label='TLS: verified'", svc)
+        self.assertIn("2 credentials", body)
+
+    def test_search_hides_rows_that_do_not_match(self):
+        code, body = self.get("/credentials?q=10.9.8")
+        self.assertEqual(code, 200)
+        self.assertEqual(self.visible(body), ["shell"])
+        self.assertIn("href='/credentials/svc'", body)                   # rendered, only hidden
+        self.assertIn("1 of 2 credentials", body)
+        self.assertIn("<p id=cnone hidden>", body)
+        code, body = self.get("/credentials?q=allow+unverified")         # every word must match
+        self.assertEqual(self.visible(body), ["shell"])
+        code, body = self.get("/credentials?q=nothing-like-this")
+        self.assertEqual(self.visible(body), [])
+        self.assertIn("0 of 2 credentials", body)
+        self.assertIn("<p id=cnone>", body)
+
+    def test_the_query_is_escaped(self):
+        evil = "<script>alert(1)</script>'"
+        code, body = self.get("/credentials?q=" + urllib.parse.quote(evil))
+        self.assertEqual(code, 200)
+        self.assertIn("value='&lt;script&gt;alert(1)&lt;/script&gt;&#x27;'", body)
+        self.assertNotIn(evil, body)
+
+    def test_the_list_shows_no_value(self):
+        code, body = self.get("/credentials")
+        self.assertIn("href='/credentials/shell'", body)
+        self.assertNotIn("S3CR3T-shell", body)
+        self.assertNotIn(t.SECRET, body)
+
+
 class Units(unittest.TestCase):
+    def test_kind_of(self):
+        self.assertEqual(crededitor.kind_of({"ssh": True, "vars": {"K": {"field": "private_key"}}}), "ssh")
+        self.assertEqual(crededitor.kind_of({"vars": {"U": {"field": "username"}, "P": {"field": "password"}}}),
+                         "login")
+        self.assertEqual(crededitor.kind_of({"vars": {"U": {"field": "notes", "key": "username"}}}), "login")
+        self.assertEqual(crededitor.kind_of({"vars": {"T": {"field": "notes"}}}), "token")
+
+    def test_matches_needs_every_word(self):
+        self.assertTrue(crededitor.matches("svc token 127.0.0.1", "SVC  127"))
+        self.assertFalse(crededitor.matches("svc token 127.0.0.1", "svc login"))
+        self.assertTrue(crededitor.matches("anything", ""))
+
     def test_widened_is_empty_for_narrowing(self):
         old = {"allowed_hosts": ["a.example.com", "b.example.com"], "tls_verify": False}
         self.assertEqual(crededitor.widened(old, {"allowed_hosts": ["a.example.com"]}), [])
