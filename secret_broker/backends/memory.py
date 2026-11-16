@@ -3,7 +3,7 @@ persists. For tests and embedding, and as the worked example for third-party
 backends: it passes tests/backend_contract.py in about 150 lines."""
 import threading
 
-from .base import (AUTO_ALIASES, as_uris, merge_uri_hosts, CAP_ADOPTS, CAP_CREATE_LOGIN, CAP_EDIT_ITEM, CAP_EXPORT_ITEMS,
+from .base import (AUTO_ALIASES, check_new_field, as_uris, merge_uri_hosts, CAP_ADOPTS, CAP_CREATE_LOGIN, CAP_EDIT_ITEM, CAP_EXPORT_ITEMS,
                    CAP_IMPORT_ITEMS, CAP_SET_META, LOGIN, META_FIELD, NOTE, PREVIOUS_FIELDS,
                    RESERVED_FIELDS, SSH_KEY, BackendConflict, BackendInvalid, BackendNotFound,
                    Item, VaultBackend, BackendSpec, auto_shape, check_item_args, clean_meta,
@@ -59,13 +59,25 @@ class MemoryBackend(VaultBackend):
             v = self._read(slot)
             return v.strip() if f == "notes" else v
 
-    def put(self, item, field, value, create=False, keep_previous=False, meta=None):
+    def put(self, item, field, value, create=False, keep_previous=False, meta=None, add_field=False):
         check_item_args(item, value)
         if field in RESERVED_FIELDS:
             raise BackendInvalid(f"field {field!r} is reserved")
         meta = clean_meta(meta) if meta is not None else None
+        if add_field:
+            check_new_field(field)
         with self._lock:
             existing = lookup_name(self._items, item)
+            if add_field and not create:
+                if existing is None:
+                    raise BackendNotFound(f"item {item!r} not found")
+                it = self._items[existing]
+                if field in it.fields:
+                    raise BackendConflict(f"field {field!r} already exists on item {item!r}")
+                it.fields[field] = value
+                if meta is not None:
+                    it.meta = meta
+                return
             if create:
                 if existing is not None:
                     raise BackendConflict(f"item {item!r} already exists")

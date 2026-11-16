@@ -5,7 +5,7 @@ including `broker` metadata and adoption of items without it. See
 docs/reference.md ("Local encrypted backend")."""
 import copy
 
-from .base import (AUTO_ALIASES, as_uris, merge_uri_hosts, CAP_ADOPTS, CAP_CREATE_LOGIN, CAP_EDIT_ITEM, CAP_EXPORT_ITEMS,
+from .base import (AUTO_ALIASES, check_new_field, as_uris, merge_uri_hosts, CAP_ADOPTS, CAP_CREATE_LOGIN, CAP_EDIT_ITEM, CAP_EXPORT_ITEMS,
                    CAP_IMPORT_ITEMS, CAP_ON_EVENT, CAP_SET_META, CAP_WARM, LOGIN, META_FIELD, NOTE,
                    PREVIOUS_FIELDS, RESERVED_FIELDS, SSH_KEY, BackendConfigError, BackendConflict,
                    BackendInvalid, BackendNotFound, BackendSpec, Item, VaultBackend, auto_field_for,
@@ -102,14 +102,29 @@ class LocalBackend(VaultBackend):
                                                for n, it in items.items()])
 
     # -- writes ------------------------------------------------------------
-    def put(self, item, field, value, create=False, keep_previous=False, meta=None):
+    def put(self, item, field, value, create=False, keep_previous=False, meta=None, add_field=False):
         check_item_args(item, value)
         if field in RESERVED_FIELDS:
             raise BackendInvalid(f"field {field!r} is reserved")
         meta = clean_meta(meta) if meta is not None else None
+        if add_field:
+            check_new_field(field)
 
         def apply(items):
             existing = self._find(items, item)
+            if add_field and not create:
+                if existing is None:
+                    raise BackendNotFound(f"item {item!r} not found")
+                it = items[existing]
+                if it.get("fields") is None:
+                    it["fields"] = {}
+                fields = it["fields"]
+                if field in fields:
+                    raise BackendConflict(f"field {field!r} already exists on item {item!r}")
+                fields[field] = value
+                if meta is not None:
+                    it[META_FIELD] = meta
+                return
             if create:
                 if existing is not None:
                     raise BackendConflict(f"item {item!r} already exists")
@@ -135,8 +150,8 @@ class LocalBackend(VaultBackend):
             it = items[existing]
             kind = _kind(it)
             f = auto_field_for(kind) if field in AUTO_ALIASES else field
-            if f == "password" and kind == LOGIN:
-                old, it["password"] = it.get("password"), value
+            if f in ("password", "username") and kind == LOGIN:
+                old, it[f] = it.get(f), value
             elif f == "private_key" and kind == SSH_KEY:
                 old, it["private_key"] = it.get("private_key"), value
             elif f == "notes":

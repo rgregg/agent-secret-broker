@@ -3,7 +3,7 @@ only; it never writes the file back, so changes last as long as the process."""
 import json
 import threading
 
-from .base import (AUTO_ALIASES, CAP_SET_META, META_FIELD, RESERVED_FIELDS, BackendConfigError,
+from .base import (AUTO_ALIASES, check_new_field, CAP_SET_META, META_FIELD, RESERVED_FIELDS, BackendConfigError,
                    BackendConflict, BackendInvalid, BackendNotFound, BackendSpec, VaultBackend,
                    catalog_rows, check_item_args, clean_meta, lookup_name, now_iso)
 
@@ -40,13 +40,25 @@ class FileBackend(VaultBackend):
                 raise BackendNotFound(f"{item}/{f} not found")
             return rec[f]
 
-    def put(self, item, field, value, create=False, keep_previous=False, meta=None):
+    def put(self, item, field, value, create=False, keep_previous=False, meta=None, add_field=False):
         check_item_args(item, value)
         if field in RESERVED_FIELDS:
             raise BackendInvalid(f"field {field!r} is reserved")
         meta = clean_meta(meta) if meta is not None else None
+        if add_field:
+            check_new_field(field)
         with self._lock:
             existing = lookup_name(self._data, item)
+            if add_field and not create:
+                if existing is None:
+                    raise BackendNotFound(f"item {item!r} not found")
+                rec = self._data[existing]
+                if field in rec:
+                    raise BackendConflict(f"field {field!r} already exists on item {item!r}")
+                rec[field] = value
+                if meta is not None:
+                    rec[META_FIELD] = json.dumps(meta)
+                return
             if create:
                 if existing is not None:
                     raise BackendConflict(f"item {item!r} already exists")

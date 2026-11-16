@@ -371,6 +371,40 @@ class BackendContract:
         meta["vars"]["T"]["field"] = "mutated after the call"
         self.assertNotEqual(self.row("N")["meta"], meta)         # the backend kept its own copy
 
+    def test_add_field_adds_a_missing_field_with_meta(self):
+        self.b.put("AF", "notes", "first", create=True, meta={"vars": {"A": {"field": "notes"}}})
+        meta = {"vars": {"A": {"field": "notes"}, "EXTRA": {"field": "EXTRA"}}}
+        self.b.put("AF", "EXTRA", OTHER, add_field=True, meta=meta)
+        self.assertEqual(self.b.get("AF", "EXTRA"), OTHER)
+        self.assertEqual(self.b.get("AF", "notes"), "first")          # the item's own value is untouched
+        self.assertEqual(self.row("AF")["meta"], meta)                 # metadata written with the field
+
+    def test_add_field_refuses_an_existing_field(self):
+        self.b.put("AF", "notes", "first", create=True)
+        self.b.put("AF", "EXTRA", OTHER, add_field=True)
+        self.assertEqual(self.b.get("AF", "EXTRA"), OTHER)            # premise: the first add worked
+        with self.assertRaises(BackendConflict):
+            self.b.put("AF", "EXTRA", "replaced", add_field=True, meta={"x": 1})
+        self.assertEqual(self.b.get("AF", "EXTRA"), OTHER)
+        self.assertNotEqual((self.row("AF") or {}).get("meta"), {"x": 1})
+
+    def test_add_field_refuses_builtin_and_reserved_names(self):
+        self.b.put("AF", "notes", "first", create=True)
+        for f in ("notes", "password", "username", "private_key", "auto", "previous_value", "broker"):
+            with self.subTest(f), self.assertRaises(BackendInvalid):
+                self.b.put("AF", f, "v", add_field=True)
+        self.assertEqual(self.b.get("AF", "notes"), "first")
+
+    def test_add_field_on_a_missing_item_is_not_found(self):
+        with self.assertRaises(BackendNotFound):
+            self.b.put("Nope", "EXTRA", "v", add_field=True)
+
+    def test_replace_login_username(self):
+        self.need("create_login")
+        self.b.create_login("Site", "alice", "pw-1")
+        self.b.put("Site", "username", "bob")
+        self.assertEqual((self.b.get("Site", "username"), self.b.get("Site", "password")), ("bob", "pw-1"))
+
     def test_set_meta_replaces_the_metadata(self):
         self.need("set_meta")
         self.b.put("S", "notes", "v", create=True, meta={"a": 1})
