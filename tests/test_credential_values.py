@@ -216,3 +216,110 @@ class Hidden(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Pages(Base):
+    """The Values card and its routes on the approval site."""
+
+    def raw_post(self, path, accept=None, csrf=True, user="alice", **form):
+        if csrf:
+            form["csrf"] = self.broker.csrf_token("alice")
+        hdr = {"X-authentik-username": user}
+        if accept:
+            hdr["Accept"] = accept
+        r = t.urllib.request.Request(self.abase + path, data=ed.urllib.parse.urlencode(form).encode(),
+                                     headers=hdr, method="POST")
+        try:
+            with t.urllib.request.urlopen(r, timeout=10) as resp:
+                return resp.status, dict(resp.headers), resp.read().decode()
+        except t.urllib.error.HTTPError as e:
+            return e.code, dict(e.headers), e.read().decode()
+
+    def test_the_edit_page_lists_variables_and_holds_no_value(self):
+        code, body = self.get("/credentials/multi")
+        self.assertEqual(code, 200)
+        self.assertIn("<code>M_ID</code>", body)                         # positive control
+        self.assertIn("<code>M_SEC</code>", body)
+        self.assertIn("field <code>notes</code>, key <code>SECRET</code>", body)
+        self.assertIn("action='/credentials/multi/reveal'", body)
+        for v in (MULTI_ID, MULTI_SEC, t.SECRET):
+            self.assertNotIn(v, body)
+
+    def test_reveal_json(self):
+        code, hdr, body = self.raw_post("/credentials/svc/reveal", accept="application/json", var="SVC_TOKEN")
+        self.assertEqual(code, 200)
+        self.assertEqual(json.loads(body), {"value": t.SECRET})
+        self.assertEqual(hdr["Cache-Control"], "no-store")
+        code, _, body = self.raw_post("/credentials/svc/reveal", accept="application/json", var="NOPE")
+        self.assertEqual(code, 400)
+        self.assertEqual(json.loads(body), {"error": self.broker._VALUE_TEXT["unknown_var"]})
+
+    def test_reveal_without_script_renders_the_one_value_escaped(self):
+        tricky = "S3CR3T-'<b>x</b></script>"
+        self.broker.backend.put("Multi", "notes", json.dumps({"ID": tricky, "SECRET": MULTI_SEC}))
+        code, hdr, body = self.raw_post("/credentials/multi/reveal", var="M_ID")
+        self.assertEqual(code, 200)
+        self.assertEqual(hdr["Cache-Control"], "no-store")
+        esc = "value='S3CR3T-&#x27;&lt;b&gt;x&lt;/b&gt;&lt;/script&gt;'"
+        self.assertEqual(body.count(esc), 1)                             # in one box: M_ID's
+        self.assertIn("id='val-M_ID' aria-label='Value of M_ID' placeholder='hidden' autocomplete=off "
+                      "spellcheck=false " + esc, body)
+        self.assertNotIn(tricky, body)
+        self.assertNotIn(MULTI_SEC, body)                                # only the one asked for
+
+    def test_reveal_needs_csrf_and_the_human(self):
+        code, _, _ = self.raw_post("/credentials/svc/reveal", csrf=False, var="SVC_TOKEN")
+        self.assertEqual(code, 403)
+        code, _, _ = self.raw_post("/credentials/svc/reveal", user="mallory", var="SVC_TOKEN")
+        self.assertEqual(code, 403)
+        self.assertEqual(self.events("credential_value_revealed"), [])
+        code, _ = t.req(self.base + "/credentials/svc/reveal", "POST", {"var": "SVC_TOKEN"}, {"X-Client-Key": t.KEY})
+        self.assertEqual(code, 404)
+        # positive control: the same request with the token works
+        self.assertEqual(self.raw_post("/credentials/svc/reveal", var="SVC_TOKEN")[0], 200)
+
+    def test_replace_never_echoes_the_value(self):
+        code, _, body = self.raw_post("/credentials/svc/value", var="SVC_TOKEN", value=NEW_VALUE)
+        self.assertEqual(code, 200)
+        self.assertIn("Value replaced: SVC_TOKEN", body)
+        self.assertNotIn(NEW_VALUE, body)
+        self.assertEqual(self.vault("Svc", "token"), NEW_VALUE)
+
+    def test_a_failed_replace_re_renders_without_the_value(self):
+        with mock.patch.object(self.broker.backend, "put", side_effect=BackendError("x")):
+            code, _, body = self.raw_post("/credentials/svc/value", var="SVC_TOKEN", value=NEW_VALUE)
+        self.assertEqual(code, 500)
+        self.assertIn("Could not save to the vault", body)
+        self.assertNotIn(NEW_VALUE, body)
+
+    def test_add_and_remove(self):
+        sha = self.sha("svc")
+        code, _, body = self.raw_post("/credentials/svc/value/add", var="SVC_EXTRA", value=EXTRA, old_sha=sha)
+        self.assertEqual(code, 400)                                      # no tick
+        self.assertIn("Tick the box", body)
+        self.assertNotIn(EXTRA, body)
+        code, _, body = self.raw_post("/credentials/svc/value/add", var="SVC_EXTRA", value=EXTRA, old_sha=sha,
+                                      confirm="1")
+        self.assertEqual(code, 200)
+        self.assertIn("Value added: SVC_EXTRA", body)
+        self.assertNotIn(EXTRA, body)
+        self.assertEqual(self.vault("Svc", "SVC_EXTRA"), EXTRA)
+        code, _, body = self.raw_post("/credentials/svc/value/remove", var="SVC_EXTRA", old_sha=self.sha("svc"))
+        self.assertEqual(code, 200)
+        self.assertIn("Variable removed: SVC_EXTRA", body)
+        self.assertNotIn("SVC_EXTRA", self.stored()["vars"])
+        code, _, _ = self.raw_post("/credentials/svc/value/remove", var="SVC_TOKEN", old_sha="0" * 64)
+        self.assertEqual(code, 409)
+
+    def test_ssh_shows_the_public_key_and_no_show_button(self):
+        code, body = self.get("/credentials/sshk")
+        self.assertEqual(code, 200)
+        self.assertIn(SSH_PUB.split()[1][:40], body)
+        self.assertNotIn("action='/credentials/sshk/reveal'", body)
+        self.assertNotIn(SSH_PRIV.splitlines()[1], body)
+        self.assertEqual(self.raw_post("/credentials/sshk/reveal", var="SSHK_KEY")[0], 400)
+
+    def test_page_script_wires_the_buttons(self):
+        code, body = self.get("/credentials/svc")
+        self.assertIn("data-reveal", body)
+        self.assertIn("'Accept':'application/json'", body)

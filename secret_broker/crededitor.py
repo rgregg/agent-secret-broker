@@ -266,6 +266,13 @@ padding:.7rem 1rem;margin:1rem 0 0;background:var(--card);border:1px solid var(-
 box-shadow:0 4px 18px #0002}
 .abar .sp{flex:1}.abar .dirty{color:var(--wfg);font-size:.85rem;font-weight:600}
 .dzone{border-color:var(--badbg)}
+.vrow{border-top:1px solid var(--line);padding:.7rem 0}.vrow:first-of-type{border-top:0}
+.vhead{display:flex;align-items:baseline;gap:.6rem;flex-wrap:wrap}.vhead code{font-weight:600}
+.vline{display:flex;gap:.4rem;flex-wrap:wrap;align-items:center;margin-top:.4rem}
+.vline input{flex:1 1 14rem;font:.85rem ui-monospace,Menlo,monospace;padding:.4rem .6rem;border:1px solid var(--line);
+border-radius:.5rem;background:var(--bg);color:var(--fg)}
+.vline form{display:contents}.vrow details{margin:.45rem 0 0}.vrow summary{font-weight:400;font-size:.85rem}
+.pubkey{font:.78rem ui-monospace,Menlo,monospace;overflow-wrap:anywhere}
 @media (max-width:42rem){.ctbl th.ic,.ctbl td.ic{text-align:left;width:100%}
  .ctbl td .vh{position:static;width:auto;height:auto;clip:auto;align-self:center;font-size:.85rem}
  .abar .btn,.abar button{flex:1 1 auto}}
@@ -413,6 +420,27 @@ JS = r"""
     var cl=document.getElementById('cclose');
     if(cl)cl.addEventListener('click',function(e){if(dirty&&!confirm('Discard your unsaved changes?'))e.preventDefault();});
   }
+  var btn=function(kind,v){return document.querySelector('[data-'+kind+'="'+v+'"]');};
+  [].forEach.call(document.querySelectorAll('[data-reveal]'),function(b){
+    b.form.addEventListener('submit',function(e){
+      e.preventDefault();var v=b.getAttribute('data-reveal'),box=document.getElementById('val-'+v);
+      fetch(b.form.action,{method:'POST',credentials:'same-origin',cache:'no-store',redirect:'manual',
+        headers:{'Accept':'application/json'},body:new URLSearchParams(new FormData(b.form))})
+      .then(function(r){return r.json();}).then(function(d){
+        if(d.value===undefined){alert(d.error||'Could not show the value');return;}
+        box.value=d.value;box.type='text';btn('copy',v).hidden=false;btn('hide',v).hidden=false;b.hidden=true;
+      }).catch(function(){alert('Could not show the value');});
+    });
+  });
+  [].forEach.call(document.querySelectorAll('[data-hide]'),function(b){b.addEventListener('click',function(){
+    var v=b.getAttribute('data-hide');document.getElementById('val-'+v).value='';b.hidden=true;
+    btn('copy',v).hidden=true;var r=btn('reveal',v);if(r)r.hidden=false;});});
+  [].forEach.call(document.querySelectorAll('[data-copy]'),function(b){b.addEventListener('click',function(){
+    var v=b.getAttribute('data-copy'),box=document.getElementById('val-'+v);
+    if(navigator.clipboard)navigator.clipboard.writeText(box.value).then(function(){b.textContent='Copied';
+      setTimeout(function(){b.textContent='Copy';},1500);});});});
+  [].forEach.call(document.querySelectorAll('form[data-confirm]'),function(f){f.addEventListener('submit',function(e){
+    if(!confirm(f.getAttribute('data-confirm')))e.preventDefault();});});
 })();
 """
 
@@ -467,8 +495,73 @@ def manage_section(name, token, sha, bindings, *, can_write, blocked=""):
             f"<p><button type=submit class='btn deny'{dis}>Delete this credential</button></p></form>")
 
 
+def _where(ref):
+    """Where a variable's value lives, for the page (field and key names are metadata, never values)."""
+    e = html.escape
+    f = ref.get("field") or "auto"
+    out = "the item's own value" if f == "auto" else f"field <code>{e(f)}</code>"
+    return out + (f", key <code>{e(ref['key'])}</code>" if ref.get("key") else "")
+
+
+def values_section(name, sc, token, sha, *, can_write, revealed=None):
+    """The Values card. No value is ever in it, except `revealed` = (var, value): the one value the human just
+    asked to see through the no-script fallback (the script fills the box from a JSON reply instead)."""
+    e = html.escape
+    n = e(name)
+    hid = f"<input type=hidden name=csrf value='{e(token)}'>"
+    if sc.get("ssh"):
+        return (f"<div class=card><h2>Values</h2><p class=hint>An SSH key. The private key is never shown or "
+                f"changed here; replace it with <code>asb store --replace</code>.</p>"
+                f"<p><b>Public key</b></p><p class=pubkey>{e(str(sc.get('ssh_public_key') or ''))}</p></div>")
+    vars_ = sc.get("vars") or {}
+    rows = []
+    for var, ref in vars_.items():
+        v = e(var)
+        shown = revealed[1] if revealed and revealed[0] == var else None
+        box = (f"<input type=text readonly id='val-{v}' aria-label='Value of {v}' placeholder='hidden' "
+               f"autocomplete=off spellcheck=false value='{e(shown)}'>" if shown is not None else
+               f"<input type=text readonly id='val-{v}' aria-label='Value of {v}' placeholder='hidden' "
+               f"autocomplete=off spellcheck=false>")
+        remove = ""
+        if can_write and len(vars_) > 1 and not sc.get("auto"):
+            remove = (f"<form method=post action='/credentials/{n}/value/remove' data-confirm='Remove {v} from "
+                      f"this credential? The value stays in the vault item.'>{hid}"
+                      f"<input type=hidden name=old_sha value='{e(sha)}'><input type=hidden name=var value='{v}'>"
+                      f"<button type=submit class='btn sm'>Remove</button></form>")
+        rows.append(
+            f"<div class=vrow><div class=vhead><code>{v}</code><small class=muted>{_where(ref)}</small></div>"
+            f"<div class=vline>{box}"
+            f"<form method=post action='/credentials/{n}/reveal'>{hid}<input type=hidden name=var value='{v}'>"
+            f"<button type=submit class='btn sm' data-reveal='{v}'>Show</button></form>"
+            f"<button type=button class='btn sm' data-copy='{v}'{'' if shown is not None else ' hidden'}>Copy</button>"
+            f"<button type=button class='btn sm' data-hide='{v}'{'' if shown is not None else ' hidden'}>Hide</button>"
+            f"{remove}</div>"
+            f"<details><summary>Replace the value</summary>"
+            f"<form method=post action='/credentials/{n}/value' autocomplete=off class=vline>{hid}"
+            f"<input type=hidden name=var value='{v}'>"
+            f"<input type=password name=value autocomplete=new-password aria-label='New value of {v}'"
+            f" placeholder='new value'><button type=submit class='btn sm'>Save value</button></form>"
+            f"<p class=hint>The old value is kept in the item's <code>previous_value</code>.</p></details></div>")
+    add = ""
+    if can_write and not sc.get("auto"):
+        add = (f"<details><summary>Add a value</summary>"
+               f"<form method=post action='/credentials/{n}/value/add' autocomplete=off class=cred-form>{hid}"
+               f"<input type=hidden name=old_sha value='{e(sha)}'>"
+               f"<label>Variable name (letters, digits and _, like <code>API_SECRET</code>)</label>"
+               f"<input type=text name=var maxlength=64 spellcheck=false>"
+               f"<label>Value</label><input type=password name=value autocomplete=new-password>"
+               f"<label style='font-weight:400'><input type=checkbox name=confirm value=1> I understand agents can "
+               f"use this value on this credential's hosts</label>"
+               f"<p class=hint>Stored in a new hidden field of the same vault item, named like the variable.</p>"
+               f"<p><button type=submit class='btn sm'>Add value</button></p></form></details>")
+    elif sc.get("auto"):
+        add = "<p class=hint>Save this credential once below to give it its own metadata; then values can be added.</p>"
+    return (f"<div class=card><h2>Values</h2><p class=hint>Shown only when you press Show; each view is recorded "
+            f"in the audit log.</p>{''.join(rows)}{add}</div>")
+
+
 def edit_section(name, meta, token, stored, *, can_write, error="", preview=None, widen=(), conflict=False,
-                 extra="", fetched=""):
+                 extra="", fetched="", values="", flash=""):
     """The edit page. `stored`: the metadata the vault holds (what the diff is against and what the
     concurrency hash covers); `meta`: what the form fields show (the stored metadata, or the human's
     rejected candidate). `preview`: the candidate metadata on the confirm step (diff + save button)."""
@@ -546,4 +639,5 @@ def edit_section(name, meta, token, stored, *, can_write, error="", preview=None
             f"host, a TLS pin added or removed, checks turned off, approval or plans allowed) opens a review "
             f"page first and needs your tick.</p>")
     manage = f"<div class='card dzone'>{extra}</div>" if extra else ""
-    return f"<div class=ced><h1>Edit {e(name)}</h1>{err}{off}{fetched}{form}{manage}</div>"
+    note = f"<div class=flash>{e(flash)}</div>" if flash else ""
+    return f"<div class=ced><h1>Edit {e(name)}</h1>{note}{err}{off}{fetched}{values}{form}{manage}</div>"

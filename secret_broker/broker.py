@@ -6814,10 +6814,43 @@ def approval_handler(broker):
             extra = "" if kw.get("preview") is not None else crededitor_mod.manage_section(
                 name, self._tok(user), crededitor_mod.digest(stored), broker.credential_bindings(name),
                 can_write=can_write, blocked=blocked)
+            revealed = kw.pop("revealed", None)
+            values = "" if kw.get("preview") is not None or broker.is_internal_secret(name) else \
+                crededitor_mod.values_section(name, sc, self._tok(user), crededitor_mod.digest(stored),
+                                              can_write=can_write, revealed=revealed)
             _page(self, status, crededitor_mod.edit_section(
                 name, stored if meta is None else meta, self._tok(user), stored, can_write=can_write,
-                extra=extra, **kw),
+                extra=extra, values=values, **kw),
                 tab="credentials", script=crededitor_mod.JS, badge=broker.attention(), user=user, wide=True)
+
+        def _credential_value_post(self, name, action, one, user):
+            """Show, replace, add or remove one value. A value only ever appears in a reveal reply; every other
+            page re-renders from the vault, so nothing the human typed is echoed back."""
+            who = dict(peer=self._ip, client_ip=self._fwd())
+            var = one("var").strip()[:64]
+            if action == "reveal":
+                res = broker.reveal_value(name, var, user, **who)
+                if "application/json" in (self.headers.get("Accept") or ""):
+                    if res["status"] == "ok":
+                        return self._json(200, {"value": res["value"]})
+                    return self._json(429 if res["reason"] == "rate_limited" else 400 if res["status"] == "refused"
+                                      else 500, {"error": res["message"]})
+                if res["status"] == "ok":
+                    return self._credential_edit(user, name, revealed=(var, res["value"]))
+            elif action == "value":
+                res = broker.replace_value(name, var, one("value"), user, **who)
+                flash = f"Value replaced: {var}"
+            elif action == "value/add":
+                res = broker.add_value(name, var, one("value"), one("old_sha"), user,
+                                       confirm=one("confirm") == "1", **who)
+                flash = f"Value added: {var}"
+            else:
+                res = broker.remove_value(name, var, one("old_sha"), user, **who)
+                flash = f"Variable removed: {var}"
+            if res["status"] == "ok":
+                return self._credential_edit(user, name, flash=flash)
+            code = {"conflict": 409, "failed": 500}.get(res["status"], 429 if res["reason"] == "rate_limited" else 400)
+            return self._credential_edit(user, name, status=code, error=res["message"])
 
         def _credential_new(self, user, status=200, **kw):
             _page(self, status, crededitor_mod.new_section(
@@ -6834,10 +6867,13 @@ def approval_handler(broker):
                     return self._credentials_page(user, f"Created: {html.escape(one('name'))}")
                 return self._credential_new(user, status=500 if res["status"] == "failed" else 400,
                                             name=one("name"), hosts=one("allowed_hosts"), error=res["message"])
-            name = parts[2] if len(parts) == 4 else ""
-            action = parts[3] if len(parts) == 4 else ""
-            if name not in cfg["secrets"] or action not in ("preview", "save", "rename", "delete", "fingerprint"):
+            name = parts[2] if len(parts) >= 4 else ""
+            action = "/".join(parts[3:])
+            if name not in cfg["secrets"] or action not in ("preview", "save", "rename", "delete", "fingerprint",
+                                                            "reveal", "value", "value/add", "value/remove"):
                 return _page(self, 404, "<h1>Not found</h1>")
+            if action in ("reveal", "value", "value/add", "value/remove"):
+                return self._credential_value_post(name, action, one, user)
             if action in ("rename", "delete"):
                 if action == "rename":
                     res = broker.rename_credential(name, one("new_name"), one("old_sha"), user,
