@@ -31,6 +31,8 @@ import html
 import re
 import time
 
+from . import peek
+
 from . import clients as clients_mod
 from . import guidance as guidance_mod
 
@@ -177,13 +179,13 @@ def form_html(req, csrf, values=None, errors=()):
                   "<input id=username type=text name=username autocomplete=off required "
                   "spellcheck=false autocapitalize=off>"
                   "<label for=password>Password</label>"
-                  "<input id=password type=password name=password autocomplete=new-password required "
-                  "spellcheck=false>")
+                  + peek.wrap("<input id=password type=password name=password autocomplete=new-password "
+                              "required spellcheck=false>"))
     else:
         secret = ("<label for=token>Token<span class=hint>Paste the API token or key. It is stored in the "
                   "vault and never shown again.</span></label>"
-                  "<input id=token type=password name=token autocomplete=new-password required "
-                  "spellcheck=false autocapitalize=off>")
+                  + peek.wrap("<input id=token type=password name=token autocomplete=new-password required "
+                              "spellcheck=false autocapitalize=off>"))
     sel = "".join(f"<option value={m}{' selected' if v['cred_mode'] == m else ''}>{m}</option>" for m in MODES)
     var_hint = ("Prefix for the two variables (PREFIX_USERNAME, PREFIX_PASSWORD)." if kind == "login"
                 else "The placeholder name agents use, as in {{NAME}}.")

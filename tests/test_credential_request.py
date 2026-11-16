@@ -244,6 +244,17 @@ class Happy(H):
         self.assertEqual(self.stub.calls[-1][1], "http")      # the http request, not the credential request
         self.assertNotIn(("analyze", "credential"), self.stub.calls)
 
+    def test_the_secret_boxes_have_a_show_toggle(self):
+        r = self.ask(var="NEWAPI_KEY")
+        _, form, _ = self.get(f"/credential/{r['id']}")
+        self.assertRegex(form, r"<span class=peek><input id=token type=password name=token [^>]*>"
+                               r"<button type=button class='btn sm peekbtn' data-peek hidden")
+        self.assertIn("querySelectorAll('button[data-peek]')", form)          # the script that un-hides it
+        r = self.ask("site", kind="login", hosts=["127.0.0.1"])
+        _, form, _ = self.get(f"/credential/{r['id']}")
+        self.assertRegex(form, r"<span class=peek><input id=password type=password name=password [^>]*>"
+                               r"<button type=button class='btn sm peekbtn' data-peek hidden")
+
     def test_default_variable_name(self):
         r = self.ask("my-svc2")
         self.submit(r["id"], name="my-svc2")

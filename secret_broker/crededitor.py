@@ -12,6 +12,8 @@ import html
 import json
 import re
 
+from . import peek
+
 MAX_JSON = 100_000          # the advanced box, in characters
 FORM_LIMIT = 400_000        # percent-encoding of the above, plus the form fields
 MAX_PINS = 20
@@ -459,7 +461,7 @@ def new_section(token, name="", hosts="", error="", can_write=True):
             f"<label>Allowed hosts (one per line, <code>host</code> or <code>host:port</code>)</label>"
             f"<textarea name=allowed_hosts rows=3{dis}>{e(hosts)}</textarea>"
             f"<label>Token (the value the broker will keep; it is never shown again)</label>"
-            f"<input type=password name=value autocomplete=new-password{dis}>"
+            + peek.wrap(f"<input type=password name=value autocomplete=new-password{dis}>") +
             f"<p><small class=muted>Created like <code>asb store</code>: a vault item with this name, the token in "
             f"its <code>notes</code> field and the variable <code>NAME_TOKEN</code>. Approval is "
             f"<code>prompt</code>. You can change everything but the name afterwards.</small></p>"
@@ -539,8 +541,9 @@ def values_section(name, sc, token, sha, *, can_write, revealed=None):
             f"<details><summary>Replace the value</summary>"
             f"<form method=post action='/credentials/{n}/value' autocomplete=off class=vline>{hid}"
             f"<input type=hidden name=var value='{v}'>"
-            f"<input type=password name=value autocomplete=new-password aria-label='New value of {v}'"
-            f" placeholder='new value'><button type=submit class='btn sm'>Save value</button></form>"
+            + peek.wrap(f"<input type=password name=value autocomplete=new-password aria-label='New value of {v}'"
+                        f" placeholder='new value'>")
+            + f"<button type=submit class='btn sm'>Save value</button></form>"
             f"<p class=hint>The old value is kept in the item's <code>previous_value</code>.</p></details></div>")
     add = ""
     if can_write and not sc.get("auto"):
@@ -549,7 +552,7 @@ def values_section(name, sc, token, sha, *, can_write, revealed=None):
                f"<input type=hidden name=old_sha value='{e(sha)}'>"
                f"<label>Variable name (letters, digits and _, like <code>API_SECRET</code>)</label>"
                f"<input type=text name=var maxlength=64 spellcheck=false>"
-               f"<label>Value</label><input type=password name=value autocomplete=new-password>"
+               f"<label>Value</label>" + peek.wrap("<input type=password name=value autocomplete=new-password>") +
                f"<label style='font-weight:400'><input type=checkbox name=confirm value=1> I understand agents can "
                f"use this value on this credential's hosts</label>"
                f"<p class=hint>Stored in a new hidden field of the same vault item, named like the variable.</p>"

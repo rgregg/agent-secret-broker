@@ -622,7 +622,7 @@ Policies tab, and no route on the agent-facing port. Agents cannot reach it, and
     Vaultwarden web UI does); agents still never receive one (no route on the agent port).
   - **Replace the value** (`POST /credentials/<name>/value`, `var`, `value`): written with `keep_previous`, so
     the old value is in the item's `previous_value` (one slot per item, as with `asb store --replace`). A
-    variable with a `key` changes only that key of its structured field. The value box is never filled back in.
+    variable with a `key` changes only that key of its structured field. The value box is never filled back in. Every value box on the tab (Replace, Add, New credential) has the same **Show** toggle as the credential entry page.
   - **Add a value** (`POST /credentials/<name>/value/add`, `var`, `value`, `confirm`, `old_sha`): a new hidden
     custom field named like the variable and `vars[VAR] = {"field": VAR}` in the metadata, in one vault write
     (`put(add_field=True)`). Needs the tick, because agents can then place that value on the credential's hosts.
@@ -2093,7 +2093,7 @@ Request (client API, agent key): `POST /v1/requests` with
 The card (dashboard, and the approval link the notification opens) shows the name, kind, purpose and the
 suggestions, and a **Review and enter value** button and **Deny**. The button opens `/credential/<id>`,
 a form with the name, allowed hosts, mode, variable name and the secret: one `type=password` field for a
-token, or a plain text username plus a `type=password` password for a login (the username is cleared on a form error, like the secrets). It is a separate page because the dashboard refreshes itself
+token, or a plain text username plus a `type=password` password for a login (the username is cleared on a form error, like the secrets). Each secret box has a **Show** button that switches it to plain text while you type, so you can check what you pasted (only in the browser; nothing is sent until you submit, and it switches back on submit). It is a separate page because the dashboard refreshes itself
 and must never hold a half-typed secret. **Store credential** posts to `/credential` on the approval
 listener only, with the per-user CSRF token and the same-origin check.
 

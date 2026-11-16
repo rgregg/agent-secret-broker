@@ -323,3 +323,22 @@ class Pages(Base):
         code, body = self.get("/credentials/svc")
         self.assertIn("data-reveal", body)
         self.assertIn("'Accept':'application/json'", body)
+
+
+class Peek(Base):
+    def test_every_value_box_on_the_editor_has_the_toggle(self):
+        code, body = self.get("/credentials/svc")
+        self.assertEqual(code, 200)
+        boxes = body.count("type=password name=value")
+        self.assertEqual(boxes, 2)                                       # Replace (one variable) and Add
+        self.assertEqual(body.count("<span class=peek><input type=password name=value"), boxes)
+        self.assertIn("querySelectorAll('button[data-peek]')", body)
+        code, body = self.get("/credentials/new")
+        self.assertIn("<span class=peek><input type=password name=value", body)
+        self.assertIn("querySelectorAll('button[data-peek]')", body)
+
+    def test_the_toggle_never_carries_a_value(self):
+        from secret_broker import peek
+        out = peek.wrap("<input type=password name=x>")
+        self.assertTrue(out.startswith("<span class=peek><input type=password name=x><button type=button"))
+        self.assertNotIn("value=", out)

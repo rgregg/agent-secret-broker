@@ -73,6 +73,7 @@ from . import request_details as details_mod
 from . import scripts as scripts_mod
 from . import sshkey
 from . import structured
+from . import peek as peek_mod
 from . import keyprovider as keyprovider_mod
 from .history import History, OUTCOMES
 
@@ -5298,7 +5299,7 @@ def _page(h, code, body, wide=False, nav=True, script=None, tab=None, badge=0, u
            f"<link rel=icon href=\"{_ICON}\">"
            f"<link rel=apple-touch-icon sizes=180x180 href=\"{_ICON_PNG_URI}\">"
            "<link rel=manifest href=/manifest.webmanifest crossorigin=use-credentials>"
-           f"<style>{_CSS}{scripts_mod.CSS}{details_mod.CSS}{proposals_mod.CSS}{credreq_mod.CSS}{crededitor_mod.CSS}{clients_mod.CSS}{sessions_mod.CSS}{plans_mod.CSS}</style><body>{_chrome(tab, badge, user) if nav else ''}"
+           f"<style>{_CSS}{scripts_mod.CSS}{details_mod.CSS}{proposals_mod.CSS}{credreq_mod.CSS}{crededitor_mod.CSS}{peek_mod.CSS}{clients_mod.CSS}{sessions_mod.CSS}{plans_mod.CSS}</style><body>{_chrome(tab, badge, user) if nav else ''}"
            f"<main class='{'wide' if wide else 'narrow'}'>{_SIGNED_OUT if nav else ''}{body}</main>{scr}</body></html>").encode()
     h.send_response(code)
     h.send_header("Content-Type", "text/html; charset=utf-8")
@@ -6491,7 +6492,7 @@ def approval_handler(broker):
             """The credential entry page. Served only to the authenticated approver. The secret
             fields are never filled in, so an error re-render cannot echo the value."""
             body = credreq_mod.form_html(req, self._tok(user), values, errors)
-            _page(self, status, body, tab="requests", badge=broker.attention(), user=user)
+            _page(self, status, body, tab="requests", script=peek_mod.JS, badge=broker.attention(), user=user)
 
         def _plan_page(self, req, user):
             """/a/<nonce> for a plan: the whole card, with its own CSRF-protected form. The nonce
@@ -6796,7 +6797,7 @@ def approval_handler(broker):
         def _credentials_page(self, user, note="", status=200, q=""):
             flash = f"<div class=flash>{note}</div>" if note else ""
             _page(self, status, crededitor_mod.list_section(cfg["secrets"], flash, q), tab="credentials",
-                  script=crededitor_mod.JS, badge=broker.attention(), user=user, wide=True)
+                  script=crededitor_mod.JS + peek_mod.JS, badge=broker.attention(), user=user, wide=True)
 
         def _credential_edit(self, user, name, meta=None, stored=None, status=200, **kw):
             """The edit page for `name`. Reads the vault for the stored metadata (the diff and the concurrency
@@ -6821,7 +6822,7 @@ def approval_handler(broker):
             _page(self, status, crededitor_mod.edit_section(
                 name, stored if meta is None else meta, self._tok(user), stored, can_write=can_write,
                 extra=extra, values=values, **kw),
-                tab="credentials", script=crededitor_mod.JS, badge=broker.attention(), user=user, wide=True)
+                tab="credentials", script=crededitor_mod.JS + peek_mod.JS, badge=broker.attention(), user=user, wide=True)
 
         def _credential_value_post(self, name, action, one, user):
             """Show, replace, add or remove one value. A value only ever appears in a reveal reply; every other
@@ -6855,7 +6856,7 @@ def approval_handler(broker):
         def _credential_new(self, user, status=200, **kw):
             _page(self, status, crededitor_mod.new_section(
                 self._tok(user), can_write=backend_base.CAP_SET_META in broker.backend.capabilities, **kw),
-                tab="credentials", badge=broker.attention(), user=user, wide=True)
+                tab="credentials", script=peek_mod.JS, badge=broker.attention(), user=user, wide=True)
 
         def _credentials_post(self, path, form, user):
             parts = path.split("/")          # ["", "credentials", name, action] or ["", "credentials", "new"]
