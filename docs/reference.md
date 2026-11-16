@@ -560,20 +560,29 @@ A credential's policy is the JSON `broker` field of its vault item. The **Creden
 opening Bitwarden. It is human-only: the same authenticated approval session, CSRF token and Origin check as the
 Policies tab, and no route on the agent-facing port. Agents cannot reach it, and a client key does not open it.
 
-- **List** (`GET /credentials`): name, kind, allowed hosts, approval mode and TLS (`verified`, `pinned (N)` or
-  `NOT verified`) of every credential.
+- **List** (`GET /credentials`): every credential with its kind (token, login or SSH key), allowed hosts,
+  approval mode, TLS (`verified`, `pinned (N)` or `NOT verified`) and whether plans are allowed, shown as
+  icons with a key below the table (each icon's label is its tooltip and accessible name, and is printed in
+  the narrow phone layout). A search box filters as you type: every word must appear in the credential's name,
+  hosts, kind, approval or TLS words (`ssh`, `login`, `allow`, `pinned`, `unverified`...). `/` focuses it.
+  `GET /credentials?q=...` applies the same filter on the server, so a search link works without the script.
 - **Edit** (`GET /credentials/<name>`): a form for `allowed_hosts` (`host` or `host:port`, one per line), the TLS
   mode (verify normally, trust only listed `tls_fingerprint` values, or `tls_verify: false`), `approval` and
   `plans`. Every other key (`vars`, `standing`, `ws`, `ssh_*`, and keys the form does not know) is carried
   through untouched. **Advanced** shows the whole metadata as JSON; if you change it, it replaces the form's fields.
-- **Review, then save.** `POST /credentials/<name>/preview` builds the candidate and shows a diff against what the
-  vault holds now; it writes nothing. `POST /credentials/<name>/save` writes exactly the metadata that was shown.
+- **Save, Review, Close.** The edit page has a bar that stays on screen with **Save**, **Review changes** and
+  **Close** (back to the list; it asks first if the form has unsaved changes). **Save** posts the form to
+  `POST /credentials/<name>/save`: a change that only narrows (or changes nothing) is written at once and the
+  page returns to the list. A change that widens access is never written from the form: Save shows the review
+  page instead, and a `confirm_widen` sent with the form is ignored. **Review changes**
+  (`POST /credentials/<name>/preview`) builds the candidate and shows a diff against what the vault holds now;
+  it writes nothing. The review page's Save posts `meta_json`, exactly the metadata that was shown.
 - **One validator.** Both steps run the candidate through `Broker._entry`, the function the catalog loader runs, so
   the editor can never write metadata the loader would reject. A rejection shows the loader's own message.
   Saving writes the vault first (`set_meta`), then rebuilds the live catalog from the vault.
 - **Widening needs a tick.** A change that adds an allowed host or port, adds or removes a TLS fingerprint,
   turns TLS verification off, sets `approval: allow` or enables `plans` is refused until "I understand this
-  widens access" is ticked. Narrowing saves without it.
+  widens access" is ticked on the review page, where the diff is shown. Narrowing saves without it.
 - **No silent overwrite.** The page carries a hash of the stored metadata it loaded. If the vault changed since
   (an edit in Bitwarden, another save), the save is refused with 409 and the form re-renders with the current
   values.

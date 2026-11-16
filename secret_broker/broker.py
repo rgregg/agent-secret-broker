@@ -6602,9 +6602,10 @@ def approval_handler(broker):
                                                   client_choices=broker.clients.active_choices()),
                   script=_GRANTS_JS + guidance_mod.JS + sshhosts_mod.JS, tab="policies", badge=broker.attention(), user=user)
 
-        def _credentials_page(self, user, note="", status=200):
-            _page(self, status, crededitor_mod.list_section(cfg["secrets"], note), tab="credentials",
-                  badge=broker.attention(), user=user, wide=True)
+        def _credentials_page(self, user, note="", status=200, q=""):
+            flash = f"<div class=flash>{note}</div>" if note else ""
+            _page(self, status, crededitor_mod.list_section(cfg["secrets"], flash, q), tab="credentials",
+                  script=crededitor_mod.JS, badge=broker.attention(), user=user, wide=True)
 
         def _credential_edit(self, user, name, meta=None, stored=None, status=200, **kw):
             """The edit page for `name`. Reads the vault for the stored metadata (the diff and the concurrency
@@ -6625,7 +6626,7 @@ def approval_handler(broker):
             _page(self, status, crededitor_mod.edit_section(
                 name, stored if meta is None else meta, self._tok(user), stored, can_write=can_write,
                 extra=extra, **kw),
-                tab="credentials", badge=broker.attention(), user=user, wide=True)
+                tab="credentials", script=crededitor_mod.JS, badge=broker.attention(), user=user, wide=True)
 
         def _credential_new(self, user, status=200, **kw):
             _page(self, status, crededitor_mod.new_section(
@@ -6639,7 +6640,7 @@ def approval_handler(broker):
                 res = broker.create_credential(one("name"), one("allowed_hosts"), one("value"), user,
                                                peer=self._ip, client_ip=self._fwd())
                 if res["status"] == "created":
-                    return self._credentials_page(user, f"<p>Created: {html.escape(one('name'))}</p>")
+                    return self._credentials_page(user, f"Created: {html.escape(one('name'))}")
                 return self._credential_new(user, status=500 if res["status"] == "failed" else 400,
                                             name=one("name"), hosts=one("allowed_hosts"), error=res["message"])
             name = parts[2] if len(parts) == 4 else ""
@@ -6655,7 +6656,7 @@ def approval_handler(broker):
                     res = broker.delete_credential(name, one("typed"), user, peer=self._ip, client_ip=self._fwd())
                     done, flash = res["status"] == "deleted", f"Deleted {html.escape(name)}"
                 if done:
-                    return self._credentials_page(user, f"<p>{flash}</p>")
+                    return self._credentials_page(user, flash)
                 code = 409 if res["status"] == "conflict" else 500 if res["status"] == "failed" else 400
                 return self._credential_edit(user, name, status=code, error=res["message"],
                                              conflict=res["status"] == "conflict")
@@ -6678,7 +6679,8 @@ def approval_handler(broker):
                 return self._credential_edit(user, name, stored=stored,
                                              meta=crededitor_mod.add_pin(cand, res["details"]["fingerprint"]),
                                              fetched=crededitor_mod.fetched_html(entry, res["details"]))
-            if action == "preview":
+            from_form = "meta_json" not in form      # Save on the edit form itself, not on the review page
+            if action == "preview" or from_form:
                 if crededitor_mod.digest(stored) != one("old_sha"):
                     broker.log("credential_change_refused", reason="conflict", secret=name, user=user,
                                peer=self._ip, client_ip=self._fwd())
@@ -6692,18 +6694,23 @@ def approval_handler(broker):
                 except ValueError as e:
                     return self._credential_edit(user, name, stored=stored, status=400, error=str(e)[:200],
                                                  meta=locals().get("cand"))
-                return self._credential_edit(user, name, stored=stored, preview=cand,
-                                             widen=crededitor_mod.widened(stored, cand))
-            try:
-                cand = json.loads(one("meta_json")[:crededitor_mod.MAX_JSON])
-            except ValueError:
-                cand = None
-            res = broker.set_credential_meta(name, cand, one("old_sha"), user,
-                                             confirm_widen=one("confirm_widen") == "1",
+                widen = crededitor_mod.widened(stored, cand)
+                if action == "preview" or widen:
+                    # a widening change is never saved straight from the form: the human sees the diff and
+                    # ticks the box on the review page (a confirm_widen sent with the form is ignored)
+                    return self._credential_edit(user, name, stored=stored, preview=cand, widen=widen)
+                confirm = False
+            else:
+                try:
+                    cand = json.loads(one("meta_json")[:crededitor_mod.MAX_JSON])
+                except ValueError:
+                    cand = None
+                confirm = one("confirm_widen") == "1"
+            res = broker.set_credential_meta(name, cand, one("old_sha"), user, confirm_widen=confirm,
                                              peer=self._ip, client_ip=self._fwd())
             if res["status"] in ("saved", "unchanged"):
                 return self._credentials_page(
-                    user, f"<p>{'Saved' if res['status'] == 'saved' else 'No changes'}: {html.escape(name)}</p>")
+                    user, f"{'Saved' if res['status'] == 'saved' else 'No changes'}: {html.escape(name)}")
             if res["status"] == "conflict":
                 return self._credential_edit(user, name, stored=res.get("current"), status=409, conflict=True)
             if res["reason"] == "needs_confirmation":
@@ -6800,7 +6807,7 @@ def approval_handler(broker):
                 return self._policies_page(user)
             if self.path.split("?")[0].rstrip("/") == "/credentials":
                 broker.log("credentials_viewed", peer=self._ip, client_ip=self._fwd())
-                return self._credentials_page(user)
+                return self._credentials_page(user, q=(urllib.parse.parse_qs(u.query).get("q") or [""])[0])
             if u.path == "/credentials/new":
                 return self._credential_new(user)
             if u.path.startswith("/credentials/") and u.path.count("/") == 2:
