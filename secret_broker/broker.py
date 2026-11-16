@@ -1394,6 +1394,142 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                  new_sha256=crededitor_mod.digest(new_meta), **who)
         return {"status": "saved", "message": "", "reason": "", "widen": widen}
 
+    RESERVED_NAMES = frozenset({"new"})      # routes under /credentials/
+
+    def credential_bindings(self, name):
+        """What is bound to this credential's NAME right now. Rename and delete refuse while any is non-zero:
+        a grant, plan, session or standing entry names the credential, so it must not silently follow or
+        outlive it. Counts only."""
+        with self._lock:
+            pending = sum(1 for r in self._by_id.values() if r.status == "pending" and name in r.names)
+        sc = self.cfg["secrets"].get(name) or {}
+        return {"timed_grants": sum(1 for g in self.active_grants() if name in g["secrets"]),
+                "always": len(sc.get("standing") or []),
+                "plans": sum(1 for p in self.active_plans() if name in p["names"]),
+                "sessions": sum(1 for x in self.active_sessions() if x["cred"] == name),
+                "pending": pending}
+
+    def create_credential(self, name, hosts_text, value, user, peer=None, client_ip=None):
+        """Create a credential from the Credentials tab: a token whose value the human typed. The same
+        validation as `asb store` (`_validate_store`: name, hosts and destinations, the vault item not
+        already used) and the same write (`_create_item`). The value is never logged, echoed or kept.
+        Returns {"status": created|refused|failed, "reason", "message"}."""
+        who = dict(secret=name if isinstance(name, str) else "", user=user, peer=peer, client_ip=client_ip)
+
+        def refused(reason, msg):
+            self.log("credential_change_refused", reason=reason, **who)
+            return {"status": "refused", "reason": reason, "message": msg}
+        if backend_base.CAP_SET_META not in self.backend.capabilities:
+            return refused("unsupported", "This vault backend cannot store metadata")
+        if not isinstance(name, str) or name in self.RESERVED_NAMES:
+            return refused("invalid", "secret name must be 1-41 chars of a-z 0-9 _ - ")
+        try:
+            hosts = crededitor_mod.host_lines(hosts_text)
+            spec = {"op": "create", "value": value, "allowed_hosts": hosts}
+            self._deny_internal("store", [name], spec, "web", peer, None)
+            self._validate_store([name], spec)
+        except ValueError as e:
+            return refused("exists" if "already" in str(e) else "invalid", str(e)[:200])
+        try:
+            self._create_item(name, spec, user)
+        except (OSError, ValueError, KeyError, BackendError):
+            self.log("credential_change_failed", reason="vault_write", **who)
+            return {"status": "failed", "reason": "vault_write", "message": "Could not create the credential"}
+        self.log("credential_created", hosts=len(spec["allowed_hosts"]), value_bytes=spec["value_bytes"], **who)
+        return {"status": "created", "reason": "", "message": ""}
+
+    def _manage_guard(self, name, who):
+        """Shared preconditions of rename and delete -> a refusal dict, or None to go on."""
+        def refused(reason, msg):
+            self.log("credential_change_refused", reason=reason, **who)
+            return {"status": "refused", "reason": reason, "message": msg}
+        if backend_base.CAP_SET_META not in self.backend.capabilities:
+            return refused("unsupported", "This vault backend cannot store metadata")
+        sc = self.cfg["secrets"][name]
+        if name in self._internal_secrets()[0]:
+            return refused("internal", "This is the broker's own key and cannot be changed here")
+        if sc.get("auto"):
+            return refused("adopted", "This item has no broker metadata yet (it was adopted with defaults): "
+                                      "open it and save once on the edit page first")
+        bound = {k: v for k, v in self.credential_bindings(name).items() if v}
+        if bound:
+            what = ", ".join(f"{v} {k.replace('_', ' ')}" for k, v in sorted(bound.items()))
+            return refused("bound", f"Still in use by {what}. Revoke or finish those first.")
+        return None
+
+    def rename_credential(self, name, new_name, old_sha, user, peer=None, client_ip=None):
+        """Change a credential's name (the `name` key of its metadata; the vault item is untouched).
+        Refused while anything is bound to the old name, or the old name is in `plans.deny_secrets`
+        (a renamed credential would silently stop matching that deny list). Returns
+        {"status": renamed|refused|conflict|failed, "reason", "message"}."""
+        if name not in self.cfg["secrets"]:
+            raise ValueError("bad credential change")
+        who = dict(secret=name, user=user, peer=peer, client_ip=client_ip)
+
+        def refused(reason, msg, status="refused"):
+            self.log("credential_change_refused", reason=reason, **who)
+            return {"status": status, "reason": reason, "message": msg}
+        if (not isinstance(new_name, str) or not _NAME_RE.match(new_name) or new_name in self.RESERVED_NAMES):
+            return refused("invalid", "secret name must be 1-41 chars of a-z 0-9 _ - ")
+        if new_name == name:
+            return refused("invalid", "That is already its name")
+        if new_name in self.cfg["secrets"] or self._internal_hit([new_name]):
+            return refused("exists", "A credential with that name already exists")
+        if name in (self.plans_cfg.get("deny_secrets") or ()):
+            return refused("denied_by_name", "plans.deny_secrets names this credential; "
+                                             "change the config first, or the deny rule would stop matching")
+        with self._cfg_lock:
+            guard = self._manage_guard(name, who)
+            if guard:
+                return guard
+            sc = self.cfg["secrets"][name]
+            try:
+                current = self.credential_stored_meta(name)
+            except (OSError, ValueError, KeyError, BackendError):
+                return {"status": "failed", "reason": "vault_read", "message": "Could not read the vault"}
+            if crededitor_mod.digest(current) != old_sha:
+                return refused("conflict", "Changed in the vault since you opened it", status="conflict")
+            meta = {**current, "name": new_name}
+            try:
+                got, _e = Broker._entry(sc["_item"], meta)
+            except ValueError as e:
+                return refused("invalid", str(e)[:200])
+            if got != new_name:
+                return refused("invalid", "That name cannot be used")
+            try:
+                self.backend.set_meta(sc["_item"], meta)
+            except (OSError, ValueError, KeyError, BackendError):
+                self.log("credential_change_failed", reason="vault_write", **who)
+                return {"status": "failed", "reason": "vault_write", "message": "Could not save the credential"}
+        self._refresh_if(0)
+        self.log("credential_renamed", new_secret=new_name, **who)
+        return {"status": "renamed", "reason": "", "message": ""}
+
+    def delete_credential(self, name, typed, user, peer=None, client_ip=None):
+        """Delete a credential's vault item (its value goes with it). The human must type the name.
+        Refused for the broker's own key, an adopted item (it may be a login the human keeps for other
+        reasons) and while anything is bound to the name. Returns {"status": deleted|refused|failed,
+        "reason", "message"}."""
+        if name not in self.cfg["secrets"]:
+            raise ValueError("bad credential change")
+        who = dict(secret=name, user=user, peer=peer, client_ip=client_ip)
+        if typed != name:
+            self.log("credential_change_refused", reason="confirm", **who)
+            return {"status": "refused", "reason": "confirm", "message": "Type the credential's name to confirm"}
+        with self._cfg_lock:
+            guard = self._manage_guard(name, who)
+            if guard:
+                return guard
+            item = self.cfg["secrets"][name]["_item"]
+            try:
+                self.backend.delete(item)
+            except (OSError, ValueError, KeyError, BackendError):
+                self.log("credential_change_failed", reason="vault_write", **who)
+                return {"status": "failed", "reason": "vault_write", "message": "Could not delete the credential"}
+        self._refresh_if(0)
+        self.log("credential_deleted", **who)
+        return {"status": "deleted", "reason": "", "message": ""}
+
     # -- discovery (no approval, no push, no values) ----------------------
     def available(self, host=None):
         """Secrets usable for `host` in http mode. Names and placeholder
@@ -3479,24 +3615,28 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                 self.log("backend_ready", duration_ms=int((time.time() - t0) * 1000))
         threading.Thread(target=run, daemon=True).start()
 
+    def _create_item(self, name, sp, by):
+        """Create a credential from a validated store spec (`_validate_store`): ONE atomic vault write
+        holding the item, its value and its broker metadata (the catalog entry), then the live entry.
+        Nothing to roll back and no second place to keep in sync. Shared by `asb store` and the
+        Credentials tab, so both create the same thing."""
+        stamp = {"by": by, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+        meta = {"name": name, "vars": {sp["var"]: {"field": sp["field"]}},
+                "allowed_hosts": sp["allowed_hosts"], "approval": "prompt", "created": stamp}
+        if sp.get("ssh"):
+            meta.update(ssh=True, ssh_public_key=sp["ssh_public_key"])   # stored as an ssh_key item
+        self.backend.put(sp["item"], sp["field"], sp["value"], create=True, meta=meta)
+        _, entry = self._entry(sp["item"], meta)
+        with self._cfg_lock:
+            self.cfg["secrets"][name] = entry
+
     def _store(self, req):
         """Write the credential to the vault; a create also writes its catalog entry."""
         sp = req.spec
         name, by = req.names[0], req.approver or "unknown"
         t0 = time.time()
         if sp["op"] == "create":
-            # One atomic vault write: the item, its value and its broker metadata
-            # (the catalog entry) are created together, so there is nothing to
-            # roll back and no second place to keep in sync.
-            stamp = {"by": by, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
-            meta = {"name": name, "vars": {sp["var"]: {"field": sp["field"]}},
-                    "allowed_hosts": sp["allowed_hosts"], "approval": "prompt", "created": stamp}
-            if sp.get("ssh"):
-                meta.update(ssh=True, ssh_public_key=sp["ssh_public_key"])   # stored as an ssh_key item
-            self.backend.put(sp["item"], sp["field"], sp["value"], create=True, meta=meta)
-            _, entry = self._entry(sp["item"], meta)
-            with self._cfg_lock:
-                self.cfg["secrets"][name] = entry
+            self._create_item(name, sp, by)
         elif sp.get("hosts_after") is not None:
             return self._store_hosts(req)
         else:
@@ -6422,17 +6562,50 @@ def approval_handler(broker):
                 except (OSError, ValueError, KeyError, BackendError):
                     return _page(self, 502, "<h1>Could not read the vault</h1>", tab="credentials", user=user)
             can_write = backend_base.CAP_SET_META in broker.backend.capabilities
+            sc = cfg["secrets"][name]
+            blocked = ("This is the broker's own key and cannot be changed here" if broker.is_internal_secret(name)
+                       else "This item has no broker metadata yet (adopted with defaults): save it once above "
+                            "to give it its own, then it can be renamed or deleted" if sc.get("auto") else "")
+            extra = "" if kw.get("preview") is not None else crededitor_mod.manage_section(
+                name, self._tok(user), crededitor_mod.digest(stored), broker.credential_bindings(name),
+                can_write=can_write, blocked=blocked)
             _page(self, status, crededitor_mod.edit_section(
-                name, stored if meta is None else meta, self._tok(user), stored, can_write=can_write, **kw),
+                name, stored if meta is None else meta, self._tok(user), stored, can_write=can_write,
+                extra=extra, **kw),
+                tab="credentials", badge=broker.attention(), user=user, wide=True)
+
+        def _credential_new(self, user, status=200, **kw):
+            _page(self, status, crededitor_mod.new_section(
+                self._tok(user), can_write=backend_base.CAP_SET_META in broker.backend.capabilities, **kw),
                 tab="credentials", badge=broker.attention(), user=user, wide=True)
 
         def _credentials_post(self, path, form, user):
-            parts = path.split("/")          # ["", "credentials", name, action]
+            parts = path.split("/")          # ["", "credentials", name, action] or ["", "credentials", "new"]
+            one = lambda k: form.get(k, [""])[0]  # noqa: E731
+            if parts[2:] == ["new"]:
+                res = broker.create_credential(one("name"), one("allowed_hosts"), one("value"), user,
+                                               peer=self._ip, client_ip=self._fwd())
+                if res["status"] == "created":
+                    return self._credentials_page(user, f"<p>Created: {html.escape(one('name'))}</p>")
+                return self._credential_new(user, status=500 if res["status"] == "failed" else 400,
+                                            name=one("name"), hosts=one("allowed_hosts"), error=res["message"])
             name = parts[2] if len(parts) == 4 else ""
             action = parts[3] if len(parts) == 4 else ""
-            if name not in cfg["secrets"] or action not in ("preview", "save"):
+            if name not in cfg["secrets"] or action not in ("preview", "save", "rename", "delete"):
                 return _page(self, 404, "<h1>Not found</h1>")
-            one = lambda k: form.get(k, [""])[0]  # noqa: E731
+            if action in ("rename", "delete"):
+                if action == "rename":
+                    res = broker.rename_credential(name, one("new_name"), one("old_sha"), user,
+                                                   peer=self._ip, client_ip=self._fwd())
+                    done, flash = res["status"] == "renamed", f"Renamed {html.escape(name)} to {html.escape(one('new_name'))}"
+                else:
+                    res = broker.delete_credential(name, one("typed"), user, peer=self._ip, client_ip=self._fwd())
+                    done, flash = res["status"] == "deleted", f"Deleted {html.escape(name)}"
+                if done:
+                    return self._credentials_page(user, f"<p>{flash}</p>")
+                code = 409 if res["status"] == "conflict" else 500 if res["status"] == "failed" else 400
+                return self._credential_edit(user, name, status=code, error=res["message"],
+                                             conflict=res["status"] == "conflict")
             try:
                 stored = broker.credential_stored_meta(name)
             except (OSError, ValueError, KeyError, BackendError):
@@ -6559,6 +6732,8 @@ def approval_handler(broker):
             if self.path.split("?")[0].rstrip("/") == "/credentials":
                 broker.log("credentials_viewed", peer=self._ip, client_ip=self._fwd())
                 return self._credentials_page(user)
+            if u.path == "/credentials/new":
+                return self._credential_new(user)
             if u.path.startswith("/credentials/") and u.path.count("/") == 2:
                 nm = u.path[len("/credentials/"):]
                 if nm not in cfg["secrets"]:

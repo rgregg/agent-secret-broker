@@ -577,14 +577,32 @@ Policies tab, and no route on the agent-facing port. Agents cannot reach it, and
 - **No silent overwrite.** The page carries a hash of the stored metadata it loaded. If the vault changed since
   (an edit in Bitwarden, another save), the save is refused with 409 and the form re-renders with the current
   values.
-- **Not here (yet).** Renaming (a changed `name` is refused), creating and deleting credentials, and fetching a
-  server's fingerprint are separate stages. Credential values are never shown or edited here; use
-  `request-credential` / `--replace`. A backend without the `set_meta` capability shows the form disabled.
+- **Create** (`GET/POST /credentials/new`): a name, allowed hosts and a token the human types into a password
+  box. It runs the same validation as `asb store` (`_validate_store`: name, 1-10 hosts and acceptable
+  destinations, the vault item not already used, never the broker's own summary key) and the same write
+  (`_create_item`), so the result is identical: an item named like the credential, the token in its `notes`
+  field, the variable `NAME_TOKEN`, `approval: prompt`, a `created: {by, at}` stamp. The token is never
+  shown, logged or put in an audit event or error page; the box is never filled back in. `new` is reserved
+  (it is a route).
+- **Rename** (on the edit page): changes only the `name` key; the vault item and its value stay. Refused
+  while anything is bound to the old name, because a grant, plan, session or standing entry names the
+  credential and must not silently follow or outlive it: timed grants, Always entries, active plans, open
+  sessions and pending requests (the page says how many). Also refused while the name is in
+  `plans.deny_secrets` (a renamed credential would silently stop matching that deny list), for the broker's
+  own summary key, for an item adopted with defaults (save it once on the edit page first), and when the
+  new name is taken. Same concurrency check as an edit.
+- **Delete** (on the edit page): deletes the vault item and its value. The human types the credential's name.
+  Same refusals as rename except `deny_secrets`. It cannot be undone from here.
+- **Not here.** Fetching a server's fingerprint (a later stage) and creating an SSH key or a login with two
+  values (use `request-credential` or `asb store`). Credential values are never shown or edited here; use
+  `request-credential` / `--replace`. A backend without the `set_meta` capability shows the forms disabled.
 - **Audit** (all hidden from the agent audit API; counts, closed labels and 64-character hashes only, never host
   names or values): `credentials_viewed`, `credential_changed` (`secret`, `user`, `peer`, `client_ip`,
-  `changed_keys` count, `widened` labels, `old_sha256`, `new_sha256`), `credential_change_refused` (`reason`:
-  `invalid`, `needs_confirmation`, `conflict`, `rename`, `unsupported`) and `credential_change_failed`
-  (`reason`: `vault_read`, `vault_write`).
+  `changed_keys` count, `widened` labels, `old_sha256`, `new_sha256`), `credential_created` (`hosts` count,
+  `value_bytes`), `credential_renamed` (`new_secret`), `credential_deleted`, `credential_change_refused`
+  (`reason`: `invalid`, `needs_confirmation`, `conflict`, `rename`, `unsupported`, `exists`, `internal`,
+  `adopted`, `bound`, `denied_by_name`, `confirm`) and `credential_change_failed` (`reason`: `vault_read`,
+  `vault_write`).
 
 ## Policy, risk, discovery
 
