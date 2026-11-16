@@ -1,10 +1,16 @@
 # Credential editor (approval site)
 
-Status: stage 1 built (list, metadata edit); stages 2 and 3 pending. Date: 2026-11-14.
+Status: stages 1 (list, metadata edit) and 2 (create, rename, delete) built; stage 3 (fingerprint fetch) pending. Date: 2026-11-14.
 
 Built-as notes for stage 1: the preview step puts the candidate metadata in a hidden `meta_json` field and the save
 writes exactly that (re-validated), instead of re-reading form fields; the validator is `Broker._entry` itself, which
 already was the single shared function, so no extraction was needed; no `edit_item` or rename in this stage.
+
+Built-as notes for stage 2: rename sets only the `name` key of the metadata (the vault item is not renamed, so
+`edit_item` is still unused); instead of dropping grants and plans on rename, rename and delete refuse while any
+are bound to the name (the safer reading of the design's "drops them with a warning"); rename also refuses a name
+in `plans.deny_secrets`; create is token-only and reuses `_validate_store`/`_create_item`; adopted items and the
+summary key can be neither renamed nor deleted.
 
 ## Intent
 

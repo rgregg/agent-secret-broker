@@ -53,6 +53,11 @@ def _lines(text, what):
     return [ln.strip() for ln in text.replace("\r\n", "\n").replace("\r", "\n").split("\n") if ln.strip()]
 
 
+def host_lines(text):
+    """The allowed-hosts box -> a list of host entries (ValueError for control characters)."""
+    return _lines(text, "allowed hosts")
+
+
 def build(old, form):
     """The candidate metadata from the form (`form`: field -> text), starting from the stored `old`.
 
@@ -174,10 +179,60 @@ def list_section(secrets, flash=""):
                     f"<td>{e(str(sc.get('approval', 'prompt')))}</td><td>{e(tls_summary(meta))}</td></tr>")
     body = ("<table><tr><th>Name</th><th>Kind</th><th>Hosts</th><th>Approval</th><th>TLS</th></tr>"
             + "".join(rows) + "</table>") if rows else "<p><small class=muted>No credentials.</small></p>"
-    return f"<h1>Credentials</h1>{flash}{body}"
+    return f"<h1>Credentials</h1>{flash}<p><a class=btn href='/credentials/new'>New credential</a></p>{body}"
 
 
-def edit_section(name, meta, token, stored, *, can_write, error="", preview=None, widen=(), conflict=False):
+def new_section(token, name="", hosts="", error="", can_write=True):
+    """The create form. The value is a password box and is never filled back in."""
+    e = html.escape
+    err = f"<p class=err>{e(error)}</p>" if error else ""
+    off = "" if can_write else "<p class=err>This vault backend cannot store metadata, so credentials cannot be created here.</p>"
+    dis = "" if can_write else " disabled"
+    return (f"<h1>New credential</h1>{err}{off}"
+            f"<form class=cred-form method=post action='/credentials/new' autocomplete=off>"
+            f"<input type=hidden name=csrf value='{e(token)}'>"
+            f"<label>Name (a-z, 0-9, _ and -, up to 41 characters)</label>"
+            f"<input type=text name=name value='{e(name)}' maxlength=41{dis}>"
+            f"<label>Allowed hosts (one per line, <code>host</code> or <code>host:port</code>)</label>"
+            f"<textarea name=allowed_hosts rows=3{dis}>{e(hosts)}</textarea>"
+            f"<label>Token (the value the broker will keep; it is never shown again)</label>"
+            f"<input type=password name=value autocomplete=new-password{dis}>"
+            f"<p><small class=muted>Created like <code>asb store</code>: a vault item with this name, the token in "
+            f"its <code>notes</code> field and the variable <code>NAME_TOKEN</code>. Approval is "
+            f"<code>prompt</code>. You can change everything but the name afterwards.</small></p>"
+            f"<p><button type=submit{dis}>Create</button> <a href='/credentials'>Cancel</a></p></form>")
+
+
+def manage_section(name, token, sha, bindings, *, can_write, blocked=""):
+    """Rename and delete, under the edit form. `bindings`: {kind: count} of what is bound to the name;
+    `blocked`: why neither is possible (internal key, adopted item), or ''."""
+    e = html.escape
+    bound = {k: v for k, v in bindings.items() if v}
+    note = ""
+    if blocked:
+        note = f"<p><small class=muted>{e(blocked)}</small></p>"
+    elif bound:
+        what = ", ".join(f"{v} {k.replace('_', ' ')}" for k, v in sorted(bound.items()))
+        note = (f"<p><small class=muted>Rename and delete are unavailable while this credential is in use "
+                f"({e(what)}). Revoke those on the Policies and Clients tabs first.</small></p>")
+    dis = "" if (can_write and not blocked and not bound) else " disabled"
+    return (f"<h2 style='margin-top:1.6rem'>Rename or delete</h2>{note}"
+            f"<form class=cred-form method=post action='/credentials/{e(name)}/rename'>"
+            f"<input type=hidden name=csrf value='{e(token)}'><input type=hidden name=old_sha value='{e(sha)}'>"
+            f"<label>New name</label><input type=text name=new_name maxlength=41{dis}>"
+            f"<p><small class=muted>Only the name changes; the vault item and its value stay. Anything that "
+            f"refers to the old name (a deny rule in the config, an agent's saved command) must be updated.</small></p>"
+            f"<p><button type=submit{dis}>Rename</button></p></form>"
+            f"<form class=cred-form method=post action='/credentials/{e(name)}/delete'>"
+            f"<input type=hidden name=csrf value='{e(token)}'>"
+            f"<label>Delete: type <code>{e(name)}</code> to confirm</label>"
+            f"<input type=text name=typed autocomplete=off{dis}>"
+            f"<p><small class=muted>This deletes the vault item and its value. It cannot be undone from here.</small></p>"
+            f"<p><button type=submit{dis}>Delete this credential</button></p></form>")
+
+
+def edit_section(name, meta, token, stored, *, can_write, error="", preview=None, widen=(), conflict=False,
+                 extra=""):
     """The edit page. `stored`: the metadata the vault holds (what the diff is against and what the
     concurrency hash covers); `meta`: what the form fields show (the stored metadata, or the human's
     rejected candidate). `preview`: the candidate metadata on the confirm step (diff + save button)."""
@@ -228,4 +283,4 @@ def edit_section(name, meta, token, stored, *, can_write, error="", preview=None
                 f"<input type=hidden name=csrf value='{e(token)}'><input type=hidden name=old_sha value='{e(sha)}'>"
                 f"<input type=hidden name=meta_json value='{e(json.dumps(preview, sort_keys=True))}'>"
                 f"{ticks}<p><button type=submit>Save</button> <a href='/credentials/{e(name)}'>Back</a></p></form>")
-    return f"<h1>Edit {e(name)}</h1>{err}{off}{form}"
+    return f"<h1>Edit {e(name)}</h1>{err}{off}{form}{extra}"
