@@ -62,6 +62,7 @@ from . import placeholders as placeholders_mod
 from . import sessions as sessions_mod
 from . import wssessions as ws_mod
 from . import sshhosts as sshhosts_mod
+from . import crededitor as crededitor_mod
 from . import sshrules as sshrules_mod
 from . import risk as risk_mod
 from . import request_details as details_mod
@@ -1331,6 +1332,67 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                  enforcing_old=old_enf, enforcing_new=new_enf,
                  old_sha256=sshhosts_mod.digest(old_raw), new_sha256=sshhosts_mod.digest(raw), **who)
         return {"status": "saved", "message": "", "enforcing": new_enf}
+
+    def credential_stored_meta(self, name):
+        """The metadata the VAULT holds now for `name` (not the cache), for the editor's concurrency check.
+        An item without a `broker` field (adopted with defaults) falls back to the cached derived metadata."""
+        sc = self.cfg["secrets"][name]
+        for row in self.backend.catalog():
+            if row.get("item") == sc["_item"] and isinstance(row.get("meta"), dict):
+                return row["meta"]
+        return sc["_meta"]
+
+    def set_credential_meta(self, name, new_meta, old_sha, user, confirm_widen=False, peer=None, client_ip=None):
+        """Replace a credential's `broker` metadata from the Credentials editor. The new metadata goes through
+        Broker._entry, the validator the catalog loader runs; it must be what the human was shown (`old_sha` is
+        the hash of the stored metadata they opened) and a change that widens access needs `confirm_widen`.
+        Vault first, then the live catalog. Returns {"status": saved|unchanged|refused|conflict|failed,
+        "message", "reason", "widen"}; raises ValueError for an unknown secret. Audit events carry closed labels,
+        counts and hashes, never names, hosts or values."""
+        if name not in self.cfg["secrets"]:
+            raise ValueError("bad credential change")
+        who = dict(secret=name, user=user, peer=peer, client_ip=client_ip)
+
+        def refused(reason, msg, status="refused", **extra):
+            self.log("credential_change_refused", reason=reason, **who)
+            return {"status": status, "message": msg, "reason": reason, "widen": [], **extra}
+        if backend_base.CAP_SET_META not in self.backend.capabilities:
+            return refused("unsupported", "This vault backend cannot store metadata")
+        if not isinstance(new_meta, dict):
+            return refused("invalid", "The metadata must be a JSON object")
+        sc = self.cfg["secrets"][name]
+        try:
+            new_name, _entry = Broker._entry(sc["_item"], new_meta)
+        except ValueError as e:
+            return refused("invalid", str(e)[:200])
+        if new_name != name:
+            return refused("rename", "Renaming is not supported here: the name must stay the same")
+        with self._cfg_lock:
+            try:
+                current = self.credential_stored_meta(name)
+            except (OSError, ValueError, KeyError, BackendError):
+                self.log("credential_change_failed", reason="vault_read", **who)
+                return {"status": "failed", "message": "Could not read the vault", "reason": "vault_read",
+                        "widen": []}
+            if crededitor_mod.digest(current) != old_sha:
+                return refused("conflict", "Changed in the vault since you opened it", status="conflict",
+                               current=current)
+            if new_meta == current:
+                return {"status": "unchanged", "message": "", "reason": "", "widen": []}
+            widen = crededitor_mod.widened(current, new_meta)
+            if widen and not confirm_widen:
+                return refused("needs_confirmation", "Tick the box to confirm this widens access", widen=widen)
+            try:
+                self.backend.set_meta(sc["_item"], new_meta)
+            except (OSError, ValueError, KeyError, BackendError):
+                self.log("credential_change_failed", reason="vault_write", **who)
+                return {"status": "failed", "message": "Could not save the credential", "reason": "vault_write",
+                        "widen": []}
+        self._refresh_if(0)          # rebuild the live catalog from the vault, outside the lock
+        self.log("credential_changed", changed_keys=len(crededitor_mod.changed_keys(current, new_meta)),
+                 widened=sorted(widen), old_sha256=crededitor_mod.digest(current),
+                 new_sha256=crededitor_mod.digest(new_meta), **who)
+        return {"status": "saved", "message": "", "reason": "", "widen": widen}
 
     # -- discovery (no approval, no push, no values) ----------------------
     def available(self, host=None):
@@ -4812,7 +4874,7 @@ _MANIFEST = {
 _ICON_PNG_URI = "data:image/png;base64," + base64.b64encode(icon_mod.PNG).decode()
 
 _TABS = (("requests", "/", "Requests"), ("policies", "/policies", "Policies"),
-         ("clients", "/clients", "Clients"), ("settings", "/settings", "Settings"))
+         ("credentials", "/credentials", "Credentials"), ("clients", "/clients", "Clients"), ("settings", "/settings", "Settings"))
 
 
 def _chrome(tab, badge, user):
@@ -4852,7 +4914,7 @@ def _page(h, code, body, wide=False, nav=True, script=None, tab=None, badge=0, u
            f"<link rel=icon href=\"{_ICON}\">"
            f"<link rel=apple-touch-icon sizes=180x180 href=\"{_ICON_PNG_URI}\">"
            "<link rel=manifest href=/manifest.webmanifest crossorigin=use-credentials>"
-           f"<style>{_CSS}{scripts_mod.CSS}{details_mod.CSS}{proposals_mod.CSS}{credreq_mod.CSS}{clients_mod.CSS}{sessions_mod.CSS}{plans_mod.CSS}</style><body>{_chrome(tab, badge, user) if nav else ''}"
+           f"<style>{_CSS}{scripts_mod.CSS}{details_mod.CSS}{proposals_mod.CSS}{credreq_mod.CSS}{crededitor_mod.CSS}{clients_mod.CSS}{sessions_mod.CSS}{plans_mod.CSS}</style><body>{_chrome(tab, badge, user) if nav else ''}"
            f"<main class='{'wide' if wide else 'narrow'}'>{_SIGNED_OUT if nav else ''}{body}</main>{scr}</body></html>").encode()
     h.send_response(code)
     h.send_header("Content-Type", "text/html; charset=utf-8")
@@ -6347,6 +6409,67 @@ def approval_handler(broker):
                                                   client_choices=broker.clients.active_choices()),
                   script=_GRANTS_JS + guidance_mod.JS + sshhosts_mod.JS, tab="policies", badge=broker.attention(), user=user)
 
+        def _credentials_page(self, user, note="", status=200):
+            _page(self, status, crededitor_mod.list_section(cfg["secrets"], note), tab="credentials",
+                  badge=broker.attention(), user=user, wide=True)
+
+        def _credential_edit(self, user, name, meta=None, stored=None, status=200, **kw):
+            """The edit page for `name`. Reads the vault for the stored metadata (the diff and the concurrency
+            hash are against what the vault holds now)."""
+            if stored is None:
+                try:
+                    stored = broker.credential_stored_meta(name)
+                except (OSError, ValueError, KeyError, BackendError):
+                    return _page(self, 502, "<h1>Could not read the vault</h1>", tab="credentials", user=user)
+            can_write = backend_base.CAP_SET_META in broker.backend.capabilities
+            _page(self, status, crededitor_mod.edit_section(
+                name, stored if meta is None else meta, self._tok(user), stored, can_write=can_write, **kw),
+                tab="credentials", badge=broker.attention(), user=user, wide=True)
+
+        def _credentials_post(self, path, form, user):
+            parts = path.split("/")          # ["", "credentials", name, action]
+            name = parts[2] if len(parts) == 4 else ""
+            action = parts[3] if len(parts) == 4 else ""
+            if name not in cfg["secrets"] or action not in ("preview", "save"):
+                return _page(self, 404, "<h1>Not found</h1>")
+            one = lambda k: form.get(k, [""])[0]  # noqa: E731
+            try:
+                stored = broker.credential_stored_meta(name)
+            except (OSError, ValueError, KeyError, BackendError):
+                return _page(self, 502, "<h1>Could not read the vault</h1>", tab="credentials", user=user)
+            if action == "preview":
+                if crededitor_mod.digest(stored) != one("old_sha"):
+                    broker.log("credential_change_refused", reason="conflict", secret=name, user=user,
+                               peer=self._ip, client_ip=self._fwd())
+                    return self._credential_edit(user, name, stored=stored, status=409, conflict=True)
+                try:
+                    cand = crededitor_mod.build(stored, {k: v[0] for k, v in form.items()})
+                    new_name, _e = Broker._entry(cfg["secrets"][name]["_item"], cand)
+                    if new_name != name:
+                        raise ValueError("Renaming is not supported here: the name must stay the same")
+                except ValueError as e:
+                    return self._credential_edit(user, name, stored=stored, status=400, error=str(e)[:200],
+                                                 meta=locals().get("cand"))
+                return self._credential_edit(user, name, stored=stored, preview=cand,
+                                             widen=crededitor_mod.widened(stored, cand))
+            try:
+                cand = json.loads(one("meta_json")[:crededitor_mod.MAX_JSON])
+            except ValueError:
+                cand = None
+            res = broker.set_credential_meta(name, cand, one("old_sha"), user,
+                                             confirm_widen=one("confirm_widen") == "1",
+                                             peer=self._ip, client_ip=self._fwd())
+            if res["status"] in ("saved", "unchanged"):
+                return self._credentials_page(
+                    user, f"<p>{'Saved' if res['status'] == 'saved' else 'No changes'}: {html.escape(name)}</p>")
+            if res["status"] == "conflict":
+                return self._credential_edit(user, name, stored=res.get("current"), status=409, conflict=True)
+            if res["reason"] == "needs_confirmation":
+                return self._credential_edit(user, name, stored=stored, status=400, preview=cand,
+                                             widen=res["widen"], error=res["message"])
+            return self._credential_edit(user, name, stored=stored, status=500 if res["status"] == "failed" else 400,
+                                         error=res["message"], meta=cand if isinstance(cand, dict) else None)
+
         def _clients_page(self, user, note="", status=200):
             token = self._tok(user)
             # the approvals that belong to a client live together under the clients: plans, then sessions
@@ -6433,6 +6556,14 @@ def approval_handler(broker):
             if self.path.split("?")[0].rstrip("/") == "/policies":
                 broker.log("policies_viewed", peer=self._ip, client_ip=self._fwd())
                 return self._policies_page(user)
+            if self.path.split("?")[0].rstrip("/") == "/credentials":
+                broker.log("credentials_viewed", peer=self._ip, client_ip=self._fwd())
+                return self._credentials_page(user)
+            if u.path.startswith("/credentials/") and u.path.count("/") == 2:
+                nm = u.path[len("/credentials/"):]
+                if nm not in cfg["secrets"]:
+                    return _page(self, 404, "<h1>Not found</h1>", tab="credentials", user=user)
+                return self._credential_edit(user, nm)
             if self.path.split("?")[0].rstrip("/") == "/clients":
                 q = urllib.parse.parse_qs(u.query)
                 return self._clients_page(user, _CLIENT_NOTES.get((q.get("note") or [""])[0][:12], ""))
@@ -6620,13 +6751,16 @@ def approval_handler(broker):
             # a guidance form can hold 2000 characters of percent-encoded text
             limit = {"/policies/guidance": 40000, "/policies/ssh_hosts": sshhosts_mod.FORM_LIMIT,
                      "/credential": credreq_mod.FORM_LIMIT}.get(path, 8192)
+            cred_edit = path.startswith("/credentials/")
+            if cred_edit:
+                limit = crededitor_mod.FORM_LIMIT
             if (int(self.headers.get("Content-Length", 0)) > limit
-                    and path in ("/policies/guidance", "/policies/ssh_hosts", "/credential")):
+                    and (cred_edit or path in ("/policies/guidance", "/policies/ssh_hosts", "/credential"))):
                 return _page(self, 413, "<h1>Too large</h1>")
             form = urllib.parse.parse_qs(
                 self.rfile.read(min(int(self.headers.get("Content-Length", 0)), limit)).decode())
             link = path.startswith("/a/") and not broker.dest_guard.allow_loopback   # the notification link page
-            if (link or path in ("/decide", "/credential", "/request/retry", "/policies", "/policies/guidance", "/policies/ssh_hosts", "/grants/revoke",
+            if (link or cred_edit or path in ("/decide", "/credential", "/request/retry", "/policies", "/policies/guidance", "/policies/ssh_hosts", "/grants/revoke",
                         "/enroll/decide", "/clients/rename", "/clients/revoke", "/clients/remove", "/sessions/revoke",
                         "/policies/ssh_rules/add", "/policies/ssh_rules/revoke", "/push/subscribe",
                         "/push/revoke", "/push/test", "/plans/decide", "/plans/revoke")) and not (
@@ -6637,6 +6771,8 @@ def approval_handler(broker):
                 return _page(self, 403, "<h1>Forbidden</h1><p>Reload the page and try again.</p>")
             if path.startswith("/push/"):
                 return self._push_post(path, form, user)
+            if cred_edit:
+                return self._credentials_post(path, form, user)
             if path == "/credential":
                 return self._credential_post(user, form)
             if path in ("/plans/decide", "/plans/revoke"):

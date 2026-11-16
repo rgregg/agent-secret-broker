@@ -554,6 +554,38 @@ defaults (next section). The object looks like this:
   --config /data/config.json [--apply]` writes each secret's metadata onto its
   item (dry run by default).
 
+## Editing credentials: the Credentials tab
+
+A credential's policy is the JSON `broker` field of its vault item. The **Credentials** tab edits it without
+opening Bitwarden. It is human-only: the same authenticated approval session, CSRF token and Origin check as the
+Policies tab, and no route on the agent-facing port. Agents cannot reach it, and a client key does not open it.
+
+- **List** (`GET /credentials`): name, kind, allowed hosts, approval mode and TLS (`verified`, `pinned (N)` or
+  `NOT verified`) of every credential.
+- **Edit** (`GET /credentials/<name>`): a form for `allowed_hosts` (`host` or `host:port`, one per line), the TLS
+  mode (verify normally, trust only listed `tls_fingerprint` values, or `tls_verify: false`), `approval` and
+  `plans`. Every other key (`vars`, `standing`, `ws`, `ssh_*`, and keys the form does not know) is carried
+  through untouched. **Advanced** shows the whole metadata as JSON; if you change it, it replaces the form's fields.
+- **Review, then save.** `POST /credentials/<name>/preview` builds the candidate and shows a diff against what the
+  vault holds now; it writes nothing. `POST /credentials/<name>/save` writes exactly the metadata that was shown.
+- **One validator.** Both steps run the candidate through `Broker._entry`, the function the catalog loader runs, so
+  the editor can never write metadata the loader would reject. A rejection shows the loader's own message.
+  Saving writes the vault first (`set_meta`), then rebuilds the live catalog from the vault.
+- **Widening needs a tick.** A change that adds an allowed host or port, adds or removes a TLS fingerprint,
+  turns TLS verification off, sets `approval: allow` or enables `plans` is refused until "I understand this
+  widens access" is ticked. Narrowing saves without it.
+- **No silent overwrite.** The page carries a hash of the stored metadata it loaded. If the vault changed since
+  (an edit in Bitwarden, another save), the save is refused with 409 and the form re-renders with the current
+  values.
+- **Not here (yet).** Renaming (a changed `name` is refused), creating and deleting credentials, and fetching a
+  server's fingerprint are separate stages. Credential values are never shown or edited here; use
+  `request-credential` / `--replace`. A backend without the `set_meta` capability shows the form disabled.
+- **Audit** (all hidden from the agent audit API; counts, closed labels and 64-character hashes only, never host
+  names or values): `credentials_viewed`, `credential_changed` (`secret`, `user`, `peer`, `client_ip`,
+  `changed_keys` count, `widened` labels, `old_sha256`, `new_sha256`), `credential_change_refused` (`reason`:
+  `invalid`, `needs_confirmation`, `conflict`, `rename`, `unsupported`) and `credential_change_failed`
+  (`reason`: `vault_read`, `vault_write`).
+
 ## Policy, risk, discovery
 
 `list` and `which` never touch the vault or send a notification; each call is
