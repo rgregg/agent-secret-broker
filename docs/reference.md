@@ -593,8 +593,17 @@ Policies tab, and no route on the agent-facing port. Agents cannot reach it, and
   new name is taken. Same concurrency check as an edit.
 - **Delete** (on the edit page): deletes the vault item and its value. The human types the credential's name.
   Same refusals as rename except `deny_secrets`. It cannot be undone from here.
-- **Not here.** Fetching a server's fingerprint (a later stage) and creating an SSH key or a login with two
-  values (use `request-credential` or `asb store`). Credential values are never shown or edited here; use
+- **Fetch fingerprint** (on the edit form): type a `host` or `host:port` (443 by default) that is in the form's
+  allowed hosts and press **Fetch fingerprint**. The broker connects through the destination guard like any
+  call (one resolution, every address checked, the port checked against the entries), completes a TLS
+  handshake **without** verifying the certificate, reads the leaf certificate and sends nothing. The page shows
+  its sha256, subject, issuer (marked self-signed when it is), names and expiry, all escaped, and adds the
+  fingerprint to the pin list with TLS set to pin mode. Nothing is written: the pin is saved only through the
+  normal review, where adding a fingerprint is a widening that needs the tick. Check that it is the device
+  you mean before you save, and remember that a renewed certificate has a new fingerprint (pin a self-signed
+  device, not a Let's Encrypt name). At most 10 fetches a minute. A failure is a closed label (`connection`,
+  `tls`, `timeout`, `dns`, `destination not allowed`, `other`).
+- **Not here.** Creating an SSH key or a login with two values (use `request-credential` or `asb store`). Credential values are never shown or edited here; use
   `request-credential` / `--replace`. A backend without the `set_meta` capability shows the forms disabled.
 - **Audit** (all hidden from the agent audit API; counts, closed labels and 64-character hashes only, never host
   names or values): `credentials_viewed`, `credential_changed` (`secret`, `user`, `peer`, `client_ip`,
@@ -602,7 +611,8 @@ Policies tab, and no route on the agent-facing port. Agents cannot reach it, and
   `value_bytes`), `credential_renamed` (`new_secret`), `credential_deleted`, `credential_change_refused`
   (`reason`: `invalid`, `needs_confirmation`, `conflict`, `rename`, `unsupported`, `exists`, `internal`,
   `adopted`, `bound`, `denied_by_name`, `confirm`) and `credential_change_failed` (`reason`: `vault_read`,
-  `vault_write`).
+  `vault_write`), and `credential_fingerprint_fetched` (`result`: `ok`, `invalid`, `not_listed`, `destination`,
+  `rate_limited` or a failure label; `host_sha256`, the first 12 hex of the entry's sha256, never the host).
 
 ## Policy, risk, discovery
 

@@ -1,8 +1,15 @@
 """The Credentials-tab editor: change a credential's broker metadata from the approval site."""
 import _fast  # noqa: F401  (test-only: prompt server shutdown, fake-clock helpers)
+import datetime
+import hashlib
 import html
 import json
 import os
+import re
+import socket
+import ssl
+import tempfile
+import threading
 import sys
 import unittest
 import urllib.parse
@@ -171,6 +178,19 @@ class Editing(Base):
         self.assertEqual(code, 400)
         self.assertEqual(self.stored(), before)
         self.assertEqual(self.events("credential_change_refused")[-1]["reason"], "invalid")
+
+    def test_a_rejected_candidate_keeps_its_keys_when_the_form_is_then_fixed(self):
+        s = self.stored()
+        bad = crededitor.pretty({**s, "custom2": {"added": 1}, "allowed_hosts": ["not a host!"]})
+        code, body = self.post("/credentials/svc/preview", **self.form(advanced=bad))
+        self.assertEqual(code, 400)                                      # rejected: the bad host
+        orig = html.unescape(re.search(r"name=advanced_orig value='(.*?)'>", body, re.S).group(1))
+        self.assertIn("custom2", orig)                                   # premise: the page shows the candidate
+        pc, pbody = self.post("/credentials/svc/preview", **self.form(advanced=orig, advanced_orig=orig,
+                                                                     allowed_hosts="127.0.0.1"))
+        self.assertEqual(pc, 200)
+        meta = json.loads(html.unescape(pbody.split("name=meta_json value='")[1].split("'>")[0]))
+        self.assertEqual((meta["custom2"], meta["allowed_hosts"]), ({"added": 1}, ["127.0.0.1"]))
 
     def test_the_advanced_box_replaces_the_form_when_edited(self):
         s = self.stored()
@@ -530,11 +550,183 @@ class Manage(Base):
         self.assertIn("Svc", self.broker.backend._data)
 
 
+def _self_signed(cn):
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)])
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name).public_key(key.public_key())
+            .serial_number(x509.random_serial_number()).not_valid_before(now - datetime.timedelta(days=1))
+            .not_valid_after(now + datetime.timedelta(days=30))
+            .add_extension(x509.SubjectAlternativeName([x509.DNSName("device.example.com")]), critical=False)
+            .sign(key, hashes.SHA256()))
+    d = tempfile.mkdtemp()
+    cp, kp = os.path.join(d, "c.pem"), os.path.join(d, "k.pem")
+    with open(cp, "wb") as f:
+        f.write(cert.public_bytes(serialization.Encoding.PEM))
+    with open(kp, "wb") as f:
+        f.write(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                  serialization.NoEncryption()))
+    return cert.public_bytes(serialization.Encoding.DER), cp, kp
+
+
+class TlsDevice:
+    """A TLS server on 127.0.0.1 that completes a handshake and counts connections."""
+    def __init__(self, cn):
+        self.der, cp, kp = _self_signed(cn)
+        self.fp = "sha256:" + hashlib.sha256(self.der).hexdigest()
+        self.ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+        self.ctx.load_cert_chain(cp, kp)
+        self.sock = socket.create_server(("127.0.0.1", 0))
+        self.port = self.sock.getsockname()[1]
+        self.accepted = 0
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        while True:
+            try:
+                c, _ = self.sock.accept()
+            except OSError:
+                return
+            self.accepted += 1
+            try:
+                with self.ctx.wrap_socket(c, server_side=True) as t:
+                    t.recv(1)
+            except OSError:
+                pass
+
+    def close(self):
+        self.sock.close()
+
+
+def _closed_port():
+    s = socket.create_server(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+class Fingerprint(Base):
+    CN = "dev<i>x</i>.example.com"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.dev = TlsDevice(cls.CN)
+        cls.entry = f"127.0.0.1:{cls.dev.port}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.dev.close()
+
+    def tweak(self, cfg):
+        super().tweak(cfg)
+        cfg["secrets"]["svc"]["allowed_hosts"] = [self.entry]
+
+    def fetch(self, fp_host=None, **over):
+        return self.post("/credentials/svc/fingerprint", **self.form(fp_host=fp_host or self.entry, **over))
+
+    def fields(self, body):
+        """The form fields of a re-rendered edit page, the way a browser would submit them."""
+        tx = lambda n: html.unescape(re.search(rf"<textarea name={n} rows=\d+>(.*?)</textarea>", body, re.S).group(1))  # noqa: E731
+        orig = html.unescape(re.search(r"name=advanced_orig value='(.*?)'>", body, re.S).group(1))
+        sha = re.search(r"name=old_sha value='([0-9a-f]{64})'", body).group(1)
+        tls = re.search(r"name=tls value=(\w+) checked", body).group(1)
+        return {"allowed_hosts": tx("allowed_hosts"), "tls_fingerprint": tx("tls_fingerprint"), "tls": tls,
+                "advanced": tx("advanced"), "advanced_orig": orig, "old_sha": sha, "approval": "prompt"}
+
+    def test_fetch_shows_the_certificate_and_adds_the_pin_without_saving(self):
+        before = self.stored()
+        code, body = self.fetch()
+        self.assertEqual(code, 200)
+        self.assertIn(self.dev.fp, body)
+        self.assertIn("(self-signed)", body)
+        self.assertIn("device.example.com", body)
+        f = self.fields(body)
+        self.assertEqual((f["tls"], f["tls_fingerprint"]), ("pin", self.dev.fp))
+        self.assertEqual(self.stored(), before)                          # a fetch writes nothing
+        self.assertEqual(self.events("credential_changed"), [])
+        ev = self.events("credential_fingerprint_fetched")
+        self.assertEqual([e["result"] for e in ev], ["ok"])
+        self.assertGreaterEqual(self.dev.accepted, 1)
+
+    def test_the_fetched_pin_saves_through_review_with_the_widening_tick(self):
+        code, body = self.fetch()
+        self.assertEqual(code, 200)
+        pc, pbody = self.post("/credentials/svc/preview", **self.fields(body))
+        self.assertEqual(pc, 200)
+        self.assertIn("adds a trusted TLS fingerprint", pbody)
+        meta_json = html.unescape(pbody.split("name=meta_json value='")[1].split("'>")[0])
+        sc, _ = self.post("/credentials/svc/save", old_sha=self.stored_sha(), meta_json=meta_json)
+        self.assertEqual(sc, 400)                                        # not without the tick
+        self.assertNotIn("tls_fingerprint", self.stored())
+        sc, _ = self.post("/credentials/svc/save", old_sha=self.stored_sha(), meta_json=meta_json, confirm_widen="1")
+        self.assertEqual(sc, 200)
+        self.assertEqual(self.stored()["tls_fingerprint"], self.dev.fp)
+        self.assertEqual(self.stored()["custom"], {"keep": "me"})        # the rest of the metadata survived the round trip
+        self.assertEqual(self.broker._tls_policy(["svc"])["fingerprint"], (self.dev.fp.split(":")[1],))
+
+    def test_certificate_text_is_escaped(self):
+        code, body = self.fetch()
+        self.assertEqual(code, 200)
+        # the certificate library writes the subject as CN=dev\<i\>x\</i\>...; the page must escape what it gets
+        self.assertIn("CN=dev\\&lt;i\\&gt;x", body)                     # positive control: the subject is shown
+        self.assertNotIn("\\<i\\>", body)
+
+    def test_only_a_listed_host_and_port_is_fetched(self):
+        before = self.dev.accepted
+        for reason, fp_host, hosts in (("not_listed", "other.example.com", self.entry),
+                                       ("not_listed", "127.0.0.1:1", self.entry),
+                                       ("invalid", "bad host!", self.entry),
+                                       ("destination", "169.254.169.254", "169.254.169.254")):
+            with self.subTest(fp_host=fp_host):
+                code, body = self.fetch(fp_host=fp_host, allowed_hosts=hosts)
+                self.assertEqual(code, 400)
+                self.assertIn("Could not fetch a certificate", body)
+                self.assertEqual(self.events("credential_fingerprint_fetched")[-1]["result"], reason)
+        self.assertEqual(self.dev.accepted, before)                      # nothing was dialled
+        self.assertEqual(self.fetch()[0], 200)                           # positive control
+
+    def test_a_failure_is_a_closed_label(self):
+        port = _closed_port()
+        code, body = self.fetch(fp_host=f"127.0.0.1:{port}", allowed_hosts=f"127.0.0.1:{port}")
+        self.assertEqual(code, 400)
+        self.assertIn("Could not fetch a certificate: connection", body)
+        self.assertNotIn("Errno", body)
+        self.assertEqual(self.events("credential_fingerprint_fetched")[-1]["result"], "connection")
+
+    def test_fetches_are_rate_limited(self):
+        self.broker.FP_RATE = (1, 60)
+        self.assertEqual(self.fetch()[0], 200)
+        code, body = self.fetch()
+        self.assertEqual(code, 400)
+        self.assertEqual(self.events("credential_fingerprint_fetched")[-1]["result"], "rate_limited")
+
+    def test_needs_the_human_session_and_a_token(self):
+        before = self.dev.accepted
+        self.assertEqual(self.post("/credentials/svc/fingerprint", csrf=False, fp_host=self.entry,
+                                   allowed_hosts=self.entry)[0], 403)
+        self.assertEqual(self.post("/credentials/svc/fingerprint", user="mallory", fp_host=self.entry,
+                                   allowed_hosts=self.entry)[0], 403)
+        self.assertEqual(self.dev.accepted, before)
+
+    def test_the_audit_names_no_host(self):
+        self.assertEqual(self.fetch()[0], 200)
+        ev = self.events("credential_fingerprint_fetched")
+        self.assertEqual(len(ev), 1)                                     # positive control
+        self.assertEqual(len(ev[0]["host_sha256"]), 12)
+        with open(self.audit) as f:
+            self.assertNotIn(self.entry, f.read())
+
+
 class Secrecy(Base):
     def test_editor_events_are_hidden_from_the_agent_audit_api(self):
         from secret_broker import audit_api
         for ev in ("credentials_viewed", "credential_changed", "credential_change_refused",
-                   "credential_change_failed", "credential_created", "credential_renamed", "credential_deleted"):
+                   "credential_change_failed", "credential_created", "credential_renamed", "credential_deleted",
+                   "credential_fingerprint_fetched"):
             self.assertIn(ev, audit_api.HIDDEN)
             self.assertIsNone(audit_api.redact({"seq": 1, "ts": 1.0, "event": ev, "secret": "svc",
                                                 "new_sha256": "ab", "request": "r"}), ev)

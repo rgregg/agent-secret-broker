@@ -27,6 +27,8 @@ import queue
 import random
 import re
 import secrets
+import socket
+import ssl
 import threading
 import time
 import urllib.error
@@ -1395,6 +1397,57 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         return {"status": "saved", "message": "", "reason": "", "widen": widen}
 
     RESERVED_NAMES = frozenset({"new"})      # routes under /credentials/
+
+    FP_RATE = (10, 60)          # certificate fetches: at most 10 per 60 s, for the whole broker
+
+    def fetch_certificate(self, name, entry, pending_hosts, user, peer=None, client_ip=None):
+        """Read the TLS certificate a server presents, for the human to pin. `entry` (host or host:port, 443 by
+        default) must be one of the hosts the edit form lists (`pending_hosts`), and the connection goes
+        through the destination guard like any call: one resolution, every address checked, the port
+        checked against the entries. The handshake does NOT verify the certificate: it only reads it, and
+        nothing is sent. Failures are closed labels. Returns {"status": ok|refused|failed, "reason",
+        "message", "details"}."""
+        if name not in self.cfg["secrets"]:
+            raise ValueError("bad credential change")
+        hsh = hashlib.sha256(str(entry).lower().encode()).hexdigest()[:12]
+        who = dict(secret=name, user=user, peer=peer, client_ip=client_ip, host_sha256=hsh)
+
+        def done(status, reason, msg="", details=None):
+            self.log("credential_fingerprint_fetched", result=reason or "ok", **who)
+            return {"status": status, "reason": reason, "message": msg, "details": details}
+        host, port = destguard.split_entry(entry) if isinstance(entry, str) else (None, None)
+        if host is None:
+            return done("refused", "invalid", "enter a host or host:port from the allowed hosts")
+        port = port or 443
+        pending = [str(h).lower() for h in pending_hosts if isinstance(h, str)]
+        if host.lower() not in destguard.host_parts(pending) or not destguard.entry_allows(pending, host, port):
+            return done("refused", "not_listed", "that host and port are not in the allowed hosts list")
+        if self.dest_guard.entry_problem(entry, from_store=False):
+            return done("refused", "destination", "that host is not allowed as a destination")
+        now = time.time()
+        with self._lock:
+            times = self._fp_times = [t for t in getattr(self, "_fp_times", []) if now - t < self.FP_RATE[1]]
+            if len(times) >= self.FP_RATE[0]:
+                limited = True
+            else:
+                limited = False
+                times.append(now)
+        if limited:
+            return done("refused", "rate_limited", "too many fetches; wait a minute")
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE         # read the certificate, whatever it is; nothing is trusted here
+        sni = None if destguard.parse_ip(host.strip("[]")) is not None else host
+        try:
+            raw = self.dest_guard.connect(host, port, timeout=10, entries=pending)
+            with ctx.wrap_socket(raw, server_hostname=sni) as tls:
+                der = tls.getpeercert(binary_form=True)
+        except (OSError, ValueError) as e:      # ssl.SSLError and socket.timeout are OSErrors
+            label = errclass.classify(e)
+            return done("failed", label, label)
+        if not der:
+            return done("failed", errclass.TLS, errclass.TLS)
+        return done("ok", "", details=crededitor_mod.cert_details(der))
 
     def credential_bindings(self, name):
         """What is bound to this credential's NAME right now. Rename and delete refuse while any is non-zero:
@@ -6591,7 +6644,7 @@ def approval_handler(broker):
                                             name=one("name"), hosts=one("allowed_hosts"), error=res["message"])
             name = parts[2] if len(parts) == 4 else ""
             action = parts[3] if len(parts) == 4 else ""
-            if name not in cfg["secrets"] or action not in ("preview", "save", "rename", "delete"):
+            if name not in cfg["secrets"] or action not in ("preview", "save", "rename", "delete", "fingerprint"):
                 return _page(self, 404, "<h1>Not found</h1>")
             if action in ("rename", "delete"):
                 if action == "rename":
@@ -6610,13 +6663,29 @@ def approval_handler(broker):
                 stored = broker.credential_stored_meta(name)
             except (OSError, ValueError, KeyError, BackendError):
                 return _page(self, 502, "<h1>Could not read the vault</h1>", tab="credentials", user=user)
+            if action == "fingerprint":
+                flat = {k: v[0] for k, v in form.items()}
+                try:
+                    cand = crededitor_mod.build(crededitor_mod.base_from_form(flat, stored), flat)
+                except ValueError as e:
+                    return self._credential_edit(user, name, stored=stored, status=400, error=str(e)[:200])
+                entry = one("fp_host").strip()
+                res = broker.fetch_certificate(name, entry, cand.get("allowed_hosts") or [], user,
+                                               peer=self._ip, client_ip=self._fwd())
+                if res["status"] != "ok":
+                    return self._credential_edit(user, name, stored=stored, meta=cand, status=400,
+                                                 error="Could not fetch a certificate: " + res["message"])
+                return self._credential_edit(user, name, stored=stored,
+                                             meta=crededitor_mod.add_pin(cand, res["details"]["fingerprint"]),
+                                             fetched=crededitor_mod.fetched_html(entry, res["details"]))
             if action == "preview":
                 if crededitor_mod.digest(stored) != one("old_sha"):
                     broker.log("credential_change_refused", reason="conflict", secret=name, user=user,
                                peer=self._ip, client_ip=self._fwd())
                     return self._credential_edit(user, name, stored=stored, status=409, conflict=True)
                 try:
-                    cand = crededitor_mod.build(stored, {k: v[0] for k, v in form.items()})
+                    flat = {k: v[0] for k, v in form.items()}
+                    cand = crededitor_mod.build(crededitor_mod.base_from_form(flat, stored), flat)
                     new_name, _e = Broker._entry(cfg["secrets"][name]["_item"], cand)
                     if new_name != name:
                         raise ValueError("Renaming is not supported here: the name must stay the same")
