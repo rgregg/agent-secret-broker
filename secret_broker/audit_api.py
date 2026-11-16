@@ -130,6 +130,8 @@ HIDDEN = frozenset({
     # the Credentials-tab editor: who changed a credential's policy is approval context
     "credentials_viewed", "credential_changed", "credential_change_refused", "credential_change_failed",
     "credential_created", "credential_renamed", "credential_deleted", "credential_fingerprint_fetched",
+    "credential_value_revealed", "credential_value_changed", "credential_value_added", "credential_value_removed",
+    "credential_value_refused",
     "ha_hook_any_device", "config_warning", "session_sweep_error",
     # destination guard and listener hardening: operator-side events about the broker's own network
     "dest_guard_config_error", "egress_marker_refused", "config_error", "config_info", "client_peer_refused", "client_peer_observed",

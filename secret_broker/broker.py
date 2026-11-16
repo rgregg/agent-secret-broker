@@ -15,10 +15,12 @@ Everything, including auto-approved use and rejected attempts, is audited.
 """
 import base64
 import binascii
+import copy
 import dataclasses
 import hashlib
 import hmac
 import html
+import functools
 import ipaddress
 import json
 import logging
@@ -38,7 +40,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .audit import AuditLog
 from .backends import BackendError
-from .backends.base import BackendNotFound
+from .backends.base import BackendConflict, BackendInvalid, BackendNotFound
 from .backends import base as backend_base
 from . import audit_api
 from . import destguard
@@ -71,6 +73,7 @@ from . import request_details as details_mod
 from . import scripts as scripts_mod
 from . import sshkey
 from . import structured
+from . import peek as peek_mod
 from . import keyprovider as keyprovider_mod
 from .history import History, OUTCOMES
 
@@ -1395,6 +1398,205 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                  widened=sorted(widen), old_sha256=crededitor_mod.digest(current),
                  new_sha256=crededitor_mod.digest(new_meta), **who)
         return {"status": "saved", "message": "", "reason": "", "widen": widen}
+
+    # -- values on the Credentials tab (the human's authenticated session only; see crededitor) ------------------
+    VALUE_RATE = (30, 60)       # reveals: at most 30 per 60 s per user
+
+    _VALUE_TEXT = {             # the ONLY messages these return: fixed text, never built from a value or exception
+        "unknown_var": "That variable is not part of this credential",
+        "ssh": "An SSH key's private key cannot be shown or changed here; use asb store --replace",
+        "invalid": "The vault field does not hold the structured value this variable names",
+        "vault_read": "Could not read the vault",
+        "vault_write": "Could not save to the vault",
+        "rate_limited": "Too many values shown; wait a minute",
+        "empty": "Enter a value",
+        "too_large": f"The value is larger than {MAX_STORE_VALUE} bytes",
+        "bad_value": "The value contains control characters",
+        "exists": "A variable with that name already exists",
+        "field_exists": "The vault item already has a field with that name",
+        "adopted": "This item has no broker metadata yet: save it once on this page first",
+        "needs_confirmation": "Tick the box to confirm agents may use this value",
+        "conflict": "Changed in the vault since you opened it",
+        "last": "A credential needs at least one variable",
+        "unsupported": "This vault backend cannot store metadata",
+        "internal": "This is the broker's own key and cannot be shown or changed here",
+    }
+
+    def _value_result(self, action, name, user, peer, client_ip, reason="", status=None, **extra):
+        """A value action's result. A refusal is audited as credential_value_refused with closed labels."""
+        if reason:
+            self.log("credential_value_refused", action=action, reason=reason, secret=name, user=user,
+                     peer=peer, client_ip=client_ip)
+            return {"status": status or ("failed" if reason.startswith("vault_") else "refused"),
+                    "reason": reason, "message": self._VALUE_TEXT[reason], **extra}
+        return {"status": "ok", "reason": "", "message": "", **extra}
+
+    @staticmethod
+    def _value_problem(value):
+        """The closed label for a value the human typed that cannot be stored, or ''."""
+        if not isinstance(value, str) or not value:
+            return "empty"
+        if len(value.encode()) > MAX_STORE_VALUE:
+            return "too_large"
+        if re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", value):
+            return "bad_value"
+        return ""
+
+    def _value_ref(self, name, var):
+        """(credential entry, variable ref) or a refusal label."""
+        sc = self.cfg["secrets"].get(name)
+        if sc is None:
+            raise ValueError("bad credential")
+        if self.is_internal_secret(name):
+            return sc, None, "internal"
+        if sc.get("ssh"):
+            return sc, None, "ssh"
+        ref = (sc.get("vars") or {}).get(var)
+        return sc, ref, ("" if ref else "unknown_var")
+
+    def reveal_value(self, name, var, user, peer=None, client_ip=None):
+        """One variable's current value, for the human who asked on the Credentials tab. The value goes only
+        into the return value; the audit event names the credential and variable, never the value."""
+        res = functools.partial(self._value_result, "reveal", name, user, peer, client_ip)
+        sc, ref, bad = self._value_ref(name, var)
+        if bad:
+            return res(bad)
+        now = time.time()
+        with self._lock:
+            hits = getattr(self, "_value_times", {})
+            self._value_times = hits
+            times = hits[user] = [t for t in hits.get(user, []) if now - t < self.VALUE_RATE[1]]
+            if len(times) >= self.VALUE_RATE[0]:
+                return res("rate_limited")
+            times.append(now)
+        try:
+            raw = self.backend.get(ref["item"], ref.get("field") or "auto")
+            value = structured.get(raw, ref["key"]) if ref.get("key") else raw
+        except structured.StructuredError:
+            return res("invalid")
+        except (OSError, ValueError, KeyError, BackendError):
+            return res("vault_read")
+        self.log("credential_value_revealed", secret=name, var=var, user=user, peer=peer, client_ip=client_ip)
+        return res(value=value)
+
+    def replace_value(self, name, var, value, user, peer=None, client_ip=None):
+        """Replace one variable's value (the old one is kept as previous_value, as `asb store --replace` does)."""
+        res = functools.partial(self._value_result, "replace", name, user, peer, client_ip)
+        sc, ref, bad = self._value_ref(name, var)
+        if bad or self._value_problem(value):
+            return res(bad or self._value_problem(value))
+        field = ref.get("field") or "auto"
+        try:
+            new = value
+            if ref.get("key"):
+                new = structured.set_key(self.backend.get(ref["item"], field), ref["key"], value)
+            self.backend.put(ref["item"], field, new, create=False, keep_previous=True)
+        except structured.StructuredError:
+            return res("invalid")
+        except (OSError, ValueError, KeyError, BackendError):
+            return res("vault_write")
+        self.log("credential_value_changed", secret=name, var=var, value_bytes=len(value.encode()), user=user,
+                 peer=peer, client_ip=client_ip)
+        return res()
+
+    def _value_precheck(self, name, res):
+        """The refusal for add/remove that needs no vault read, or None. Called WITHOUT _cfg_lock held:
+        is_internal_secret takes that lock itself (a plain Lock, so taking it twice deadlocks)."""
+        sc = self.cfg["secrets"][name]
+        if self.is_internal_secret(name):
+            return res("internal")
+        if sc.get("ssh"):
+            return res("ssh")
+        if backend_base.CAP_SET_META not in self.backend.capabilities:
+            return res("unsupported")
+        if sc.get("auto"):
+            return res("adopted")
+        return None
+
+    def _value_meta_guard(self, name, old_sha, res):
+        """(stored metadata, refusal) for add/remove, under _cfg_lock: the metadata the human opened."""
+        try:
+            stored = self.credential_stored_meta(name)
+        except (OSError, ValueError, KeyError, BackendError):
+            return None, res("vault_read")
+        if crededitor_mod.digest(stored) != old_sha:
+            return None, res("conflict", status="conflict")
+        return stored, None
+
+    def add_value(self, name, var, value, old_sha, user, confirm=False, peer=None, client_ip=None):
+        """Add a variable: a new custom field `var` on the credential's item holding `value`, and
+        `vars[var] = {"field": var}` in its metadata, in ONE vault write. Agents can then place the value on the
+        credential's hosts, so it needs `confirm` (the human's tick)."""
+        res = functools.partial(self._value_result, "add", name, user, peer, client_ip)
+        if name not in self.cfg["secrets"]:
+            raise ValueError("bad credential")
+        refusal = self._value_precheck(name, res)
+        if refusal:
+            return refusal
+        with self._cfg_lock:
+            stored, refusal = self._value_meta_guard(name, old_sha, res)
+            if refusal:
+                return refusal
+            if var in (stored.get("vars") or {}):
+                return res("exists")
+            if self._value_problem(value):
+                return res(self._value_problem(value))
+            new_meta = copy.deepcopy(stored)
+            new_meta.setdefault("vars", {})[var] = {"field": var}
+            try:
+                Broker._entry(self.cfg["secrets"][name]["_item"], new_meta)
+                backend_base.check_new_field(var)
+            except (ValueError, BackendInvalid) as e:
+                self.log("credential_value_refused", action="add", reason="invalid_name", secret=name, user=user,
+                         peer=peer, client_ip=client_ip)
+                # the loader's own message about the NAME (a variable name is metadata, never the value)
+                return {"status": "refused", "reason": "invalid_name",
+                        "message": str(e)[:200] if isinstance(e, ValueError) else "That name cannot be used"}
+            if not confirm:
+                return res("needs_confirmation")
+            try:
+                self.backend.put(self.cfg["secrets"][name]["_item"], var, value, add_field=True, meta=new_meta)
+            except BackendConflict:
+                return res("field_exists")
+            except (OSError, ValueError, KeyError, BackendError):
+                return res("vault_write")
+        self._refresh_if(0)
+        self.log("credential_value_added", secret=name, var=var, value_bytes=len(value.encode()), user=user,
+                 peer=peer, client_ip=client_ip)
+        return res()
+
+    def remove_value(self, name, var, old_sha, user, peer=None, client_ip=None):
+        """Drop a variable from the metadata. The vault field stays (nothing is destroyed; reversible in the vault)."""
+        res = functools.partial(self._value_result, "remove", name, user, peer, client_ip)
+        if name not in self.cfg["secrets"]:
+            raise ValueError("bad credential")
+        refusal = self._value_precheck(name, res)
+        if refusal:
+            return refusal
+        with self._cfg_lock:
+            stored, refusal = self._value_meta_guard(name, old_sha, res)
+            if refusal:
+                return refusal
+            vars_ = stored.get("vars") or {}
+            if var not in vars_:
+                return res("unknown_var")
+            if len(vars_) == 1:
+                return res("last")
+            new_meta = copy.deepcopy(stored)
+            del new_meta["vars"][var]
+            try:
+                Broker._entry(self.cfg["secrets"][name]["_item"], new_meta)
+            except ValueError as e:
+                self.log("credential_value_refused", action="remove", reason="invalid", secret=name, user=user,
+                         peer=peer, client_ip=client_ip)
+                return {"status": "refused", "reason": "invalid", "message": str(e)[:200]}
+            try:
+                self.backend.set_meta(self.cfg["secrets"][name]["_item"], new_meta)
+            except (OSError, ValueError, KeyError, BackendError):
+                return res("vault_write")
+        self._refresh_if(0)
+        self.log("credential_value_removed", secret=name, var=var, user=user, peer=peer, client_ip=client_ip)
+        return res()
 
     RESERVED_NAMES = frozenset({"new"})      # routes under /credentials/
 
@@ -5107,7 +5309,7 @@ def _page(h, code, body, wide=False, nav=True, script=None, tab=None, badge=0, u
            f"<link rel=icon href=\"{_ICON}\">"
            f"<link rel=apple-touch-icon sizes=180x180 href=\"{_ICON_PNG_URI}\">"
            "<link rel=manifest href=/manifest.webmanifest crossorigin=use-credentials>"
-           f"<style>{_CSS}{scripts_mod.CSS}{details_mod.CSS}{proposals_mod.CSS}{credreq_mod.CSS}{crededitor_mod.CSS}{clients_mod.CSS}{sessions_mod.CSS}{plans_mod.CSS}</style><body>{_chrome(tab, badge, user) if nav else ''}"
+           f"<style>{_CSS}{scripts_mod.CSS}{details_mod.CSS}{proposals_mod.CSS}{credreq_mod.CSS}{crededitor_mod.CSS}{peek_mod.CSS}{clients_mod.CSS}{sessions_mod.CSS}{plans_mod.CSS}</style><body>{_chrome(tab, badge, user) if nav else ''}"
            f"<main class='{'wide' if wide else 'narrow'}'>{_SIGNED_OUT if nav else ''}{body}</main>{scr}</body></html>").encode()
     h.send_response(code)
     h.send_header("Content-Type", "text/html; charset=utf-8")
@@ -6300,7 +6502,7 @@ def approval_handler(broker):
             """The credential entry page. Served only to the authenticated approver. The secret
             fields are never filled in, so an error re-render cannot echo the value."""
             body = credreq_mod.form_html(req, self._tok(user), values, errors)
-            _page(self, status, body, tab="requests", badge=broker.attention(), user=user)
+            _page(self, status, body, tab="requests", script=peek_mod.JS, badge=broker.attention(), user=user)
 
         def _plan_page(self, req, user):
             """/a/<nonce> for a plan: the whole card, with its own CSRF-protected form. The nonce
@@ -6605,7 +6807,7 @@ def approval_handler(broker):
         def _credentials_page(self, user, note="", status=200, q=""):
             flash = f"<div class=flash>{note}</div>" if note else ""
             _page(self, status, crededitor_mod.list_section(cfg["secrets"], flash, q), tab="credentials",
-                  script=crededitor_mod.JS, badge=broker.attention(), user=user, wide=True)
+                  script=crededitor_mod.JS + peek_mod.JS, badge=broker.attention(), user=user, wide=True)
 
         def _credential_edit(self, user, name, meta=None, stored=None, status=200, **kw):
             """The edit page for `name`. Reads the vault for the stored metadata (the diff and the concurrency
@@ -6623,15 +6825,50 @@ def approval_handler(broker):
             extra = "" if kw.get("preview") is not None else crededitor_mod.manage_section(
                 name, self._tok(user), crededitor_mod.digest(stored), broker.credential_bindings(name),
                 can_write=can_write, blocked=blocked)
+            revealed = kw.pop("revealed", None)
+            values = "" if kw.get("preview") is not None or broker.is_internal_secret(name) else \
+                crededitor_mod.values_section(name, sc, self._tok(user), crededitor_mod.digest(stored),
+                                              can_write=can_write, revealed=revealed)
             _page(self, status, crededitor_mod.edit_section(
                 name, stored if meta is None else meta, self._tok(user), stored, can_write=can_write,
-                extra=extra, **kw),
-                tab="credentials", script=crededitor_mod.JS, badge=broker.attention(), user=user, wide=True)
+                extra=extra, values=values, **kw),
+                tab="credentials", script=crededitor_mod.JS + peek_mod.JS, badge=broker.attention(), user=user, wide=True)
+
+        def _credential_value_post(self, name, action, one, user):
+            """Show, replace, add or remove one value. A value only ever appears in a reveal reply; every other
+            page re-renders from the vault, so nothing the human typed is echoed back."""
+            who = dict(peer=self._ip, client_ip=self._fwd())
+            var = one("var").strip()[:64]
+            # the multi-line box (a textarea) wins when filled; browsers send its line ends as CRLF
+            value = one("value_ml").replace("\r\n", "\n") if one("value_ml") else one("value")
+            if action == "reveal":
+                res = broker.reveal_value(name, var, user, **who)
+                if "application/json" in (self.headers.get("Accept") or ""):
+                    if res["status"] == "ok":
+                        return self._json(200, {"value": res["value"]})
+                    return self._json(429 if res["reason"] == "rate_limited" else 400 if res["status"] == "refused"
+                                      else 500, {"error": res["message"]})
+                if res["status"] == "ok":
+                    return self._credential_edit(user, name, revealed=(var, res["value"]))
+            elif action == "value":
+                res = broker.replace_value(name, var, value, user, **who)
+                flash = f"Value replaced: {var}"
+            elif action == "value/add":
+                res = broker.add_value(name, var, value, one("old_sha"), user,
+                                       confirm=one("confirm") == "1", **who)
+                flash = f"Value added: {var}"
+            else:
+                res = broker.remove_value(name, var, one("old_sha"), user, **who)
+                flash = f"Variable removed: {var}"
+            if res["status"] == "ok":
+                return self._credential_edit(user, name, flash=flash)
+            code = {"conflict": 409, "failed": 500}.get(res["status"], 429 if res["reason"] == "rate_limited" else 400)
+            return self._credential_edit(user, name, status=code, error=res["message"])
 
         def _credential_new(self, user, status=200, **kw):
             _page(self, status, crededitor_mod.new_section(
                 self._tok(user), can_write=backend_base.CAP_SET_META in broker.backend.capabilities, **kw),
-                tab="credentials", badge=broker.attention(), user=user, wide=True)
+                tab="credentials", script=peek_mod.JS, badge=broker.attention(), user=user, wide=True)
 
         def _credentials_post(self, path, form, user):
             parts = path.split("/")          # ["", "credentials", name, action] or ["", "credentials", "new"]
@@ -6643,10 +6880,13 @@ def approval_handler(broker):
                     return self._credentials_page(user, f"Created: {html.escape(one('name'))}")
                 return self._credential_new(user, status=500 if res["status"] == "failed" else 400,
                                             name=one("name"), hosts=one("allowed_hosts"), error=res["message"])
-            name = parts[2] if len(parts) == 4 else ""
-            action = parts[3] if len(parts) == 4 else ""
-            if name not in cfg["secrets"] or action not in ("preview", "save", "rename", "delete", "fingerprint"):
+            name = parts[2] if len(parts) >= 4 else ""
+            action = "/".join(parts[3:])
+            if name not in cfg["secrets"] or action not in ("preview", "save", "rename", "delete", "fingerprint",
+                                                            "reveal", "value", "value/add", "value/remove"):
                 return _page(self, 404, "<h1>Not found</h1>")
+            if action in ("reveal", "value", "value/add", "value/remove"):
+                return self._credential_value_post(name, action, one, user)
             if action in ("rename", "delete"):
                 if action == "rename":
                     res = broker.rename_credential(name, one("new_name"), one("old_sha"), user,

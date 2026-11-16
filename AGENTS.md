@@ -54,7 +54,9 @@ you change code near these, say so in the PR and add a test that fails if the pr
 - **The agent never receives a credential value** in `http`, `session`, `plan` or `ws` modes; responses are masked
   (`masking.py`), including values split across chunks and ranges.
 - **No text from an exception, a filled request, a credential or the agent's own input crosses a trust boundary**
-  (agent response, audit, history, logs, notifications, pages). Errors are fixed labels from a closed set
+  (agent response, audit, history, logs, notifications, pages). The one exception is deliberate: the human's own
+  **Show** on the Credentials tab returns that one value to their authenticated session (`reveal_value`), audited
+  by name only. Nothing else may put a value on a page. Errors are fixed labels from a closed set
   (`errclass.py`, `httpcheck.py`), not `str(exc)` and not an echo of what the agent sent. A filled value can contain
   anything, so never build an error message from one.
 - **Destinations are checked before a value is released** (`destguard.py`): allowed hosts and ports per credential,

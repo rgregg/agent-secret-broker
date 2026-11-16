@@ -65,7 +65,8 @@ Then:
 
 `https://<your approval site>/` has these tabs: **Requests** (what is waiting, and
 recent history), **Policies** (active plans and standing approvals, each with Revoke),
-**Credentials** (edit a credential's hosts, TLS pin and approval mode without opening the vault), and
+**Credentials** (edit a credential's hosts, TLS pin and approval mode, and show, replace or add its values,
+without opening the vault), and
 **Settings** (browser and push notifications). It follows your system light or
 dark setting and works on small screens.
 

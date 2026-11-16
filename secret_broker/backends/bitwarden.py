@@ -16,7 +16,7 @@ import urllib.request
 from .. import destguard
 
 from .. import sshkey
-from .base import (as_uris, merge_uri_hosts, CAP_ADOPTS, CAP_CREATE_LOGIN, CAP_EDIT_ITEM, CAP_EXPORT_ITEMS, CAP_ON_EVENT,
+from .base import (as_uris, check_new_field, merge_uri_hosts, CAP_ADOPTS, CAP_CREATE_LOGIN, CAP_EDIT_ITEM, CAP_EXPORT_ITEMS, CAP_ON_EVENT,
                    CAP_SET_META, CAP_WARM, LOGIN, META_FIELD, NOTE, RESERVED_FIELDS, SSH_KEY,
                    BackendConfigError, BackendConflict, BackendError, BackendInvalid,
                    BackendNotFound, BackendRateLimited, BackendSpec, BackendUnavailable, Item,
@@ -284,9 +284,9 @@ class BwBackend(VaultBackend):
         old = None
         if field in (None, "", "auto"):
             field = BwBackend._auto_field(obj)
-        if field == "password" and obj.get("login") is not None:
-            old = obj["login"].get("password")
-            obj["login"]["password"] = value
+        if field in ("password", "username") and obj.get("login") is not None:
+            old = obj["login"].get(field)
+            obj["login"][field] = value
         elif field == "private_key" and obj.get("sshKey") is not None:
             old = obj["sshKey"].get("privateKey")
             obj["sshKey"]["privateKey"] = value
@@ -313,7 +313,7 @@ class BwBackend(VaultBackend):
         args = [verb, "item"] + ([item_id] if item_id else []) + ["--session", self._session]
         return self._run(*args, stdin=enc)
 
-    def put(self, item, field, value, create=False, keep_previous=False, meta=None):
+    def put(self, item, field, value, create=False, keep_previous=False, meta=None, add_field=False):
         """Create a new item (with its broker metadata), or replace one field of
         an existing item."""
         check_item_args(item, value)
@@ -325,9 +325,11 @@ class BwBackend(VaultBackend):
             meta = clean_meta(meta)
         if create and field in AUTO_ALIASES:
             field = "notes"
+        if add_field:
+            check_new_field(field)
         with self._lock:
             try:
-                self._put_locked(item, field, value, create, keep_previous, meta)
+                self._put_locked(item, field, value, create, keep_previous, meta, add_field)
             except BackendError as e:
                 msg = str(e).lower()
                 if (isinstance(e, (BackendNotFound, BackendConflict, BackendInvalid))
@@ -337,9 +339,9 @@ class BwBackend(VaultBackend):
                 # the session may have been invalidated behind our back (another
                 # bw process on the same state dir): start clean once and retry
                 self._session, self._synced, self._target_ids = None, 0.0, None
-                self._put_locked(item, field, value, create, keep_previous, meta)
+                self._put_locked(item, field, value, create, keep_previous, meta, add_field)
 
-    def _put_locked(self, item, field, value, create, keep_previous, meta=None):
+    def _put_locked(self, item, field, value, create, keep_previous, meta=None, add_field=False):
         existing = self._find(item)
         if create:
             if existing is not None:
@@ -349,7 +351,13 @@ class BwBackend(VaultBackend):
         else:
             if existing is None:
                 raise BackendNotFound(f"item {item!r} not found")
-            self._apply(existing, field, value, keep_previous)
+            if add_field:
+                fields = existing.get("fields") or []
+                if any(f.get("name") == field for f in fields):
+                    raise BackendConflict(f"field {field!r} already exists on item {item!r}")
+                existing["fields"] = fields + [{"name": field, "value": value, "type": 1}]   # hidden
+            else:
+                self._apply(existing, field, value, keep_previous)
             if meta is not None:
                 self._with_meta(existing, meta)
             self._submit("edit", existing, existing["id"])

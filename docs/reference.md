@@ -612,8 +612,33 @@ Policies tab, and no route on the agent-facing port. Agents cannot reach it, and
   you mean before you save, and remember that a renewed certificate has a new fingerprint (pin a self-signed
   device, not a Let's Encrypt name). At most 10 fetches a minute. A failure is a closed label (`connection`,
   `tls`, `timeout`, `dns`, `destination not allowed`, `other`).
-- **Not here.** Creating an SSH key or a login with two values (use `request-credential` or `asb store`). Credential values are never shown or edited here; use
-  `request-credential` / `--replace`. A backend without the `set_meta` capability shows the forms disabled.
+- **Values** (a card at the top of the edit page): one row per variable with where its value lives (the item's own
+  value, a field, or a field and key). Values are not in the page; they appear only when the human asks:
+  - **Show** (`POST /credentials/<name>/reveal`, `var`): the page script asks for JSON (`Accept:
+    application/json`, reply `{"value": ...}`, `Cache-Control: no-store`) and puts it in a read-only text area (newlines kept) with
+    **Copy** and **Hide**; without the script the edit page re-renders with that one value in its box. A POST,
+    never a GET, so it is not prefetched or kept in browser history. At most 30 a minute per user. This is the
+    one place the broker puts a credential value on a page, on purpose, for the signed-in human (as the
+    Vaultwarden web UI does); agents still never receive one (no route on the agent port).
+  - **Replace the value** (`POST /credentials/<name>/value`, `var`, `value`): written with `keep_previous`, so
+    the old value is in the item's `previous_value` (one slot per item, as with `asb store --replace`). A
+    variable with a `key` changes only that key of its structured field. The value box is never filled back in.
+    A **Multi-line value** box (PEM, JSON; shown as you type) is used instead when it is not empty; its CRLF line
+    ends, as browsers send them, are stored as LF. Add has the same box. Every value box on the tab (Replace, Add, New credential) has the same **Show** toggle as the credential entry page.
+  - **Add a value** (`POST /credentials/<name>/value/add`, `var`, `value`, `confirm`, `old_sha`): a new hidden
+    custom field named like the variable and `vars[VAR] = {"field": VAR}` in the metadata, in one vault write
+    (`put(add_field=True)`). Needs the tick, because agents can then place that value on the credential's hosts.
+  - **Remove** (`POST /credentials/<name>/value/remove`, `var`, `old_sha`): drops the variable from the metadata
+    only; the vault field and its value stay. Not the last variable.
+  - Refusals are fixed messages: `unknown_var`, `ssh`, `internal`, `invalid` (the field is not structured),
+    `empty`, `too_large`, `bad_value` (control characters other than tab and newlines), `exists`,
+    `field_exists`, `invalid_name` (the loader's rule about the name), `adopted` (add/remove need the item's own
+    metadata: save it once), `needs_confirmation`, `conflict`, `last`, `unsupported`, `rate_limited`,
+    `vault_read`, `vault_write`.
+  - An SSH key's private key is never shown, replaced or added here (the public key is shown); use
+    `asb store --replace`. The broker's own summary key is not offered.
+- **Not here.** Creating an SSH key or a login with two values (use `request-credential` or `asb store`).
+  A backend without the `set_meta` capability shows the forms disabled (Show and Replace still work).
 - **Audit** (all hidden from the agent audit API; counts, closed labels and 64-character hashes only, never host
   names or values): `credentials_viewed`, `credential_changed` (`secret`, `user`, `peer`, `client_ip`,
   `changed_keys` count, `widened` labels, `old_sha256`, `new_sha256`), `credential_created` (`hosts` count,
@@ -621,7 +646,10 @@ Policies tab, and no route on the agent-facing port. Agents cannot reach it, and
   (`reason`: `invalid`, `needs_confirmation`, `conflict`, `rename`, `unsupported`, `exists`, `internal`,
   `adopted`, `bound`, `denied_by_name`, `confirm`) and `credential_change_failed` (`reason`: `vault_read`,
   `vault_write`), and `credential_fingerprint_fetched` (`result`: `ok`, `invalid`, `not_listed`, `destination`,
-  `rate_limited` or a failure label; `host_sha256`, the first 12 hex of the entry's sha256, never the host).
+  `rate_limited` or a failure label; `host_sha256`, the first 12 hex of the entry's sha256, never the host),
+  `credential_value_revealed` (`secret`, `var`), `credential_value_changed` and `credential_value_added`
+  (`secret`, `var`, `value_bytes`), `credential_value_removed` (`secret`, `var`) and
+  `credential_value_refused` (`action`: `reveal`, `replace`, `add`, `remove`; `reason`). Never a value.
 
 ## Policy, risk, discovery
 
@@ -2067,7 +2095,7 @@ Request (client API, agent key): `POST /v1/requests` with
 The card (dashboard, and the approval link the notification opens) shows the name, kind, purpose and the
 suggestions, and a **Review and enter value** button and **Deny**. The button opens `/credential/<id>`,
 a form with the name, allowed hosts, mode, variable name and the secret: one `type=password` field for a
-token, or a plain text username plus a `type=password` password for a login (the username is cleared on a form error, like the secrets). It is a separate page because the dashboard refreshes itself
+token, or a plain text username plus a `type=password` password for a login (the username is cleared on a form error, like the secrets). Each secret box has a **Show** button that switches it to plain text while you type, so you can check what you pasted (only in the browser; nothing is sent until you submit, and it switches back on submit). It is a separate page because the dashboard refreshes itself
 and must never hold a half-typed secret. **Store credential** posts to `/credential` on the approval
 listener only, with the per-user CSRF token and the same-origin check.
 
@@ -3294,6 +3322,11 @@ ignored) and an injectable `dest_guard=` argument of `Broker`.
   needs you to match the code. An attacker who can race a pending enrollment gains nothing unless
   you approve a card you did not start. Rate limits are per socket address, so behind a proxy they
   are global. Until `legacy_client_key` is `deny`, anyone with the old shared key still works.
+- **The Credentials tab shows values to you.** Anyone signed in to the approval site as the allowed user can
+  press Show and read a credential's value, as in the Vaultwarden web UI; each view is in the audit log (by name,
+  never the value). The approval site is as sensitive as the vault itself: keep its SSO behind a strong second
+  factor, and do not leave it open on a shared screen. Agents still have no path to a value: the routes exist
+  only on the approval port, behind SSO, the CSRF cookie and the Origin check.
 - **Plans** are one human approval for a deterministic list of calls with an absolute deadline; they do not
   stop what an approved call does at the target. See [Plans](#plans-task-scoped-grants-for-unattended-jobs).
 - **HTTP sessions are standing permissions.** Approving a session lets that client make any call inside its hosts,

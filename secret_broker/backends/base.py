@@ -116,6 +116,14 @@ META_FIELD = "broker"
 PREVIOUS_FIELDS = ("previous_value", "previous_replaced_at")
 RESERVED_FIELDS = (META_FIELD,) + PREVIOUS_FIELDS
 AUTO_ALIASES = (None, "", "auto")
+# An item's own built-in fields: `put(add_field=True)` never creates one of these (they exist by item kind).
+BUILTIN_FIELDS = ("notes", "password", "username", "private_key", "public_key", "uri", "uris", "name")
+
+
+def check_new_field(field):
+    """BackendInvalid unless `field` may be added as a new custom field (`put(add_field=True)`)."""
+    if field in AUTO_ALIASES or field in BUILTIN_FIELDS or field in RESERVED_FIELDS or not isinstance(field, str):
+        raise BackendInvalid(f"field {field!r} cannot be added")
 
 # -- capabilities ---------------------------------------------------------------
 CAP_SET_META = "set_meta"           # set_meta persists (policy edits, standing approvals...)
@@ -356,8 +364,8 @@ class VaultBackend(abc.ABC):
         """
 
     @abc.abstractmethod
-    def put(self, item, field, value, create=False, keep_previous=False, meta=None):
-        """Create an item, or replace one field of an existing item.
+    def put(self, item, field, value, create=False, keep_previous=False, meta=None, add_field=False):
+        """Create an item, or replace one field of an existing item, or add a field to one.
 
         create=True: make a new item holding `value` in `field` and (optionally)
         `meta`, in ONE atomic write. The field decides the kind: `password` makes a
@@ -371,6 +379,11 @@ class VaultBackend(abc.ABC):
         `broker` and the previous_* names are reserved: BackendInvalid.
         `value` must be a str (BackendInvalid otherwise). The value never
         appears in an error.
+        add_field=True (with create=False): add `field` as a new custom field
+        of the existing item (hidden where the store has the notion), with
+        `meta`, if given, in the same write. BackendConflict if the field is
+        already there; BackendInvalid for a built-in or reserved name
+        (`check_new_field`); BackendNotFound for a missing item.
         """
 
     @abc.abstractmethod
