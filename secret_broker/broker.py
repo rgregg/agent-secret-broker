@@ -1499,18 +1499,22 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                  peer=peer, client_ip=client_ip)
         return res()
 
-    def _value_meta_guard(self, name, old_sha, res):
-        """(stored metadata, refusal) for add/remove: needs set_meta, broker metadata of its own and the
-        metadata the human opened."""
+    def _value_precheck(self, name, res):
+        """The refusal for add/remove that needs no vault read, or None. Called WITHOUT _cfg_lock held:
+        is_internal_secret takes that lock itself (a plain Lock, so taking it twice deadlocks)."""
         sc = self.cfg["secrets"][name]
         if self.is_internal_secret(name):
-            return None, res("internal")
+            return res("internal")
         if sc.get("ssh"):
-            return None, res("ssh")
+            return res("ssh")
         if backend_base.CAP_SET_META not in self.backend.capabilities:
-            return None, res("unsupported")
+            return res("unsupported")
         if sc.get("auto"):
-            return None, res("adopted")
+            return res("adopted")
+        return None
+
+    def _value_meta_guard(self, name, old_sha, res):
+        """(stored metadata, refusal) for add/remove, under _cfg_lock: the metadata the human opened."""
         try:
             stored = self.credential_stored_meta(name)
         except (OSError, ValueError, KeyError, BackendError):
@@ -1526,6 +1530,9 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         res = functools.partial(self._value_result, "add", name, user, peer, client_ip)
         if name not in self.cfg["secrets"]:
             raise ValueError("bad credential")
+        refusal = self._value_precheck(name, res)
+        if refusal:
+            return refusal
         with self._cfg_lock:
             stored, refusal = self._value_meta_guard(name, old_sha, res)
             if refusal:
@@ -1563,6 +1570,9 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         res = functools.partial(self._value_result, "remove", name, user, peer, client_ip)
         if name not in self.cfg["secrets"]:
             raise ValueError("bad credential")
+        refusal = self._value_precheck(name, res)
+        if refusal:
+            return refusal
         with self._cfg_lock:
             stored, refusal = self._value_meta_guard(name, old_sha, res)
             if refusal:
@@ -6829,6 +6839,8 @@ def approval_handler(broker):
             page re-renders from the vault, so nothing the human typed is echoed back."""
             who = dict(peer=self._ip, client_ip=self._fwd())
             var = one("var").strip()[:64]
+            # the multi-line box (a textarea) wins when filled; browsers send its line ends as CRLF
+            value = one("value_ml").replace("\r\n", "\n") if one("value_ml") else one("value")
             if action == "reveal":
                 res = broker.reveal_value(name, var, user, **who)
                 if "application/json" in (self.headers.get("Accept") or ""):
@@ -6839,10 +6851,10 @@ def approval_handler(broker):
                 if res["status"] == "ok":
                     return self._credential_edit(user, name, revealed=(var, res["value"]))
             elif action == "value":
-                res = broker.replace_value(name, var, one("value"), user, **who)
+                res = broker.replace_value(name, var, value, user, **who)
                 flash = f"Value replaced: {var}"
             elif action == "value/add":
-                res = broker.add_value(name, var, one("value"), one("old_sha"), user,
+                res = broker.add_value(name, var, value, one("old_sha"), user,
                                        confirm=one("confirm") == "1", **who)
                 flash = f"Value added: {var}"
             else:

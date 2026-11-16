@@ -615,14 +615,16 @@ Policies tab, and no route on the agent-facing port. Agents cannot reach it, and
 - **Values** (a card at the top of the edit page): one row per variable with where its value lives (the item's own
   value, a field, or a field and key). Values are not in the page; they appear only when the human asks:
   - **Show** (`POST /credentials/<name>/reveal`, `var`): the page script asks for JSON (`Accept:
-    application/json`, reply `{"value": ...}`, `Cache-Control: no-store`) and puts it in a read-only box with
+    application/json`, reply `{"value": ...}`, `Cache-Control: no-store`) and puts it in a read-only text area (newlines kept) with
     **Copy** and **Hide**; without the script the edit page re-renders with that one value in its box. A POST,
     never a GET, so it is not prefetched or kept in browser history. At most 30 a minute per user. This is the
     one place the broker puts a credential value on a page, on purpose, for the signed-in human (as the
     Vaultwarden web UI does); agents still never receive one (no route on the agent port).
   - **Replace the value** (`POST /credentials/<name>/value`, `var`, `value`): written with `keep_previous`, so
     the old value is in the item's `previous_value` (one slot per item, as with `asb store --replace`). A
-    variable with a `key` changes only that key of its structured field. The value box is never filled back in. Every value box on the tab (Replace, Add, New credential) has the same **Show** toggle as the credential entry page.
+    variable with a `key` changes only that key of its structured field. The value box is never filled back in.
+    A **Multi-line value** box (PEM, JSON; shown as you type) is used instead when it is not empty; its CRLF line
+    ends, as browsers send them, are stored as LF. Add has the same box. Every value box on the tab (Replace, Add, New credential) has the same **Show** toggle as the credential entry page.
   - **Add a value** (`POST /credentials/<name>/value/add`, `var`, `value`, `confirm`, `old_sha`): a new hidden
     custom field named like the variable and `vars[VAR] = {"field": VAR}` in the metadata, in one vault write
     (`put(add_field=True)`). Needs the tick, because agents can then place that value on the credential's hosts.

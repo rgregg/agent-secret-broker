@@ -275,6 +275,10 @@ box-shadow:0 4px 18px #0002}
 border-radius:.5rem;background:var(--bg);color:var(--fg)}
 .vline form{display:contents}.vrow details{margin:.45rem 0 0}.vrow summary{font-weight:400;font-size:.85rem}
 .pubkey{font:.78rem ui-monospace,Menlo,monospace;overflow-wrap:anywhere}
+.vline textarea{flex:1 1 14rem;font:.85rem ui-monospace,Menlo,monospace;padding:.4rem .6rem;border:1px solid var(--line);
+border-radius:.5rem;background:var(--bg);color:var(--fg);resize:vertical}
+details.ml{flex:1 1 100%}details.ml textarea{width:100%;font:.85rem ui-monospace,Menlo,monospace;padding:.4rem .6rem;
+border:1px solid var(--line);border-radius:.5rem;background:var(--bg);color:var(--fg)}
 @media (max-width:42rem){.ctbl th.ic,.ctbl td.ic{text-align:left;width:100%}
  .ctbl td .vh{position:static;width:auto;height:auto;clip:auto;align-self:center;font-size:.85rem}
  .abar .btn,.abar button{flex:1 1 auto}}
@@ -430,12 +434,12 @@ JS = r"""
         headers:{'Accept':'application/json'},body:new URLSearchParams(new FormData(b.form))})
       .then(function(r){return r.json();}).then(function(d){
         if(d.value===undefined){alert(d.error||'Could not show the value');return;}
-        box.value=d.value;box.type='text';btn('copy',v).hidden=false;btn('hide',v).hidden=false;b.hidden=true;
+        box.value=d.value;box.rows=Math.min(12,d.value.replace(/\n+$/,'').split('\n').length);btn('copy',v).hidden=false;btn('hide',v).hidden=false;b.hidden=true;
       }).catch(function(){alert('Could not show the value');});
     });
   });
   [].forEach.call(document.querySelectorAll('[data-hide]'),function(b){b.addEventListener('click',function(){
-    var v=b.getAttribute('data-hide');document.getElementById('val-'+v).value='';b.hidden=true;
+    var v=b.getAttribute('data-hide'),bx=document.getElementById('val-'+v);bx.value='';bx.rows=1;b.hidden=true;
     btn('copy',v).hidden=true;var r=btn('reveal',v);if(r)r.hidden=false;});});
   [].forEach.call(document.querySelectorAll('[data-copy]'),function(b){b.addEventListener('click',function(){
     var v=b.getAttribute('data-copy'),box=document.getElementById('val-'+v);
@@ -520,10 +524,11 @@ def values_section(name, sc, token, sha, *, can_write, revealed=None):
     for var, ref in vars_.items():
         v = e(var)
         shown = revealed[1] if revealed and revealed[0] == var else None
-        box = (f"<input type=text readonly id='val-{v}' aria-label='Value of {v}' placeholder='hidden' "
-               f"autocomplete=off spellcheck=false value='{e(shown)}'>" if shown is not None else
-               f"<input type=text readonly id='val-{v}' aria-label='Value of {v}' placeholder='hidden' "
-               f"autocomplete=off spellcheck=false>")
+        # a textarea keeps a value's newlines (an <input> drops them); the newline right after <textarea> is
+        # the one the HTML parser discards, so a value that starts with a newline keeps it
+        nrows = min(12, (shown or "").rstrip("\n").count("\n") + 1)
+        box = (f"<textarea readonly id='val-{v}' aria-label='Value of {v}' rows={nrows} spellcheck=false "
+               f"placeholder='hidden'>\n{e(shown or '')}</textarea>")
         remove = ""
         if can_write and len(vars_) > 1 and not sc.get("auto"):
             remove = (f"<form method=post action='/credentials/{n}/value/remove' data-confirm='Remove {v} from "
@@ -543,7 +548,10 @@ def values_section(name, sc, token, sha, *, can_write, revealed=None):
             f"<input type=hidden name=var value='{v}'>"
             + peek.wrap(f"<input type=password name=value autocomplete=new-password aria-label='New value of {v}'"
                         f" placeholder='new value'>")
-            + f"<button type=submit class='btn sm'>Save value</button></form>"
+            + f"<button type=submit class='btn sm'>Save value</button>"
+            + f"<details class=ml><summary>Multi-line value (PEM, JSON)</summary><textarea name=value_ml rows=5 "
+               f"spellcheck=false autocomplete=off aria-label='Multi-line value'></textarea><p class=hint>Shown as "
+               f"you type. Used instead of the box above when it is not empty.</p></details>" + "</form>"
             f"<p class=hint>The old value is kept in the item's <code>previous_value</code>.</p></details></div>")
     add = ""
     if can_write and not sc.get("auto"):
@@ -552,7 +560,10 @@ def values_section(name, sc, token, sha, *, can_write, revealed=None):
                f"<input type=hidden name=old_sha value='{e(sha)}'>"
                f"<label>Variable name (letters, digits and _, like <code>API_SECRET</code>)</label>"
                f"<input type=text name=var maxlength=64 spellcheck=false>"
-               f"<label>Value</label>" + peek.wrap("<input type=password name=value autocomplete=new-password>") +
+               f"<label>Value</label>" + peek.wrap("<input type=password name=value autocomplete=new-password>")
+               + f"<details class=ml><summary>Multi-line value (PEM, JSON)</summary><textarea name=value_ml rows=5 "
+               f"spellcheck=false autocomplete=off aria-label='Multi-line value'></textarea><p class=hint>Shown as "
+               f"you type. Used instead of the box above when it is not empty.</p></details>" +
                f"<label style='font-weight:400'><input type=checkbox name=confirm value=1> I understand agents can "
                f"use this value on this credential's hosts</label>"
                f"<p class=hint>Stored in a new hidden field of the same vault item, named like the variable.</p>"

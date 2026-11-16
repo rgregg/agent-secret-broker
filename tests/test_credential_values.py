@@ -2,6 +2,7 @@
 import _fast  # noqa: F401  (test-only: prompt server shutdown, fake-clock helpers)
 import json
 import os
+import re
 import sys
 import unittest
 from unittest import mock
@@ -56,6 +57,20 @@ class Base(ed.Base):
         self.assertIn("credential_value", text)                          # positive control: events were written
         for v in (t.SECRET, NEW_VALUE, EXTRA, MULTI_ID, MULTI_SEC):
             self.assertNotIn(v, text)
+
+    def raw_post(self, path, accept=None, csrf=True, user="alice", **form):
+        if csrf:
+            form["csrf"] = self.broker.csrf_token("alice")
+        hdr = {"X-authentik-username": user}
+        if accept:
+            hdr["Accept"] = accept
+        r = t.urllib.request.Request(self.abase + path, data=ed.urllib.parse.urlencode(form).encode(),
+                                     headers=hdr, method="POST")
+        try:
+            with t.urllib.request.urlopen(r, timeout=10) as resp:
+                return resp.status, dict(resp.headers), resp.read().decode()
+        except t.urllib.error.HTTPError as e:
+            return e.code, dict(e.headers), e.read().decode()
 
     def sha(self, name):
         return crededitor.digest(self.broker.credential_stored_meta(name))
@@ -178,12 +193,6 @@ class Add(Base):
         r = self.broker.add_value("sshk", "X", EXTRA, self.sha("sshk"), "alice", confirm=True)
         self.assertEqual(r["reason"], "ssh")
 
-    def test_adopted_item_is_refused(self):
-        self.broker.cfg["secrets"]["svc"]["auto"] = True
-        r = self.broker.add_value("svc", "SVC_EXTRA", EXTRA, self.sha("svc"), "alice", confirm=True)
-        self.assertEqual(r["reason"], "adopted")
-        # an adopted item's values can still be shown and replaced
-        self.assertEqual(self.broker.reveal_value("svc", "SVC_TOKEN", "alice")["value"], t.SECRET)
 
 
 class Remove(Base):
@@ -214,26 +223,8 @@ class Hidden(unittest.TestCase):
             self.assertIsNone(audit_api.redact({"seq": 1, "ts": 1.0, "event": ev, "secret": "svc", "var": "V"}))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class Pages(Base):
     """The Values card and its routes on the approval site."""
-
-    def raw_post(self, path, accept=None, csrf=True, user="alice", **form):
-        if csrf:
-            form["csrf"] = self.broker.csrf_token("alice")
-        hdr = {"X-authentik-username": user}
-        if accept:
-            hdr["Accept"] = accept
-        r = t.urllib.request.Request(self.abase + path, data=ed.urllib.parse.urlencode(form).encode(),
-                                     headers=hdr, method="POST")
-        try:
-            with t.urllib.request.urlopen(r, timeout=10) as resp:
-                return resp.status, dict(resp.headers), resp.read().decode()
-        except t.urllib.error.HTTPError as e:
-            return e.code, dict(e.headers), e.read().decode()
 
     def test_the_edit_page_lists_variables_and_holds_no_value(self):
         code, body = self.get("/credentials/multi")
@@ -260,10 +251,9 @@ class Pages(Base):
         code, hdr, body = self.raw_post("/credentials/multi/reveal", var="M_ID")
         self.assertEqual(code, 200)
         self.assertEqual(hdr["Cache-Control"], "no-store")
-        esc = "value='S3CR3T-&#x27;&lt;b&gt;x&lt;/b&gt;&lt;/script&gt;'"
+        esc = "S3CR3T-&#x27;&lt;b&gt;x&lt;/b&gt;&lt;/script&gt;"
         self.assertEqual(body.count(esc), 1)                             # in one box: M_ID's
-        self.assertIn("id='val-M_ID' aria-label='Value of M_ID' placeholder='hidden' autocomplete=off "
-                      "spellcheck=false " + esc, body)
+        self.assertRegex(body, r"<textarea readonly id='val-M_ID' [^>]*>\n" + re.escape(esc) + "</textarea>")
         self.assertNotIn(tricky, body)
         self.assertNotIn(MULTI_SEC, body)                                # only the one asked for
 
@@ -342,3 +332,123 @@ class Peek(Base):
         out = peek.wrap("<input type=password name=x>")
         self.assertTrue(out.startswith("<span class=peek><input type=password name=x><button type=button"))
         self.assertNotIn("value=", out)
+
+
+class WithASummaryKey(Base):
+    """A summary key provider is configured (the normal production setup): is_internal_secret takes the
+    catalog lock, so a value action must not call it while holding that lock."""
+
+    def setUp(self):
+        super().setUp()
+        import types
+        self.broker.summarizer = types.SimpleNamespace(key_providers=[types.SimpleNamespace(name="multi")])
+        self.assertTrue(self.broker.is_internal_secret("multi"))          # premise: real lookup, not a mock
+
+    def run_bounded(self, fn):
+        import threading
+        out = {}
+        th = threading.Thread(target=lambda: out.setdefault("r", fn()), daemon=True)
+        th.start()
+        th.join(10)                                                      # returns at once unless it deadlocks
+        self.assertFalse(th.is_alive(), "the value action deadlocked on the catalog lock")
+        self.assertFalse(self.broker._cfg_lock.locked())
+        return out["r"]
+
+    def test_add_and_remove_finish_and_work(self):
+        r = self.run_bounded(lambda: self.broker.add_value("svc", "SVC_EXTRA", EXTRA, self.sha("svc"), "alice",
+                                                           confirm=True))
+        self.assertEqual(r["status"], "ok")
+        self.assertEqual(self.vault("Svc", "SVC_EXTRA"), EXTRA)
+        r = self.run_bounded(lambda: self.broker.remove_value("svc", "SVC_EXTRA", self.sha("svc"), "alice"))
+        self.assertEqual(r["status"], "ok")
+        self.assertNotIn("SVC_EXTRA", self.stored()["vars"])
+
+    def test_the_internal_key_itself_is_refused_for_every_action(self):
+        sha = self.sha("multi")
+        self.assertEqual(self.run_bounded(lambda: self.broker.reveal_value("multi", "M_ID", "alice"))["reason"],
+                         "internal")
+        self.assertEqual(self.run_bounded(lambda: self.broker.replace_value("multi", "M_ID", NEW_VALUE,
+                                                                            "alice"))["reason"], "internal")
+        self.assertEqual(self.run_bounded(lambda: self.broker.add_value("multi", "M_X", EXTRA, sha, "alice",
+                                                                        confirm=True))["reason"], "internal")
+        self.assertEqual(self.run_bounded(lambda: self.broker.remove_value("multi", "M_ID", sha,
+                                                                           "alice"))["reason"], "internal")
+        self.assertEqual(json.loads(self.vault("Multi", "notes")), {"ID": MULTI_ID, "SECRET": MULTI_SEC})
+
+
+class MultiLine(Base):
+    PEM = "-----BEGIN KEY-----\nS3CR3T-line-one\nS3CR3T-line-two\n-----END KEY-----\n"
+
+    def test_reveal_keeps_newlines_in_both_paths(self):
+        self.broker.backend.put("Svc", "token", self.PEM)
+        code, _, body = self.raw_post("/credentials/svc/reveal", accept="application/json", var="SVC_TOKEN")
+        self.assertEqual(json.loads(body)["value"], self.PEM)
+        code, _, body = self.raw_post("/credentials/svc/reveal", var="SVC_TOKEN")
+        self.assertEqual(code, 200)
+        # a textarea, with the leading newline the HTML parser drops, so the value's own first line survives
+        self.assertIn("rows=4 spellcheck=false placeholder='hidden'>\n-----BEGIN KEY-----\nS3CR3T-line-one\n", body)
+
+    def test_replace_and_add_take_a_multi_line_value_with_lf_line_ends(self):
+        crlf = self.PEM.replace("\n", "\r\n")                           # what a browser submits from a textarea
+        code, _, body = self.raw_post("/credentials/svc/value", var="SVC_TOKEN", value="", value_ml=crlf)
+        self.assertEqual(code, 200)
+        self.assertNotIn("S3CR3T-line-one", body)
+        self.assertEqual(self.vault("Svc", "token"), self.PEM)            # LF line ends, nothing else changed
+        code, _, _ = self.raw_post("/credentials/svc/value/add", var="SVC_PEM", value="", value_ml=crlf,
+                                   old_sha=self.sha("svc"), confirm="1")
+        self.assertEqual(code, 200)
+        self.assertEqual(self.vault("Svc", "SVC_PEM"), self.PEM)
+
+    def test_the_single_line_box_still_wins_when_the_multi_line_one_is_empty(self):
+        code, _, _ = self.raw_post("/credentials/svc/value", var="SVC_TOKEN", value=NEW_VALUE, value_ml="")
+        self.assertEqual(code, 200)
+        self.assertEqual(self.vault("Svc", "token"), NEW_VALUE)
+
+    def test_the_page_offers_the_multi_line_box(self):
+        code, body = self.get("/credentials/svc")
+        self.assertEqual(body.count("<textarea name=value_ml"), 2)       # Replace and Add
+
+
+class Adopted(unittest.TestCase):
+    """A vault item with no `broker` field, adopted with defaults (a real one: the memory backend adopts)."""
+
+    def setUp(self):
+        import tempfile
+        from secret_broker.backends import MemoryBackend
+        from secret_broker.broker import Broker
+        from secret_broker.notify import FakeNotifier
+        self.b = MemoryBackend()
+        self.b.put("Plain Note", "notes", t.SECRET, create=True)
+        self.broker = Broker({"approve_base_url": "https://s.example"}, self.b, FakeNotifier(),
+                             os.path.join(tempfile.mkdtemp(), "audit.jsonl"))
+        self.broker.refresh_catalog(fresh=True)
+        sc = self.broker.cfg["secrets"]["plain-note"]
+        self.assertTrue(sc["auto"])                                       # premise: adopted, no metadata
+        self.assertIsNone(self.b.catalog()[0]["meta"])
+        self.sha = crededitor.digest(self.broker.credential_stored_meta("plain-note"))
+
+    def test_show_and_replace_work(self):
+        self.assertEqual(self.broker.reveal_value("plain-note", "PLAIN_NOTE_NOTE", "alice")["value"], t.SECRET)
+        self.assertEqual(self.broker.replace_value("plain-note", "PLAIN_NOTE_NOTE", NEW_VALUE, "alice")["status"], "ok")
+        self.assertEqual(self.b.get("Plain Note", "notes"), NEW_VALUE)
+
+    def test_add_and_remove_are_refused_and_write_no_metadata(self):
+        r = self.broker.add_value("plain-note", "EXTRA", EXTRA, self.sha, "alice", confirm=True)
+        self.assertEqual((r["status"], r["reason"]), ("refused", "adopted"))
+        r = self.broker.remove_value("plain-note", "PLAIN_NOTE_NOTE", self.sha, "alice")
+        self.assertEqual((r["status"], r["reason"]), ("refused", "adopted"))
+        self.assertIsNone(self.b.catalog()[0]["meta"])                    # still no metadata written
+        with self.assertRaises(BackendNotFound):
+            self.b.get("Plain Note", "EXTRA")
+
+    def test_replace_on_an_unstructured_key_field_is_invalid(self):
+        self.b.put("Plain Note", "notes", "not structured")
+        self.broker.cfg["secrets"]["plain-note"]["vars"]["K"] = {"item": "Plain Note", "field": "notes", "key": "X"}
+        r = self.broker.replace_value("plain-note", "K", NEW_VALUE, "alice")
+        self.assertEqual((r["status"], r["reason"], r["message"]), ("refused", "invalid",
+                                                                    self.broker._VALUE_TEXT["invalid"]))
+        self.assertEqual(self.b.get("Plain Note", "notes"), "not structured")
+
+
+if __name__ == "__main__":
+    unittest.main()
