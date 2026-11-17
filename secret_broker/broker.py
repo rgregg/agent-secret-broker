@@ -941,6 +941,10 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             if sp.get("replace"):
                 rec.setdefault("replace", True)
                 rec.setdefault("var", sp.get("var"))
+            if sp.get("ws_change"):         # whether it turns sessions on or off; never the setup's text
+                rec.setdefault("ws_change", "off" if sp["ws"] is None else "on")
+            elif sp.get("ws") is not None:
+                rec.setdefault("ws_proposed", True)
         elif req.mode == "plan":
             sp = req.spec       # counts, hashes and lengths only; never the task, description or any rule text
             rec.update(plan_id=req.plan_id, plan_rules=len(sp["rules"]), plan_tier=sp["tier"],
@@ -2136,6 +2140,11 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         name = names[0]
         if _UUID_RE.match(name):
             raise ValueError("secret name must be 1-41 chars of a-z 0-9 _ - ")
+        ws_change = spec.pop("ws_change", None)
+        if ws_change is not None and not isinstance(ws_change, bool):
+            raise ValueError("ws_change must be true or false")
+        if ws_change:
+            return self._validate_ws_change(name, spec)
         replace = spec.get("replace")
         if replace is not None and not isinstance(replace, bool):
             raise ValueError("replace must be true or false")
@@ -2164,9 +2173,15 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         for v in credreq_mod.default_vars(name, kind, var).values():
             if not _VAR_RE.match(v) or _DANGEROUS_VAR_RE.match(v):
                 raise ValueError("variable must look like MY_TOKEN")
+        ws = None
+        if spec.get("ws") is not None:      # the agent's proposal; the human opts in on the entry page
+            ws = credreq_mod.ws_proposal(spec["ws"])
+            if not hosts:
+                raise ValueError("ws only applies to an http credential with allowed_hosts")
+            ws_mod.parse_cred_config(ws, list(credreq_mod.default_vars(name, kind, var).values()))
         spec.clear()
         spec.update(kind=kind, cred_mode=mode, purpose=purpose,
-                    hosts=sorted(set(h.lower() for h in hosts)), var=var)
+                    hosts=sorted(set(h.lower() for h in hosts)), var=var, ws=ws)
 
     def _validate_replacement(self, name, spec):
         """An agent's request for a NEW VALUE of an existing credential (it expired, was revoked or
@@ -2174,7 +2189,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         update it changes one value and nothing else: the item, field and key come from the
         credential's own metadata, never from the request, and the allowed hosts and approval policy
         are not touched. The human types the value on the approval page, as for a new credential."""
-        if any(spec.get(k) not in (None, [], "") for k in ("kind", "hosts", "cred_mode")):
+        if any(spec.get(k) not in (None, [], "") for k in ("kind", "hosts", "cred_mode", "ws")):
             raise ValueError("a replacement takes only a purpose and, for a credential with several "
                              "variables, var: the hosts, kind and mode stay as they are")
         secrets_cfg = self.cfg["secrets"]
@@ -2203,6 +2218,40 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         spec.update(replace=True, kind="token", cred_mode=None, purpose=purpose, var=var,
                     hosts=list(sc.get("allowed_hosts") or []), item=ref["item"],
                     field=ref.get("field") or "auto", key=ref.get("key"))
+
+    def _validate_ws_change(self, name, spec):
+        """An agent's proposal to set (or remove, `ws: null`) the WebSocket setup of an existing credential. It
+        changes nothing until the human approves it on the approval page; the proposal must pass the catalog's
+        own validator now, so the human is never asked about something that cannot be saved."""
+        if any(spec.get(k) not in (None, [], "", False) for k in ("kind", "hosts", "cred_mode", "var", "replace")):
+            raise ValueError("a WebSocket setup change takes only a purpose and ws: the hosts, kind, mode and "
+                             "variables stay as they are")
+        secrets_cfg = self.cfg["secrets"]
+        if name not in secrets_cfg or name in self._internal_secrets()[0]:
+            raise ValueError("unknown secret name")
+        sc = secrets_cfg[name]
+        if sc.get("ssh") or not sc.get("allowed_hosts"):
+            raise ValueError("ws only applies to an http credential with allowed_hosts")
+        if backend_base.CAP_SET_META not in self.backend.capabilities:
+            raise ValueError("this vault backend cannot store metadata, so a WebSocket setup cannot be changed")
+        purpose = credreq_mod.validate_purpose(spec.get("purpose"))
+        ws = None if spec.get("ws") in (None, "off") else credreq_mod.ws_proposal(spec["ws"])
+        before = sc["_meta"].get("ws")
+        if ws == before:
+            raise ValueError(f"{name} already has this WebSocket setup")
+        meta = {k: v for k, v in sc["_meta"].items() if k != "ws"}
+        if ws is not None:
+            meta["ws"] = ws
+        self._entry(sc["_item"], meta)      # ValueError (the loader's fixed text) for a setup it would reject
+        ref = next(iter(sc["vars"].values()))
+        try:
+            meta_sha = crededitor_mod.digest(self.credential_stored_meta(name))   # what the card shows, exactly
+        except (OSError, ValueError, KeyError, BackendError):
+            raise ValueError("could not read the vault; try again") from None
+        spec.clear()
+        spec.update(ws_change=True, kind="ws", cred_mode=None, purpose=purpose, ws=ws, ws_before=before,
+                    hosts=list(sc["allowed_hosts"]), item=sc["_item"], field=ref.get("field") or "auto",
+                    meta_sha=meta_sha)
 
     def _credential_pending(self, req):
         """Hand a validated request to the human. High by code with no model call, never
@@ -2251,6 +2300,10 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         one = lambda k: form.get(k) if isinstance(form.get(k), str) else ""  # noqa: E731
         if sp.get("replace"):
             return self._replacement_check(req, one)
+        if sp.get("ws_change"):         # nothing to enter: approving the shown change is the whole decision
+            return ({"ws_change": True, "name": req.names[0], "item": sp["item"], "field": sp["field"],
+                     "ws": sp["ws"], "ws_before": sp["ws_before"], "hosts": sp["hosts"],
+                     "meta_sha": sp["meta_sha"]}, {}, [], {})
         name = one("name").strip()
         if not _NAME_RE.match(name) or _UUID_RE.match(name):
             errs.append("name must be 1-41 chars of a-z 0-9 _ -")
@@ -2319,6 +2372,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         final = {"name": name, "item": item, "field": "notes", "kind": kind, "cred_mode": mode,
                  "hosts": hosts, "no_hosts": bool(no_hosts and not hosts), "vars": vars_,
                  "var_input": var,
+                 "ws": sp.get("ws") if one("allow_ws") == "1" else None,
                  "real_login": kind == "login" and backend_base.CAP_CREATE_LOGIN in self.backend.capabilities}
         if not errs:
             # dry-run the metadata exactly as the catalog will read it back
@@ -2327,7 +2381,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             except ValueError as e:
                 errs.append(str(e)[:160])
         values = {"name": name, "hosts": ", ".join(hosts), "var": one("var").strip(),
-                  "cred_mode": mode, "no_hosts": "1" if no_hosts else ""}
+                  "cred_mode": mode, "no_hosts": "1" if no_hosts else "", "allow_ws": one("allow_ws") == "1"}
         return final, secret, errs, values
 
     def _replacement_check(self, req, one):
@@ -2355,8 +2409,11 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             vars_ = {v: {"field": field, "key": role} for role, v in final["vars"].items()}
         else:
             vars_ = {v: {"field": field} for v in final["vars"].values()}
-        return {"name": final["name"], "vars": vars_, "allowed_hosts": final["hosts"], "approval": "prompt",
+        meta = {"name": final["name"], "vars": vars_, "allowed_hosts": final["hosts"], "approval": "prompt",
                 "created": {"by": by, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}}
+        if final.get("ws") is not None:     # the agent proposed it and the human ticked the box
+            meta["ws"] = final["ws"]
+        return meta
 
     def submit_credential(self, rid, form, actor, *, peer=None, client_ip=None):
         """The human pressed Store. Validates the submission and, only if it is complete and
@@ -2671,6 +2728,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             what = f"Guidance change proposed for {k} credential{'' if k == 1 else 's'}"
         elif req.mode == "credential":
             what = (f"Credential replacement requested: {req.names[0]}" if req.spec.get("replace")
+                    else f"WebSocket setup change requested: {req.names[0]}" if req.spec.get("ws_change")
                     else f"Credential requested: {req.names[0]}")
         elif req.mode == "plan":
             k = len(req.spec["rules"])
@@ -2706,6 +2764,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         elif req.mode == "credential":  # name only: no purpose (untrusted agent text), never a value
             msg = f"{what}\nFrom {req.source}. Open the approval page to enter the value or deny."
             title = ("Credential replacement requested [HIGH]" if req.spec.get("replace")
+                     else "WebSocket setup change requested [HIGH]" if req.spec.get("ws_change")
                      else "Credential requested [HIGH]")
         elif req.mode == "plan":        # names only: never the task, description or any rule text
             msg = f"{what}\nOpen the approval page to read the plan and approve or deny it."
@@ -4017,6 +4076,8 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         fin, sec = req.spec["final"], req.spec["secret"]
         if fin.get("replace"):
             return self._credential_replace(req, fin, sec, who)
+        if fin.get("ws_change"):
+            return self._credential_ws_apply(req, fin, who)
         name = fin["name"]
         by = req.approver or "unknown"
         t0 = time.time()
@@ -4031,7 +4092,8 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                        k for k, same in (("name", name == req.names[0]),
                                          ("hosts", fin["hosts"] == req.spec.get("hosts")),
                                          ("cred_mode", fin["cred_mode"] == req.spec["cred_mode"])) if not same),
-                   value_bytes=len(value.encode()), **{k: v for k, v in who.items() if k == "channel"})
+                   value_bytes=len(value.encode()), ws=fin.get("ws") is not None,
+                   **{k: v for k, v in who.items() if k == "channel"})
         if fin.get("real_login"):
             # the allowed hosts are the Login's websites, so they show (and can be edited) in a vault client
             self.backend.create_login(fin["item"], sec["username"], sec["password"],
@@ -4046,6 +4108,30 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         self.audit("stored", req, op="create", item=fin["item"], field=fin["field"], hosts=fin["hosts"],
                    value_bytes=len(value.encode()), duration_ms=int((time.time() - t0) * 1000))
         return {"stored": {"name": name, "op": "create", "item": fin["item"], "field": fin["field"]}}
+
+    def _credential_ws_apply(self, req, fin, who):
+        """Apply an approved WebSocket setup change through the Credentials editor's own save (one validator,
+        the same audit event, vault first). It runs only if the credential's whole metadata is still what it was
+        when the card was made (its hash, taken then): a change to its hosts, item or anything else meanwhile
+        fails the request, so the human never approves a setup for a credential they did not see."""
+        name, by = fin["name"], req.approver or "unknown"
+        t0 = time.time()
+        moved = "the credential changed since this was requested; ask again"
+        if name not in self.cfg["secrets"] or name in self._internal_secrets()[0]:
+            raise BackendError(moved)
+        current = self.credential_stored_meta(name)
+        if crededitor_mod.digest(current) != fin["meta_sha"] or current.get("ws") != fin["ws_before"]:
+            raise BackendError(moved)
+        new = {k: v for k, v in current.items() if k != "ws"}
+        if fin["ws"] is not None:
+            new["ws"] = fin["ws"]
+        r = self.set_credential_meta(name, new, fin["meta_sha"], by, confirm_widen=True,
+                                     peer=who.get("approver_peer"), client_ip=who.get("approver_ip"))
+        if r["status"] != "saved":
+            raise BackendError(moved if r["status"] == "conflict" else "could not save the WebSocket setup")
+        self.audit("stored", req, op="ws", item=fin["item"], field=fin["field"], hosts=fin["hosts"],
+                   duration_ms=int((time.time() - t0) * 1000))
+        return {"stored": {"name": name, "op": "ws", "item": fin["item"], "field": fin["field"]}}
 
     def _credential_replace(self, req, fin, sec, who):
         """Write the human's new value over ONE existing value, as an approved update does: the old
@@ -6136,7 +6222,8 @@ def client_handler(broker, client_key):
                                          "it on the approval page")
                     spec = {"kind": body.get("kind"), "purpose": body.get("purpose"),
                             "hosts": body.get("hosts"), "var": body.get("var"),
-                            "cred_mode": body.get("cred_mode"), "replace": body.get("replace")}
+                            "cred_mode": body.get("cred_mode"), "replace": body.get("replace"),
+                            "ws": body.get("ws"), "ws_change": body.get("ws_change")}
                 elif mode == "sudo":
                     if body.get("names"):
                         raise ValueError("a sudo request names no credential")
@@ -6678,7 +6765,7 @@ def approval_handler(broker):
                 return _page(self, 200, "<h1>Denied</h1><p>Nothing was stored.</p>", tab="requests",
                              badge=broker.attention(), user=user)
             one = {k: v[0] for k, v in form.items() if k in (
-                "name", "hosts", "cred_mode", "no_hosts", "var", "token", "username", "password")}
+                "name", "hosts", "cred_mode", "no_hosts", "var", "token", "username", "password", "allow_ws")}
             code, done, errs, values = broker.submit_credential(rid, one, user, peer=peer, client_ip=fwd)
             one.clear()
             form.pop("token", None)
@@ -6692,6 +6779,10 @@ def approval_handler(broker):
                              badge=broker.attention(), user=user)
             done.done.wait(15)          # the vault write runs in the background; say how it ended
             if done.status in ("approved", "released"):
+                if done.spec.get("ws_change"):
+                    return _page(self, 200, f"<h1>Saved</h1><p>The WebSocket setup of <b>{html.escape(done.names[0])}"
+                                 "</b> was changed. You can close this page.</p>", tab="requests",
+                                 badge=broker.attention(), user=user)
                 return _page(self, 200, f"<h1>Stored</h1><p>The credential <b>{html.escape(done.names[0])}</b> "
                              "is in the vault. The agent was told only its name. You can close this page.</p>",
                              tab="requests", badge=broker.attention(), user=user)

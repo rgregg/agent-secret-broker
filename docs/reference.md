@@ -2068,7 +2068,7 @@ context. A credential request removes that step: the agent says it needs a crede
 name.
 
     asb request-credential NAME --kind token|login --for "what it is for" \
-        [--host H[,H]]... [--var VAR] [--mode http|env]
+        [--host H[,H]]... [--var VAR] [--mode http|env] [--ws SETUP]
 
 Request (client API, agent key): `POST /v1/requests` with
 
@@ -2123,6 +2123,40 @@ for it, the same way as for a new credential:
 - Result: `{"status": "approved", "stored": {"name", "op": "replace", "item", "field"}}`; `asb` prints
   `replaced: NAME`. Audit: `requested` carries `replace: true` and `var`; `credential_provided` and `stored`
   (`op: replace`) record names and the value size only, never the value or the purpose.
+
+### Proposing a WebSocket setup
+
+A credential opens WebSocket sessions only with a `ws` setting
+([WebSocket sessions](#websocket-sessions-the-broker-holds-the-connection)). The agent may **propose** one;
+only the human's decision on the approval page applies it.
+
+    asb request-credential NAME --kind token --host H --for "..." --ws home-assistant|FILE   # with a new credential
+    asb request-credential NAME --ws home-assistant|FILE|off --for "..."                    # for an existing one
+
+`home-assistant` is the preset (`{"handshake": "home-assistant"}`); FILE holds the whole `ws` object; `off`
+(JSON `null`) removes it. Request bodies: `"ws": <object or "home-assistant">` on a new-credential request, and
+`{"mode": "credential", "names": [NAME], "ws_change": true, "ws": <object, "home-assistant" or null>,
+"purpose": "..."}` for an existing credential.
+
+- **Validated before anyone is asked**, by the catalog's own rules (`wssessions.parse_cred_config` and
+  `Broker._entry`): a setup the loader would reject is refused (400) with its fixed message. At most 4096
+  characters of JSON. A setup needs allowed hosts and is refused for an SSH key or the broker's own key.
+  Proposing the setup a credential already has is refused.
+- **With a new credential**, the entry page shows the setup and its blocked message types and has an
+  "Also allow WebSocket sessions" box that **starts unticked**: without the tick the credential is stored
+  without `ws`. With it, the dry run of the new metadata includes `ws`, so a setup naming a variable the
+  human renamed on the form is caught there (422, nothing stored).
+- **For an existing credential** it is its own card ("WebSocket setup change requested [HIGH]"): the page
+  shows the setup now and proposed, the purpose as the agent's unverified claim, and **Apply this setup** /
+  **Deny**; there is nothing to type. It takes only `purpose` and `ws` (`kind`, `hosts`, `cred_mode`, `var` or
+  `replace` are refused). Applying goes through the Credentials editor's save (`set_credential_meta`, so the
+  same validator and the `credential_changed` event with its `ws_enabled`/`ws_changed` label); it runs only
+  if the credential's `ws` is still what the page showed as "now", and fails the request otherwise. `asb`
+  prints `ws updated: NAME`.
+- Like every credential request: always high, never auto-approved, decided only on the approval page. A
+  setup that blocks no message types is shown in red. The audit log records only whether a setup was
+  proposed (`ws_proposed`), the change's direction (`ws_change`: `on`/`off`) and whether the new credential
+  got it (`credential_provided.ws`), never the setup's text.
 
 ### What the human sees and does
 
@@ -2619,8 +2653,9 @@ path and query it chose are shown escaped and labelled unverified, and are not i
 only: **what the agent sends once approved is not filtered** (no message-type allowlist). The session is the unit of
 approval; an optional per-credential allowlist could be added later without changing the protocol.
 
-**Operator setup (never agent input).** The Credentials tab's WebSocket card sets it (see
-[Editing credentials](#editing-credentials-the-credentials-tab)). A credential can open a WebSocket session only if its broker metadata has a `ws`
+**Setup (never agent input without the human).** The Credentials tab's WebSocket card sets it (see
+[Editing credentials](#editing-credentials-the-credentials-tab)); an agent can only propose one for the human to
+apply ([Proposing a WebSocket setup](#proposing-a-websocket-setup)). A credential can open a WebSocket session only if its broker metadata has a `ws`
 object (fail closed: with none, the open is refused). The credential also needs `allowed_hosts` as for http; the host and
 port of the URL must be allowed by the same rule as http (`ws` defaults to port 80, `wss` to 443; a bare name entry allows
 any port, `host:port` exactly that port). TLS follows the credential's `tls_fingerprint` / `tls_verify` as for http, otherwise

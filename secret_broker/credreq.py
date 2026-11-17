@@ -28,6 +28,7 @@ the card and entry-page HTML.
 """
 import hashlib
 import html
+import json
 import re
 import time
 
@@ -53,6 +54,10 @@ REPLACE_WARNING = ("The requesting agent asked for a new value for a credential 
                    "meant to replace it; this overwrites the current value in the vault. The agent never sees "
                    "the value you type.")
 # keys a client request must never carry: the value is entered by the human, on the approval page
+MAX_WS_JSON = 4096              # characters of a proposed WebSocket setup, as JSON
+WS_WARNING = ("The requesting agent proposed this WebSocket setup. If you approve, an agent may then ask for a "
+              "WebSocket session on this credential (each one still needs your approval) and send any message "
+              "the setup does not block.")
 FORBIDDEN_KEYS = ("value", "secret", "token", "password", "username", "credential", "values", "data",
                   "field_values")
 _PURPOSE_BAD = re.compile(r"[\x00-\x1f\x7f]")
@@ -78,6 +83,39 @@ def parse_config(raw, field="credential_requests"):
     if not _int(out["ttl_s"]) or not TTL_MIN <= out["ttl_s"] <= TTL_MAX:
         raise ValueError(f"{field}.ttl_s must be a whole number of seconds from {TTL_MIN} to {TTL_MAX}")
     return out
+
+
+def ws_proposal(raw):
+    """An agent's proposed `ws` setting -> the object to store: the preset's name is short for its object.
+    ValueError (fixed text) for anything else; the catalog's own validator (wssessions.parse_cred_config)
+    checks the content."""
+    if raw == "home-assistant":
+        raw = {"handshake": "home-assistant"}
+    if not isinstance(raw, dict):
+        raise ValueError("ws must be home-assistant or a JSON object")
+    if len(json.dumps(raw)) > MAX_WS_JSON:
+        raise ValueError("the WebSocket setup is too long")
+    return raw
+
+
+def ws_html(ws):
+    """A WebSocket setup for the human: Off, the preset, or the whole object (escaped JSON, non-ASCII as
+    \\uXXXX), then the message types a session may not send, in red when there are none."""
+    if ws is None:
+        return "Off (no WebSocket sessions)"
+    e = html.escape
+    preset = ws == {"handshake": "home-assistant"}
+    head = ("Home Assistant preset" if isinstance(ws.get("handshake"), str) and ws["handshake"] == "home-assistant"
+            else "Custom setup")
+    body = "" if preset else f"<pre class=crws>{e(json.dumps(ws, indent=2, sort_keys=True))}</pre>"
+    from . import crededitor        # here, not at the top: crededitor -> wssessions -> sessions -> credreq
+    blocked = crededitor.ws_blocked(ws)
+    if blocked:
+        body += (f"<div>Blocked message types ({len(blocked)}): "
+                 + " ".join(f"<code>{_esc(b)}</code>" for b in blocked) + "</div>")
+    else:
+        body += "<div class=crerr>No message types are blocked: a session may send anything.</div>"
+    return f"<b>{head}</b>{body}"
 
 
 def validate_purpose(raw):
@@ -114,6 +152,7 @@ def default_vars(name, kind, var=None):
 # ---------------------------------------------------------------- html
 CSS = """
 .cr{margin:.6rem 0}
+.crws{white-space:pre-wrap;word-break:break-word;font-size:.8rem;max-height:16rem;overflow:auto;margin:.3rem 0}
 .cr label{display:block;font-weight:600;font-size:.85rem;margin:.7rem 0 .2rem}
 .cr input[type=text],.cr input[type=password],.cr select{font:inherit;width:100%;min-height:2.5rem;padding:.3rem .6rem;
 border-radius:.5rem;border:1px solid var(--line);background:var(--card);color:var(--fg)}
@@ -143,6 +182,14 @@ def describe_html(req):
     """(what_html, note_html) for the card header: name, kind, purpose, suggestions. The
     purpose is shown escaped and marked as the agent's claim."""
     sp, e = req.spec, html.escape
+    if sp.get("ws_change"):
+        na = guidance_mod.non_ascii_count(sp["purpose"])
+        flag = (f" <span class='pill warn'>Non-ASCII characters: {na} (shown as U+XXXX)</span>" if na else "")
+        return (f"<b>WebSocket setup change</b> for the existing credential {e(req.names[0])}<br>"
+                f"Purpose, as the agent put it (unverified):<div class=crpurpose>{_esc(sp['purpose'])}</div>{flag}"
+                f"<div>Now: {ws_html(sp['ws_before'])}</div><div>Proposed: {ws_html(sp['ws'])}</div>"
+                f"Stays as it is: the value, allowed hosts ({e(', '.join(sp['hosts']))}) and approval policy.",
+                WS_WARNING)
     if sp.get("replace"):
         na = guidance_mod.non_ascii_count(sp["purpose"])
         flag = (f" <span class='pill warn'>Non-ASCII characters: {na} (shown as U+XXXX)</span>" if na else "")
@@ -157,6 +204,8 @@ def describe_html(req):
     what = (f"<b>Credential request</b>: {e(req.names[0])} ({e(sp['kind'])})<br>"
             f"Purpose, as the agent put it (unverified):<div class=crpurpose>{_esc(sp['purpose'])}</div>{flag}"
             f"Suggested hosts: {e(hosts)}<br>Suggested mode: {e(sp['cred_mode'])}")
+    if sp.get("ws") is not None:
+        what += f"<div>Proposed WebSocket setup: {ws_html(sp['ws'])}</div>"
     return what, WARNING
 
 
@@ -164,7 +213,8 @@ def card_actions_html(req):
     """The dashboard card controls: open the entry page, or Deny. No value field here (the
     dashboard refreshes itself and must never hold a half-typed secret)."""
     return (f"<div class=decide-row><a class='btn approve' href='/credential/{html.escape(req.id)}'>"
-            f"Review and enter {'new ' if req.spec.get('replace') else ''}value</a>"
+            + ("Review WebSocket setup" if req.spec.get("ws_change") else
+               f"Review and enter {'new ' if req.spec.get('replace') else ''}value") + "</a>"
             "<button class='btn deny' name=decision value=deny>Deny</button></div>"
             "<p class=scope><small class=muted>Nothing is stored unless you enter a value and press "
             "Store. No standing approval can cover a credential request.</small></p>")
@@ -177,8 +227,10 @@ def form_html(req, csrf, values=None, errors=()):
     sp, e = req.spec, html.escape
     if sp.get("replace"):
         return _replace_form_html(req, csrf, errors)
+    if sp.get("ws_change"):
+        return _ws_change_form_html(req, csrf)
     v = {"name": req.names[0], "hosts": ", ".join(sp.get("hosts") or []), "var": sp.get("var") or "",
-         "cred_mode": sp["cred_mode"], "no_hosts": ""}
+         "cred_mode": sp["cred_mode"], "no_hosts": "", "allow_ws": False}
     v.update(values or {})
     what, note = describe_html(req)
     errs = ""
@@ -229,6 +281,9 @@ def form_html(req, csrf, values=None, errors=()):
         f"<input id=var type=text name=var value='{e(v['var'])}' spellcheck=false autocapitalize=off "
         "placeholder='default from the name'>"
         f"<fieldset class=vault><legend>The secret ({e(kind)})</legend>{secret}</fieldset>"
+        + (f"<label class=chk><input type=checkbox name=allow_ws value=1{' checked' if v['allow_ws'] else ''}> "
+           "Also allow WebSocket sessions with the setup shown above (each session still asks you)</label>"
+           if sp.get("ws") is not None else "") +
         "<div class=crbtns><button class='btn approve' type=submit name=decision value=approve>"
         "Store credential</button>"
         "<button class='btn deny' type=submit name=decision value=deny formnovalidate>Deny</button></div>"
@@ -236,6 +291,25 @@ def form_html(req, csrf, values=None, errors=()):
         "<p><small class=muted>Stored with approval on every use: no standing approval, grant or Always "
         "applies to it unless you add one later under Policies. The value is sent only to this page's "
         "broker and is not logged.</small></p>")
+
+
+def _ws_change_form_html(req, csrf):
+    """The page for a WebSocket setup change: the request, now and proposed, and the two buttons. Nothing to
+    type: approving the change shown is the whole decision."""
+    e = html.escape
+    what, note = describe_html(req)
+    return (
+        "<h1>WebSocket setup change</h1>"
+        f"<div class=box>{clients_mod.from_html(req)}<br>{what}</div>"
+        f"<p><small>{e(note)}</small></p>"
+        f"<p><small>Expires in {max(0, int(req.expires - time.time()))}s</small></p>"
+        "<form method=post action='/credential' id=f class=cr>"
+        f"<input type=hidden name=id value='{e(req.id)}'>"
+        f"<input type=hidden name=csrf value='{e(csrf)}'>"
+        "<div class=crbtns><button class='btn approve' type=submit name=decision value=approve>"
+        "Apply this setup</button>"
+        "<button class='btn deny' type=submit name=decision value=deny formnovalidate>Deny</button></div>"
+        "</form>")
 
 
 def _replace_form_html(req, csrf, errors=()):

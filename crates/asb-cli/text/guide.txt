@@ -77,6 +77,8 @@ WebSocket sessions (a service that speaks WebSocket, e.g. Home Assistant's /api/
   The human approves ONE card (always high risk: it names the credential, host and port, time limit and
   caps); the broker opens the connection and signs in itself with the credential's handshake, so you never
   see the token. Prints the session id; `export ASB_WS_SESSION=ID` lets you leave the id off below.
+  "not set up for WebSocket sessions"? Propose a setup and let the human decide:
+    asb request-credential ha --ws home-assistant --for "why"   (or --ws FILE with the `ws` JSON object)
     asb ws send ID '{"id":1,"type":"get_states"}'     one text frame to the server
     asb ws recv ID --wait 5                           frames from the server, one per line (waits up to 25 s)
     printf '%s\n' '{"id":2,"type":"ping"}' | asb ws ID   line pipe: each stdin line is a frame, replies on stdout

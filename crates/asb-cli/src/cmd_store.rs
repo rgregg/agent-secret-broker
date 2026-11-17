@@ -106,6 +106,37 @@ pub fn store_or_update(argv: &[String]) -> R {
     Ok(0)
 }
 
+/// `--ws`: `home-assistant` (the preset), `off` (an existing credential only: JSON null) or a file holding the
+/// JSON object. A setup holds placeholders, never a value; the broker validates it before anyone is asked.
+fn read_ws_setup(arg: &str, new: bool) -> Result<Value, crate::exit::Die> {
+    if arg == "home-assistant" {
+        return Ok(json!(arg));
+    }
+    if arg == "off" {
+        if new {
+            return Err(die(
+                "--ws off applies to an existing credential (a new one starts without WebSocket sessions)",
+                USAGE,
+            ));
+        }
+        return Ok(Value::Null);
+    }
+    let text = std::fs::read_to_string(arg).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::InvalidData {
+            return die(format!("--ws: {arg} is not valid JSON"), USAGE); // not UTF-8, as Python reports it
+        }
+        let msg = e.to_string();
+        let msg = msg.split(" (os error").next().unwrap_or(&msg).to_string();
+        die(format!("--ws: cannot read {arg}: {msg}"), USAGE)
+    })?;
+    let ws: Value = serde_json::from_str(&text)
+        .map_err(|_| die(format!("--ws: {arg} is not valid JSON"), USAGE))?;
+    if !ws.is_object() {
+        return Err(die("--ws: the file must hold a JSON object", USAGE));
+    }
+    Ok(ws)
+}
+
 pub fn request_credential(argv: &[String]) -> R {
     let help = || crate::text_gen::help("request-credential").unwrap_or_default();
     if argv.is_empty() {
@@ -125,7 +156,9 @@ pub fn request_credential(argv: &[String]) -> R {
             i += 1;
             continue;
         }
-        if !["--kind", "--for", "--host", "--var", "--mode"].contains(&k) || i + 1 >= rest.len() {
+        if !["--kind", "--for", "--host", "--var", "--mode", "--ws"].contains(&k)
+            || i + 1 >= rest.len()
+        {
             return Err(die(
                 format!("unexpected argument {}\n{}", repr(k), help()),
                 USAGE,
@@ -155,6 +188,43 @@ pub fn request_credential(argv: &[String]) -> R {
     }
     if purpose.chars().count() > 300 {
         return Err(die("--for is limited to 300 characters", USAGE));
+    }
+    let mut ws: Option<Value> = None;
+    if let Some(arg) = get("--ws") {
+        if replace {
+            return Err(die(
+                format!(
+                    "--replace changes only the value: it takes no --ws\n{}",
+                    help()
+                ),
+                USAGE,
+            ));
+        }
+        let setup = read_ws_setup(arg, get("--kind").is_some())?;
+        if get("--kind").is_none() {
+            if !hosts.is_empty() || get("--mode").is_some() || get("--var").is_some() {
+                return Err(die(
+                    format!(
+                        "--ws for an existing credential takes only --for: its hosts, mode and variables stay\n{}",
+                        help()
+                    ),
+                    USAGE,
+                ));
+            }
+            let mut payload = Map::new();
+            payload.insert("mode".into(), json!("credential"));
+            payload.insert("names".into(), json!([argv[0]]));
+            payload.insert("ws_change".into(), json!(true));
+            payload.insert("ws".into(), setup);
+            payload.insert("purpose".into(), json!(purpose));
+            obtain(
+                payload,
+                "waiting for the human to review the WebSocket setup on the approval page...",
+            )?;
+            println!("ws updated: {}", argv[0]);
+            return Ok(0);
+        }
+        ws = Some(setup);
     }
     if replace {
         if !hosts.is_empty() || get("--kind").is_some() || get("--mode").is_some() {
@@ -207,6 +277,9 @@ pub fn request_credential(argv: &[String]) -> R {
     payload.insert("cred_mode".into(), json!(mode));
     if let Some(v) = get("--var").filter(|v| !v.is_empty()) {
         payload.insert("var".into(), json!(v));
+    }
+    if let Some(setup) = ws {
+        payload.insert("ws".into(), setup);
     }
     let r = obtain(
         payload,
