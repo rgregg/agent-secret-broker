@@ -176,6 +176,7 @@ to read current guidance: the client never sees it. The review flow and its safe
 
     asb request-credential NAME --kind token|login --for "purpose" [--host H[,H]]... [--var VAR] [--mode http|env]
     asb request-credential NAME --replace --for "purpose" [--var VAR]
+    asb request-credential NAME --ws home-assistant|FILE|off --for "purpose"
 
 When the agent needs a service the broker does not know, it runs this instead of asking in chat or
 reading a secret itself. A card appears on the approval site (and a notification that names only the
@@ -193,6 +194,13 @@ credential keeps its hosts, variables and approval policy, the old value is kept
 nothing can change where the value goes. `--var` picks the variable when the credential has several (a
 login's password, say; the value goes to that one only). It takes no `--kind`, `--host` or `--mode`, and
 `asb` prints `replaced: NAME`. An SSH key cannot be replaced this way.
+
+**`--ws` proposes a WebSocket setup** so `asb ws` can open sessions with the credential: `home-assistant` (the
+preset) or a file holding the `ws` JSON object. With `--kind` (a new credential) the entry page shows it with an
+"Also allow WebSocket sessions" box that starts unticked. Without `--kind` it asks to change an existing
+credential's setup (`off` removes it): you see the setup now and proposed and press Apply or Deny, and `asb`
+prints `ws updated: NAME`. The broker checks the setup before you are asked. See
+[reference.md](reference.md#proposing-a-websocket-setup).
 
 Exit codes: 0 stored, 4 denied, 5 expired, 3 the broker refused it (the name exists: use `--replace`, or
 `asb update` if you hold the value; invalid name; too many pending; disabled; with `--replace`, no such

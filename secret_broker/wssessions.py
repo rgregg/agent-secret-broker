@@ -227,7 +227,8 @@ def _norm_steps(hs, names):
 def parse_cred_config(raw, var_names):
     """The credential's operator `ws` setting -> a normalized dict. ValueError (fixed text) on anything wrong,
     which makes the credential invalid in the catalog: it fails closed. A credential with no `ws` setting can
-    not open a WebSocket session at all. Never agent input. Options (all optional):
+    not open a WebSocket session at all. Set by the human (the Credentials tab, or approving an agent's
+    proposal: credreq.ws_proposal); never agent input on its own. Options (all optional):
         "handshake": a preset ("home-assistant"), {"steps": [...]} or {"wait": X, "send": Y, "expect": Z}.
             send step:   {"send": JSON-or-text}      strings inside are filled ({{VAR}}); JSON is encoded
                          by the broker, so a value cannot break out of its string
@@ -249,7 +250,9 @@ def parse_cred_config(raw, var_names):
         raise ValueError("ws must be an object")
     for k in raw:
         if k not in ("handshake", "origin", "subprotocols", "query", "headers", "deny_send"):
-            raise ValueError(f"ws.{k} is not a known option")
+            # fixed text: an agent's proposal reaches this (credreq.ws_proposal), so never repeat its key
+            raise ValueError("ws has an option that is not known (handshake, origin, subprotocols, query, "
+                             "headers, deny_send)")
     names = set(var_names)
     out = {"steps": None, "origin": None, "subprotocols": [], "query": {}, "headers": {}, "deny_send": []}
     if "deny_send" in raw:
@@ -841,8 +844,8 @@ class WsMixin:
         if sc.get("ssh") or not sc.get("allowed_hosts"):
             raise PermissionError("a WebSocket session needs an http credential with allowed hosts")
         if sc.get("_ws") is None:
-            raise PermissionError("this credential is not set up for WebSocket sessions (the operator "
-                                  "adds a `ws` setting to it)")
+            raise PermissionError("this credential is not set up for WebSocket sessions (propose a setup with "
+                                  "`asb request-credential NAME --ws home-assistant|FILE`; the human decides)")
         if any(k in spec for k in ("purpose", "hosts", "methods")) and any(spec.get(k) for k in ("purpose", "hosts", "methods")):
             raise ValueError("a WebSocket session takes a url, --ttl and --max-frames only")
         scheme, host, port, target = parse_url(spec.get("url"))

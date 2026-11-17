@@ -152,6 +152,8 @@ WebSocket sessions (a service that speaks WebSocket, e.g. Home Assistant's /api/
   The human approves ONE card (always high risk: it names the credential, host and port, time limit and
   caps); the broker opens the connection and signs in itself with the credential's handshake, so you never
   see the token. Prints the session id; `export ASB_WS_SESSION=ID` lets you leave the id off below.
+  "not set up for WebSocket sessions"? Propose a setup and let the human decide:
+    asb request-credential ha --ws home-assistant --for "why"   (or --ws FILE with the `ws` JSON object)
     asb ws send ID '{"id":1,"type":"get_states"}'     one text frame to the server
     asb ws recv ID --wait 5                           frames from the server, one per line (waits up to 25 s)
     printf '%s\\n' '{"id":2,"type":"ping"}' | asb ws ID   line pipe: each stdin line is a frame, replies on stdout
@@ -428,8 +430,9 @@ terminal), never from an argument. --hosts is required: where it may be used.
 example: printf '%s' "$TOKEN" | asb store myapi --hosts api.example.com
 SSH key: asb store NAME --ssh < unencrypted_private_key   (no --hosts; use with asb ssh-agent)""",
     "request-credential": """usage: asb request-credential NAME --kind token|login --for "purpose"
-                              [--host H[,H]]... [--var VAR] [--mode http|env]
+                              [--host H[,H]]... [--var VAR] [--mode http|env] [--ws SETUP]
        asb request-credential NAME --replace --for "purpose" [--var VAR]
+       asb request-credential NAME --ws SETUP|off --for "purpose"
 
 Ask the human to supply a credential the broker does not have yet. You never see the value:
 they type it on the approval page, which stores it in the vault. --kind token is one API
@@ -446,8 +449,14 @@ rotated). The human types it on the approval page; the old value is kept as prev
 the value changes: the hosts and approval policy stay. --var says which variable when the
 credential has several (a login's password, say). It takes no --kind, --host or --mode. Prints
 "replaced: NAME". Exit codes as above; 3 also when NAME does not exist or is an SSH key.
+--ws proposes a WebSocket setup, so `asb ws` can open sessions with the credential: SETUP is
+home-assistant (the preset: the broker signs in with the token and blocks token and user-management
+commands) or a file holding the `ws` JSON object (see docs/reference.md, "WebSocket sessions").
+With --kind the human sees it on the entry page and may tick it; for an existing credential (no
+--kind) the human approves or denies the change, and `off` removes it. Prints "ws updated: NAME".
 example: asb request-credential myapi --kind token --for "read the Example API" --host api.example.com
-         asb request-credential myapi --replace --for "the token expired; I need a new one\"""",
+         asb request-credential myapi --replace --for "the token expired; I need a new one"
+         asb request-credential ha --ws home-assistant --for "edit dashboards over the websocket API\"""",
     "update": """usage: asb update NAME [--var V]   < value
        asb update NAME [--add-host H[,H]] [--remove-host H[,H]]
 
@@ -867,6 +876,29 @@ def run_enroll(argv):
     return 0
 
 
+def read_ws_setup(arg, new):
+    """--ws: `home-assistant` (the preset), `off` (an existing credential only) or a file holding the JSON
+    object. A setup holds placeholders, never a value; the broker validates it before anyone is asked."""
+    if arg == "home-assistant":
+        return arg
+    if arg == "off":
+        if new:
+            die("--ws off applies to an existing credential (a new one starts without WebSocket sessions)")
+        return None
+    def no_constant(c):
+        raise ValueError(c)
+    try:
+        with open(arg, encoding="utf-8") as f:
+            ws = json.load(f, parse_constant=no_constant)
+    except OSError as e:
+        die(f"--ws: cannot read {arg}: {e.strerror}")
+    except ValueError:
+        die(f"--ws: {arg} is not valid JSON")
+    if not isinstance(ws, dict):
+        die("--ws: the file must hold a JSON object")
+    return ws
+
+
 def run_request_credential(argv):
     """asb request-credential NAME --kind token|login --for TEXT [--host H]... [--var V] [--mode M]
     or NAME --replace --for TEXT [--var V]. Nothing secret is read or sent: the human types the
@@ -882,7 +914,7 @@ def run_request_credential(argv):
                 die("--replace given twice")
             replace, i = True, i + 1
             continue
-        if k not in ("--kind", "--for", "--host", "--var", "--mode") or i + 1 >= len(rest):
+        if k not in ("--kind", "--for", "--host", "--var", "--mode", "--ws") or i + 1 >= len(rest):
             die(f"unexpected argument {k!r}\n" + HELP["request-credential"])
         v = rest[i + 1]
         if k == "--host":
@@ -896,6 +928,19 @@ def run_request_credential(argv):
         die('--for "what it is for" is required\n' + HELP["request-credential"])
     if len(opts["--for"]) > 300:
         die("--for is limited to 300 characters")
+    ws = None
+    if "--ws" in opts:
+        if replace:
+            die("--replace changes only the value: it takes no --ws\n" + HELP["request-credential"])
+        ws = read_ws_setup(opts["--ws"], new="--kind" in opts)
+        if "--kind" not in opts:
+            if hosts or "--mode" in opts or "--var" in opts:
+                die("--ws for an existing credential takes only --for: its hosts, mode and variables stay\n"
+                    + HELP["request-credential"])
+            obtain({"mode": "credential", "names": [name], "ws_change": True, "ws": ws, "purpose": opts["--for"]},
+                   "waiting for the human to review the WebSocket setup on the approval page...")
+            print(f"ws updated: {name}")
+            return 0
     if replace:
         if hosts or "--kind" in opts or "--mode" in opts:
             die("--replace changes only the value: it takes no --kind, --host or --mode\n"
@@ -919,6 +964,8 @@ def run_request_credential(argv):
                "hosts": hosts, "cred_mode": mode}
     if opts.get("--var"):
         payload["var"] = opts["--var"]
+    if ws is not None:
+        payload["ws"] = ws
     r = obtain(payload, "waiting for the human to enter the credential on the approval page "
                         "(you will not see the value)...")["stored"]
     print(f"stored: {r['name']}")
