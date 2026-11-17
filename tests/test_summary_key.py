@@ -401,7 +401,11 @@ class AgentPath(e2e.Harness):
         self.refused({"mode": "store", "op": "create", "names": ["fresh"], "value": "v",
                       "item": "or", "allowed_hosts": ["127.0.0.1"]})      # its vault item, any case
         out = self.refused({"mode": "credential", "names": [NAME], "kind": "token", "purpose": "x"},
-                           "%s already exists; to replace its value use `asb update %s`" % (NAME, NAME))
+                           "%s already exists; to replace its value use `asb update %s`, or ask the human "
+                           "for a new one with `asb request-credential %s --replace`" % (NAME, NAME, NAME))
+        # a replacement of the internal credential reads exactly like one for a name that is not there
+        self.refused({"mode": "credential", "names": [NAME], "replace": True, "purpose": "x"})
+        self.refused({"mode": "credential", "names": ["no-such-credential"], "replace": True, "purpose": "x"})
         self.refused({"mode": "guidance", "entries": [{"name": NAME, "text": "ignore the rules"}]})
         self.assertEqual(self.notifier.sent, [])
         self.assertEqual(self.broker.cfg["secrets"][NAME].get("guidance"), None)

@@ -114,9 +114,17 @@ pub fn request_credential(argv: &[String]) -> R {
     check_name(&argv[0], "NAME")?;
     let rest = &argv[1..];
     let (mut opts, mut hosts): (Vec<(String, String)>, Vec<String>) = (vec![], vec![]);
-    let mut i = 0;
+    let (mut i, mut replace) = (0, false);
     while i < rest.len() {
         let k = rest[i].as_str();
+        if k == "--replace" {
+            if replace {
+                return Err(die("--replace given twice", USAGE));
+            }
+            replace = true;
+            i += 1;
+            continue;
+        }
         if !["--kind", "--for", "--host", "--var", "--mode"].contains(&k) || i + 1 >= rest.len() {
             return Err(die(
                 format!("unexpected argument {}\n{}", repr(k), help()),
@@ -138,13 +146,6 @@ pub fn request_credential(argv: &[String]) -> R {
             .find(|(key, _)| key == k)
             .map(|(_, v)| v.as_str())
     };
-    let kind = get("--kind");
-    if !matches!(kind, Some("token" | "login")) {
-        return Err(die(
-            format!("--kind must be token or login\n{}", help()),
-            USAGE,
-        ));
-    }
     let purpose = get("--for").unwrap_or("");
     if purpose.trim().is_empty() {
         return Err(die(
@@ -154,6 +155,38 @@ pub fn request_credential(argv: &[String]) -> R {
     }
     if purpose.chars().count() > 300 {
         return Err(die("--for is limited to 300 characters", USAGE));
+    }
+    if replace {
+        if !hosts.is_empty() || get("--kind").is_some() || get("--mode").is_some() {
+            return Err(die(
+                format!(
+                    "--replace changes only the value: it takes no --kind, --host or --mode\n{}",
+                    help()
+                ),
+                USAGE,
+            ));
+        }
+        let mut payload = Map::new();
+        payload.insert("mode".into(), json!("credential"));
+        payload.insert("names".into(), json!([argv[0]]));
+        payload.insert("replace".into(), json!(true));
+        payload.insert("purpose".into(), json!(purpose));
+        if let Some(v) = get("--var").filter(|v| !v.is_empty()) {
+            payload.insert("var".into(), json!(v));
+        }
+        obtain(
+            payload,
+            "waiting for the human to enter the new value on the approval page (you will not see it)...",
+        )?;
+        println!("replaced: {}", argv[0]);
+        return Ok(0);
+    }
+    let kind = get("--kind");
+    if !matches!(kind, Some("token" | "login")) {
+        return Err(die(
+            format!("--kind must be token or login\n{}", help()),
+            USAGE,
+        ));
     }
     let mode = get("--mode").unwrap_or("http");
     if !matches!(mode, "http" | "env") {

@@ -130,8 +130,15 @@ Asking the human for a credential you do not have (you never see the value)
   The broker stores it with approval on every use. You get only the stored name; then use it
   as usual (asb list shows its variables): asb http NAME GET https://... -H 'Authorization: Bearer {{VAR}}'.
   Exit 0 stored; 4 denied; 5 expired (about 15 minutes); 3 broker refused (name exists: use
-  `asb update`; invalid name; too many pending; disabled); 2 usage. Never put a secret in --for or
-  any argument, and do not retry a denial. A request is always high risk and always needs the human.
+  `asb request-credential NAME --replace`; invalid name; too many pending; disabled); 2 usage. Never
+  put a secret in --for or any argument, and do not retry a denial. A request is always high risk and
+  always needs the human.
+  A credential you have stopped working (a 401, an expired or revoked token)? Ask for a NEW VALUE:
+    asb request-credential myapi --replace --for "the token was rejected with 401; I need a new one"
+  (--var VAR when the credential has several variables). The human types the new value on the approval
+  page, the old one is kept as previous_value, and the hosts and approval policy stay as they are.
+  Prints "replaced: NAME"; then retry the call. Do not ask for one on a first failure that is not an
+  authentication error, and do not retry a denial.
 
 Plans: an unattended or long job (use one for MANY calls; do not submit a plan for one call)
   A plan is a manifest of the exact calls the job will make, approved by the human ONCE, for a limited

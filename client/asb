@@ -205,8 +205,15 @@ Asking the human for a credential you do not have (you never see the value)
   The broker stores it with approval on every use. You get only the stored name; then use it
   as usual (asb list shows its variables): asb http NAME GET https://... -H 'Authorization: Bearer {{VAR}}'.
   Exit 0 stored; 4 denied; 5 expired (about 15 minutes); 3 broker refused (name exists: use
-  `asb update`; invalid name; too many pending; disabled); 2 usage. Never put a secret in --for or
-  any argument, and do not retry a denial. A request is always high risk and always needs the human.
+  `asb request-credential NAME --replace`; invalid name; too many pending; disabled); 2 usage. Never
+  put a secret in --for or any argument, and do not retry a denial. A request is always high risk and
+  always needs the human.
+  A credential you have stopped working (a 401, an expired or revoked token)? Ask for a NEW VALUE:
+    asb request-credential myapi --replace --for "the token was rejected with 401; I need a new one"
+  (--var VAR when the credential has several variables). The human types the new value on the approval
+  page, the old one is kept as previous_value, and the hosts and approval policy stay as they are.
+  Prints "replaced: NAME"; then retry the call. Do not ask for one on a first failure that is not an
+  authentication error, and do not retry a denial.
 
 Plans: an unattended or long job (use one for MANY calls; do not submit a plan for one call)
   A plan is a manifest of the exact calls the job will make, approved by the human ONCE, for a limited
@@ -422,6 +429,7 @@ example: printf '%s' "$TOKEN" | asb store myapi --hosts api.example.com
 SSH key: asb store NAME --ssh < unencrypted_private_key   (no --hosts; use with asb ssh-agent)""",
     "request-credential": """usage: asb request-credential NAME --kind token|login --for "purpose"
                               [--host H[,H]]... [--var VAR] [--mode http|env]
+       asb request-credential NAME --replace --for "purpose" [--var VAR]
 
 Ask the human to supply a credential the broker does not have yet. You never see the value:
 they type it on the approval page, which stores it in the vault. --kind token is one API
@@ -431,9 +439,15 @@ separated) suggests the hosts it may be used against; the human confirms or edit
 --var suggests the placeholder name (for a login, the prefix of NAME_USERNAME and
 NAME_PASSWORD). --mode http (default) needs hosts; env may be used without hosts.
 Waits for the human (about 15 minutes), then prints "stored: NAME". Exit 0 stored, 4 denied,
-5 expired, 3 refused (the name exists: use `asb update`), 2 usage. Never reads stdin; never
+5 expired, 3 refused (the name exists: use --replace), 2 usage. Never reads stdin; never
 put a secret in an argument.
-example: asb request-credential myapi --kind token --for "read the Example API" --host api.example.com""",
+--replace asks for a NEW VALUE of a credential that already exists (a token that expired or was
+rotated). The human types it on the approval page; the old value is kept as previous_value. Only
+the value changes: the hosts and approval policy stay. --var says which variable when the
+credential has several (a login's password, say). It takes no --kind, --host or --mode. Prints
+"replaced: NAME". Exit codes as above; 3 also when NAME does not exist or is an SSH key.
+example: asb request-credential myapi --kind token --for "read the Example API" --host api.example.com
+         asb request-credential myapi --replace --for "the token expired; I need a new one\"""",
     "update": """usage: asb update NAME [--var V]   < value
        asb update NAME [--add-host H[,H]] [--remove-host H[,H]]
 
@@ -854,14 +868,20 @@ def run_enroll(argv):
 
 
 def run_request_credential(argv):
-    """asb request-credential NAME --kind token|login --for TEXT [--host H]... [--var V] [--mode M].
-    Nothing secret is read or sent: the human types the value on the approval page."""
+    """asb request-credential NAME --kind token|login --for TEXT [--host H]... [--var V] [--mode M]
+    or NAME --replace --for TEXT [--var V]. Nothing secret is read or sent: the human types the
+    value on the approval page."""
     if not argv:
         die(HELP["request-credential"])
     name, rest = check_name(argv[0]), argv[1:]
-    opts, hosts, i = {}, [], 0
+    opts, hosts, i, replace = {}, [], 0, False
     while i < len(rest):
         k = rest[i]
+        if k == "--replace":
+            if replace:
+                die("--replace given twice")
+            replace, i = True, i + 1
+            continue
         if k not in ("--kind", "--for", "--host", "--var", "--mode") or i + 1 >= len(rest):
             die(f"unexpected argument {k!r}\n" + HELP["request-credential"])
         v = rest[i + 1]
@@ -872,12 +892,23 @@ def run_request_credential(argv):
         else:
             opts[k] = v
         i += 2
-    if opts.get("--kind") not in ("token", "login"):
-        die("--kind must be token or login\n" + HELP["request-credential"])
     if not opts.get("--for", "").strip():
         die('--for "what it is for" is required\n' + HELP["request-credential"])
     if len(opts["--for"]) > 300:
         die("--for is limited to 300 characters")
+    if replace:
+        if hosts or "--kind" in opts or "--mode" in opts:
+            die("--replace changes only the value: it takes no --kind, --host or --mode\n"
+                + HELP["request-credential"])
+        payload = {"mode": "credential", "names": [name], "replace": True, "purpose": opts["--for"]}
+        if opts.get("--var"):
+            payload["var"] = opts["--var"]
+        obtain(payload, "waiting for the human to enter the new value on the approval page "
+                        "(you will not see it)...")
+        print(f"replaced: {name}")
+        return 0
+    if opts.get("--kind") not in ("token", "login"):
+        die("--kind must be token or login\n" + HELP["request-credential"])
     mode = opts.get("--mode", "http")
     if mode not in ("http", "env"):
         die("--mode must be http or env")
