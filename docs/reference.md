@@ -1198,6 +1198,14 @@ creating a new one does not unless `store.create` is `prompt` (below):
   echoing values. `update NAME --var APP_SECRET` rewrites only that key and
   leaves the other lines (and comments) as they were; the whole previous text
   goes to `previous_value`.
+- **`store --keys` creates such a credential in one step.** The value on stdin is `KEY=value` lines or a
+  JSON object with 2 to 20 keys; it is stored as given (comments included) in one item, and each key becomes a
+  variable of the **same name** mapped with `key` (request body `"keys": true`). So keys must look like
+  `MY_TOKEN` and may not be names that change how processes run (`PATH`, `LD_*`, ...). A repeated key, an
+  empty value or a JSON value that is not a string is refused (400), with `--var` or `--ssh` too, and on an
+  update. Errors name at most a key, and only when it is a plain name; never a value. The card and the
+  `stored` event list the variable names (`var_names`), and the result has `stored.vars`. The usual store
+  policy applies (create is `policy:auto-create` unless `store.create` is `prompt`).
 - **Create needs no tap** (it is always rated low: it cannot read or change
   anything that exists, and the new secret still prompts on every use). It is
   recorded as `policy:auto-create`; set `"store": {"create": "prompt"}` to ask

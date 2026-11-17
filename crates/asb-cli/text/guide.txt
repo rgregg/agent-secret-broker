@@ -163,6 +163,7 @@ Giving this machine its own credential
 
 Storing and rotating (value ONLY on stdin, never as an argument)
   printf '%s' "$VALUE" | asb store NAME --hosts a.example.com[,b] [--field F] [--item I] [--var V]
+  printf 'A=...\nB=...\n' | asb store NAME --hosts a.example.com --keys   (several values: variables A and B)
   printf '%s' "$VALUE" | asb update NAME [--var V]
   asb update NAME [--add-host H[,H]] [--remove-host H[,H]]     (change the allowed hosts)
   store creates a credential without a tap; update asks for approval, and a host change is always a human decision.
