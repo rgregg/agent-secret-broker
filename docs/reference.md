@@ -561,15 +561,22 @@ opening Bitwarden. It is human-only: the same authenticated approval session, CS
 Policies tab, and no route on the agent-facing port. Agents cannot reach it, and a client key does not open it.
 
 - **List** (`GET /credentials`): every credential with its kind (token, login or SSH key), allowed hosts,
-  approval mode, TLS (`verified`, `pinned (N)` or `NOT verified`) and whether plans are allowed, shown as
+  approval mode, TLS (`verified`, `pinned (N)` or `NOT verified`) and whether plans and WebSocket sessions are allowed, shown as
   icons with a key below the table (each icon's label is its tooltip and accessible name, and is printed in
   the narrow phone layout). A search box filters as you type: every word must appear in the credential's name,
-  hosts, kind, approval or TLS words (`ssh`, `login`, `allow`, `pinned`, `unverified`...). `/` focuses it.
+  hosts, kind, approval or TLS words (`ssh`, `login`, `allow`, `pinned`, `unverified`, `websocket`...). `/` focuses it.
   `GET /credentials?q=...` applies the same filter on the server, so a search link works without the script.
 - **Edit** (`GET /credentials/<name>`): a form for `allowed_hosts` (`host` or `host:port`, one per line), the TLS
-  mode (verify normally, trust only listed `tls_fingerprint` values, or `tls_verify: false`), `approval` and
-  `plans`. Every other key (`vars`, `standing`, `ws`, `ssh_*`, and keys the form does not know) is carried
-  through untouched. **Advanced** shows the whole metadata as JSON; if you change it, it replaces the form's fields.
+  mode (verify normally, trust only listed `tls_fingerprint` values, or `tls_verify: false`), `approval`,
+  `plans` and `ws`. Every other key (`vars`, `standing`, `ssh_*`, and keys the form does not know) is carried
+  through untouched.
+- **WebSocket card.** Whether `asb ws` may open a session on this credential (see
+  [WebSocket sessions](#websocket-sessions-the-broker-holds-the-connection)): **Off** (no `ws` key),
+  **Home Assistant** (`{"handshake": "home-assistant"}`) or, only when the stored setting is something else,
+  **Custom**, which keeps it as it is (change a custom setup in Advanced). Choosing the mode a credential already
+  has keeps its stored setting, tweaks included (`deny_send`, `origin`). The card lists the message types a
+  session may not send (the stored `deny_send`, else the preset's default) and says so when none are. It is
+  disabled for a credential with no allowed hosts or an SSH key, where the loader rejects `ws`. **Advanced** shows the whole metadata as JSON; if you change it, it replaces the form's fields.
 - **Save, Review, Close.** The edit page has a bar that stays on screen with **Save**, **Review changes** and
   **Close** (back to the list; it asks first if the form has unsaved changes). **Save** posts the form to
   `POST /credentials/<name>/save`: a change that only narrows (or changes nothing) is written at once and the
@@ -581,7 +588,8 @@ Policies tab, and no route on the agent-facing port. Agents cannot reach it, and
   the editor can never write metadata the loader would reject. A rejection shows the loader's own message.
   Saving writes the vault first (`set_meta`), then rebuilds the live catalog from the vault.
 - **Widening needs a tick.** A change that adds an allowed host or port, adds or removes a TLS fingerprint,
-  turns TLS verification off, sets `approval: allow` or enables `plans` is refused until "I understand this
+  turns TLS verification off, sets `approval: allow`, enables `plans`, turns WebSocket sessions on, or changes
+  the `ws` setting while they are on (`ws_enabled`, `ws_changed`) is refused until "I understand this
   widens access" is ticked on the review page, where the diff is shown. Narrowing saves without it.
 - **No silent overwrite.** The page carries a hash of the stored metadata it loaded. If the vault changed since
   (an edit in Bitwarden, another save), the save is refused with 409 and the form re-renders with the current
@@ -2611,7 +2619,8 @@ path and query it chose are shown escaped and labelled unverified, and are not i
 only: **what the agent sends once approved is not filtered** (no message-type allowlist). The session is the unit of
 approval; an optional per-credential allowlist could be added later without changing the protocol.
 
-**Operator setup (never agent input).** A credential can open a WebSocket session only if its broker metadata has a `ws`
+**Operator setup (never agent input).** The Credentials tab's WebSocket card sets it (see
+[Editing credentials](#editing-credentials-the-credentials-tab)). A credential can open a WebSocket session only if its broker metadata has a `ws`
 object (fail closed: with none, the open is refused). The credential also needs `allowed_hosts` as for http; the host and
 port of the URL must be allowed by the same rule as http (`ws` defaults to port 80, `wss` to 443; a bare name entry allows
 any port, `host:port` exactly that port). TLS follows the credential's `tls_fingerprint` / `tls_verify` as for http, otherwise

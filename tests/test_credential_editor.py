@@ -864,7 +864,134 @@ class ListPage(Base):
         self.assertNotIn(t.SECRET, body)
 
 
+HA_WS = {"handshake": "home-assistant"}
+
+
+class WebSocketCard(Base):
+    """The WebSocket card: off / the Home Assistant preset / a custom setup kept from the Advanced box."""
+
+    def direct(self, **over):
+        return self.post("/credentials/svc/save", **self.form(**over))
+
+    def card(self, body):
+        return body[body.index("<h2>WebSocket</h2>"):body.index("Advanced: the whole metadata")]
+
+    def test_the_card_shows_off_for_a_credential_without_ws(self):
+        code, body = self.get("/credentials/svc")
+        self.assertEqual(code, 200)
+        card = self.card(body)
+        self.assertIn("<input type=radio name=ws value=off checked>", card)
+        self.assertIn("<input type=radio name=ws value=home-assistant>", card)
+        self.assertNotIn("value=custom", card)
+        self.assertNotIn("ws", self.stored())
+
+    def test_turning_it_on_is_a_widening_change(self):
+        before = self.stored()
+        code, body = self.direct(confirm_widen="1", ws="home-assistant")
+        self.assertEqual(code, 200)
+        self.assertIn("Review changes to svc", body)
+        self.assertIn(crededitor.WIDEN_TEXT["ws_enabled"], body)
+        self.assertEqual(self.stored(), before)
+        self.assertEqual(self.save(confirm=False, ws="home-assistant")[1], 400)     # the review page needs the tick
+        self.assertNotIn("ws", self.stored())
+        self.assertEqual(self.save(confirm=True, ws="home-assistant")[1], 200)
+        self.assertEqual(self.stored()["ws"], HA_WS)
+        self.assertEqual(self.stored()["custom"], {"keep": "me"})
+        self.assertIsNotNone(self.broker.cfg["secrets"]["svc"]["_ws"])              # the live entry can open one
+
+    def test_turning_it_off_saves_directly(self):
+        self.reset_to({**self.stored(), "ws": HA_WS})
+        self.assertIsNotNone(self.broker.cfg["secrets"]["svc"]["_ws"])
+        code, body = self.direct(ws="off")
+        self.assertEqual(code, 200)
+        self.assertIn("<div class=flash>Saved: svc</div>", body)
+        self.assertNotIn("ws", self.stored())
+        self.assertIsNone(self.broker.cfg["secrets"]["svc"]["_ws"])
+
+    def test_the_preset_keeps_its_tweaks_and_lists_what_it_blocks(self):
+        tuned = {"handshake": "home-assistant", "deny_send": ["auth/sign_path", "x/canary_cmd"]}
+        self.reset_to({**self.stored(), "ws": tuned})
+        code, body = self.get("/credentials/svc")
+        card = self.card(body)
+        self.assertIn("<input type=radio name=ws value=home-assistant checked>", card)
+        self.assertIn("<code>x/canary_cmd</code>", card)
+        self.assertNotIn("auth/long_lived_access_token", card)       # the stored list, not the preset default
+        code, body = self.direct(ws="home-assistant")
+        self.assertIn("No changes: svc", body)
+        self.assertEqual(self.stored()["ws"], tuned)
+
+    def test_the_preset_default_blocks_are_listed(self):
+        self.reset_to({**self.stored(), "ws": HA_WS})
+        card = self.card(self.get("/credentials/svc")[1])
+        self.assertIn("<code>auth/long_lived_access_token</code>", card)
+
+    def test_a_custom_setup_is_kept_and_shown_as_custom(self):
+        custom = {"headers": {"Authorization": "Bearer {{SVC_TOKEN}}"}}
+        self.reset_to({**self.stored(), "ws": custom})
+        self.assertIsNotNone(self.broker.cfg["secrets"]["svc"]["_ws"])
+        card = self.card(self.get("/credentials/svc")[1])
+        self.assertIn("<input type=radio name=ws value=custom checked>", card)
+        code, body = self.direct(ws="custom")
+        self.assertIn("No changes: svc", body)
+        self.assertEqual(self.stored()["ws"], custom)
+
+    def test_custom_cannot_be_chosen_from_the_card(self):
+        code, body = self.direct(ws="custom")
+        self.assertEqual(code, 400)
+        self.assertIn("set up a custom WebSocket sign-in in the Advanced box", body)
+        self.assertNotIn("ws", self.stored())
+
+    def test_a_form_without_the_field_keeps_ws(self):
+        self.reset_to({**self.stored(), "ws": HA_WS})
+        f = self.form(allowed_hosts="127.0.0.1")
+        code, body = self.post("/credentials/svc/save", **f)
+        self.assertEqual(code, 200)
+        self.assertEqual(self.stored()["allowed_hosts"], ["127.0.0.1"])
+        self.assertEqual(self.stored()["ws"], HA_WS)
+
+    def test_an_unknown_choice_is_refused(self):
+        code, body = self.direct(ws="bogus")
+        self.assertEqual(code, 400)
+        self.assertIn("choose whether WebSocket sessions are allowed", body)
+
+    def test_changing_the_setup_while_on_is_a_widening_change(self):
+        self.reset_to({**self.stored(), "ws": HA_WS})
+        s = {**self.stored(), "ws": {"handshake": "home-assistant", "deny_send": []}}
+        code, body = self.direct(advanced=crededitor.pretty(s))
+        self.assertEqual(code, 200)
+        self.assertIn("Review changes to svc", body)
+        self.assertIn(crededitor.WIDEN_TEXT["ws_changed"], body)
+        self.assertEqual(self.stored()["ws"], HA_WS)
+
+    def test_the_list_marks_websocket_credentials(self):
+        self.reset_to({**self.stored(), "ws": HA_WS})
+        code, body = self.get("/credentials?q=websocket")
+        self.assertEqual(code, 200)
+        rows = body[body.index("<tbody>"):body.index("</tbody>")]
+        self.assertIn("aria-label='WebSocket sessions allowed'", rows)
+        self.assertIn("1 of 1 credentials", body)
+        self.reset_to({k: v for k, v in self.stored().items() if k != "ws"})
+        body = self.get("/credentials?q=websocket")[1]
+        self.assertIn("0 of 1 credentials", body)
+        rows = body[body.index("<tbody>"):body.index("</tbody>")]
+        self.assertIn("href='/credentials/svc'", rows)                  # positive control: the row is there
+        self.assertNotIn("aria-label='WebSocket sessions allowed'", rows)
+
+
 class Units(unittest.TestCase):
+    def test_websocket_widening(self):
+        on, tuned = {"ws": HA_WS}, {"ws": {**HA_WS, "deny_send": []}}
+        self.assertEqual(crededitor.widened({}, on), ["ws_enabled"])
+        self.assertEqual(crededitor.widened(on, tuned), ["ws_changed"])
+        self.assertEqual(crededitor.widened(on, {}), [])
+        self.assertEqual(crededitor.widened(on, dict(on)), [])
+
+    def test_the_card_explains_when_ws_cannot_apply(self):
+        page = crededitor.edit_section("x", {"vars": {}}, "tok", {"vars": {}}, can_write=True)
+        card = page[page.index("<h2>WebSocket</h2>"):page.index("Advanced: the whole")]
+        self.assertIn("needs allowed hosts", card)
+        self.assertIn("<input type=radio name=ws value=home-assistant disabled>", card)
+
     def test_kind_of(self):
         self.assertEqual(crededitor.kind_of({"ssh": True, "vars": {"K": {"field": "private_key"}}}), "ssh")
         self.assertEqual(crededitor.kind_of({"vars": {"U": {"field": "username"}, "P": {"field": "password"}}}),

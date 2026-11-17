@@ -13,6 +13,7 @@ import json
 import re
 
 from . import peek
+from .wssessions import PRESET_DENY
 
 MAX_JSON = 100_000          # the advanced box, in characters
 FORM_LIMIT = 400_000        # percent-encoding of the above, plus the form fields
@@ -20,8 +21,9 @@ MAX_PINS = 20
 _CTRL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f  ]")
 
 # the keys the form manages; every other key in the metadata is carried through untouched
-FORM_KEYS = ("allowed_hosts", "tls_fingerprint", "tls_verify", "approval", "plans")
+FORM_KEYS = ("allowed_hosts", "tls_fingerprint", "tls_verify", "approval", "plans", "ws")
 TLS_MODES = ("verify", "pin", "skip")
+WS_MODES = ("off", "home-assistant", "custom")
 
 
 def digest(meta):
@@ -45,6 +47,23 @@ def tls_summary(meta):
         fp = meta["tls_fingerprint"]
         return f"pinned ({len(fp) if isinstance(fp, list) else 1})"
     return "verified" if mode == "verify" else "NOT verified"
+
+
+def ws_mode(meta):
+    """off (no `ws` setting), home-assistant (the preset, with any tweaks), or custom (anything else)."""
+    ws = meta.get("ws")
+    if ws is None:
+        return "off"
+    return "home-assistant" if isinstance(ws, dict) and ws.get("handshake") == "home-assistant" else "custom"
+
+
+def ws_blocked(ws):
+    """The message types a WebSocket session may not send: the stored list, else the preset's default."""
+    if not isinstance(ws, dict):
+        return []
+    if "deny_send" in ws:
+        return [str(x) for x in ws["deny_send"]] if isinstance(ws["deny_send"], list) else []
+    return list(PRESET_DENY.get(ws.get("handshake"), [])) if isinstance(ws.get("handshake"), str) else []
 
 
 def _lines(text, what):
@@ -162,6 +181,13 @@ def build(old, form):
         new["plans"] = True
     elif "plans" in old:
         new["plans"] = False
+    ws = form.get("ws", ws_mode(old))
+    if ws not in WS_MODES:
+        raise ValueError("choose whether WebSocket sessions are allowed")
+    if ws == "custom" and ws_mode(old) != "custom":
+        raise ValueError("set up a custom WebSocket sign-in in the Advanced box")
+    if ws != "off":                         # the same mode keeps the stored setting (and its tweaks) as it is
+        new["ws"] = old["ws"] if ws == ws_mode(old) else {"handshake": "home-assistant"}
     return new
 
 
@@ -194,6 +220,11 @@ def widened(old, new):
         out.append("approval_allow")
     if not old.get("plans") and new.get("plans"):
         out.append("plans_enabled")
+    if new.get("ws") is not None:           # any change to how a session signs in or what it may send
+        if old.get("ws") is None:
+            out.append("ws_enabled")
+        elif old["ws"] != new["ws"]:
+            out.append("ws_changed")
     return out
 
 
@@ -204,6 +235,8 @@ WIDEN_TEXT = {
     "tls_unverified": "turns TLS verification off",
     "approval_allow": "lets requests through without asking",
     "plans_enabled": "allows plans for this credential",
+    "ws_enabled": "allows WebSocket sessions (the broker signs in; the agent may then send any message not blocked)",
+    "ws_changed": "changes how WebSocket sessions sign in or which messages they may send",
 }
 
 
@@ -286,6 +319,7 @@ border:1px solid var(--line);border-radius:.5rem;background:var(--bg);color:var(
 
 # Feather-style line icons (24x24, stroked by CSS). Static markup: nothing from the metadata goes in them.
 _ICONS = {
+    "ws": "<path d='M4 9h13l-3-3M20 15H7l3 3'/>",
     "key": "<circle cx=7.5 cy=15.5 r=4.5 /><path d='M10.7 12.3 21 2m-5 5 3 3m-6-0 2 2'/>",
     "user": "<path d='M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2'/><circle cx=12 cy=7 r=4 />",
     "term": "<path d='m4 17 6-6-6-6m8 14h8'/>",
@@ -337,7 +371,7 @@ def _search_text(name, sc):
     meta = sc.get("_meta") or {}
     words = [name, kind_of(sc), KIND_ICON[kind_of(sc)][2], sc.get("approval", "prompt"),
              "tls " + tls_summary(meta), "unverified" if tls_mode(meta) == "skip" else "",
-             "plans" if sc.get("plans") else "", " ".join(sc.get("allowed_hosts") or []) or "env"]
+             "plans" if sc.get("plans") else "", "websocket" if meta.get("ws") is not None else "", " ".join(sc.get("allowed_hosts") or []) or "env"]
     return " ".join(str(w) for w in words if w).lower()
 
 
@@ -367,6 +401,8 @@ def list_section(secrets, flash="", q=""):
         hit = matches(s, q)
         shown += hit
         plans = icon("list", "warn", "Plans allowed") if sc.get("plans") else "<small class=muted>-</small>"
+        if meta.get("ws") is not None:
+            plans = (plans if sc.get("plans") else "") + icon("ws", "warn", "WebSocket sessions allowed")
         rows.append(
             f"<tr class=r data-s='{e(s)}'{'' if hit else ' hidden'}>"
             f"<td data-label=Name><div class=cname>{icon(ic, tone, label)}<div><a href='/credentials/{e(name)}'>"
@@ -385,11 +421,12 @@ def list_section(secrets, flash="", q=""):
             f"placeholder='Search by name, host or kind (ssh, login, allow, pinned...)' aria-label='Search credentials'>"
             f"<span class=n id=cn aria-live=polite>{count}</span></form>")
     table = ("<table class='tbl ctbl' id=ctbl><thead><tr><th>Name</th><th>Hosts</th><th class=ic>Approval</th>"
-             "<th class=ic>TLS</th><th class=ic>Plans</th></tr></thead><tbody>" + "".join(rows) + "</tbody></table>")
+             "<th class=ic>TLS</th><th class=ic>Plans / WS</th></tr></thead><tbody>" + "".join(rows) + "</tbody></table>")
     key = ("<div class=ckey>" + "".join(f"<span>{icon(n, t, l)}{l}</span>" for n, t, l in (
         ("key", "acc", "Token"), ("user", "acc", "Login"), ("term", "acc", "SSH key"),
         ("phone", "", "Asks on your phone"), ("zap", "warn", "Allowed without asking"),
-        ("lock", "ok", "TLS verified"), ("pin", "ok", "TLS pinned"), ("unlock", "bad", "TLS not verified"))) + "</div>")
+        ("lock", "ok", "TLS verified"), ("pin", "ok", "TLS pinned"), ("unlock", "bad", "TLS not verified"),
+        ("ws", "warn", "WebSocket sessions allowed"))) + "</div>")
     body = (tool + table + none + key) if rows else "<p><small class=muted>No credentials.</small></p>"
     head = ("<div class=chead2><h1>Credentials</h1><a class='btn approve' href='/credentials/new'>New credential</a></div>")
     return head + flash + body
@@ -620,6 +657,28 @@ def edit_section(name, meta, token, stored, *, can_write, error="", preview=None
                         ("pin", "Trust only pinned fingerprints", "For a self-signed device. A renewed "
                          "certificate needs a new pin."),
                         ("skip", "Do not verify", "Private hosts only: anyone in the path could read the traffic.")))
+    wmode = ws_mode(meta)
+    can_ws = bool(meta.get("allowed_hosts")) and not meta.get("ssh")
+    wdis = dis if can_ws or wmode != "off" else " disabled"
+    wopts = [("off", "Off", "No WebSocket sessions."),
+             ("home-assistant", "Home Assistant", "The broker signs in to <code>/api/websocket</code> with the "
+              "token. Each session still needs your approval.")]
+    if wmode == "custom":
+        wopts.append(("custom", "Custom", "A hand-written sign-in; change it in the Advanced box below."))
+    wseg = "".join(
+        f"<label><input type=radio name=ws value={m}{' checked' if wmode == m else ''}{wdis}><span><b>{t}</b>"
+        f"<small class=muted>{h}</small></span></label>" for m, t, h in wopts)
+    blocked = ws_blocked(meta.get("ws")) if wmode != "off" else []
+    if wmode == "off":
+        wnote = "" if can_ws else "<p class=hint>A WebSocket session needs allowed hosts and is not for an SSH key.</p>"
+    elif blocked:
+        wnote = (f"<details><summary>{len(blocked)} message type{'s' if len(blocked) != 1 else ''} blocked"
+                 f"</summary><p>" + " ".join(f"<code>{e(b)}</code>" for b in blocked) + "</p></details>")
+    else:
+        wnote = "<p class=err>No message types are blocked: a session may send anything.</p>"
+    wcard = (f"<div class=card><h2>WebSocket</h2><p class=hint>Whether an agent may ask for a WebSocket session "
+             f"(<code>asb ws</code>), where the broker holds the connection.</p><div class=seg>{wseg}</div>"
+             f"{wnote}</div>")
     dirty = " data-dirty" if meta != stored else ""
     form = (f"<form class=cred-form id=cedit method=post action='/credentials/{e(name)}/save'{dirty}>"
             f"<input type=hidden name=csrf value='{e(token)}'><input type=hidden name=old_sha value='{e(sha)}'>"
@@ -640,7 +699,7 @@ def edit_section(name, meta, token, stored, *, can_write, error="", preview=None
             f"<select name=approval aria-label=Approval{dis}>{sel}</select>"
             f"<label style='font-weight:400'><input type=checkbox name=plans value=1"
             f"{' checked' if meta.get('plans') else ''}{dis}> Allow plans (a batch of calls approved once)</label>"
-            f"</div>"
+            f"</div>{wcard}"
             f"<details><summary>Advanced: the whole metadata as JSON</summary>"
             f"<p class=hint>Edit this only for keys the form does not cover. If you change it, it "
             f"replaces the form's fields.</p>"
@@ -650,7 +709,8 @@ def edit_section(name, meta, token, stored, *, can_write, error="", preview=None
             f"<span class=dirty id=cdirty{'' if dirty else ' hidden'}>Unsaved changes</span>"
             f"<span class=sp></span>{close}</div></form>"
             f"<p class=hint>Save stores the change and returns to the list. A change that widens access (a new "
-            f"host, a TLS pin added or removed, checks turned off, approval or plans allowed) opens a review "
+            f"host, a TLS pin added or removed, checks turned off, approval or plans allowed, WebSocket "
+            f"turned on or changed) opens a review "
             f"page first and needs your tick.</p>")
     manage = f"<div class='card dzone'>{extra}</div>" if extra else ""
     note = f"<div class=flash>{e(flash)}</div>" if flash else ""
