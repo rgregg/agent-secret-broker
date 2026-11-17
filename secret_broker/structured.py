@@ -57,6 +57,30 @@ def parse(text):
     return out
 
 
+def entries(text):
+    """[(key, value), ...] in the order written, repeats kept (parse() keeps only the last), for a caller that
+    must refuse a repeated key. A JSON value that is not a string is returned as it is, not encoded.
+    Raises StructuredError (fixed text) if the text is not structured."""
+    if is_json(text):
+        try:
+            pairs = json.loads(text, object_pairs_hook=list)
+        except ValueError:
+            raise StructuredError("field is not valid JSON") from None
+        if not isinstance(pairs, list) or not all(isinstance(p, tuple) for p in pairs):
+            raise StructuredError("field JSON must be an object")
+        return [(str(k), v) for k, v in pairs]
+    out = []
+    for line in text.splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        m = _LINE.match(line)
+        if m:
+            out.append((m.group(1), _unquote(m.group(2))))
+    if not out:
+        raise StructuredError("field has no KEY=value lines")
+    return out
+
+
 def get(text, key):
     values = parse(text)
     if key not in values:

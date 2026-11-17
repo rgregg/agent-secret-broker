@@ -11,8 +11,28 @@ pub fn store_or_update(argv: &[String]) -> R {
         return Err(die_help(&argv[0]));
     }
     let ssh = argv[2..].iter().any(|a| a == "--ssh") && argv[0] == "store";
-    let argv: Vec<String> = if ssh {
-        argv.iter().filter(|a| *a != "--ssh").cloned().collect()
+    let keys = argv[2..].iter().any(|a| a == "--keys");
+    let help = |c: &str| crate::text_gen::help(c).unwrap_or_default();
+    if keys && argv[0] != "store" {
+        return Err(die(
+            format!(
+                "--keys applies to store (change one key with update NAME --var KEY)\n{}",
+                help("update")
+            ),
+            USAGE,
+        ));
+    }
+    if keys && ssh {
+        return Err(die(
+            format!("--keys does not apply to an ssh key\n{}", help("store")),
+            USAGE,
+        ));
+    }
+    let argv: Vec<String> = if ssh || keys {
+        argv.iter()
+            .filter(|a| *a != "--ssh" && *a != "--keys")
+            .cloned()
+            .collect()
     } else {
         argv.to_vec()
     };
@@ -67,6 +87,15 @@ pub fn store_or_update(argv: &[String]) -> R {
         );
         return Ok(0);
     }
+    if keys && flag(&f, "var").is_some() {
+        return Err(die(
+            format!(
+                "--keys names the variables itself (one per key); leave out --var\n{}",
+                help("store")
+            ),
+            USAGE,
+        ));
+    }
     let mut payload = Map::new();
     payload.insert("mode".into(), json!("store"));
     payload.insert("names".into(), json!([argv[1]]));
@@ -74,6 +103,9 @@ pub fn store_or_update(argv: &[String]) -> R {
     payload.insert("value".into(), Value::String(read_value()?));
     if ssh {
         payload.insert("ssh".into(), json!(true));
+    }
+    if keys {
+        payload.insert("keys".into(), json!(true));
     }
     for k in ["field", "item", "var"] {
         if let Some(v) = flag(&f, k).filter(|v| !v.is_empty()) {
@@ -103,6 +135,10 @@ pub fn store_or_update(argv: &[String]) -> R {
         repr(&py_str(&s["item"])),
         py_str(&s["field"])
     );
+    if let Some(vars) = s["vars"].as_array().filter(|v| !v.is_empty()) {
+        let names: Vec<String> = vars.iter().map(py_str).collect();
+        eprintln!("asb: variables: {}", names.join(", "));
+    }
     Ok(0)
 }
 

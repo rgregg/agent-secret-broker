@@ -1,6 +1,9 @@
-usage: asb store NAME --hosts H[,H] [--field F] [--item I] [--var V]   < value
+usage: asb store NAME --hosts H[,H] [--field F] [--item I] [--var V|--keys]   < value
 
 Create a new credential. The value is read from stdin (or a hidden prompt on a
 terminal), never from an argument. --hosts is required: where it may be used.
 example: printf '%s' "$TOKEN" | asb store myapi --hosts api.example.com
 SSH key: asb store NAME --ssh < unencrypted_private_key   (no --hosts; use with asb ssh-agent)
+Several values: asb store NAME --hosts H --keys < values, where values is KEY=value lines or a JSON
+object (2 to 20 keys). It is one credential; each key becomes a variable of the same name ({{KEY}}),
+so keys must look like MY_TOKEN. Change one later with asb update NAME --var KEY.

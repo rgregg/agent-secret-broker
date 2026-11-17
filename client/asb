@@ -4,7 +4,7 @@
   asb NAME[,NAME2] -- command args...         run with secrets in the env
   asb sudo -- command args...                 run as root through the root helper; a human approves the exact command
   asb list [--json]                           what credentials exist? (no approval)
-  asb store NAME --hosts H[,H] [--field F] [--item I] [--var V]  < value
+  asb store NAME --hosts H[,H] [--field F] [--item I] [--var V|--keys]  < value
   asb store NAME --ssh < private_key          move an SSH private key into the broker
   asb update NAME [--var V]                   < value   (or --add-host H / --remove-host H, no value)
   asb request-credential NAME --kind token|login --for "purpose" [--host H]... [--var V] [--mode http|env]
@@ -238,6 +238,7 @@ Giving this machine its own credential
 
 Storing and rotating (value ONLY on stdin, never as an argument)
   printf '%s' "$VALUE" | asb store NAME --hosts a.example.com[,b] [--field F] [--item I] [--var V]
+  printf 'A=...\\nB=...\\n' | asb store NAME --hosts a.example.com --keys   (several values: variables A and B)
   printf '%s' "$VALUE" | asb update NAME [--var V]
   asb update NAME [--add-host H[,H]] [--remove-host H[,H]]     (change the allowed hosts)
   store creates a credential without a tap; update asks for approval, and a host change is always a human decision.
@@ -423,12 +424,15 @@ If the command runs a script file (bash deploy.sh, python3 sync.py, ./run.sh) it
 the risk check; it is re-hashed just before running and, if it changed after approval,
 nothing runs and asb exits 6. Advisory and best effort.
 example: asb grafana -- sh -c 'curl -s -H "Authorization: Bearer $GRAFANA_TOKEN" $URL'""",
-    "store": """usage: asb store NAME --hosts H[,H] [--field F] [--item I] [--var V]   < value
+    "store": """usage: asb store NAME --hosts H[,H] [--field F] [--item I] [--var V|--keys]   < value
 
 Create a new credential. The value is read from stdin (or a hidden prompt on a
 terminal), never from an argument. --hosts is required: where it may be used.
 example: printf '%s' "$TOKEN" | asb store myapi --hosts api.example.com
-SSH key: asb store NAME --ssh < unencrypted_private_key   (no --hosts; use with asb ssh-agent)""",
+SSH key: asb store NAME --ssh < unencrypted_private_key   (no --hosts; use with asb ssh-agent)
+Several values: asb store NAME --hosts H --keys < values, where values is KEY=value lines or a JSON
+object (2 to 20 keys). It is one credential; each key becomes a variable of the same name ({{KEY}}),
+so keys must look like MY_TOKEN. Change one later with asb update NAME --var KEY.""",
     "request-credential": """usage: asb request-credential NAME --kind token|login --for "purpose"
                               [--host H[,H]]... [--var VAR] [--mode http|env] [--ws SETUP]
        asb request-credential NAME --replace --for "purpose" [--var VAR]
@@ -3093,8 +3097,12 @@ def main(argv):
         if len(argv) < 2:
             die(HELP[argv[0]])
         ssh = "--ssh" in argv[2:] and argv[0] == "store"
-        if ssh:
-            argv = [a for a in argv if a != "--ssh"]
+        keys = "--keys" in argv[2:]
+        if keys and argv[0] != "store":
+            die("--keys applies to store (change one key with update NAME --var KEY)\n" + HELP["update"])
+        if keys and ssh:
+            die("--keys does not apply to an ssh key\n" + HELP["store"])
+        argv = [a for a in argv if a not in ("--ssh", "--keys")] if ssh or keys else argv
         name, op = check_name(argv[1]), "create" if argv[0] == "store" else "update"
         allowed = {"--field": "field", "--item": "item", "--var": "var", "--hosts": "hosts"}
         if op == "update":
@@ -3108,9 +3116,13 @@ def main(argv):
                         "add_hosts": change[0], "remove_hosts": change[1]})["stored"]
             print(f"updated: {r['name']} may now be used against {', '.join(r.get('hosts') or [])}")
             return 0
+        if keys and f.get("var"):
+            die("--keys names the variables itself (one per key); leave out --var\n" + HELP["store"])
         payload = {"mode": "store", "names": [name], "op": op, "value": read_value()}
         if ssh:
             payload["ssh"] = True
+        if keys:
+            payload["keys"] = True
         for k in ("field", "item", "var"):
             if f.get(k):
                 payload[k] = f[k]
@@ -3120,6 +3132,8 @@ def main(argv):
             payload["allowed_hosts"] = [h for h in (f.get("hosts") or "").split(",") if h]
         r = obtain(payload)["stored"]
         print(f"stored: {r['name']} ({r['op']}) -> item {r['item']!r} field {r['field']}")
+        if r.get("vars"):
+            print("asb: variables: " + ", ".join(r["vars"]), file=sys.stderr)
         return 0
 
     if argv[0] == "request-credential":

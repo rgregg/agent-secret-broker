@@ -927,6 +927,8 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             sp = req.spec
             rec.update(op=sp.get("op"), item=sp.get("item"), field=sp.get("field"), key=sp.get("key"),
                        hosts=sp.get("allowed_hosts"), value_bytes=sp.get("value_bytes"))
+            if sp.get("vars"):              # store --keys: the variable names (the keys), never a value
+                rec.update(var_names=sorted(sp["vars"]))
             if sp.get("hosts_after") is not None:
                 rec.update(hosts_added=sp["add_hosts"], hosts_removed=sp["remove_hosts"],
                            hosts=sp["hosts_after"])
@@ -2445,6 +2447,15 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         if len(names) != 1 or not _NAME_RE.match(names[0]):
             raise ValueError("secret name must be 1-41 chars of a-z 0-9 _ - ")
         name, op = names[0], spec.get("op")
+        keys = spec.pop("keys", None)
+        if keys not in (None, False, True):
+            raise ValueError("keys must be true or false")
+        if keys and op != "create":
+            raise ValueError("keys applies when creating a credential; change one key with an update and var")
+        if keys and spec.get("ssh"):
+            raise ValueError("keys does not apply to an ssh key")
+        if keys and spec.get("var"):
+            raise ValueError("keys names the variables itself; leave out var")
         add, rem = spec.pop("add_hosts", None), spec.pop("remove_hosts", None)
         if op == "update" and (add or rem):
             return self._validate_host_change(name, spec, add, rem)
@@ -2494,6 +2505,8 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                 raise ValueError("bad item name")
             if not _VAR_RE.match(spec["var"]):
                 raise ValueError("variable must look like MY_TOKEN")
+            if keys:
+                spec["vars"] = self._store_keys(value, spec["field"])
             internal_now = self._internal_secrets()[0]
             for other, sc in secrets_cfg.items():
                 if other in internal_now:
@@ -2524,6 +2537,33 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             spec["key"] = ref.get("key")
         else:
             raise ValueError("op must be create or update")
+
+    _KEY_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]{0,63}\Z")    # a key safe to name in an error
+
+    @staticmethod
+    def _store_keys(value, field):
+        """`store --keys`: the value is KEY=value lines or a JSON object; each key becomes a variable of the
+        same name, mapped to that key of `field`. Errors are fixed text and name at most a key (never a value,
+        and a key only when it is a plain name)."""
+        try:
+            pairs = structured.entries(value)
+        except structured.StructuredError:
+            raise ValueError("with keys, the value must be a JSON object or KEY=value lines") from None
+        if not 2 <= len(pairs) <= 20:
+            raise ValueError("with keys, the value needs 2 to 20 keys")
+        out = {}
+        for k, v in pairs:
+            label = k if Broker._KEY_NAME_RE.match(k) else "(not a plain name)"
+            if not _VAR_RE.match(k) or _DANGEROUS_VAR_RE.match(k):
+                raise ValueError(f"with keys, each key must look like MY_TOKEN: {label}")
+            if k in out:
+                raise ValueError(f"with keys, a key appears twice: {k}")
+            if not isinstance(v, str):
+                raise ValueError(f"with keys, each value must be text: {k}")
+            if not v:
+                raise ValueError(f"with keys, a key has an empty value: {k}")
+            out[k] = {"field": field, "key": k}
+        return out
 
     def _validate_host_change(self, name, spec, add, rem):
         """An update that changes which hosts a credential may be used against, and nothing else. It never
@@ -2721,7 +2761,8 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                 what = f"change allowed hosts of {req.names[0]}{_host_change_text(sp)}"
             else:
                 what = (f"{sp['op']} credential: item {sp['item']!r} field {sp['field']}"
-                        f"{' key ' + sp['key'] if sp.get('key') else ''} "
+                        f"{' key ' + sp['key'] if sp.get('key') else ''}"
+                        f"{', variables ' + ', '.join(sorted(sp['vars'])) if sp.get('vars') else ''} "
                         f"({sp['value_bytes']} bytes, value not shown)")
         elif req.mode == "guidance":
             k = len(req.names)
@@ -4000,7 +4041,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         Nothing to roll back and no second place to keep in sync. Shared by `asb store` and the
         Credentials tab, so both create the same thing."""
         stamp = {"by": by, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
-        meta = {"name": name, "vars": {sp["var"]: {"field": sp["field"]}},
+        meta = {"name": name, "vars": sp.get("vars") or {sp["var"]: {"field": sp["field"]}},
                 "allowed_hosts": sp["allowed_hosts"], "approval": "prompt", "created": stamp}
         if sp.get("ssh"):
             meta.update(ssh=True, ssh_public_key=sp["ssh_public_key"])   # stored as an ssh_key item
@@ -4028,7 +4069,10 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                     raise BackendError(str(e)) from None
             self.backend.put(sp["item"], sp["field"], value, create=False, keep_previous=True)
         self.audit("stored", req, duration_ms=int((time.time() - t0) * 1000))
-        return {"stored": {"name": name, "op": sp["op"], "item": sp["item"], "field": sp["field"]}}
+        out = {"name": name, "op": sp["op"], "item": sp["item"], "field": sp["field"]}
+        if sp.get("vars"):
+            out["vars"] = sorted(sp["vars"])
+        return {"stored": out}
 
     def _store_hosts(self, req):
         """Apply an approved host change: the credential's metadata and, for a Login, its websites."""
@@ -6214,7 +6258,7 @@ def client_handler(broker, client_key):
                             "field": body.get("field"), "item": body.get("item"),
                             "var": body.get("var"), "allowed_hosts": body.get("allowed_hosts"),
                             "add_hosts": body.get("add_hosts"), "remove_hosts": body.get("remove_hosts"),
-                            "ssh": body.get("ssh") is True}
+                            "ssh": body.get("ssh") is True, "keys": body.get("keys")}
                 elif mode == "credential":
                     if any(k in body for k in credreq_mod.FORBIDDEN_KEYS):
                         # the human types the value on the approval page; never accept one here

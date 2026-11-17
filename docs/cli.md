@@ -47,6 +47,7 @@ Check it:
     asb sudo -- command args...           # run a command as root through the root helper (you approve it)
 
     printf '%s' "$VALUE" | asb store NAME --hosts a.example.com   # add a credential
+    printf 'A=...\nB=...\n' | asb store NAME --hosts a.example.com --keys   # one credential, variables A and B
     printf '%s' "$VALUE" | asb update NAME                        # rotate one (needs approval)
     asb update NAME --add-host H[,H] --remove-host H[,H]          # change its allowed hosts (a human always decides)
     asb ssh-agent [-- command args...]    # use broker-held SSH keys with ssh/git (see reference.md)
