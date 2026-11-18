@@ -49,8 +49,9 @@ def tabs_html(name, active, total):
 
 def summary_html(name, counts):
     """The strip at the top of Settings: what policies this credential has, linked to the Policies sub-tab."""
-    n, r = counts["standing"], counts["rules"]
-    text = (f"{n} standing approval{'' if n == 1 else 's'}, {r} auto-approve rule{'' if r == 1 else 's'}, "
+    n, r, k = counts["standing"], counts["rules"], counts["ssh_rules"]
+    ssh = f"{k} SSH host rule{'' if k == 1 else 's'}, " if k else ""
+    text = (f"{n} standing approval{'' if n == 1 else 's'}, {r} auto-approve rule{'' if r == 1 else 's'}, {ssh}"
             f"risk guidance {'set' if counts['guidance'] else 'not set'}")
     return f"<p class=hint>{credlinks.link(name, tab='policies', text=text)}</p>"
 

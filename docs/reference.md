@@ -1844,7 +1844,8 @@ shown (request cards, history details, the Clients tab, the Policies tab, plans)
   independent form per section (own CSRF field, hidden field naming the credential, never inside the Settings form):
   **Standing approvals** (timed and Always, with Revoke; the legacy `approval: allow` is a read-only line),
   **Auto-approve rules** (not for SSH keys), **Risk guidance**, and for SSH keys **SSH host policy** and
-  **SSH host rules**. The tab label shows the number of standing approvals plus rules (guidance is not counted).
+  **SSH host rules**. An SSH key's page also lists, read-only, any config `auto_approve` rule that names it. The tab
+  label shows the number of standing approvals plus auto-approve rules plus SSH host rules (guidance is not counted).
   A refused or saved form answers with this page (same notes, same status codes: 400 for a refusal, 500 for a
   failed write).
 

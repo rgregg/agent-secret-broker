@@ -76,6 +76,16 @@ class Cards(unittest.TestCase):
         self.assertNotEqual(sshhosts.card("deploy", SSH_CRED, CSRF), "")                    # controls
         self.assertNotEqual(uirules.card("svc", http_cred(), [], CSRF, sshrules.Usage(None)), "")
 
+    def test_a_config_rule_on_an_ssh_key_is_shown_read_only(self):
+        cfg = autorules.parse([{"name": "cfg-ssh", "mode": "ssh_sign", "secret": "deploy",
+                                "host": "web.example.com", "account": "deploy"}])
+        out = credpolicy.body("deploy", dict(SSH_CRED), ctx(config_rules=cfg))
+        self.assertIn("cfg-ssh", out)
+        self.assertIn("sign in as deploy on web.example.com", out)
+        self.assertIn("<h3>Auto-approve rules (1)", out)
+        self.assertNotIn("action='/policies/auto_rules/add'", out)                 # read-only: an ssh key takes no stored rule
+        self.assertNotIn("Auto-approve rules", credpolicy.body("deploy", dict(SSH_CRED), ctx()))   # none, no section
+
     def test_a_pair_config_rule_is_marked(self):
         pair = autorules.parse([{"name": "pair", "mode": "env", "secrets": ["svc", "other"], "argv": ["echo"]}])
         one = autorules.parse([{"name": "one", "mode": "env", "secret": "svc", "argv": ["echo"]}])
@@ -137,9 +147,19 @@ class Counts(unittest.TestCase):
     def test_counts_exclude_guidance_from_the_total(self):
         cfg = autorules.parse([{"name": "c", "mode": "env", "secret": "svc", "argv": ["echo"]}])
         c = credpolicy.counts("svc", http_cred(), [timed(), legacy()], cfg)
-        self.assertEqual(c, {"standing": 2, "rules": 2, "guidance": True, "total": 4})
+        self.assertEqual(c, {"standing": 2, "rules": 2, "ssh_rules": 0, "guidance": True, "total": 4})
         c = credpolicy.counts("svc", http_cred(guidance="", auto_rules=[]), [], [])
-        self.assertEqual(c, {"standing": 0, "rules": 0, "guidance": False, "total": 0})
+        self.assertEqual(c, {"standing": 0, "rules": 0, "ssh_rules": 0, "guidance": False, "total": 0})
+
+    def test_ssh_host_rules_count_for_an_ssh_key(self):
+        rules = sshrules.parse([{"id": "sr0001", "fp": "SHA256:" + "A" * 43, "user": "deploy", "host": "web",
+                                 "by": "alice", "at": "2026-11-18T00:00:00Z", "expires_at": None},
+                                {"id": "sr0002", "fp": "SHA256:" + "B" * 43, "user": "root", "host": "db",
+                                 "by": "alice", "at": "2026-11-18T00:00:00Z", "expires_at": None}])
+        cfg = autorules.parse([{"name": "c", "mode": "ssh_sign", "secret": "deploy", "host": "web.example.com",
+                                "account": "deploy"}])
+        c = credpolicy.counts("deploy", {"ssh": True, "ssh_rules": rules, "_meta": {}}, [timed()], cfg)
+        self.assertEqual(c, {"standing": 1, "rules": 1, "ssh_rules": 2, "guidance": False, "total": 4})
 
 
 class Link(unittest.TestCase):

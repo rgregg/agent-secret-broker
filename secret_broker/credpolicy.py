@@ -32,7 +32,9 @@ def counts(name, sc, standing_rows, config_rules):
     is not part of `total`."""
     standing = len(standing_rows)
     rules = len(sc.get("auto_rules") or []) + len(config_rules)
-    return {"standing": standing, "rules": rules, "guidance": bool(sc.get("guidance")), "total": standing + rules}
+    ssh_rules = len(sc.get("ssh_rules") or [])          # standing SSH host rules sign without asking, so they count
+    return {"standing": standing, "rules": rules, "ssh_rules": ssh_rules, "guidance": bool(sc.get("guidance")),
+            "total": standing + rules + ssh_rules}
 
 
 def _in_min(s):
@@ -129,6 +131,12 @@ def body(name, sc, ctx):
         "never expires and is used only within the auto-approve limit. Revoke to ask every time again.</small></p>"
         + ("" if ctx.grants_enabled else "<p><small class=muted>Time-boxed grants are turned off.</small></p>"),
         standing_card(name, ctx.standing_rows, ctx.csrf, ctx.client_names)]
+    if sc.get("ssh") and ctx.config_rules:
+        parts.append(f"<style>{uirules.CSS}</style><h3>Auto-approve rules ({len(ctx.config_rules)})</h3><p><small "
+                     "class=muted>Rules in the broker's configuration that name this key. A request that matches "
+                     "is released without asking, at any risk level. Edit them in the configuration. Never shown "
+                     "to agents.</small></p>" + uirules.config_table(ctx.config_rules, ctx.client_names,
+                                                                      {cid for cid, _ in ctx.client_choices}))
     if not sc.get("ssh"):
         parts.append(f"<style>{uirules.CSS}</style><h3>Auto-approve rules ({c['rules']})</h3><p><small class=muted>"
                      "A request that matches is released without asking, at any risk level. Each rule belongs to "

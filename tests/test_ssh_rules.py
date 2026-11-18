@@ -288,6 +288,14 @@ class CardCreate(Base):
         self.assertIsNone(got["unever"])
         self.assertTrue(89.9 * 86400 < sshrules.to_epoch(got["u90"]) - time.time() < 90.1 * 86400)
 
+    def test_the_approved_page_says_where_to_revoke_the_rule(self):
+        rid = self.ask_ok(login(SID_A), [HOST.bind(SID_A)])
+        status, _, body = self.decide(rid, "approve_ssh_rule", "link")
+        self.assertEqual(status, 200)
+        self.assertIn("Always approved for this account on this server", body)           # the premise: the rule was made
+        self.assertIn("href='/credentials/deploy?tab=policies'", body)
+        self.assertNotIn("href='/policies'", body)
+
     def test_bad_expiry_changes_nothing(self):
         rid = self.ask_ok(login(SID_A), [HOST.bind(SID_A)])
         self.assertEqual(self.decide(rid, "approve_ssh_rule", expiry="7")[1], "/?note=stale")

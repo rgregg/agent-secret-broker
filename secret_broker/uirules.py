@@ -222,6 +222,8 @@ def _client_label(ids, names, active):
 
 
 def _matches(rule):
+    if rule["mode"] == "ssh_sign":
+        return f"sign in as {rule['account']} on {rule['host'] or rule['host_fp']}"
     if rule["mode"] == "env":
         return "run: " + " ".join(rule["argv"])
     return f"{rule['scheme']}://{rule['host']}{rule['path_prefix']} ({', '.join(sorted(rule['methods']))})"
@@ -237,6 +239,27 @@ def _when(t):
         return sshrules.iso(t) if isinstance(t, (int, float)) else ""
     except (OverflowError, ValueError, OSError):
         return ""
+
+
+def _config_row(r, names, active):
+    """One read-only table row for a config rule."""
+    e = html.escape
+    return (
+        f"<tr><td data-label=Name>{e(r['name'])}</td><td data-label=Mode>{e(r['mode'])}</td>"
+        f"<td data-label=Matches><span class=mono>{e(_matches(r))}</span></td>"
+        f"<td data-label=Client>{e(_client_label(r['clients'], names, active))}</td>"
+        "<td data-label=Source>config"
+        + ("<br><small class=muted>covers several credentials</small>" if len(r["secrets"]) > 1 else "")
+        + "</td><td data-label=Created>-</td><td data-label=Expires>never</td>"
+        "<td data-label='Last used'>-</td><td><small class=muted>edit the configuration</small></td></tr>")
+
+
+def config_table(rules, client_names, active):
+    """A read-only table of config rules (the only auto-approve rules an SSH key's page can show)."""
+    names = client_names or {}
+    return ("<table class=tbl><thead><tr><th>Name</th><th>Mode</th><th>Matches</th><th>Client</th><th>Source</th>"
+            "<th>Created</th><th>Expires</th><th>Last used</th><th></th></tr></thead><tbody>"
+            + "".join(_config_row(r, names, active) for r in rules) + "</tbody></table>")
 
 
 def card(name, sc, config_rules, csrf, usage, now=None, state=None, client_names=None, client_choices=(),
@@ -257,16 +280,7 @@ def card(name, sc, config_rules, csrf, usage, now=None, state=None, client_names
     i = idx
     stored = sc.get("auto_rules") or []     # every credential gets a card: an env-only one has no hosts
     cfg_rules = config_rules
-    rows = []
-    for r in cfg_rules:
-        rows.append(
-            f"<tr><td data-label=Name>{e(r['name'])}</td><td data-label=Mode>{e(r['mode'])}</td>"
-            f"<td data-label=Matches><span class=mono>{e(_matches(r))}</span></td>"
-            f"<td data-label=Client>{e(_client_label(r['clients'], names, active))}</td>"
-            "<td data-label=Source>config"
-                + ("<br><small class=muted>covers several credentials</small>" if len(r["secrets"]) > 1 else "")
-                + "</td><td data-label=Created>-</td><td data-label=Expires>never</td>"
-            "<td data-label='Last used'>-</td><td><small class=muted>edit the configuration</small></td></tr>")
+    rows = [_config_row(r, names, active) for r in cfg_rules]
     for r in stored:
         u = usage.get(name, r["id"])
         expired = autorules.is_expired(r, now)

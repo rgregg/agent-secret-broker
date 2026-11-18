@@ -5929,6 +5929,14 @@ def _parse_decision(decision):
     return None
 
 
+def _revoke_where(names):
+    """Where a standing approval for these secrets is listed and revoked: the credential's Policies page for one
+    secret, the Policies tab for several."""
+    if len(names) == 1:
+        return credlinks_mod.link(names[0], tab="policies", text="the credential's Policies page")
+    return "<a href='/policies'>the Policies page</a>"
+
+
 def _in_min(s):
     """'in 12 min' for a countdown (rounded up); 'in under a minute' near the end."""
     s = int(s or 0)
@@ -7820,18 +7828,18 @@ def approval_handler(broker):
             if req.always in ("applied", "exists"):
                 what = standing_mod.scope_phrase(req.mode, grants_mod.scope_for(req.mode, req.spec))
                 extra = (f"<p>Always allow saved for <b>{credlinks_mod.link(req.names[0], tab='policies')}</b> ({html.escape(what)}). "
-                         "Revoke it at <a href='/policies'>/policies</a>.</p>")
+                         f"Revoke it on {_revoke_where(req.names)}.</p>")
             elif req.always:
                 extra = f"<p><small>Always allow {html.escape(req.always)}.</small></p>"
             if req.ssh_rule in ("created", "exists"):
-                extra += ("<p>Always approved for this account on this server with this key. Revoke it at "
-                          "<a href='/policies'>/policies</a>.</p>")
+                extra += ("<p>Always approved for this account on this server with this key. Revoke it on "
+                          f"{_revoke_where(req.names)}.</p>")
             elif req.ssh_rule:
                 extra += "<p><small>The standing rule was not created; this request was approved once.</small></p>"
             if parsed[2] is not None:
                 extra += (f"<p>Further requests for <b>{credlinks_mod.links(req.names, tab='policies')}</b> are "
-                          f"approved for {parsed[2]} minutes (same secrets only). Revoke it at "
-                          "<a href='/policies'>/policies</a>.</p>")
+                          f"approved for {parsed[2]} minutes (same secrets only). Revoke it on "
+                          f"{_revoke_where(req.names)}.</p>")
             _page(self, 200, "<h1>Approved</h1><p>Releasing now. You can close this page.</p>" + extra)
 
     return H

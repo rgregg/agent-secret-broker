@@ -200,6 +200,25 @@ class Tabs(PostBase):
                             confirm="1")
         self.assertEqual(code, 400)                                                                 # the write refusal is unchanged
 
+    def test_an_ssh_keys_host_rules_and_config_rule_are_counted_and_shown(self):
+        from secret_broker import sshrules
+        self.broker.cfg["secrets"]["deploy"]["ssh_rules"] = sshrules.parse([{
+            "id": "sr0001", "fp": "SHA256:" + "A" * 43, "user": "deploy", "host": "web", "by": "alice",
+            "at": "2026-11-18T00:00:00Z", "expires_at": None}])
+        self.broker.auto_rules = autorules.parse([{"name": "cfg-ssh", "mode": "ssh_sign", "secret": "deploy",
+                                                   "host": "web.example.com", "account": "deploy"}])
+        settings = self.get("/credentials/deploy")[1]
+        self.assertIn("Policies (2)", settings)                                          # the host rule and the config rule
+        self.assertIn("1 SSH host rule", settings)
+        self.assertIn("1 auto-approve rule", settings)
+        pol = self.get("/credentials/deploy?tab=policies")[1]
+        self.assertIn("cfg-ssh", pol)                                                    # the config rule is findable
+        self.assertEqual(pol.count("data-label=Name>cfg-ssh<"), 1)
+        row = [r for r in self.get("/credentials")[1].split("<tr class=r") if "href='/credentials/deploy'" in r][0]
+        self.assertIn("href='/credentials/deploy?tab=policies'>2</a>", row)
+        self.assertIn("<td class=ic data-label=Policies><small class=muted>-</small>",
+                      [r for r in self.get("/credentials")[1].split("<tr class=r") if "href='/credentials/other'" in r][0])
+
     def test_the_credentials_tab_stays_highlighted(self):
         for q in ("", "?tab=policies"):
             self.assertIn("href='/credentials' class=on", self.get("/credentials/svc" + q)[1], q)
@@ -319,7 +338,9 @@ class PoliciesTab(PostBase):
         self.broker.auto_rules = autorules.parse([
             {"name": "cfg-one", "mode": "env", "secret": "svc", "argv": ["echo"]},
             {"name": "cfg-pair", "mode": "env", "secrets": ["svc", "other"], "argv": ["echo"]},
-            {"name": "cfg-gone", "mode": "env", "secret": "missing", "argv": ["echo"]}])
+            {"name": "cfg-gone", "mode": "env", "secret": "missing", "argv": ["echo"]},
+            {"name": "cfg-ssh", "mode": "ssh_sign", "secret": "deploy", "host": "web.example.com",
+             "account": "deploy"}])
         pages = {"policies": self.get("/policies")[1]}
         for name in self.broker.cfg["secrets"]:
             pages[name] = self.get(f"/credentials/{name}?tab=policies")[1]
@@ -337,3 +358,4 @@ class PoliciesTab(PostBase):
         self.assertEqual(seen("data-label=Name>cfg-one<"), ["svc"])
         self.assertEqual(seen("data-label=Name>cfg-pair<"), ["other", "policies", "svc"])         # each credential it names, and the tab
         self.assertEqual(seen("data-label=Name>cfg-gone<"), ["policies"])
+        self.assertEqual(seen("data-label=Name>cfg-ssh<"), ["deploy"])                            # an ssh key's config rule is not lost

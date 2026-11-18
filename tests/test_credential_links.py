@@ -11,6 +11,8 @@ import _fast  # noqa: F401  (test-only: prompt server shutdown, fake-clock helpe
 import os
 import re
 import sys
+import urllib.parse
+import urllib.request
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import test_e2e as t  # noqa: E402
@@ -116,6 +118,34 @@ class Pages(tg.Base):
         body = self.page("/clients")
         self.assertIn("in full on each credential&#x27;s Policies page", body.replace("'", "&#x27;"))
         self.assertNotIn("on the Policies tab", body)
+
+    def link_decide(self, rid, decision):
+        """Decide on the approval link page and return the page it answers with."""
+        nonce = self.broker._by_id[rid].nonce
+        r = urllib.request.Request(self.abase + f"/a/{nonce}", headers=H, method="POST",
+                                   data=urllib.parse.urlencode({"decision": decision}).encode())
+        return urllib.request.urlopen(r, timeout=10).read().decode()
+
+    def test_the_approved_page_says_where_to_revoke_an_always(self):
+        rid = self.http(path="/always", method="POST")           # a GET would be covered by setUp's grant
+        body = self.link_decide(rid, "approve_always")
+        self.assertIn("Always allow saved for", body)                                    # the premise: the Always was made
+        self.assertIn("Revoke it on <a class=clink href='/credentials/svc?tab=policies'>the credential&#x27;s Policies "
+                      "page</a>", body)
+        self.assertNotIn("href='/policies'", body)                                       # nothing is listed there for it
+
+    def test_the_approved_page_says_where_to_revoke_a_timed_grant(self):
+        one = self.link_decide(self.http(path="/t1", method="POST"), "approve_grant_15")
+        self.assertIn("Revoke it on <a class=clink href='/credentials/svc?tab=policies'>the credential&#x27;s Policies "
+                      "page</a>", one)
+        pair = self.link_decide(self.http(("svc", "other"), path="/t2"), "approve_grant_15")
+        self.assertIn("Further requests for", pair)                                      # the premise: a grant for the pair
+        self.assertIn("Revoke it on <a href='/policies'>the Policies page</a>", pair)    # a pair is listed on the Policies tab
+        self.assertNotIn("Revoke it on <a class=clink", pair)
+
+    def test_the_policies_tab_really_lists_a_pair_but_not_a_single_grant(self):
+        self.link_decide(self.http(("svc", "other"), path="/t3"), "approve_grant_15")
+        self.assertIn("Timed approvals covering several credentials", self.page("/policies"))     # the claim the page makes is true
 
     def test_scan_helper_sees_an_unlinked_name(self):
         self.assertEqual(len(bare("<p>svc</p><a href='x'>svc</a><option>svc</option>", "svc")), 1)
