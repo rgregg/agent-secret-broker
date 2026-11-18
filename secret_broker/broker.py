@@ -3797,6 +3797,34 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
             return []
         return [{**g, "left_s": self.grants.left_s(g)} for g in self.grants.active()]
 
+    def standing_by_credential(self):
+        """(per_credential, shared): the standing approvals split by where they are shown. A row belongs to a
+        credential's page only when its set of secret names is exactly one credential that exists in the catalog;
+        every other row (two or more names, or a name that is gone) is shared and carries `orphan` (True when a
+        name is missing from the catalog)."""
+        with self._cfg_lock:
+            known = set(self.cfg["secrets"])
+        per, shared = {}, []
+        for r in self.standing_rows():
+            names = set(r["names"])
+            if len(names) == 1 and next(iter(names)) in known:
+                per.setdefault(next(iter(names)), []).append(r)
+            else:
+                shared.append({**r, "orphan": bool(names - known)})
+        return per, shared
+
+    def config_rules_for(self, name):
+        """The `auto_approve` config rules that name this credential (a pair rule is listed for each of its names)."""
+        return [r for r in self.auto_rules if name in r["secrets"]]
+
+    def shared_config_rules(self):
+        """Config rules that stay on the Policies tab: two or more credentials, or a credential that is gone
+        (those carry `orphan`)."""
+        with self._cfg_lock:
+            known = set(self.cfg["secrets"])
+        return [{**r, "orphan": bool(r["secrets"] - known)} for r in self.auto_rules
+                if len(r["secrets"]) >= 2 or r["secrets"] - known]
+
     def standing_rows(self):
         """Every standing approval for the Policies page, soonest-expiring first, then
         Always, then legacy whole-credential allows. Each row: kind (timed|always|
@@ -3804,7 +3832,8 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
         never), left_s, created_by, created_at (text), modes (legacy)."""
         rows = []
         for g in self.active_grants():
-            rows.append({"kind": "timed", "id": g["id"], "secrets": g["secrets"], "mode": g["mode"],
+            rows.append({"kind": "timed", "id": g["id"], "secrets": g["secrets"], "names": list(g["secrets"]),
+                         "mode": g["mode"],
                          "client": g["client"], "scope": g["scope"],
                          "covers": standing_mod.covers_label(g["mode"], g["scope"]),
                          "expires_at": g["expires_at"], "left_s": g["left_s"],
@@ -3818,7 +3847,8 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
             for e in sc.get("standing") or []:
                 off = e["mode"] not in self._effective_auto_modes(sc, e.get("client") if e.get("client", clients_mod.ANY) != clients_mod.ANY
                                                                    else None)
-                rows.append({"kind": "always", "id": e["id"], "secrets": [name + internal_tag(name)], "mode": e["mode"],
+                rows.append({"kind": "always", "id": e["id"], "secrets": [name + internal_tag(name)], "names": [name],
+                             "mode": e["mode"],
                              "client": e.get("client", clients_mod.ANY), "scope": e["scope"], "covers": standing_mod.covers_label(e["mode"], e["scope"], e.get("scripts"))
                              + (" (not active: mode not enabled)" if off else ""),
                              "expires_at": None, "left_s": None, "created_by": e["created_by"],
@@ -3829,7 +3859,8 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
             ch = sc.get("approval_changed") or {}
             at = ch.get("at") or ""
             modes = ", ".join(_MODE_LABEL.get(m, m) for m in self._auto_modes(sc)) or "none"
-            rows.append({"kind": "legacy", "id": "", "name": name, "secrets": [name + internal_tag(name)], "mode": None,
+            rows.append({"kind": "legacy", "id": "", "name": name, "secrets": [name + internal_tag(name)], "names": [name],
+                         "mode": None,
                          "client": clients_mod.ANY, "scope": "any", "covers": f"whole credential, any method, any covered mode ({modes})",
                          "expires_at": None, "left_s": None, "created_by": ch.get("by") or "",
                          "created_at": at.replace("T", " ").replace("Z", " UTC")})
