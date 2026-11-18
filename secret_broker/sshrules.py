@@ -237,8 +237,9 @@ class Usage:
     log (never in the vault: its writes are rate limited). Atomic, 0600. A corrupt
     or unreadable file just loses the numbers."""
 
-    def __init__(self, path, on_event=None):
+    def __init__(self, path, on_event=None, prefix="ssh_rules"):
         self._path, self._log = path, on_event or (lambda *a, **k: None)
+        self._prefix = prefix
         self._lock = threading.Lock()
         self._d = {}
         self._load()
@@ -255,7 +256,7 @@ class Usage:
             self._d = d
         except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
             self._d = {}
-            self._log("ssh_rules_state_corrupt", warning="last-used data ignored", error=str(e)[:120])
+            self._log(f"{self._prefix}_state_corrupt", warning="last-used data ignored", error=str(e)[:120])
 
     @staticmethod
     def _key(secret, rid):
@@ -271,7 +272,7 @@ class Usage:
                 json.dump({"version": 1, "rules": self._d}, f)
             os.replace(tmp, self._path)
         except OSError as e:
-            self._log("ssh_rules_state_write_failed", warning="last-used kept in memory only",
+            self._log(f"{self._prefix}_state_write_failed", warning="last-used kept in memory only",
                       error=str(e)[:120])
 
     def record(self, secret, rid, now):

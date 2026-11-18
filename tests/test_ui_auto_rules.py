@@ -6,13 +6,20 @@ rule needs the approver's authenticated session, a confirmation tick and a valid
 fixed reason; nothing typed into the form reaches an agent response or the audit log.
 """
 import _fast  # noqa: F401  (test-only: prompt server shutdown, fake-clock helpers)
+import json
 import os
 import sys
 import time
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from secret_broker import autorules, sshrules  # noqa: E402
+import test_e2e as t  # noqa: E402
+import test_grants as tg  # noqa: E402
+from secret_broker import audit_api, autorules, sshrules  # noqa: E402
+from secret_broker.backends import MemoryBackend  # noqa: E402
+from secret_broker.broker import Broker  # noqa: E402
+from secret_broker.notify import FakeNotifier  # noqa: E402
+from test_auto_rules import Enrolled  # noqa: E402
 
 FUTURE = sshrules.iso(time.time() + 86400 * 30)
 PAST = sshrules.iso(time.time() - 3600)
@@ -113,6 +120,23 @@ class Parse(unittest.TestCase):
         self.assertEqual(autorules.parse_stored(None, "k"), [])
 
 
+class SharedMatcher(unittest.TestCase):
+    """Cases the HTTP layer refuses before any rule is looked at (an override header) still must not match."""
+
+    def find(self, **spec):
+        rules = autorules.parse_stored([http_rule(methods=["GET", "POST"])], "k")
+        return autorules.find(rules, "http", ["k"], {"url": "https://api.example.com/v1/x", "method": "GET", **spec},
+                              {"id": BOX})
+
+    def test_override_headers_and_parameters_never_match(self):
+        self.assertIsNotNone(self.find(headers={}))                                       # control
+        for h in ("X-HTTP-Method-Override", "x-method-override", "X-Original-URL", "X-Rewrite-URL"):
+            self.assertIsNone(self.find(headers={h: "DELETE"}), h)
+        self.assertIsNone(self.find(url="https://api.example.com/v1/x?_method=DELETE"))
+        self.assertIsNone(self.find(method="POST", body='{"method": "DELETE"}'))
+        self.assertIsNotNone(self.find(method="POST", body='{"payment_method": "card"}'))   # only the name counts
+
+
 class Expiry(unittest.TestCase):
     SPEC = {"url": "https://api.example.com/v1/x", "method": "GET", "headers": {}}
 
@@ -133,6 +157,190 @@ class Expiry(unittest.TestCase):
         self.assertFalse(autorules.is_expired(cfg, time.time() + 10 ** 9))
         stored = autorules.parse_stored([http_rule()], "k")[0]
         self.assertFalse(autorules.is_expired(stored, time.time() + 10 ** 9))
+
+
+def svc_rule(**kw):
+    """A stored rule for the harness's `svc` credential: plain http to the local stub under /x."""
+    return http_rule(scheme="http", host="127.0.0.1", methods=["GET", "POST"], path_prefix="/x", **kw)
+
+
+class Match(Enrolled, t.Harness):
+    """A stored rule approves exactly what the same rule in the config approves."""
+
+    def setUp(self):
+        super().setUp()
+        self.port = self.up.server_address[1]
+        self.set_stored(svc_rule())
+
+    def set_stored(self, *raw, name="svc"):
+        self.broker.cfg["secrets"][name]["auto_rules"] = autorules.parse_stored(list(raw), name)
+
+    def call(self, method="GET", path="/x", headers=None, body=None, key=None):
+        spec = {"mode": "http", "names": ["svc"], "method": method, "url": f"http://127.0.0.1:{self.port}{path}",
+                "headers": {"Authorization": "Bearer {{SVC_TOKEN}}", **(headers or {})}}
+        if body is not None:
+            spec["body"] = body
+        code, raw = self.api("POST", "/v1/requests", spec, key=key)
+        self.assertEqual(code, 202, raw)
+        return json.loads(raw)["id"]
+
+    def approved_without_asking(self, rid):
+        _, b = self.api("GET", f"/v1/requests/{rid}?wait=5")
+        self.assertEqual(json.loads(b)["http"]["status"], 200)
+        return self.events("approved")[-1]
+
+    def prompted(self, rid):
+        """True when no rule decided this request (the harness's fake phone then answered it)."""
+        return not [e for e in self.events("auto_rule_used") if e.get("id") == rid]
+
+    def test_stored_http_rule_approves_like_a_config_rule(self):
+        stored = self.approved_without_asking(self.call())
+        self.assertEqual((stored["via"], stored["decision_source"], stored["rule_name"]),
+                         ("policy", "ui_rule", "news"))
+        self.set_stored()                                             # no stored rule now
+        self.broker.auto_rules = autorules.parse([
+            {"name": "news", "mode": "http", "secret": "svc", "scheme": "http", "host": "127.0.0.1",
+             "methods": ["GET", "POST"], "path_prefix": "/x"}])
+        config = self.approved_without_asking(self.call())
+        self.assertEqual((config["via"], config["decision_source"], config["rule_name"]),
+                         ("policy", "config_rule", "news"))
+        self.assertEqual(self.notifier.sent, [])
+
+    def test_the_matcher_table_is_shared_with_config_rules(self):
+        cases = {
+            "percent escape in the path": dict(path="/x%2fy"),
+            "dot segment": dict(path="/x/../admin"),
+            "GET with a body": dict(body="x=1"),
+            "method named in a body": dict(method="POST", body="_method=DELETE"),
+            "wrong prefix": dict(path="/xy"),
+            "wrong method": dict(method="DELETE"),
+        }
+        for label, kw in cases.items():
+            rid = self.call(**kw)
+            self.assertTrue(self.prompted(rid), label)
+        self.assertEqual(len(self.notifier.sent), len(cases))
+        self.assertEqual(self.approved_without_asking(self.call())["decision_source"], "ui_rule")   # control
+
+    def test_empty_clients_means_an_enrolled_client_and_never_the_legacy_key(self):
+        self.assertTrue(self.prompted(self.call(key=t.KEY)))
+        self.assertFalse(self.prompted(self.call()))
+        self.assertEqual(self.broker.cfg["secrets"]["svc"]["auto_rules"][0]["clients"], frozenset())
+
+    def test_a_rule_pinned_to_one_client_serves_only_that_client(self):
+        self.set_stored(svc_rule(clients=["c-0a0b0c0d"]))
+        self.assertTrue(self.prompted(self.call()))
+        self.set_stored(svc_rule(clients=[self.client.id]))
+        self.assertFalse(self.prompted(self.call()))
+
+    def test_a_client_set_to_never_auto_approve_still_prompts(self):
+        self.broker.clients_cfg["overrides"][self.client.id] = {"auto_approve_max": "none"}
+        self.assertTrue(self.prompted(self.call()))
+        self.assertEqual(self.events("auto_rule_used"), [])
+        del self.broker.clients_cfg["overrides"][self.client.id]
+        self.assertFalse(self.prompted(self.call()))                  # control: the rule works without it
+
+    def test_an_expired_rule_is_ignored_before_any_sweep(self):
+        self.set_stored(svc_rule(expires_at=PAST))
+        self.assertTrue(self.prompted(self.call()))
+        self.set_stored(svc_rule(expires_at=FUTURE))
+        self.assertFalse(self.prompted(self.call()))
+
+    def test_usage_is_counted_and_kept_beside_the_audit_log(self):
+        self.assertEqual(self.broker.auto_rule_usage.get("svc", "r0001")["uses"], 0)
+        self.approved_without_asking(self.call())
+        u = self.broker.auto_rule_usage.get("svc", "r0001")
+        self.assertEqual(u["uses"], 1)
+        self.assertIsNotNone(u["last_used"])
+        self.assertTrue(os.path.exists(os.path.join(os.path.dirname(self.broker._audit._path),
+                                                    "auto_rules_state.json")))
+
+    def test_the_used_event_names_the_source_and_the_rule_and_is_hidden_from_agents(self):
+        self.approved_without_asking(self.call())
+        used = self.events("auto_rule_used")[-1]
+        self.assertEqual((used["source"], used["rule_id"], used["rule_name"]), ("ui", "r0001", "news"))
+        self.assertIn("auto_rule_used", audit_api.HIDDEN)             # the agent API never returns it
+        code, body = self.api("GET", "/v1/audit")
+        self.assertEqual(code, 200)
+        self.assertNotIn("auto_rule_used", body)
+        self.assertNotIn("news", body)
+        self.assertIn('"approved"', body)                             # control: the audit view is populated
+
+    def test_the_history_says_a_policies_rule_decided(self):
+        rid = self.call()
+        self.approved_without_asking(rid)
+        row, _ = self.broker.history.detail(rid)
+        self.assertEqual((row["outcome"], row["rule_name"], row["decision_source"]),
+                         ("auto-approved", "news", "ui_rule"))
+        page = t.req(self.abase + f"/request/{rid}?fragment=1", headers={"X-authentik-username": "alice"})[1]
+        self.assertIn('Policies rule "news" (auto-approved)', page)
+        self.assertIn("class='pill ok'>auto-approved", page)           # the pill's class is not clobbered
+        self.assertNotIn("configuration rule", page)
+
+
+class WrongCredential(Enrolled, tg.Base):
+    """A rule stored on one credential never approves a request that names another, or a pair."""
+
+    def setUp(self):
+        super().setUp()
+        raw = {"id": "e0001", "name": "greet", "mode": "env", "argv": ["echo", "hi"], "by": "alice",
+               "at": "2026-11-18T00:00:00Z", "expires_at": None}
+        self.broker.cfg["secrets"]["svc"]["auto_rules"] = autorules.parse_stored([raw], "svc")
+
+    def env(self, names):
+        code, body = self.api("POST", "/v1/requests", {"mode": "env", "names": names, "argv": ["echo", "hi"]})
+        self.assertEqual(code, 202, body)
+        return json.loads(body)["id"]
+
+    def test_a_rule_on_svc_never_approves_svc_and_other_or_just_other(self):
+        self.assertEqual(len(self.notifier.sent), 0)
+        self.env(["svc", "other"])
+        self.env(["other"])
+        self.assertEqual(len(self.notifier.sent), 2)                  # a human was asked both times
+        self.assertEqual(self.events("auto_rule_used"), [])
+        rid = self.env(["svc"])                                       # control: the rule serves its own credential
+        _, b = self.api("GET", f"/v1/requests/{rid}?wait=3")
+        self.assertEqual(json.loads(b)["env"], {"SVC_TOKEN": t.SECRET})
+        self.assertEqual(self.events("auto_rule_used")[-1]["source"], "ui")
+
+
+class Loading(unittest.TestCase):
+    META = {"name": "k", "vars": {"K": {"item": "Item", "field": "password"}}, "allowed_hosts": ["a.example"]}
+
+    def test_stored_rules_load_onto_the_entry_and_not_into_the_raw_metadata(self):
+        _, entry = Broker._entry("Item", {**self.META, "auto_rules": [http_rule()]})
+        self.assertEqual(entry["auto_rules"][0]["name"], "news")
+        self.assertEqual(entry["auto_rules"][0]["secrets"], frozenset({"k"}))
+        self.assertEqual(entry["_meta"]["auto_rules"][0]["name"], "news")      # still the vault's own JSON
+
+    def test_only_for_credentials_that_are_not_ssh_keys(self):
+        import test_ssh_rules as tsr
+        meta = tsr.Validation.meta(tsr.Validation(), auto_rules=[http_rule()])
+        with self.assertRaises(ValueError) as cm:
+            Broker._entry("Item", meta)
+        self.assertIn("auto_rules only applies to a credential that is not an ssh key", str(cm.exception))
+        _, ok = Broker._entry("Item", {**self.META, "auto_rules": [http_rule()]})      # control
+        self.assertIn("auto_rules", ok)
+
+    def test_a_malformed_list_names_the_field(self):
+        for label, bad in {"host": http_rule(host="not a host"), "mode": http_rule(mode="ssh_sign"),
+                           "no id": {k: v for k, v in http_rule().items() if k != "id"}}.items():
+            with self.assertRaises(ValueError, msg=label) as cm:
+                Broker._entry("Item", {**self.META, "auto_rules": [bad]})
+            self.assertIn("auto_rules[0].", str(cm.exception), label)
+
+    def test_a_malformed_list_invalidates_only_that_credential(self):
+        def meta(name, item, rules):
+            return {**self.META, "name": name, "vars": {"K": {"item": item, "field": "password"}},
+                    "auto_rules": rules}
+        good, bad = meta("good", "ItemA", [http_rule()]), meta("bad", "ItemB", [{"id": "x"}])
+
+        class Rows(MemoryBackend):
+            def catalog(self):
+                return [{"item": "ItemA", "meta": good, "auto": None}, {"item": "ItemB", "meta": bad, "auto": None}]
+        b = Broker({"approve_base_url": "https://s.example"}, Rows(), FakeNotifier(), None)
+        self.assertIn("good", b.cfg["secrets"])
+        self.assertNotIn("bad", b.cfg["secrets"])
+        self.assertEqual(b._catalog_stats["invalid"], 1)
 
 
 if __name__ == "__main__":

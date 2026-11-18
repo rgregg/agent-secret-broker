@@ -331,6 +331,10 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         self._init_grants(config)
         self._init_plans(config)
         self._init_ssh_rules()
+        apath = self._audit._path
+        self.auto_rule_usage = sshrules_mod.Usage(
+            os.path.join(os.path.dirname(os.path.abspath(apath)), "auto_rules_state.json") if apath else None,
+            self.log, prefix="auto_rules")
         if not self.dest_guard.allow_loopback:
             for w in self.trust_warnings():
                 self.log("config_warning", warning=w)
@@ -442,6 +446,11 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             ref0 = next(iter(raw_vars.values()))
             if (ref0 if isinstance(ref0, dict) else {}).get("field", "auto") not in ("private_key", "auto"):
                 raise ValueError("an ssh key secret's variable must use the private_key field")
+        auto_rules = None
+        if meta.get("auto_rules") is not None:
+            if ssh:
+                raise ValueError("auto_rules only applies to a credential that is not an ssh key")
+            auto_rules = autorules_mod.parse_stored(meta["auto_rules"], name)
         ssh_hosts = None
         if meta.get("ssh_hosts") is not None:
             if not ssh:
@@ -490,11 +499,14 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             entry["guidance_invalid"] = ginvalid
         entry.pop("ssh_hosts", None)
         entry.pop("ssh_rules", None)
+        entry.pop("auto_rules", None)
         entry.pop("standing", None)
         if standing:
             entry["standing"] = standing        # parsed; policy context, never in discovery/status output
         if ssh_rules:
             entry["ssh_rules"] = ssh_rules      # parsed; policy context, never in discovery/status output
+        if auto_rules:
+            entry["auto_rules"] = auto_rules    # parsed; policy context, never in discovery/status output
         if ssh_hosts and (ssh_hosts["known"] or ssh_hosts["allowed"] or ssh_hosts["allow_forwarded"]):
             entry["ssh_hosts"] = ssh_hosts      # parsed; never part of discovery/status output
         if note:
@@ -1982,7 +1994,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         never = self.client_never_auto(cid)
         if not never and self._ssh_rule_claim(req):   # standing per-host rule: explicit policy, any risk limit
             return req
-        if not never and self._config_rule_claim(req):   # `auto_approve` rule in the config: same standing, any risk
+        if not never and self._rule_claim(req):   # `auto_approve` rule in the config: same standing, any risk
             return req
         auto = self._auto_allowed(mode, names, spec, cid)
         if never and auto:
@@ -2016,19 +2028,29 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             self._finish(req, "failed", error="could not notify")
         return req
 
-    def _config_rule_claim(self, req):
-        """Approve `req` from a matching `auto_approve` rule of the broker's configuration (see autorules.py).
-        Called from create() after the assessment, beside the standing SSH rules. Returns True when the request
-        was finished here."""
-        rule = autorules_mod.find(self.auto_rules, req.mode, req.names, req.spec, req.client)
+    def _rule_claim(self, req):
+        """Approve `req` from a matching `auto_approve` rule: one in the broker's configuration (see
+        autorules.py), or, for a request naming a single credential, one kept in that credential's vault
+        metadata and managed on the Policies tab. Config rules are tried first. Called from create() after the
+        assessment, beside the standing SSH rules. Returns True when the request was finished here."""
+        stored = []
+        if len(req.names) == 1:
+            stored = (self.cfg["secrets"].get(req.names[0]) or {}).get("auto_rules") or []
+        now = time.time()
+        rule = autorules_mod.find(self.auto_rules + stored, req.mode, req.names, req.spec, req.client, now)
         if rule is None:
             return False
         with self._lock:                # a human decision and a rule never both act
             if req.status != "pending":
                 return False
             req.status = "deciding"
-        self.audit("auto_rule_used", req, rule_name=rule["name"])
-        extra = dict(decision_source="config_rule", rule_name=rule["name"])
+        if rule["source"] == "ui":
+            self.audit("auto_rule_used", req, source="ui", rule_id=rule["id"], rule_name=rule["name"])
+            self.auto_rule_usage.record(req.names[0], rule["id"], now)
+            extra = dict(decision_source="ui_rule", rule_name=rule["name"])
+        else:
+            self.audit("auto_rule_used", req, source="config", rule_name=rule["name"])
+            extra = dict(decision_source="config_rule", rule_name=rule["name"])
         try:
             result = self._release(req)
         except Exception as e:  # noqa: BLE001 -- the request must always settle; a fixed label only
@@ -5994,7 +6016,8 @@ def _detail_html(r, evs, retained=""):
             f"{used.get('account') or '?'}@{used.get('rule_host') or sshrules_mod.short_fp(used.get('host_fp')) or '?'}"
             f", rule {str(r['rule_id'])[:16]}")
     elif r["via"] == "policy" and r.get("rule_name"):
-        add("Decided by", f"configuration rule \"{e(str(r['rule_name']))}\" (auto-approved)", True)
+        which = "Policies rule" if r.get("decision_source") == "ui_rule" else "configuration rule"
+        add("Decided by", f"{which} \"{e(str(r['rule_name']))}\" (auto-approved)", True)
     elif r["via"] == "policy" and r.get("plan_id"):
         left = r.get("plan_left_s")
         add("Decided by", f"plan {str(r['plan_id'])[:8]} (auto-approved)"

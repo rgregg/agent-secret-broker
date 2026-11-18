@@ -159,6 +159,9 @@ HIDDEN = frozenset({
     # and the agent must never learn which servers have rules
     "auto_rule_used", "vault_sync_failed", "ssh_rule_created", "ssh_rule_used", "ssh_rule_revoked", "ssh_rule_expired", "ssh_rule_refused",
     "ssh_rule_change_failed", "ssh_rules_state_corrupt", "ssh_rules_state_write_failed",
+    # rules kept in a credential's metadata and managed from the Policies tab: approval policy, like the above
+    "auto_rule_created", "auto_rule_revoked", "auto_rule_expired", "auto_rule_refused", "auto_rule_change_failed",
+    "auto_rules_state_corrupt", "auto_rules_state_write_failed",
     # per-client credentials: enrolling, renaming and revoking clients is approver activity, and an
     # authentication failure can name a revoked client; none of it is the agent's business
     "enroll_requested", "enroll_decided", "enroll_refused", "enroll_notify_failed",
