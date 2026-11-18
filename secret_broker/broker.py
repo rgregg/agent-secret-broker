@@ -58,6 +58,7 @@ from . import proposals as proposals_mod
 from . import credreq as credreq_mod
 from . import sudomode as sudo_mod
 from . import autorules as autorules_mod
+from . import uirules as uirules_mod
 from . import clients as clients_mod
 from . import clock as clock_mod
 from . import plans as plans_mod
@@ -231,7 +232,7 @@ class _InternalRefused(ValueError):
     """An internal refusal already audited (hidden event); the text is the generic one."""
 
 
-class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.SessionsMixin,
+class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.ClientsMixin, sessions_mod.SessionsMixin,
              ws_mod.WsMixin, planflow.PlansMixin):
     def __init__(self, config, backend, notifier, audit=None, summarizer=None,
                  background_load=False, push=None, dest_guard=None):
@@ -335,6 +336,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         self.auto_rule_usage = sshrules_mod.Usage(
             os.path.join(os.path.dirname(os.path.abspath(apath)), "auto_rules_state.json") if apath else None,
             self.log, prefix="auto_rules")
+        self._init_ui_rules()
         if not self.dest_guard.allow_loopback:
             for w in self.trust_warnings():
                 self.log("config_warning", warning=w)

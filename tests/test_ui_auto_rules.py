@@ -20,6 +20,7 @@ from secret_broker.backends import MemoryBackend  # noqa: E402
 from secret_broker.broker import Broker  # noqa: E402
 from secret_broker.notify import FakeNotifier  # noqa: E402
 from test_auto_rules import Enrolled  # noqa: E402
+from test_ssh_rules import NoMeta  # noqa: E402
 
 FUTURE = sshrules.iso(time.time() + 86400 * 30)
 PAST = sshrules.iso(time.time() - 3600)
@@ -341,6 +342,224 @@ class Loading(unittest.TestCase):
         self.assertIn("good", b.cfg["secrets"])
         self.assertNotIn("bad", b.cfg["secrets"])
         self.assertEqual(b._catalog_stats["invalid"], 1)
+
+
+class Manage(Enrolled, tg.Base):
+    """Adding, revoking and expiring stored rules through the Broker methods the Policies tab calls."""
+    risk = "high"
+
+    def tweak(self, cfg):
+        super().tweak(cfg)
+        cfg["secrets"]["svc"]["approval"] = "allow"          # another metadata key a rule write must not clobber
+
+    FIELDS = dict(name="news", mode="http", host="127.0.0.1", scheme="http", methods=["GET", "POST"],
+                  path_prefix="/x", argv=[], client="*")
+
+    def add(self, cred="svc", expiry="never", confirm=True, user="alice", **over):
+        """`over` overrides the rule's own fields (including its `name`); `cred` is the credential."""
+        return self.broker.add_auto_rule(cred, {**self.FIELDS, **over}, expiry, confirm, user, "127.0.0.1", "10.0.0.9")
+
+    def stored(self, name="svc"):
+        return self.disk()["secrets"][name].get("auto_rules", [])
+
+    def live(self, name="svc"):
+        return self.broker.cfg["secrets"][name].get("auto_rules", [])
+
+    def call(self):
+        port = self.up.server_address[1]
+        code, raw = self.api("POST", "/v1/requests", {
+            "mode": "http", "names": ["svc"], "method": "GET", "url": f"http://127.0.0.1:{port}/x",
+            "headers": {"Authorization": "Bearer {{SVC_TOKEN}}"}})
+        self.assertEqual(code, 202, raw)
+        return json.loads(raw)["id"]
+
+    def used(self):
+        return len(self.events("auto_rule_used"))
+
+    def seed(self, *raw, name="svc"):
+        """Rules already in the vault (as an earlier session left them)."""
+        self.broker._persist_auto_rules(name, autorules.parse_stored(list(raw), name), "seed")
+
+    # -- add
+    def test_add_http_rule_persists_is_live_and_approves(self):
+        res = self.add(expiry="30")
+        self.assertEqual((res["status"], res["message"]), ("created", ""))
+        [rule] = self.stored()
+        self.assertEqual((rule["name"], rule["mode"], rule["host"], rule["methods"], rule["path_prefix"], rule["by"]),
+                         ("news", "http", "127.0.0.1", ["GET", "POST"], "/x", "alice"))
+        self.assertEqual(rule["scheme"], "http")
+        self.assertNotIn("clients", rule)
+        self.assertEqual(sshrules.to_epoch(rule["expires_at"]) // 86400, int(time.time() + 30 * 86400) // 86400)
+        self.assertEqual(self.live()[0]["id"], rule["id"])
+        self.assertEqual(self.disk()["secrets"]["svc"]["approval"], "allow")          # nothing else was clobbered
+        ev = self.events("auto_rule_created")[-1]
+        self.assertEqual((ev["credential"], ev["rule_id"], ev["rule_name"], ev["rule_mode"], ev["created_by"],
+                          ev["channel"], ev["approver_peer"], ev["approver_ip"], ev["rule_host"]),
+                         ("svc", rule["id"], "news", "http", "alice", "policies", "127.0.0.1", "10.0.0.9",
+                          "127.0.0.1"))
+        before = self.used()
+        self.call()
+        self.assertEqual(self.used(), before + 1)                                     # it is live without a restart
+        self.assertEqual(self.events("approved")[-1]["decision_source"], "ui_rule")
+
+    def test_add_env_rule_and_pin_a_client(self):
+        res = self.add(name="greet", mode="env", argv=["echo", "hi"], client=self.client.id)
+        self.assertEqual(res["status"], "created")
+        [rule] = self.stored()
+        self.assertEqual((rule["mode"], rule["argv"], rule["clients"]), ("env", ["echo", "hi"], [self.client.id]))
+        self.assertNotIn("host", rule)
+        self.assertNotIn("rule_host", self.events("auto_rule_created")[-1])
+        code, body = self.api("POST", "/v1/requests", {"mode": "env", "names": ["svc"], "argv": ["echo", "hi"]})
+        self.assertEqual(code, 202, body)
+        self.assertEqual(self.events("auto_rule_used")[-1]["source"], "ui")
+
+    def refuse(self, reason, **kw):
+        before = (self.stored(), self.live())
+        res = self.add(**kw)
+        self.assertEqual(res["status"], "refused", kw)
+        self.assertEqual(self.events("auto_rule_refused")[-1]["reason"], reason, kw)
+        self.assertEqual((self.stored(), self.live()), before, kw)                    # nothing written, nothing live
+        return res
+
+    def test_every_refusal_has_a_fixed_reason_and_writes_nothing(self):
+        self.assertEqual(self.add(name="first")["status"], "created")               # the surface is populated
+        self.refuse("not_confirmed", confirm=False)
+        self.refuse("invalid", expiry="7")
+        self.refuse("invalid", client="c-deadbeef")                                   # not enrolled
+        self.refuse("invalid", client="legacy")                                       # the legacy key never matches a rule
+        self.refuse("invalid", client="bogus")
+        for mode in ("ssh_sign", "sudo", "plan", "bogus", ""):
+            self.refuse("invalid", mode=mode)
+        self.refuse("invalid", host="not a host")
+        self.refuse("invalid", host="")
+        self.refuse("invalid", methods=[])
+        self.refuse("invalid", methods=["get"])
+        self.refuse("invalid", scheme="ftp")
+        self.refuse("invalid", path_prefix="/x/../y")
+        self.refuse("invalid", mode="env", argv=[])
+        self.refuse("invalid", name="")
+        self.refuse("duplicate_name", name="FIRST")
+        self.assertEqual(len(self.stored()), 1)
+
+    def test_a_revoked_client_cannot_be_chosen(self):
+        other = self.mk("gone")
+        self.assertEqual(self.add(name="a", client=other.id)["status"], "created")     # control
+        self.broker.revoke_client(other.id, "alice")
+        self.refuse("invalid", name="b", client=other.id)
+
+    def test_the_message_is_a_fixed_label_and_never_echoes_input(self):
+        canary = "S3CR3T-<b>canary"
+        for label, kw, field in (
+                ("host", dict(host=canary + " bad host", name=canary, path_prefix=canary), "host"),
+                ("argv", dict(mode="env", argv=[canary] * 65, name=canary), "argv"),
+                ("mode", dict(mode=canary, name=canary, host=canary), "mode")):
+            res = self.add(**kw)
+            self.assertEqual(res["status"], "refused", label)
+            self.assertEqual(res["message"], f"Not a valid value for {field}.", label)
+        ev = json.dumps(self.events("auto_rule_refused"))
+        self.assertEqual(ev.count('"reason": "invalid"'), 3)                          # the events exist
+        self.assertNotIn("S3CR3T", ev)
+        self.assertEqual(self.stored(), [])
+
+    def test_the_cap_is_50(self):
+        self.seed(*[http_rule(id=f"r{i:04d}", name=f"n{i}") for i in range(50)])
+        self.assertEqual(len(self.live()), 50)
+        self.refuse("cap", name="one more")
+
+    def test_a_backend_that_cannot_write_metadata_is_refused(self):
+        self.broker.backend = NoMeta(self.broker.backend)
+        self.refuse("backend")
+
+    def test_ssh_and_unknown_credentials_raise(self):
+        for cred in ("deploy", "nope"):
+            with self.assertRaises(ValueError, msg=cred):
+                self.add(cred=cred)
+        self.assertEqual(self.events("auto_rule_created"), [])
+        self.assertEqual(self.add()["status"], "created")                             # control
+
+    def test_a_vault_write_failure_activates_nothing_and_says_so(self):
+        def boom(*a):
+            raise OSError("disk")
+        real = self.broker.backend.set_meta
+        self.broker.backend.set_meta = boom
+        res = self.add()
+        self.assertEqual(res["status"], "failed")
+        self.assertEqual((self.live(), self.stored()), ([], []))
+        self.assertEqual(self.events("auto_rule_change_failed")[-1]["op"], "create")
+        self.assertEqual(self.events("auto_rule_created"), [])
+        self.broker.backend.set_meta = real
+        self.assertEqual(self.add()["status"], "created")                             # control: it works again
+
+    # -- revoke
+    def test_revoke_removes_the_rule_and_its_usage(self):
+        self.add()
+        rid = self.live()[0]["id"]
+        self.call()
+        self.assertEqual(self.broker.auto_rule_usage.get("svc", rid)["uses"], 1)
+        self.assertEqual(self.broker.revoke_auto_rule("svc", rid, "alice", "127.0.0.1", "10.0.0.9"), "revoked")
+        self.assertEqual((self.live(), self.stored()), ([], []))
+        self.assertNotIn("auto_rules", self.disk()["secrets"]["svc"])
+        self.assertEqual(self.broker.auto_rule_usage.get("svc", rid)["uses"], 0)
+        ev = self.events("auto_rule_revoked")[-1]
+        self.assertEqual((ev["credential"], ev["rule_id"], ev["revoked_by"], ev["channel"]),
+                         ("svc", rid, "alice", "policies"))
+        before = self.used()
+        self.call()
+        self.assertEqual(self.used(), before)                                         # no longer approves
+
+    def test_revoke_missing_and_unknown(self):
+        self.assertEqual(self.broker.revoke_auto_rule("svc", "nope1234", "alice"), "missing")
+        self.assertEqual(self.broker.revoke_auto_rule("nope", "x", "alice"), "missing")
+        self.assertEqual(self.broker.revoke_auto_rule("deploy", "x", "alice"), "missing")
+
+    def test_revoke_failure_keeps_the_rule_active(self):
+        self.add()
+        rid = self.live()[0]["id"]
+
+        def boom(*a):
+            raise OSError("disk")
+        real = self.broker.backend.set_meta
+        self.broker.backend.set_meta = boom
+        self.assertEqual(self.broker.revoke_auto_rule("svc", rid, "alice"), "failed")
+        self.assertEqual(len(self.live()), 1)
+        self.assertEqual(len(self.stored()), 1)
+        self.assertEqual(self.events("auto_rule_change_failed")[-1]["op"], "revoke")
+        self.assertEqual(self.events("auto_rule_revoked"), [])
+        self.broker.backend.set_meta = real
+        self.assertEqual(self.broker.revoke_auto_rule("svc", rid, "alice"), "revoked")   # control
+
+    # -- expiry
+    def test_expiry_drops_the_rule_and_audits_it_once(self):
+        self.seed(http_rule(id="old01", name="old", expires_at=PAST), http_rule(id="new01", name="new",
+                                                                                   expires_at=FUTURE))
+        self.broker.expire_auto_rules()
+        self.broker.expire_auto_rules()
+        self.assertEqual([r["id"] for r in self.live()], ["new01"])
+        self.assertEqual([r["id"] for r in self.stored()], ["new01"])
+        gone = self.events("auto_rule_expired")
+        self.assertEqual([(e["credential"], e["rule_id"], e["rule_name"]) for e in gone], [("svc", "old01", "old")])
+
+    def test_a_failed_expiry_write_is_reported_once_and_the_rule_stays_ignored(self):
+        self.seed(http_rule(id="old01", name="old", expires_at=PAST))
+
+        def boom(*a):
+            raise OSError("disk")
+        self.broker.backend.set_meta = boom
+        self.broker.expire_auto_rules()
+        self.broker.expire_auto_rules()
+        self.assertEqual(len(self.events("auto_rule_change_failed")), 1)
+        self.assertEqual(self.events("auto_rule_change_failed")[0]["op"], "expire")
+        self.assertEqual(self.events("auto_rule_expired"), [])
+        self.assertEqual(len(self.live()), 1)                                         # still stored, but never matches
+        self.assertIsNone(autorules.find(self.live(), "http", ["svc"], {"url": "http://127.0.0.1/x"}, {"id": BOX}))
+
+    def test_usage_of_rules_that_no_longer_exist_is_pruned(self):
+        self.seed(http_rule(id="keep01", name="keep"))
+        self.broker.auto_rule_usage.record("svc", "keep01", time.time())
+        self.broker.auto_rule_usage.record("svc", "gone01", time.time())
+        self.broker.prune_auto_rule_usage()
+        self.assertEqual(self.broker.auto_rule_usage.get("svc", "keep01")["uses"], 1)
+        self.assertEqual(self.broker.auto_rule_usage.get("svc", "gone01")["uses"], 0)
 
 
 if __name__ == "__main__":

@@ -286,6 +286,16 @@ class Usage:
             v = self._d.get(self._key(secret, rid))
             return dict(v) if v else {"last_used": None, "uses": 0}
 
+    def retain(self, pairs):
+        """Keep only the entries for these (secret, rule id) pairs."""
+        keep = {self._key(s, r) for s, r in pairs}
+        with self._lock:
+            stale = [k for k in self._d if k not in keep]
+            for k in stale:
+                del self._d[k]
+            if stale:
+                self._save_locked()
+
     def forget(self, secret, rid):
         with self._lock:
             if self._d.pop(self._key(secret, rid), None) is not None:
