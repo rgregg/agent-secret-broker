@@ -654,7 +654,7 @@ class HostlessCredential(ManageBase):
                                      "allowed_hosts": []}
 
     def test_it_has_a_card_and_an_env_rule_can_be_added(self):
-        page = t.req(self.abase + "/policies", headers={"X-authentik-username": "alice"})[1]
+        page = t.req(self.abase + "/credentials/envonly?tab=policies", headers={"X-authentik-username": "alice"})[1]
         self.assertIn("name=secret value='envonly'", page.split("Auto-approve rules")[1])
         res = self.add(cred="envonly", name="greet", mode="env", argv=["echo", "hi"])
         self.assertEqual(res["status"], "created")
@@ -716,8 +716,9 @@ class PoliciesTab(ManageBase):
         return {**{k: v for k, v in self.FIELDS.items() if k != "argv"}, "argv": "", "expires": "never",
                 "confirm": "1", **over}
 
-    def page(self):
-        return t.req(self.abase + "/policies", headers=self.H)[1]
+    def page(self, cred="svc"):
+        """A credential's Policies page (where the auto-approve rules live now)."""
+        return t.req(self.abase + f"/credentials/{cred}?tab=policies", headers=self.H)[1]
 
     def section(self):
         page = self.page()

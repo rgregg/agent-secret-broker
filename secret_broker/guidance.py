@@ -242,14 +242,3 @@ def card(name, sc, csrf, idx=0, open_=False):
         f"<div class=grow><button>Save</button><small class=muted>"
         f"<span id='gc{idx}'>{len(cur)} / {MAX_LEN}</span> characters (max {MAX_LEN}). "
         "Empty removes the guidance.</small></div></form></details>")
-
-
-def policies_section(secrets_cfg, csrf):
-    """The 'Risk guidance' editors for the Policies tab: one collapsed card per secret."""
-    esc = html.escape
-    head = ("<h3>Risk guidance</h3><p><small class=muted>" + esc(NOTE) + " Guidance is never shown to "
-            "agents.</small></p>")
-    if not secrets_cfg:
-        return head + "<div class='card empty'>No secrets.</div>"
-    rows = [card(name, sc, csrf, i) for i, (name, sc) in enumerate(sorted(secrets_cfg.items()))]
-    return f"<style>{CSS}</style>" + head + "".join(rows)

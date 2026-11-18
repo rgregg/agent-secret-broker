@@ -227,6 +227,11 @@ def _matches(rule):
     return f"{rule['scheme']}://{rule['host']}{rule['path_prefix']} ({', '.join(sorted(rule['methods']))})"
 
 
+def describe(rule):
+    """What a rule matches, as text (the same words as the rule tables)."""
+    return _matches(rule)
+
+
 def _when(t):
     try:
         return sshrules.iso(t) if isinstance(t, (int, float)) else ""
@@ -316,25 +321,3 @@ def card(name, sc, config_rules, csrf, usage, now=None, state=None, client_names
         "<label class=chk><input type=checkbox name=confirm value=1> <span>I understand matching requests "
         "will be released with no approval, at any risk level</span></label>"
         "<div class=grow><button>Add rule</button></div></form></details>")
-
-
-def policies_section(secrets_cfg, config_rules, csrf, usage, now=None, state=None, client_names=None,
-                     client_choices=()):
-    """'Auto-approve rules' for the Policies tab: per credential a table of the rules that can approve its
-    requests (stored ones with Revoke, config ones read-only) and an 'Add rule' form. `state` maps a credential
-    name to {"error", "open"}. Everything shown is escaped; nothing from a failed add is echoed back."""
-    e = html.escape
-    now = time.time() if now is None else now
-    state = state or {}
-    cards = []
-    for i, (name, sc) in enumerate(sorted(secrets_cfg.items())):
-        if sc.get("ssh"):
-            continue
-        cards.append(card(name, sc, [r for r in config_rules if name in r["secrets"]], csrf, usage, now,
-                          state.get(name), client_names, client_choices, i))
-    if not cards:
-        return ""
-    head = ("<h3>Auto-approve rules</h3><p><small class=muted>A request that matches is released without asking, "
-            "at any risk level. Each rule belongs to one credential and names exactly what it covers. Never shown "
-            "to agents.</small></p>")
-    return f"<style>{CSS}</style>" + head + "".join(cards)

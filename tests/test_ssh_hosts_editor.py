@@ -3,6 +3,7 @@ import _fast  # noqa: F401  (test-only: prompt server shutdown, fake-clock helpe
 import base64
 import json
 import os
+import re
 import sys
 import unittest
 import urllib.parse
@@ -45,8 +46,9 @@ class Base(th.HostBase):
         except t.urllib.error.HTTPError as e:
             return e.code, e.read().decode()
 
-    def page(self):
-        return t.req(self.abase + "/policies", headers={"X-authentik-username": "alice"})[1]
+    def page(self, cred="deploy"):
+        """A credential's Policies page (where the SSH host policy editor lives now)."""
+        return t.req(self.abase + f"/credentials/{cred}?tab=policies", headers={"X-authentik-username": "alice"})[1]
 
     def stored(self):
         return self.disk()["secrets"]["deploy"]
@@ -67,13 +69,15 @@ class Base(th.HostBase):
 class Editor(Base):
     ssh_hosts = {"known_hosts": [HOST.line("web.example.com,10.0.0.5")], "allowed_hosts": ["web.example.com"]}
 
-    def test_card_only_for_ssh_keys_collapsed_with_badge_and_help(self):
+    def test_card_only_for_ssh_keys_open_on_its_own_page_with_badge_and_help(self):
         body = self.page()
         self.assertEqual(body.count("action='/policies/ssh_hosts'"), 1)
         card = body.split("sbox'")[1].split("</details>")[0]
-        self.assertNotIn(" open", body.split("sbox")[1].split(">")[0])
+        tag = re.search(r"<details class='card gbox sbox'([^>]*)>", body)
+        self.assertIsNotNone(tag)                                          # the premise: the card's own tag was found
+        self.assertIn(" open", tag.group(1))                               # its own page: shown expanded
         self.assertIn("<b>deploy</b>", card)
-        self.assertNotIn("<b>svc</b>", card)                 # the http secret has none
+        self.assertEqual(self.page("svc").count("action='/policies/ssh_hosts'"), 0)   # the http secret has none
         self.assertIn("Enforcing: 1 allowed hosts", card)
         for want in ("Known hosts", "Allowed hosts", "Allow forwarded agent (every hop must also be allowed)",
                      "Hashed entries", "git commit signing with this key will also be refused because it has no server",
@@ -89,7 +93,8 @@ class Editor(Base):
 
     def test_no_card_without_ssh_keys(self):
         cfg = {"svc": {"vars": {}, "allowed_hosts": ["a"]}}
-        self.assertEqual(sshhosts.policies_section(cfg, "tok"), "")
+        self.assertEqual(sshhosts.card("svc", cfg["svc"], "tok"), "")
+        self.assertNotEqual(sshhosts.card("deploy", {"ssh": True, "_meta": {}}, "tok"), "")      # control: an ssh key has one
         # an adopted item that is not an ssh key
         row = {"item": "Modem", "meta": None, "auto": {
             "login": True, "username": True, "password": True, "notes": False, "fields": [], "uris": []}}
@@ -98,7 +103,7 @@ class Editor(Base):
             def catalog(self):
                 return [row]
         b = Broker({"approve_base_url": "https://s.example"}, Rows(), FakeNotifier(), None)
-        self.assertEqual(sshhosts.policies_section(b.cfg["secrets"], "tok"), "")
+        self.assertEqual(sshhosts.card("modem", b.cfg["secrets"]["modem"], "tok"), "")
         self.assertEqual(b.set_ssh_hosts("modem", "", "a.example", False, "alice")["status"], "refused")
 
     def test_http_secret_post_is_refused_400(self):
@@ -448,9 +453,10 @@ class Secrecy(Base):
         status, page = t.req(self.abase + f"/a/{nonce}", headers={"X-authentik-username": "mallory"})
         self.assertEqual(status, 403)
         self.assertNotIn(CANARY, page)
-        status, page = t.req(self.abase + "/policies", headers={"X-authentik-username": "mallory"})
-        self.assertEqual(status, 403)
-        self.assertNotIn(CANARY, page)
+        for path in ("/policies", "/credentials/deploy?tab=policies"):
+            status, page = t.req(self.abase + path, headers={"X-authentik-username": "mallory"})
+            self.assertEqual(status, 403, path)
+            self.assertNotIn(CANARY, page, path)
 
     def test_policies_page_for_the_owner_does_show_it(self):
         self.assertIn(CANARY, self.page())

@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -376,11 +377,13 @@ class Editor(t.Harness):
     def stored(self):
         return self.disk()["secrets"]["svc"]
 
-    def test_page_renders_escaped_prefilled_collapsed_editor(self):
-        status, body = t.req(self.abase + "/policies", headers={"X-authentik-username": "alice"})
+    def test_page_renders_escaped_prefilled_open_editor(self):
+        status, body = t.req(self.abase + "/credentials/svc?tab=policies", headers={"X-authentik-username": "alice"})
         self.assertEqual(status, 200)
-        self.assertIn("<details class='card gbox'>", body)
-        self.assertNotIn(" open", body.split("gbox")[1].split(">")[0])
+        tag = re.search(r"<details class='card gbox'([^>]*)>", body)
+        self.assertIsNotNone(tag)                               # the premise: the editor's own tag was found
+        self.assertIn(" open", tag.group(1))                    # on its own page the editor is shown expanded
+        self.assertEqual(body.count("<details class='card gbox'"), 1)   # one credential, one editor
         self.assertIn("&lt;b&gt;Pull&lt;/b&gt; &quot;low&quot; &amp; GUIDE-CANARY", body)
         self.assertNotIn("<b>Pull</b>", body)
         self.assertIn("maxlength=2000", body)
@@ -418,7 +421,7 @@ class Editor(t.Harness):
         self.assertNotIn("guidance", self.stored())
         self.assertNotIn("guidance", self.broker.cfg["secrets"]["svc"])
         self.assertIsNone(self.events("guidance_changed")[0]["new_sha256"])
-        status, body = t.req(self.abase + "/policies", headers={"X-authentik-username": "alice"})
+        status, body = t.req(self.abase + "/credentials/svc?tab=policies", headers={"X-authentik-username": "alice"})
         self.assertIn("No guidance", body)
 
     def test_csrf_origin_identity_and_peer_are_enforced(self):

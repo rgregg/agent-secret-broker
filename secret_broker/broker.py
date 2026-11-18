@@ -7150,19 +7150,25 @@ def approval_handler(broker):
             parts = self.path.split("?")[0].strip("/").split("/")
             return parts[1] if len(parts) == 2 and parts[0] == "a" else None
 
-        def _policies_page(self, user, note="", status=200, ssh_state=None, rule_state=None, auto_state=None):
-            _page(self, status, f"<h1>Policies</h1>{note}{self._standing_section(user)}"
-                  + guidance_mod.policies_section(cfg["secrets"], self._tok(user))
-                  + sshhosts_mod.policies_section(cfg["secrets"], self._tok(user), ssh_state)
-                  + sshrules_mod.policies_section(cfg["secrets"], self._tok(user),
-                                                  broker.ssh_rule_usage, state=rule_state,
-                                                  client_names=broker.clients.names(),
-                                                  client_choices=broker.clients.active_choices())
-                  + uirules_mod.policies_section(cfg["secrets"], broker.auto_rules, self._tok(user),
-                                                 broker.auto_rule_usage, state=auto_state,
-                                                 client_names=broker.clients.names(),
-                                                 client_choices=broker.clients.active_choices()),
-                  script=_GRANTS_JS + guidance_mod.JS + sshhosts_mod.JS, tab="policies", badge=broker.attention(), user=user)
+        def _policies_page(self, user, note="", status=200):
+            """The Policies tab: only what spans credentials (or names one that is gone). Everything that belongs
+            to one credential is on that credential's page."""
+            _, shared = broker.standing_by_credential()
+            rules = broker.shared_config_rules()
+            cnames = broker.clients.names()
+            body = ("<p class=hint>Policies for a single credential live on that credential's page "
+                    "(<a href='/credentials'>Credentials</a>, then its Policies tab). This page lists only "
+                    "policies that cover several credentials, or name one that no longer exists.</p>")
+            if shared:
+                body += credpolicy_mod.shared_standing_section(shared, self._tok(user), cnames)
+            if rules:
+                body += credpolicy_mod.shared_rules_section(rules, cnames)
+            if not shared and not rules:
+                body += "<div class='card empty'>No policy covers more than one credential.</div>"
+            if not broker.grants_cfg["enabled"]:
+                body += "<p><small class=muted>Time-boxed grants are turned off.</small></p>"
+            _page(self, status, f"<h1>Policies</h1>{note}{body}", script=_GRANTS_JS, tab="policies",
+                  badge=broker.attention(), user=user)
 
         def _credentials_page(self, user, note="", status=200, q=""):
             flash = f"<div class=flash>{note}</div>" if note else ""
@@ -7216,7 +7222,7 @@ def approval_handler(broker):
             ctx = credpolicy_mod.PolicyCtx(
                 csrf=self._tok(user), usage_ssh=broker.ssh_rule_usage, usage_auto=broker.auto_rule_usage,
                 client_names=broker.clients.names(), client_choices=broker.clients.active_choices(),
-                standing_rows=rows, config_rules=cfg_rules,
+                standing_rows=rows, config_rules=cfg_rules, grants_enabled=broker.grants_cfg["enabled"],
                 states={"ssh_hosts": ssh_hosts, "ssh_rules": ssh_rules, "auto_rules": auto_rules})
             off = ("" if backend_base.CAP_SET_META in broker.backend.capabilities else
                    "<p class=err>This vault backend cannot store metadata, so policies cannot be changed here.</p>")
@@ -7358,51 +7364,6 @@ def approval_handler(broker):
                   + plans_mod.active_table_html(broker.active_plans(), token)
                   + sessions_mod.sessions_section(broker, token),
                   script=_GRANTS_JS, tab="clients", badge=broker.attention(), user=user)
-
-        def _standing_section(self, user):
-            """'Standing approvals' on the Policies tab: every timed grant, Always
-            approval and legacy always-allowed credential, with Revoke."""
-            e = html.escape
-            token = self._tok(user)
-            head = ("<h3 style='margin-top:0'>Standing approvals</h3><p><small class=muted>Requests "
-                    "these cover are approved without asking. A time-boxed approval has no risk limit "
-                    "and ends at its deadline. An Always approval never expires and is used only when the "
-                    f"request is within the auto-approve limit ({_AUTO_LABEL[broker.auto_approve_max()]}). "
-                    "Each covers exactly the secrets, mode and method class shown. Revoke to ask every "
-                    "time again.</small></p>")
-            if not broker.grants_cfg["enabled"]:
-                head += "<p><small class=muted>Time-boxed grants are turned off.</small></p>"
-            rows = []
-            cnames = broker.clients.names()
-            for r in broker.standing_rows():
-                if r["expires_at"] is None:
-                    exp = "never"
-                else:
-                    exp = (f"<time data-gexp='{int(r['expires_at'])}'>"
-                           f"{e(_in_min(r['left_s']))}</time>")
-                who = e(r["created_by"]) + (f" <small class=muted>{e(r['created_at'])}</small>"
-                                            if r["created_at"] else "")
-                if r["kind"] == "legacy":
-                    form = ("<form method=post class=inline>"
-                            f"<input type=hidden name=csrf value='{token}'>"
-                            f"<input type=hidden name=name value='{e(r['name'])}'>"
-                            "<button name=approval value=prompt>Revoke</button></form>")
-                else:
-                    form = ("<form method=post action='/grants/revoke' class=inline>"
-                            f"<input type=hidden name=csrf value='{token}'>"
-                            f"<input type=hidden name=grant value='{e(r['id'])}'>"
-                            "<button>Revoke</button></form>")
-                rows.append(
-                    f"<tr><td data-label=Secrets><b>{e(', '.join(r['secrets']))}</b></td>"
-                    f"<td data-label=Covers>{e(r['covers'])}</td>"
-                    f"<td data-label=Expires>{exp}</td>"
-                    f"<td data-label='Created by'>{who}</td>"
-                    f"<td data-label='Applies to'>{e(clients_mod.scope_label(r['client'], cnames))}</td>"
-                    f"<td>{form}</td></tr>")
-            if not rows:
-                return head + "<div class='card empty'>No standing approvals</div>"
-            return (head + "<table class=tbl><thead><tr><th>Secrets</th><th>Covers</th><th>Expires</th>"
-                    "<th>Created by</th><th>Applies to</th><th></th></tr></thead><tbody>" + "".join(rows) + "</tbody></table>")
 
         def do_GET(self):
             user = self._user()

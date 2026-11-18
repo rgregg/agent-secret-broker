@@ -11,6 +11,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import test_credential_editor as tce  # noqa: E402
 import test_e2e as t  # noqa: E402
 from test_ssh_rules import NoMeta  # noqa: E402
+from secret_broker import autorules  # noqa: E402
 from test_ui_auto_rules import ManageBase, svc_rule  # noqa: E402
 
 H = {"X-authentik-username": "alice"}
@@ -235,3 +236,104 @@ class ListCounts(PostBase):
     def test_the_search_filter_is_unaffected(self):
         body = self.get("/credentials?q=svc")[1]
         self.assertIn("1 of 3 credentials", body)
+
+
+class PoliciesTab(PostBase):
+    """The Policies tab now shows only what spans credentials (or names a credential that is gone)."""
+    SHARED = "<h3>Timed approvals covering several credentials"
+
+    def tab(self):
+        code, body = self.get("/policies")
+        self.assertEqual(code, 200)
+        return body
+
+    def test_it_lists_only_shared_policies(self):
+        pair = self.grant(["svc", "other"])
+        solo = self.grant(["svc"], client="c-0a0b0c0d")
+        self.broker.cfg["secrets"]["svc"]["guidance"] = "Reads are fine"
+        body = self.tab()
+        self.assertIn(self.SHARED, body)
+        self.assertIn(f"name=grant value='{pair}'", body)                                         # the shared one is here
+        self.assertNotIn(f"name=grant value='{solo}'", body)                                      # the per-credential one is not
+        for gone in ("<h3>Risk guidance", "<h3>SSH host policy", "<h3>SSH host rules", "<h3>Auto-approve rules ("):
+            self.assertNotIn(gone, body)
+        self.assertIn(f"name=grant value='{solo}'", self.get("/credentials/svc?tab=policies")[1])  # control: it lives there now
+
+    def test_shared_rows_revoke_back_to_the_tab(self):
+        pair = self.grant(["svc", "other"])
+        self.assertIn("name=back value='policies'", self.tab())
+        code, body = self.post("/grants/revoke", grant=pair, back="policies")
+        self.assertEqual(code, 200)
+        self.assertIn("<h1>Policies</h1>", body)
+        self.assertIn("Standing approval revoked", body)
+        self.assertNotIn(pair, [r["id"] for r in self.broker.standing_rows()])
+
+    def test_an_orphan_is_visible_revocable_and_unlinked(self):
+        gid = self.grant(["svc"])
+        live = self.grant(["other"])
+        del self.broker.cfg["secrets"]["svc"]
+        body = self.tab()
+        self.assertIn(f"name=grant value='{gid}'", body)
+        self.assertIn("names a credential that no longer exists", body)
+        self.assertNotIn("href='/credentials/svc", body)                                          # a gone credential has no page
+        self.assertNotIn(f"name=grant value='{live}'", body)                                      # control: the living one is not here
+        code, after = self.post("/grants/revoke", grant=gid, back="svc")                          # back to a gone credential: the tab
+        self.assertEqual(code, 200)
+        self.assertIn("<h1>Policies</h1>", after)
+        self.assertNotIn(gid, [r["id"] for r in self.broker.standing_rows()])
+
+    def test_shared_names_link_to_the_credentials_that_exist(self):
+        self.grant(["svc", "other"])
+        body = self.tab()
+        self.assertIn("href='/credentials/svc?tab=policies'", body)
+        self.assertIn("href='/credentials/other?tab=policies'", body)
+
+    def test_empty_state_points_to_the_credential_pages(self):
+        body = self.tab()
+        self.assertIn("No policy covers more than one credential.", body)
+        self.assertIn("Policies for a single credential live on that credential's page", body)
+        self.assertIn("href='/credentials'", body)
+        self.grant(["svc", "other"])
+        self.assertNotIn("No policy covers more than one credential.", self.tab())               # control
+
+    def test_shared_config_rules_and_the_orphan_marker(self):
+        self.broker.auto_rules = autorules.parse([
+            {"name": "cfg-one", "mode": "env", "secret": "svc", "argv": ["echo"]},
+            {"name": "cfg-pair", "mode": "env", "secrets": ["svc", "other"], "argv": ["echo"]},
+            {"name": "cfg-gone", "mode": "env", "secret": "missing", "argv": ["echo"]}])
+        body = self.tab()
+        self.assertIn("<h3>Auto-approve rules covering several credentials", body)
+        self.assertIn("cfg-pair", body)
+        self.assertIn("cfg-gone", body)
+        self.assertNotIn("cfg-one", body)                                                          # a single-credential rule is on its page
+        self.assertEqual(body.count("names a credential that no longer exists"), 1)                # only the orphan is marked
+        self.assertIn("cfg-one", self.get("/credentials/svc?tab=policies")[1])
+
+    def test_nothing_is_lost_or_doubled_across_the_pages(self):
+        self.broker.cfg["secrets"]["svc"]["approval"] = "prompt"
+        solo = self.grant(["svc"])
+        self.grant(["svc"], client="c-0a0b0c0d")
+        pair = self.grant(["svc", "other"])
+        orphan = self.grant(["svc", "ghost"])
+        self.seed(svc_rule(id="u0001", name="stored-one"))
+        self.broker.auto_rules = autorules.parse([
+            {"name": "cfg-one", "mode": "env", "secret": "svc", "argv": ["echo"]},
+            {"name": "cfg-pair", "mode": "env", "secrets": ["svc", "other"], "argv": ["echo"]},
+            {"name": "cfg-gone", "mode": "env", "secret": "missing", "argv": ["echo"]}])
+        pages = {"policies": self.get("/policies")[1]}
+        for name in self.broker.cfg["secrets"]:
+            pages[name] = self.get(f"/credentials/{name}?tab=policies")[1]
+        def seen(needle):
+            return sorted(k for k, body in pages.items() for _ in range(body.count(needle)))
+        every = {r["id"] for r in self.broker.standing_rows()}
+        self.assertEqual(len(every), 4)                                                           # the premise: four distinct grants
+        for gid in every:
+            where = seen(f"name=grant value='{gid}'")
+            self.assertEqual(len(where), 1, (gid, where))                                         # exactly one place
+        self.assertEqual(seen(f"name=grant value='{solo}'"), ["svc"])
+        self.assertEqual(seen(f"name=grant value='{pair}'"), ["policies"])
+        self.assertEqual(seen(f"name=grant value='{orphan}'"), ["policies"])
+        self.assertEqual(seen("name=rule value='u0001'"), ["svc"])
+        self.assertEqual(seen("data-label=Name>cfg-one<"), ["svc"])
+        self.assertEqual(seen("data-label=Name>cfg-pair<"), ["other", "policies", "svc"])         # each credential it names, and the tab
+        self.assertEqual(seen("data-label=Name>cfg-gone<"), ["policies"])

@@ -251,17 +251,3 @@ def card(name, sc, csrf, state=None, idx=0, open_=False):
         "<div class=grow><button>Save</button><small class=muted>Emptying both boxes and clearing the "
         "checkbox removes the policy.</small></div></form>"
         + _analysis(raw) + "</details>")
-
-
-def policies_section(secrets_cfg, csrf, state=None):
-    """The 'SSH host policy' cards for the Policies tab: one collapsed card per SSH key. `state` maps a secret
-    name to {"error", "known", "allowed", "fwd", "need_confirm", "need_anyway", "open"} to re-render after a
-    refused or saved form."""
-    state = state or {}
-    rows = [card(name, sc, csrf, state.get(name), i)
-            for i, (name, sc) in enumerate(sorted(secrets_cfg.items())) if sc.get("ssh")]
-    head = ("<h3>SSH host policy</h3><p><small class=muted>Restrict an SSH key to the servers it may log in to. "
-            "This is never shown to agents.</small></p>")
-    if not rows:
-        return ""
-    return f"<style>{CSS}</style>" + head + "".join(rows)

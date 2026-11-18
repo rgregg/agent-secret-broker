@@ -658,22 +658,3 @@ def card(name, sc, csrf, usage, now=None, state=None, client_names=None, client_
         "<label class=chk><input type=checkbox name=confirm value=1> <span>I understand this key will "
         "sign for that server and account without asking</span></label>"
         "<div class=grow><button>Add rule</button></div></form></details>")
-
-
-def policies_section(secrets_cfg, csrf, usage, now=None, state=None, client_names=None, client_choices=()):
-    """'SSH host rules' for the Policies tab: per SSH key a table of its rules with
-    Revoke and an 'Add rule' form. `state` maps a secret name to {"error", "open"}."""
-    e = html.escape
-    now = time.time() if now is None else now
-    state = state or {}
-    client_names = client_names or {}
-    keys = [(n, sc) for n, sc in sorted(secrets_cfg.items()) if sc.get("ssh")]
-    head = ("<h3>SSH host rules</h3><p><small class=muted>Standing approvals: a key may sign "
-            "logins to one verified server as one account without asking, whatever the auto-approve "
-            "limit. Everything else still asks. Never shown to agents.</small></p>")
-    if not keys:
-        return ""
-    cards = []
-    for i, (name, sc) in enumerate(keys):
-        cards.append(card(name, sc, csrf, usage, now, state.get(name), client_names, client_choices, i))
-    return f"<style>{CSS}</style>" + head + "".join(cards)

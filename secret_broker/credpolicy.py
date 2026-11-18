@@ -24,6 +24,7 @@ class PolicyCtx:
     standing_rows: list             # this credential's rows from Broker.standing_by_credential()
     config_rules: list              # config rules naming this credential (Broker.config_rules_for)
     states: dict = dataclasses.field(default_factory=dict)   # {"ssh_hosts", "ssh_rules", "auto_rules"}: re-render state
+    grants_enabled: bool = True
 
 
 def counts(name, sc, standing_rows, config_rules):
@@ -68,6 +69,55 @@ def standing_card(name, rows, csrf, cnames):
             "<th></th></tr></thead><tbody>" + "".join(out) + "</tbody></table>")
 
 
+ORPHAN = "names a credential that no longer exists"
+
+
+def shared_standing_section(rows, csrf, cnames):
+    """Timed approvals that cover several credentials, or one that is gone (Broker.standing_by_credential's
+    shared rows). Names link to the credentials that exist; Revoke comes back to the Policies tab."""
+    e = html.escape
+    out = []
+    for r in rows:
+        who = e(r["created_by"]) + (f" <small class=muted>{e(r['created_at'])}</small>" if r["created_at"] else "")
+        exp = ("never" if r["expires_at"] is None else
+               f"<time data-gexp='{int(r['expires_at'])}'>{e(_in_min(r['left_s']))}</time>")
+        mark = f"<br><small class=muted>{ORPHAN}</small>" if r.get("orphan") else ""
+        out.append(
+            f"<tr><td data-label=Secrets><b>{credlinks.links(r['names'], tab='policies')}</b>{mark}</td>"
+            f"<td data-label=Covers>{e(r['covers'])}</td><td data-label=Expires>{exp}</td>"
+            f"<td data-label='Created by'>{who}</td>"
+            f"<td data-label='Applies to'>{e(clients_mod.scope_label(r['client'], cnames))}</td>"
+            "<td><form method=post action='/grants/revoke' class=inline>"
+            f"<input type=hidden name=csrf value='{e(csrf, quote=True)}'>"
+            f"<input type=hidden name=grant value='{e(r['id'], quote=True)}'>"
+            "<input type=hidden name=back value='policies'>"
+            "<button>Revoke</button></form></td></tr>")
+    return ("<h3>Timed approvals covering several credentials</h3><p><small class=muted>Requests these cover "
+            "are approved without asking, with no risk limit, until the deadline. Each covers exactly the "
+            "secrets, mode and method class shown. Revoke to ask every time again.</small></p>"
+            "<table class=tbl><thead><tr><th>Secrets</th><th>Covers</th><th>Expires</th><th>Created by</th>"
+            "<th>Applies to</th><th></th></tr></thead><tbody>" + "".join(out) + "</tbody></table>")
+
+
+def shared_rules_section(rules, cnames):
+    """Config auto-approve rules that name several credentials, or one that is gone (read-only)."""
+    e = html.escape
+    out = []
+    for r in rules:
+        mark = f"<br><small class=muted>{ORPHAN}</small>" if r.get("orphan") else ""
+        out.append(
+            f"<tr><td data-label=Name>{e(r['name'])}</td><td data-label=Mode>{e(r['mode'])}</td>"
+            f"<td data-label=Matches><span class=mono>{e(uirules.describe(r))}</span></td>"
+            f"<td data-label=Covers>{credlinks.links(sorted(r['secrets']), tab='policies')}{mark}</td>"
+            f"<td data-label=Client>{e(uirules._client_label(r['clients'], cnames, set(cnames)))}</td>"
+            "<td><small class=muted>edit the configuration</small></td></tr>")
+    return (f"<style>{uirules.CSS}</style><h3>Auto-approve rules covering several credentials</h3><p><small "
+            "class=muted>Rules in the broker's configuration that name more than one credential. A request "
+            "that matches is released without asking, at any risk level. Never shown to agents.</small></p>"
+            "<table class=tbl><thead><tr><th>Name</th><th>Mode</th><th>Matches</th><th>Covers</th>"
+            "<th>Client</th><th></th></tr></thead><tbody>" + "".join(out) + "</tbody></table>")
+
+
 def body(name, sc, ctx):
     """The Policies sub-tab body for one credential."""
     st = ctx.states or {}
@@ -76,7 +126,8 @@ def body(name, sc, ctx):
         f"<style>{guidance.CSS}</style>",
         f"<h3>Standing approvals ({c['standing']})</h3><p><small class=muted>Requests these cover are approved "
         "without asking. A time-boxed approval has no risk limit and ends at its deadline; an Always approval "
-        "never expires and is used only within the auto-approve limit. Revoke to ask every time again.</small></p>",
+        "never expires and is used only within the auto-approve limit. Revoke to ask every time again.</small></p>"
+        + ("" if ctx.grants_enabled else "<p><small class=muted>Time-boxed grants are turned off.</small></p>"),
         standing_card(name, ctx.standing_rows, ctx.csrf, ctx.client_names)]
     if not sc.get("ssh"):
         parts.append(f"<style>{uirules.CSS}</style><h3>Auto-approve rules ({c['rules']})</h3><p><small class=muted>"
