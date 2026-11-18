@@ -1166,7 +1166,9 @@ once as `telegram_poll_error` `conflict`). Config, inside the `telegram` entry:
 
 - Without `allowed_users` (or with an empty list) the transport is link only and
   no polling runs. Startup refuses anything but a list of positive integers
-  (`notify[i].allowed_users`).
+  (`notify[i].allowed_users`), and with `allowed_users` set, a `chat_id` that is
+  not numeric (`notify[i].chat_id`; a tap reports the numeric id, so an `@name`
+  would never match).
 - Buttons follow the usual action policy; a per-entry `actions` object narrows
   Telegram alone, e.g. `{"approve_max_risk": "medium"}` for Deny only on high risk.
   Requests that never get buttons on any channel (credential entry, plans,
@@ -1180,9 +1182,11 @@ once as `telegram_poll_error` `conflict`). Config, inside the `telegram` entry:
   then decided through `decide_via("telegram", ...)` with approver
   `telegram:<user id>`. Anything else decides nothing and is audited as
   `telegram_decide_refused` with `reason` (`malformed`, `user`, `chat`, `message`,
-  `action`, or `status` with the decide `status` and `rid`) and `user`; at most
-  10 such lines a minute, the rest counted as `suppressed` on the next one. The
-  token and button data are never logged.
+  `action`, `settled` for a tap on a message whose request was already decided or
+  expired, or `status` with the decide `status` and `rid`) and `user`; at most
+  10 such lines a minute, the rest counted as `suppressed` on the next one. A wrong
+  token is logged once, by `decide_via`, with `status: 403`. The token and button
+  data are never logged.
 - The tap is answered with a fixed toast: Approved, Denied, Already decided or
   Not allowed.
 - Poll failures back off (1 s doubling to 60 s) and are logged as

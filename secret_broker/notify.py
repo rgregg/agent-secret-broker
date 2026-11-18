@@ -23,6 +23,7 @@ detects it once when the transport is registered.
 Configure one or more under `notify` in the broker config; with several, a
 request is delivered if at least one transport succeeds.
 """
+import collections
 import dataclasses
 import inspect
 import json
@@ -308,6 +309,8 @@ class TickerNotifier:
 
 
 MAX_CALLBACK_BYTES = 64                 # Telegram's limit on callback_data
+MAX_SETTLED = 256                       # settled rid -> message id kept, so a late tap says "Already decided"
+_TG_CHAT_RE = re.compile(r"-?[0-9]{1,20}")
 _TG_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
 
@@ -348,6 +351,7 @@ class TelegramNotifier:
         self._msg_ids = {}
         self._texts = {}
         self._by_rid = {}               # rid -> (message id, action ids rendered), while the request is open
+        self._settled = collections.OrderedDict()   # rid -> message id, after resolved(); bounded
         self.allowed_users = tuple(allowed_users)
         self.supports_actions = ("approve", "deny") if self.allowed_users else ()
         self._offset = None
@@ -403,7 +407,11 @@ class TelegramNotifier:
     def resolved(self, n, status):
         with self._lock:
             mid, text = self._msg_ids.pop(n.tag, None), self._texts.pop(n.tag, "")
-            self._by_rid.pop(n.rid, None)
+            open_ = self._by_rid.pop(n.rid, None)
+            if open_ is not None:
+                self._settled[n.rid] = open_[0]
+                while len(self._settled) > MAX_SETTLED:
+                    self._settled.popitem(last=False)
         if mid is None:
             return
         self._call("editMessageText", {"chat_id": self._chat, "message_id": mid,
@@ -430,7 +438,10 @@ class TelegramNotifier:
         else:
             with self._lock:
                 mid, shown = self._by_rid.get(parts[2], (None, frozenset()))
-            if mid is None or msg.get("message_id") != mid:
+                settled = self._settled.get(parts[2])
+            if mid is None and settled is not None and msg.get("message_id") == settled:
+                tap["refused"] = "settled"      # our message, already decided: not a forgery
+            elif mid is None or msg.get("message_id") != mid:
                 tap["refused"] = "message"
             elif parts[1] not in shown:
                 # the shared token may allow an action another transport offered; only what this
@@ -545,6 +556,11 @@ def build(cfg, read_secret, push_store=None):
             if not (isinstance(users, list) and len(users) <= 20 and all(
                     isinstance(u, int) and not isinstance(u, bool) and u > 0 for u in users)):
                 raise ValueError(f"notify[{i}].allowed_users must be a list of Telegram user ids")
+            chat = sp.get("chat_id")
+            if users and not ((isinstance(chat, int) and not isinstance(chat, bool))
+                              or (isinstance(chat, str) and _TG_CHAT_RE.fullmatch(chat))):
+                # a tap reports the numeric chat id; an @name would never match
+                raise ValueError(f"notify[{i}].chat_id must be a numeric chat id when allowed_users is set")
             out.append(TelegramNotifier(read_secret(sp["bot_token_file"]), sp["chat_id"],
                                         sp.get("api_base", "https://api.telegram.org"),
                                         allowed_users=tuple(users)))

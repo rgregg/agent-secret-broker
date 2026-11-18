@@ -3498,9 +3498,9 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         who = f"telegram:{user}" if isinstance(user, int) and not isinstance(user, bool) else "telegram:unknown"
         if tap.get("refused"):
             self._tg_refused(reason=tap["refused"], user=who)
-            return 0
+            return 410 if tap["refused"] == "settled" else 0
         code, _ = self.decide_via("telegram", tap["rid"], tap["decision"], who, token=tap["token"])
-        if code != 200:
+        if code not in (200, 403):      # decide_via already logs telegram_decide_refused for a 403
             self._tg_refused(reason="status", status=code, rid=tap["rid"], user=who)
         return code
 

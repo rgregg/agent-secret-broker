@@ -236,6 +236,22 @@ class Taps(Base):
         self.assertEqual(calls("getUpdates")[1]["offset"], 41)
         self.assertEqual(self.taps, [])
 
+    def test_tap_on_a_settled_message_says_already_decided(self):
+        self.t.resolved(self.n, "approved")
+        FakeAPI.updates = [[update(1, f"ASB|deny|{RID}|{self.n.action_token}")],
+                           [update(2, f"ASB|deny|{RID}|{self.n.action_token}", mid=78)]]
+        self.t.poll_once(self.on_tap(410), timeout=0)
+        self.t.poll_once(self.on_tap(0), timeout=0)
+        self.assertEqual([x["refused"] for x in self.taps], ["settled", "message"])   # another message: not ours
+        self.assertEqual(self.taps[0]["token"], None)
+
+    def test_settled_record_is_bounded(self):
+        for i in range(notify.MAX_SETTLED + 5):
+            n = self.note(self.t, rid=f"R{i}")
+            self.t.send(n)
+            self.t.resolved(n, "approved")
+        self.assertEqual(len(self.t._settled), notify.MAX_SETTLED)
+
     def test_resolved_removes_buttons(self):
         self.t.resolved(self.n, "approved")
         edit = calls("editMessageText")[0]
@@ -244,7 +260,7 @@ class Taps(Base):
         self.assertNotIn("reply_markup", edit)
         FakeAPI.updates = [[update(1, self.data)]]
         self.t.poll_once(self.on_tap(200), timeout=0)
-        self.assertEqual(self.taps[0]["refused"], "message")
+        self.assertEqual(self.taps[0]["refused"], "settled")
 
 
 class PollErrors(Base):
@@ -352,13 +368,12 @@ class BrokerTaps(t.Harness):
     def test_second_tap_is_already_decided(self):
         rid, d = self.pending()
         self.assertEqual(self.tap(d["Approve"], 1), "Approved")
-        self.tg._by_rid[rid] = (77, frozenset({"approve", "deny"}))                   # as if the edit had not landed yet: the broker must refuse
+        _fast.wait_until(lambda: calls("editMessageText"), what="message edited")   # settled: buttons gone                   # as if the edit had not landed yet: the broker must refuse
         self.assertEqual(self.tap(d["Deny"], 2), "Already decided")
         self.assertEqual(self.status(rid), "approved")
         self.assertEqual(len(self.events("decided")), 1)
         (ref,) = self.events("telegram_decide_refused")
-        self.assertEqual((ref["reason"], ref["status"], ref["rid"], ref["user"]),
-                         ("status", 410, rid, "telegram:111"))
+        self.assertEqual((ref["reason"], ref["user"]), ("settled", "telegram:111"))
         token = d["Deny"].rsplit("|", 1)[1]
         text = open(self.audit).read()
         self.assertIn("telegram_decide_refused", text)                     # positive control
@@ -385,7 +400,15 @@ class BrokerTaps(t.Harness):
                                        "refused": None})
         self.assertEqual(st, 403)
         self.assertEqual(self.status(rid, wait=0), "pending")
-        self.assertEqual(self.events("telegram_decide_refused")[0]["status"], 403)
+        (ref,) = self.events("telegram_decide_refused")            # one line: decide_via's own
+        self.assertEqual((ref["status"], ref["user"]), (403, "telegram:111"))
+
+    def test_decide_refusal_other_than_403_is_audited_once_with_reason(self):
+        st = self.broker.telegram_tap({"rid": "Unknown_rid", "decision": "approve", "token": "x" * 22,
+                                       "user": USER, "refused": None})
+        self.assertEqual(st, 404)
+        (ref,) = self.events("telegram_decide_refused")
+        self.assertEqual((ref["reason"], ref["status"], ref["rid"]), ("status", 404, "Unknown_rid"))
 
     def test_no_buttons_for_page_only_modes(self):
         code, body = self.api("POST", "/v1/requests", {
@@ -461,6 +484,18 @@ class Build(unittest.TestCase):
         self.assertEqual(t.allowed_users, (111, 222))
         plain = notify.build({"notify": [{"type": "telegram", "bot_token_file": "b", "chat_id": 1}]}, rd)
         self.assertFalse(plain.actions_enabled)
+        at = notify.build({"notify": [{"type": "telegram", "bot_token_file": "b", "chat_id": "@chan"}]}, rd)
+        self.assertFalse(at.actions_enabled)                    # link only: an @name is still fine
+        neg = notify.build({"notify": [{"type": "telegram", "bot_token_file": "b", "chat_id": "-100123",
+                                        "allowed_users": [111]}]}, rd)
+        self.assertTrue(neg.actions_enabled)
+        for chat in ("@chan", "12a", True, None):
+            with self.subTest(chat=chat):
+                with self.assertRaises(ValueError) as cm:
+                    notify.build({"notify": [{"type": "telegram", "bot_token_file": "b", "chat_id": chat,
+                                              "allowed_users": [111]}]}, rd)
+                self.assertEqual(str(cm.exception), "notify[0].chat_id must be a numeric chat id "
+                                 "when allowed_users is set")
         for bad in (["111"], [True], [0], [-5], "111", list(range(1, 23)), [1.5]):
             with self.subTest(bad=bad):
                 with self.assertRaises(ValueError) as cm:
