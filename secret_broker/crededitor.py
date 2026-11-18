@@ -220,6 +220,8 @@ def widened(old, new):
         out.append("approval_allow")
     if not old.get("plans") and new.get("plans"):
         out.append("plans_enabled")
+    if [r for r in new.get("auto_rules") or [] if r not in (old.get("auto_rules") or [])]:
+        out.append("auto_rules_added")      # a rule that is new or changed: it releases requests with no approval
     if new.get("ws") is not None:           # any change to how a session signs in or what it may send
         if old.get("ws") is None:
             out.append("ws_enabled")
@@ -235,6 +237,7 @@ WIDEN_TEXT = {
     "tls_unverified": "turns TLS verification off",
     "approval_allow": "lets requests through without asking",
     "plans_enabled": "allows plans for this credential",
+    "auto_rules_added": "adds or changes an auto-approve rule (matching requests are released with no approval)",
     "ws_enabled": "allows WebSocket sessions (the broker signs in; the agent may then send any message not blocked)",
     "ws_changed": "changes how WebSocket sessions sign in or which messages they may send",
 }

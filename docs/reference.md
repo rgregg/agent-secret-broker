@@ -1737,7 +1737,7 @@ setting says: the rule is the approval. It is audited as an ordinary approval (`
 `decision_source: config_rule` and the rule's `rule_name`, preceded by an `auto_rule_used` event, and the request
 history says "configuration rule "name" (auto-approved)". The agent sees a plain approval; rule names and the
 `auto_rule_used` event are hidden from the agent audit API. The rules are read when the broker starts: change them
-in the configuration and redeploy.
+in the configuration and redeploy, or, for a rule on one credential, add it on the Policies tab (below).
 
 Fields (a field a mode does not take is an error, and so is any mistake: the broker refuses to start rather than
 guess, and the message names the field, such as `auto_approve[2].host`):
@@ -1768,6 +1768,64 @@ What a rule will not do:
 
 A rule is stronger than `approval: allow` because it ignores the risk ceiling, so keep each one as narrow as the
 job needs.
+
+### Rules from the Policies tab
+
+The same rules can be added, listed and revoked on the **Policies** tab, under "Auto-approve rules", with no
+restart and no redeploy. They differ from configuration rules in four ways:
+
+- **They belong to one credential.** A rule is stored in that credential's `broker` metadata (vault field
+  `auto_rules`), so it survives restarts, redeploys and vault rebuilds, and applies only to requests that name
+  that credential alone. A request naming two credentials is matched only by a configuration rule listing both.
+  Only `http` and `env` rules can be stored; SSH signing keeps its own section ("SSH host rules"), and an
+  `auto_rules` field on an SSH key makes the credential invalid.
+- **They are validated and matched by the same code as configuration rules** (`autorules.py`), so the form and the
+  matcher cannot disagree. A stored rule that is malformed makes that one credential invalid and the message names
+  the field (`auto_rules[1].host`); the rest of the catalog loads.
+- **They carry who, when and an optional expiry.** A stored rule is
+
+      {"id": "3fa9c1d2", "name": "orca newsletter", "mode": "http", "host": "openrouter.ai",
+       "methods": ["GET", "POST"], "path_prefix": "/api/v1", "clients": ["c-1a2b3c4d"],
+       "by": "ryan", "at": "2026-11-18T16:00:00Z", "expires_at": null}
+
+  (`env` rules have `argv` instead of `host`, `methods` and `path_prefix`; `scheme` appears only when it is not
+  `https`.) At most 50 per credential, names unique within a credential. An expired rule never matches, even before
+  it is dropped; it is dropped by a 60 s sweep (until then it is just ignored) and audited once. If the vault write that drops it
+  fails, the rule stays stored but still never matches, and `auto_rule_change_failed` is audited once.
+- **"Any client" means any enrolled client**, never the legacy shared key, exactly as for configuration rules
+  (an empty `clients`). The form offers enrolled clients only. A rule pinned to a client that is later revoked
+  simply stops matching; the table shows the client as "(revoked)" until the rule is revoked or expires.
+
+**The form** (`POST /policies/auto_rules/add`, fields `secret`, `name`, `mode` (`http` or `env`), `host`, `scheme`,
+`methods` (repeated), `path_prefix`, `argv` (one word per line), `client` (`*` or a client id), `expires`
+(`never`, `30` or `90`), `confirm`) needs the confirmation tick: matching requests are then released with no
+approval, at any risk level and whatever the credential's `approval` says. A blank scheme means `https` and a blank
+path prefix means `/`. `POST /policies/auto_rules/revoke` takes `secret` and `rule`. Both are guarded like the SSH
+rule forms (SSO identity, trusted peer, CSRF token, same-origin check) and are not reachable with an agent key.
+Whoever can use the Policies tab or edit the vault collection can add one: the same trust level as `approval`.
+Configuration rules appear in the same table, read-only and marked "config", beside the credential they cover. Every non-SSH credential has a card, including one with no allowed hosts (an env-only credential can still get an `env` rule). The Credentials editor's advanced JSON box can also carry an `auto_rules` list; a save that adds or changes a rule there needs the same "this widens access" confirmation tick as turning on `approval: allow`. Use counts are pruned of vanished rules after each successful catalog refresh, and a refresh whose vault read overlapped an add, revoke or expiry is read again, so a revoked rule cannot come back from a stale snapshot. If the writes overlap the read three times running, the refresh keeps the catalog already in memory and audits `catalog_refresh_deferred` (hidden from the agent audit API); the next refresh tries again.
+
+**Refusals** are one of a closed set of reasons, audited as `auto_rule_refused` with `reason`: `invalid` (the page
+names the field, never the value), `not_confirmed`, `duplicate_name`, `cap`, `backend` (the vault backend cannot
+write metadata). A failed vault write is `auto_rule_change_failed` with an `error_class`, and nothing becomes
+active. Nothing typed into the form is echoed into a message, event or log line.
+
+**Audit** (all hidden from the agent audit API):
+
+| Event | Fields |
+| --- | --- |
+| `auto_rule_created` | `credential`, `rule_id`, `rule_name`, `rule_mode`, `rule_client`, `rule_host` (http only), `expires_at`, `created_by`, `channel` (`policies`), `approver_peer`, `approver_ip` |
+| `auto_rule_revoked` | `credential`, `rule_id`, `rule_name`, `created_by`, `revoked_by`, `user`, `peer`, `client_ip`, `channel` |
+| `auto_rule_expired` | `credential`, `rule_id`, `rule_name`, `expires_at`, `created_by` |
+| `auto_rule_refused` | `reason`, `credential`, `user`, `peer`, `client_ip`, `channel` |
+| `auto_rule_change_failed` | `op` (`create`, `revoke`, `expire`), `credential`, `error_class`; `rule_id` for `revoke` and `expire`; `user`, `peer`, `client_ip` for `create` and `revoke` (`channel` too for `create`) |
+| `auto_rule_used` | the request `id`, `source` (`config` or `ui`), `rule_name`, and for a stored rule `rule_id` |
+| `auto_rules_state_corrupt`, `auto_rules_state_write_failed` | `warning`, `error` (as for the SSH rule counters) |
+
+The approval of a stored rule is an ordinary `approved` event with `via: policy`, `decision_source: ui_rule` and the
+rule's `rule_name` (it carries no `rule_id`, which the history page reads as a standing SSH rule); the request
+history says `Policies rule "name" (auto-approved)`. Last-used time and use counts are kept in
+`auto_rules_state.json` beside the audit log, not in the vault, and are pruned of rules that no longer exist.
 
 ## Standing approvals (Always and time-boxed)
 
@@ -3201,6 +3259,9 @@ decision. Hidden on purpose:
 - Server-identity policy: `ssh_hosts_changed`, `ssh_hosts_change_refused`, `ssh_hosts_change_failed`,
   `ssh_sign_refused` (a key's `ssh_hosts.allowed_hosts` is approval
   policy; the refusal itself is already returned to the client without the allowed list).
+- Policies-tab auto-approve rules: `auto_rule_created`, `auto_rule_revoked`, `auto_rule_expired`,
+  `auto_rule_refused`, `auto_rule_change_failed`, `auto_rules_state_corrupt`,
+  `auto_rules_state_write_failed`, and `auto_rule_used` (a rule-approved request shows as a plain `approved`).
 - Standing SSH rules: `ssh_rule_created`, `ssh_rule_used`, `ssh_rule_revoked`,
   `ssh_rule_expired`, `ssh_rule_refused`, `ssh_rule_change_failed`,
   `ssh_rules_state_corrupt`, `ssh_rules_state_write_failed`, and the `rule_id` /

@@ -147,7 +147,7 @@ class History:
                 "id": rid, "ts": rec["ts"], "time": rec["time"], "names": rec.get("names") or [],
                 "mode": rec.get("mode"), "source": rec.get("source"), "outcome": "pending",
                 "via": None, "approver": None, "risk": None, "summary": None, "summary_model": None, "summary_source": None, "summary_reason": None, "summary_rule": None, "late_rating": None, "error": None,
-                "latency_ms": None, "grant_id": None, "rule_id": None, "rule_name": None, "plan_id": None, "plan_left_s": None, "delivered": False, "escalated": False,
+                "latency_ms": None, "grant_id": None, "rule_id": None, "rule_name": None, "decision_source": None, "plan_id": None, "plan_left_s": None, "delivered": False, "escalated": False,
                 "method": rec.get("method"), "url": _short_url(rec.get("url")),
                 "op": rec.get("op"), "item": rec.get("item"), "field": rec.get("field"),
                 "key": rec.get("key"), "hosts": rec.get("hosts"), "hosts_added": rec.get("hosts_added"),
@@ -201,6 +201,7 @@ class History:
             row["grant_id"] = rec.get("grant_id")
             row["rule_id"] = rec.get("rule_id")
             row["rule_name"] = rec.get("rule_name")
+            row["decision_source"] = rec.get("decision_source")
             row["plan_id"] = rec.get("plan_id")
             row["plan_left_s"] = rec.get("plan_left_s")
             if ev == "approved" and row["via"] == "policy":

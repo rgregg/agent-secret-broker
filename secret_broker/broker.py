@@ -58,6 +58,7 @@ from . import proposals as proposals_mod
 from . import credreq as credreq_mod
 from . import sudomode as sudo_mod
 from . import autorules as autorules_mod
+from . import uirules as uirules_mod
 from . import clients as clients_mod
 from . import clock as clock_mod
 from . import plans as plans_mod
@@ -232,7 +233,7 @@ class _InternalRefused(ValueError):
     """An internal refusal already audited (hidden event); the text is the generic one."""
 
 
-class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.SessionsMixin,
+class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.ClientsMixin, sessions_mod.SessionsMixin,
              ws_mod.WsMixin, planflow.PlansMixin):
     def __init__(self, config, backend, notifier, audit=None, summarizer=None,
                  background_load=False, push=None, dest_guard=None):
@@ -246,6 +247,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         self._backend_ok = True         # False while the last vault read failed
         self._refreshing = threading.Lock()
         self._cfg_lock = threading.Lock()
+        self._cfg_gen = 0               # bumped by every write of a credential's rules; see refresh_catalog
         self.summarizer = summarizer
         self._kp_seen = set()           # summary key credentials seen in the catalog (see _summary_key_read)
         self._desc_lock = threading.Lock()
@@ -334,6 +336,11 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         self._init_grants(config)
         self._init_plans(config)
         self._init_ssh_rules()
+        apath = self._audit._path
+        self.auto_rule_usage = sshrules_mod.Usage(
+            os.path.join(os.path.dirname(os.path.abspath(apath)), "auto_rules_state.json") if apath else None,
+            self.log, prefix="auto_rules")
+        self._init_ui_rules()
         if not self.dest_guard.allow_loopback:
             for w in self.trust_warnings():
                 self.log("config_warning", warning=w)
@@ -445,6 +452,11 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             ref0 = next(iter(raw_vars.values()))
             if (ref0 if isinstance(ref0, dict) else {}).get("field", "auto") not in ("private_key", "auto"):
                 raise ValueError("an ssh key secret's variable must use the private_key field")
+        auto_rules = None
+        if meta.get("auto_rules") is not None:
+            if ssh:
+                raise ValueError("auto_rules only applies to a credential that is not an ssh key")
+            auto_rules = autorules_mod.parse_stored(meta["auto_rules"], name)
         ssh_hosts = None
         if meta.get("ssh_hosts") is not None:
             if not ssh:
@@ -493,11 +505,14 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             entry["guidance_invalid"] = ginvalid
         entry.pop("ssh_hosts", None)
         entry.pop("ssh_rules", None)
+        entry.pop("auto_rules", None)
         entry.pop("standing", None)
         if standing:
             entry["standing"] = standing        # parsed; policy context, never in discovery/status output
         if ssh_rules:
             entry["ssh_rules"] = ssh_rules      # parsed; policy context, never in discovery/status output
+        if auto_rules:
+            entry["auto_rules"] = auto_rules    # parsed; policy context, never in discovery/status output
         if ssh_hosts and (ssh_hosts["known"] or ssh_hosts["allowed"] or ssh_hosts["allow_forwarded"]):
             entry["ssh_hosts"] = ssh_hosts      # parsed; never part of discovery/status output
         if note:
@@ -584,7 +599,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                          secret=name, host=h[:100])
         entry["allowed_hosts"] = keep
 
-    def refresh_catalog(self, fresh=False):
+    def refresh_catalog(self, fresh=False, _retries=2):
         """Rebuild the secret catalog from the vault's items. Raises if the vault
         cannot be read, leaving the previous catalog in place. `fresh` first pulls the
         latest from a remote vault (a request named something the catalog lacks, so a
@@ -594,6 +609,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                 self.backend.sync(min_age=self.FORCED_SYNC_MIN_AGE)
             except BackendError as e:
                 self.log("vault_sync_failed", error=type(e).__name__)   # the catalog read below reports a real outage
+        gen = self._cfg_gen
         rows = self.backend.catalog()
         out, bad, owners, autos = {}, [], {}, []
         for row in rows:
@@ -641,11 +657,22 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
                 bad.extend({"item": i, "reason": f"duplicate secret name {name!r}"} for i in items)
         out.update(adopted)
         with self._cfg_lock:
-            self.cfg["secrets"] = out
-            self._catalog_at = time.time()
-            self._backend_ok = True
-            self._catalog_stats = {"count": len(out), "invalid": len(bad), "adopted": len(adopted),
-                                   "loaded_at": _iso(self._catalog_at)}
+            moved = self._cfg_gen != gen
+            if not moved:
+                self.cfg["secrets"] = out
+                self._catalog_at = time.time()
+                self._backend_ok = True
+                self._catalog_stats = {"count": len(out), "invalid": len(bad), "adopted": len(adopted),
+                                       "loaded_at": _iso(self._catalog_at)}
+        if moved:
+            # A rule was added, revoked or expired while the vault was being read: this snapshot may still
+            # hold the old rule list (a revoked rule would come back). Read again; if the writes keep
+            # overlapping, fail closed: keep the catalog in memory (it has those writes) and try next time.
+            if _retries > 0:
+                return self.refresh_catalog(False, _retries - 1)
+            self.log("catalog_refresh_deferred", reason="rules changed while the vault was being read")
+            return
+        self.prune_auto_rule_usage()
         self._sync_summary_key(out)
         ginv = {n: e["guidance_invalid"] for n, e in sorted(out.items()) if e.get("guidance_invalid")}
         sig = json.dumps([sorted(out), bad, ginv], sort_keys=True)
@@ -1985,7 +2012,7 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         never = self.client_never_auto(cid)
         if not never and self._ssh_rule_claim(req):   # standing per-host rule: explicit policy, any risk limit
             return req
-        if not never and self._config_rule_claim(req):   # `auto_approve` rule in the config: same standing, any risk
+        if not never and self._rule_claim(req):   # `auto_approve` rule in the config: same standing, any risk
             return req
         auto = self._auto_allowed(mode, names, spec, cid)
         if never and auto:
@@ -2019,19 +2046,29 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             self._finish(req, "failed", error="could not notify")
         return req
 
-    def _config_rule_claim(self, req):
-        """Approve `req` from a matching `auto_approve` rule of the broker's configuration (see autorules.py).
-        Called from create() after the assessment, beside the standing SSH rules. Returns True when the request
-        was finished here."""
-        rule = autorules_mod.find(self.auto_rules, req.mode, req.names, req.spec, req.client)
+    def _rule_claim(self, req):
+        """Approve `req` from a matching `auto_approve` rule: one in the broker's configuration (see
+        autorules.py), or, for a request naming a single credential, one kept in that credential's vault
+        metadata and managed on the Policies tab. Config rules are tried first. Called from create() after the
+        assessment, beside the standing SSH rules. Returns True when the request was finished here."""
+        stored = []
+        if len(req.names) == 1:
+            stored = (self.cfg["secrets"].get(req.names[0]) or {}).get("auto_rules") or []
+        now = time.time()
+        rule = autorules_mod.find(self.auto_rules + stored, req.mode, req.names, req.spec, req.client, now)
         if rule is None:
             return False
         with self._lock:                # a human decision and a rule never both act
             if req.status != "pending":
                 return False
             req.status = "deciding"
-        self.audit("auto_rule_used", req, rule_name=rule["name"])
-        extra = dict(decision_source="config_rule", rule_name=rule["name"])
+        if rule["source"] == "ui":
+            self.audit("auto_rule_used", req, source="ui", rule_id=rule["id"], rule_name=rule["name"])
+            self.auto_rule_usage.record(req.names[0], rule["id"], now)
+            extra = dict(decision_source="ui_rule", rule_name=rule["name"])
+        else:
+            self.audit("auto_rule_used", req, source="config", rule_name=rule["name"])
+            extra = dict(decision_source="config_rule", rule_name=rule["name"])
         try:
             result = self._release(req)
         except Exception as e:  # noqa: BLE001 -- the request must always settle; a fixed label only
@@ -6032,7 +6069,8 @@ def _detail_html(r, evs, retained=""):
             f"{used.get('account') or '?'}@{used.get('rule_host') or sshrules_mod.short_fp(used.get('host_fp')) or '?'}"
             f", rule {str(r['rule_id'])[:16]}")
     elif r["via"] == "policy" and r.get("rule_name"):
-        add("Decided by", f"configuration rule \"{e(str(r['rule_name']))}\" (auto-approved)", True)
+        which = "Policies rule" if r.get("decision_source") == "ui_rule" else "configuration rule"
+        add("Decided by", f"{which} \"{e(str(r['rule_name']))}\" (auto-approved)", True)
     elif r["via"] == "policy" and r.get("plan_id"):
         left = r.get("plan_left_s")
         add("Decided by", f"plan {str(r['plan_id'])[:8]} (auto-approved)"
@@ -7067,14 +7105,18 @@ def approval_handler(broker):
             parts = self.path.split("?")[0].strip("/").split("/")
             return parts[1] if len(parts) == 2 and parts[0] == "a" else None
 
-        def _policies_page(self, user, note="", status=200, ssh_state=None, rule_state=None):
+        def _policies_page(self, user, note="", status=200, ssh_state=None, rule_state=None, auto_state=None):
             _page(self, status, f"<h1>Policies</h1>{note}{self._standing_section(user)}"
                   + guidance_mod.policies_section(cfg["secrets"], self._tok(user))
                   + sshhosts_mod.policies_section(cfg["secrets"], self._tok(user), ssh_state)
                   + sshrules_mod.policies_section(cfg["secrets"], self._tok(user),
                                                   broker.ssh_rule_usage, state=rule_state,
                                                   client_names=broker.clients.names(),
-                                                  client_choices=broker.clients.active_choices()),
+                                                  client_choices=broker.clients.active_choices())
+                  + uirules_mod.policies_section(cfg["secrets"], broker.auto_rules, self._tok(user),
+                                                 broker.auto_rule_usage, state=auto_state,
+                                                 client_names=broker.clients.names(),
+                                                 client_choices=broker.clients.active_choices()),
                   script=_GRANTS_JS + guidance_mod.JS + sshhosts_mod.JS, tab="policies", badge=broker.attention(), user=user)
 
         def _credentials_page(self, user, note="", status=200, q=""):
@@ -7526,7 +7568,8 @@ def approval_handler(broker):
             link = path.startswith("/a/") and not broker.dest_guard.allow_loopback   # the notification link page
             if (link or cred_edit or path in ("/decide", "/credential", "/request/retry", "/policies", "/policies/guidance", "/policies/ssh_hosts", "/grants/revoke",
                         "/enroll/decide", "/clients/rename", "/clients/revoke", "/clients/remove", "/sessions/revoke",
-                        "/policies/ssh_rules/add", "/policies/ssh_rules/revoke", "/push/subscribe",
+                        "/policies/ssh_rules/add", "/policies/ssh_rules/revoke", "/policies/auto_rules/add",
+                        "/policies/auto_rules/revoke", "/push/subscribe",
                         "/push/revoke", "/push/test", "/plans/decide", "/plans/revoke")) and not (
                     self._csrf_ok(user, form.get("csrf", [""])[0]) and (not link or bool(self.headers.get("Origin")))):
                 broker.log("csrf_refused", path=path, peer=self._ip,
@@ -7610,6 +7653,34 @@ def approval_handler(broker):
                     user, f"<p>Could not add the SSH rule: {html.escape(name)}</p>",
                     status=400 if res["status"] == "refused" else 500,
                     rule_state={name: {"open": True, "error": res["message"]}})
+            if path == "/policies/auto_rules/revoke":
+                name, rid = form.get("secret", [""])[0], form.get("rule", [""])[0][:16]
+                if name not in cfg["secrets"] or cfg["secrets"][name].get("ssh"):
+                    return _page(self, 400, "<h1>Bad request</h1>")
+                res = broker.revoke_auto_rule(name, rid, user, self._ip, self._fwd())
+                msg = {"revoked": "Auto-approve rule revoked", "missing": "That rule no longer exists",
+                       "failed": "Could not revoke the rule"}[res]
+                return self._policies_page(user, f"<p>{msg}: {html.escape(name)}</p>",
+                                           status=500 if res == "failed" else 200,
+                                           auto_state={name: {"open": True}})
+            if path == "/policies/auto_rules/add":
+                name = form.get("secret", [""])[0]
+                if name not in cfg["secrets"] or cfg["secrets"][name].get("ssh"):
+                    return _page(self, 400, "<h1>Bad request</h1>")
+                one = lambda k: form.get(k, [""])[0]  # noqa: E731
+                fields = dict(name=one("name"), mode=one("mode"), host=one("host"), scheme=one("scheme"),
+                              methods=form.get("methods", []), path_prefix=one("path_prefix"),
+                              argv=[w.strip() for w in one("argv").splitlines() if w.strip()],
+                              client=one("client") or clients_mod.ANY)
+                res = broker.add_auto_rule(name, fields, one("expires"), one("confirm") == "1", user,
+                                           self._ip, self._fwd())
+                if res["status"] == "created":
+                    return self._policies_page(user, f"<p>Auto-approve rule added: {html.escape(name)}</p>",
+                                               auto_state={name: {"open": True}})
+                return self._policies_page(
+                    user, f"<p>Could not add the rule: {html.escape(name)}</p>",
+                    status=400 if res["status"] == "refused" else 500,
+                    auto_state={name: {"open": True, "error": res["message"]}})
             if path == "/policies/ssh_hosts":
                 name = form.get("secret", [""])[0]
                 if name not in cfg["secrets"]:
