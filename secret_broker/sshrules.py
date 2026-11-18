@@ -18,7 +18,7 @@ Server-side refusals (`ssh_hosts`) run in Broker.create() before a request
 exists, so a rule can never release anything they refuse.
 
 This module holds the rule schema/validator, the matching helpers, the small
-last-used state file, the Policies-page section, the approval-card chip and the
+last-used state file, the credential Policies page's section, the approval-card chip and the
 Broker mixin (rule creation, revoke, expiry, claim). Audit note for anything that
 exposes audit events to the agent: every `ssh_rule_*` event and the `rule_id`
 field are policy context (hidden in audit_api); a rule-approved request shows
@@ -430,7 +430,7 @@ class SshRulesMixin:
 
     def add_ssh_rule(self, name, fp, account, expiry, confirm, user, peer=None, client_ip=None,
                      client=clients_mod.ANY):
-        """Policies-page 'Add rule' for one client (or `*` = any client). Returns {"status":
+        """credential-Policies-page 'Add rule' for one client (or `*` = any client). Returns {"status":
         created|exists|refused|failed, "message"}; raises ValueError for an unknown or non-ssh
         secret."""
         sc = self.cfg["secrets"].get(name)
@@ -563,7 +563,7 @@ def chip_html(account, server, fp):
     e = html.escape
     shown = f"{account}@{server}"
     tip = (f"Approve this request and always approve this key for {shown} "
-           f"({fp}) without asking. Revoke any time under Policies.")
+           f"({fp}) without asking. Revoke any time on the credential's Policies page.")
     return (f"<details class='alw sshrule'><summary class='chip always' data-tip='{e(tip, quote=True)}' "
             f"aria-label='Always approve {e(shown, quote=True)} with this key: {e(tip, quote=True)}'>"
             "Always: this host</summary>"

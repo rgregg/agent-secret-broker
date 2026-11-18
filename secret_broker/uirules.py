@@ -1,10 +1,10 @@
-"""Auto-approve rules kept in a credential's vault metadata and managed from the Policies tab.
+"""Auto-approve rules kept in a credential's vault metadata and managed from the credential's Policies page.
 
 A rule here is the same thing as an `auto_approve` rule in the broker config (autorules.py: one validator, one
 matcher), with three differences: it belongs to the one credential it is stored on, it is created and revoked by
-the human on the Policies tab (a confirmation tick, an optional expiry) instead of by editing the configuration,
+the human on the credential's Policies page (a confirmation tick, an optional expiry) instead of by editing the configuration,
 and it lives in the credential's `broker` metadata (vault field `auto_rules`), so it survives restarts and
-redeploys and takes effect at once. Whoever can use the Policies tab or edit the vault collection can add one: the
+redeploys and takes effect at once. Whoever can use the approval site or edit the vault collection can add one: the
 same trust level as `approval` and the SSH host rules. An agent can neither create nor see them.
 
 Nothing typed into the form is ever echoed into a message, an event or a log line: refusals are one of a closed set
@@ -98,7 +98,7 @@ class UiRulesMixin:
             sc.pop("auto_rules", None)
 
     def add_auto_rule(self, name, fields, expiry, confirm, user, peer=None, client_ip=None):
-        """The Policies page's 'Add rule'. `fields`: name, mode (http|env), host, scheme, methods (list),
+        """The credential Policies page's 'Add rule'. `fields`: name, mode (http|env), host, scheme, methods (list),
         path_prefix, argv (list), client ("*" = any enrolled client, or a client id). Returns {"status":
         created|refused|failed, "message", "rule_id"?}; raises ValueError for an unknown or ssh credential."""
         sc = self.cfg["secrets"].get(name)

@@ -5,7 +5,7 @@ to tell the risk classifier (and the description writer) how to think about
 requests made with THAT credential ("PullStack only downloads images: low ...").
 
 Trust model: guidance is POLICY CONTEXT, at the same trust level as ``approval``.
-Whoever can edit the vault collection or use the Policies tab can change ratings
+Whoever can edit the vault collection or use the approval site can change ratings
 with it. It is therefore never shown to the agent: not by discovery, `which`,
 `/v1/secrets`, `/v1/status`, request results, notifications or the agent audit
 API. The classifier sees it in the trusted instruction part of the prompt, never
@@ -15,7 +15,7 @@ change their forced HIGH rating, and the deterministic floors in risk.assess are
 untouched.
 
 This module holds the validation, the prompt sections, the analyzer-keyword
-compatibility shim and the Policies-page editor, so the core files only need
+compatibility shim and the credential page's editor, so the core files only need
 small hooks.
 """
 import hashlib

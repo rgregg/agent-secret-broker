@@ -13,7 +13,7 @@ always `any`). Two kinds exist:
            No risk ceiling: the human chose it explicitly for a short time.
 
 This module holds the metadata schema and validator plus the display helpers used
-by the Policies page and the approval card. The decision hooks live in broker.py
+by the Policies pages and the approval card. The decision hooks live in broker.py
 (`Broker._standing_claim`, `Broker._always_create`, `Broker.revoke_grant`).
 
 Audit note for anything that exposes audit events to the agent side: standing

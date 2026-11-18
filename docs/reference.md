@@ -186,9 +186,9 @@ socket, and every signature ssh asks for becomes a broker request (mode
   config error (name the field), not "allow everything". Neither `ssh_hosts` nor
   its contents appear in `list`, `which`, `status`, or the agent's audit view;
   the refusal message does not say what is allowed.
-- **Editing `ssh_hosts` on the Policies tab.** The policy lives in the key item's
-  `broker` metadata (vault field `ssh_hosts`) and is edited from the **Policies** tab
-  ("SSH host policy"): a collapsed card per SSH key with a **Known hosts** box (one
+- **Editing `ssh_hosts` on the credential's Policies page.** The policy lives in the key item's
+  `broker` metadata (vault field `ssh_hosts`) and is edited from the key's **Policies** page
+  ("SSH host policy"): a card with a **Known hosts** box (one
   plain known_hosts line per line, pasted from `~/.ssh/known_hosts`; hashed `|1|`
   entries are unsupported and listed as ignored), an **Allowed hosts** box (one host
   name or `SHA256:` fingerprint per line; empty means no enforcement) and an **Allow
@@ -198,7 +198,7 @@ socket, and every signature ssh asks for becomes a broker request (mode
   reason, and Allowed hosts entries that cannot match (`unknown name`, or `will only
   match by fingerprint`). `POST /policies/ssh_hosts` (fields `secret`, `known_hosts`,
   `allowed_hosts`, `allow_forwarded`) has the same SSO, trusted-peer, CSRF and Origin
-  checks as the other Policies forms and a 1.5 MB body limit (413 above). It runs the
+  checks as the other policy forms and a 1.5 MB body limit (413 above). It runs the
   same validator as catalog load (plus: no control characters, `SHA256:` entries need
   43 base64 characters, names are letters/digits/`._:-`), so the editor cannot write
   something the loader rejects; any error refuses the whole save (400, nothing
@@ -272,7 +272,7 @@ only loses those numbers (`ssh_rules_state_corrupt` audit warning).
 `host_forwarded`, `bind_invalid`, `session_mismatch`, `host_conflict`) run first,
 in `Broker.create()` before the request exists, so a rule can never release a
 request they refuse. Removing a host from `allowed_hosts` therefore makes its
-rules ineffective (they stay stored; the Policies tab flags them). After the
+rules ineffective (they stay stored; the key's Policies page flags them). After the
 assessment, `create()` checks a matching rule *before* auto-approval, grants and
 the prompt. A matching rule releases the signature without a notification at
 ANY `risk.auto_approve_max` (including `none`) and regardless of the HIGH rating
@@ -291,7 +291,7 @@ env request only when it runs the same program (argv[0] base name) over exactly
 those script texts. A changed script, another program, or a request with no
 readable script (`bash -c ...`) is not covered and asks again (audited as
 `grant_skipped` with `reason: script`). The risk ceiling still applies. The
-Policies page shows the program and the first 12 hex digits of the hash.
+the credential's Policies page shows the program and the first 12 hex digits of the hash.
 Arguments to the script are not part of the binding.
 
 **Creating a rule from the approval card.** For a pending SSH login that is eligible
@@ -312,7 +312,7 @@ pending (dashboard note, or a 409 page on the link). A duplicate (same fingerpri
 account) is a no-op that still approves. If the vault write fails after eligibility, the
 request is approved once and `ssh_rule_change_failed` is audited.
 
-**Policies tab: "SSH host rules".** Per SSH key a table: host label, short fingerprint,
+**Credential Policies page: "SSH host rules".** Per SSH key a table: host label, short fingerprint,
 account, created by/when, expires, last used and use count, and **Revoke**
 (`POST /policies/ssh_rules/revoke`, fields `secret`, `rule`). An "Add rule" form takes a
 server from the key's parsed `known_hosts` (or a `SHA256:` fingerprint), an account, an
@@ -321,7 +321,7 @@ or `fp`, `account`, `expires`, `confirm`), validated by the same code as the loa
 POSTs are guarded like the other policy forms (SSO identity, trusted peer, CSRF token and
 same-origin check). A rule whose host is not on an enforcing `allowed_hosts` shows
 "blocked by the allowed hosts list". Whoever can edit the vault collection or use the
-Policies tab can add rules: the same trust level as `approval`.
+credential Policies page can add rules: the same trust level as `approval`.
 
 **Expiry.** Expired rules are ignored at match time, dropped lazily (the next matching
 request triggers it) and by a 60 s sweep, and `ssh_rule_expired` is audited once.
@@ -500,7 +500,7 @@ defaults (next section). The object looks like this:
   (reported in `catalog_loaded`, naming the field). Items adopted without
   metadata have none. It is policy context: never returned by `list`, `which`,
   `/v1/secrets`, `/v1/status`, request results, notifications or the agent
-  audit API. Edit it on the Policies tab ("Risk guidance"), which writes it into
+  audit API. Edit it on the credential's Policies page ("Risk guidance"), which writes it into
   the item's `broker` metadata like standing approvals do.
 - `allowed_hosts` may be omitted for credentials that are not HTTP tokens (a
   Wi-Fi password): such a secret can never be used in `http` mode, only fetched
@@ -800,8 +800,7 @@ credentials with `"risk": {"auto_modes": ["http"]}` in the broker config.
   risk rating and the script text are hints, not enforcement. Opt a credential
   out with `auto_modes: ["http"]` when it should never be handed out unattended.
 - Store requests, the SSH floor and SSH host rules are unchanged.
-- The Policies tab's "Standing approvals" table lists each `approval: allow`
-  credential with the modes that are auto-eligible (for example `web,
+- A credential's Policies page shows its `approval: allow` as a read-only line (changed under Settings), with the modes that are auto-eligible (for example `web,
   run-with-secret`); see "Standing approvals".
 
 ### Auto-approve level: `risk.auto_approve_max`
@@ -1318,7 +1317,7 @@ Extras only widen the Origin check. Links in notifications, the Web Push VAPID s
 every other generated URL keep using `approve_base_url`; the manifest, service worker scope
 and push payloads are origin-relative or carry no URL, so each origin serves its own copy.
 
-The Revoke buttons on the Policies tab use the same token.
+The Revoke buttons on the Policies tab and on the credential pages use the same token.
 
 The approval listener trusts the identity header, so it must only ever hear from
 your SSO proxy. Besides not publishing its port, set
@@ -1741,7 +1740,7 @@ setting says: the rule is the approval. It is audited as an ordinary approval (`
 `decision_source: config_rule` and the rule's `rule_name`, preceded by an `auto_rule_used` event, and the request
 history says "configuration rule "name" (auto-approved)". The agent sees a plain approval; rule names and the
 `auto_rule_used` event are hidden from the agent audit API. The rules are read when the broker starts: change them
-in the configuration and redeploy, or, for a rule on one credential, add it on the Policies tab (below).
+in the configuration and redeploy, or, for a rule on one credential, add it on that credential's Policies page (below).
 
 Fields (a field a mode does not take is an error, and so is any mistake: the broker refuses to start rather than
 guess, and the message names the field, such as `auto_approve[2].host`):
@@ -1773,9 +1772,10 @@ What a rule will not do:
 A rule is stronger than `approval: allow` because it ignores the risk ceiling, so keep each one as narrow as the
 job needs.
 
-### Rules from the Policies tab
+### Rules on a credential's Policies page
 
-The same rules can be added, listed and revoked on the **Policies** tab, under "Auto-approve rules", with no
+The same rules can be added, listed and revoked on a credential's **Policies** page
+(`/credentials/NAME?tab=policies`), under "Auto-approve rules", with no
 restart and no redeploy. They differ from configuration rules in four ways:
 
 - **They belong to one credential.** A rule is stored in that credential's `broker` metadata (vault field
@@ -1806,7 +1806,7 @@ restart and no redeploy. They differ from configuration rules in four ways:
 approval, at any risk level and whatever the credential's `approval` says. A blank scheme means `https` and a blank
 path prefix means `/`. `POST /policies/auto_rules/revoke` takes `secret` and `rule`. Both are guarded like the SSH
 rule forms (SSO identity, trusted peer, CSRF token, same-origin check) and are not reachable with an agent key.
-Whoever can use the Policies tab or edit the vault collection can add one: the same trust level as `approval`.
+Whoever can use the approval site or edit the vault collection can add one: the same trust level as `approval`.
 Configuration rules appear in the same table, read-only and marked "config", beside the credential they cover. Every non-SSH credential has a card, including one with no allowed hosts (an env-only credential can still get an `env` rule). The Credentials editor's advanced JSON box can also carry an `auto_rules` list; a save that adds or changes a rule there needs the same "this widens access" confirmation tick as turning on `approval: allow`. Use counts are pruned of vanished rules after each successful catalog refresh, and a refresh whose vault read overlapped an add, revoke or expiry is read again, so a revoked rule cannot come back from a stale snapshot. If the writes overlap the read three times running, the refresh keeps the catalog already in memory and audits `catalog_refresh_deferred` (hidden from the agent audit API); the next refresh tries again.
 
 **Refusals** are one of a closed set of reasons, audited as `auto_rule_refused` with `reason`: `invalid` (the page
@@ -1830,6 +1830,36 @@ The approval of a stored rule is an ordinary `approved` event with `via: policy`
 rule's `rule_name` (it carries no `rule_id`, which the history page reads as a standing SSH rule); the request
 history says `Policies rule "name" (auto-approved)`. Last-used time and use counts are kept in
 `auto_rules_state.json` beside the audit log, not in the vault, and are pruned of rules that no longer exist.
+
+## The credential page: Settings and Policies
+
+Every credential has a page at `/credentials/NAME` with two tabs, linked from every place a credential's name is
+shown (request cards, history details, the Clients tab, the Policies tab, plans):
+
+- **Settings** (`/credentials/NAME`) is the editor: allowed hosts, TLS, approval, WebSocket, values, the advanced
+  JSON box, rename and delete. A strip at the top says how many standing approvals and auto-approve rules the
+  credential has and whether risk guidance is set, with a link to the Policies tab. The Credentials list shows
+  the same count per credential.
+- **Policies** (`/credentials/NAME?tab=policies`) holds everything that belongs to this credential alone, one
+  independent form per section (own CSRF field, hidden field naming the credential, never inside the Settings form):
+  **Standing approvals** (timed and Always, with Revoke; the legacy `approval: allow` is a read-only line),
+  **Auto-approve rules** (not for SSH keys), **Risk guidance**, and for SSH keys **SSH host policy** and
+  **SSH host rules**. The tab label shows the number of standing approvals plus rules (guidance is not counted).
+  A refused or saved form answers with this page (same notes, same status codes: 400 for a refusal, 500 for a
+  failed write).
+
+The **Policies** tab (`/policies`) lists only what does not fit on one credential's page: timed approvals that cover
+two or more credentials, config `auto_approve` rules that name two or more, and either kind when a name no longer
+exists in the catalog (marked "names a credential that no longer exists", not linked, still revocable). A pair
+config rule is also shown, marked "covers several credentials", on each credential it names. `POST /grants/revoke`
+takes an optional hidden `back`: a credential name that exists returns to that credential's Policies page;
+`policies`, nothing, or anything else returns to the Policies tab (the value is never echoed). Plans stay on the
+Clients tab.
+
+A name links only when the credential exists in the catalog at the time the page is rendered (`credlinks`); anything
+else is plain text. Names inside a policy (standing approvals, rules, plans) link to the Policies page; elsewhere to
+Settings. Left as plain text on purpose: history rows (each is one button that opens the pop-over, whose title is
+linked), the detail timeline's raw audit fields, tooltips and `<option>` text, and the value-entry form's legend.
 
 ## Standing approvals (Always and time-boxed)
 
@@ -1898,7 +1928,7 @@ values are `approve_grant_<minutes>` and `approve_always`.
   `auto_modes` metadata, else `risk.auto_modes` (SSH keys default to
   `["ssh_sign"]`). With `auto_modes: ["http"]` there is no env Always chip, and an
   existing env Always entry is skipped (`grant_skipped`, `reason: auto_modes`) and
-  shown on the Policies tab as "not active: mode not enabled". Timed grants are
+  shown on the credential's Policies page as "not active: mode not enabled". Timed grants are
   explicit human choices and are not subject to `auto_modes`.
 
 ### Evaluation order
@@ -1933,13 +1963,14 @@ approval never both act. A request released by a standing approval ends
   grant for the same set and mode replaces (and restarts) the old one.
 - **Cap:** 50 Always approvals per credential (`grant_refused`, `reason: cap`; the
   request is still approved).
-- **Revoking.** The **Policies** tab has one "Standing approvals" table with
-  every timed grant, Always approval and legacy always-allowed credential:
-  Secrets, Covers (web reads only / web any method / run-with-secret / ssh),
+- **Revoking.** A credential's **Policies** page lists its standing approvals (timed grants and Always
+  approvals for that credential alone; `approval: allow` is a read-only line pointing at Settings), and the
+  **Policies** tab lists the timed grants that cover several credentials or name one that no longer exists.
+  Each table has Covers (web reads only / web any method / run-with-secret / ssh),
   Expires ("never" or a live countdown, "in 12 min"), who created it and when,
-  and **Revoke**. Timed and Always rows `POST /grants/revoke` (CSRF-checked); a
-  legacy `approval: allow` row (marked "whole credential, any method, any covered
-  mode") posts to `/policies` and sets the policy back to `prompt`, as before.
+  and **Revoke**. Timed and Always rows `POST /grants/revoke` (CSRF-checked, with a hidden `back`: the
+  credential's name, or `policies`); a legacy `approval: allow` line ("whole credential, any method, any covered
+  mode") is changed under **Settings** (Approval); `POST /policies` still sets a credential back to `prompt`.
   Programmatic: `Broker.revoke_grant(id, user)` returns True, False (not found) or
   None (an Always could not be removed from the vault). The SSH host rules section
   is separate.
@@ -2086,7 +2117,7 @@ ticked entries one after another used to fail the later ones. Now:
 ### Hidden characters are rejected
 
 Text a model reads but a reviewer cannot see could differ from what you approve, so one strict
-validator (`guidance.validate_text`) is used by proposals, the Policies-tab editor and the
+validator (`guidance.validate_text`) is used by proposals, the credential page's guidance editor and the
 catalog loader. It **rejects**, never strips or normalizes (stored text is byte-identical to
 what was reviewed; only CRLF becomes LF and the ends are trimmed of spaces, tabs and newlines),
 any of: control characters other than newline and tab; invisible format characters (zero-width
@@ -2098,7 +2129,7 @@ U+1160, U+3164, U+FFA0; and more than 3 combining marks in a row. The error name
 and offset (`guidance contains hidden characters (invisible format character at offset 12)`)
 and never echoes the characters. A proposal gets 400; the editor re-renders with the error.
 In the catalog loader the credential stays valid but its guidance is ignored for
-classification, flagged `guidance_invalid` (a note on the Policies page) and reported in a
+classification, flagged `guidance_invalid` (a note on the credential's Policies page) and reported in a
 hidden `guidance_ignored` audit event. Accented letters, curly quotes and dashes are allowed.
 
 On the review card, an entry whose proposed text contains any non-ASCII character shows
@@ -2155,7 +2186,7 @@ refuses an approval with nothing ticked, 400, and the proposal stays pending) an
 ### Applying
 
 Apply selected sends `apply_<index>` for each ticked entry through the normal decision
-path. Only ticked entries are applied, each through the same code as the Policies-tab
+path. Only ticked entries are applied, each through the same code as the credential page's
 editor (`set_guidance`: vault first, then the live catalog, the `guidance_changed:
 {by, at}` marker in the item's metadata). An entry whose write fails is reported as
 `failed` and the others still apply. Entries you did not tick are `denied`.
@@ -3165,8 +3196,8 @@ Every Always approval, timed grant and SSH host rule has a **client scope**: `*`
 client id.
 
 - A rule made from a card defaults to the requesting client; the card has an explicit "any client"
-  choice (`rule_scope`; any unrecognised value means the requesting client). The Policies SSH rule
-  form has a client select (default: any client, as such rules always were). The legacy shared key is
+  choice (`rule_scope`; any unrecognised value means the requesting client). The SSH rule form on the
+  credential's Policies page has a client select (default: any client, as such rules always were). The legacy shared key is
   one client (`legacy`), so its card rules are legacy-scoped.
 - Resolution: a request is covered by a rule scoped to its client or a rule for any client (its own is
   tried first, then the global one; a read-only rule that does not cover a POST falls through to a
@@ -3183,7 +3214,7 @@ client id.
   client-scoped Always/SSH rule carries `client` (an older broker rejects that credential's metadata
   until the rule is removed: **remove client-scoped rules before downgrading**). Client-scoped timed
   grants are stored under `client_grants` so an older broker drops them instead of widening them.
-- The Policies tables show who each rule applies to; the Clients tab lists each client's own rules.
+- The credential Policies pages show who each rule applies to; the Clients tab lists each client's own rules.
   Revoking a client removes them.
 
 ### Audit events
@@ -3263,7 +3294,7 @@ decision. Hidden on purpose:
 - Server-identity policy: `ssh_hosts_changed`, `ssh_hosts_change_refused`, `ssh_hosts_change_failed`,
   `ssh_sign_refused` (a key's `ssh_hosts.allowed_hosts` is approval
   policy; the refusal itself is already returned to the client without the allowed list).
-- Policies-tab auto-approve rules: `auto_rule_created`, `auto_rule_revoked`, `auto_rule_expired`,
+- Policies-page auto-approve rules: `auto_rule_created`, `auto_rule_revoked`, `auto_rule_expired`,
   `auto_rule_refused`, `auto_rule_change_failed`, `auto_rules_state_corrupt`,
   `auto_rules_state_write_failed`, and `auto_rule_used` (a rule-approved request shows as a plain `approved`).
 - Standing SSH rules: `ssh_rule_created`, `ssh_rule_used`, `ssh_rule_revoked`,

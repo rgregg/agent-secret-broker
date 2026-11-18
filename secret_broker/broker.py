@@ -2056,7 +2056,7 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
     def _rule_claim(self, req):
         """Approve `req` from a matching `auto_approve` rule: one in the broker's configuration (see
         autorules.py), or, for a request naming a single credential, one kept in that credential's vault
-        metadata and managed on the Policies tab. Config rules are tried first. Called from create() after the
+        metadata and managed on the credential's Policies page. Config rules are tried first. Called from create() after the
         assessment, beside the standing SSH rules. Returns True when the request was finished here."""
         stored = []
         if len(req.names) == 1:
@@ -3827,7 +3827,7 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
                 if len(r["secrets"]) >= 2 or r["secrets"] - known]
 
     def standing_rows(self):
-        """Every standing approval for the Policies page, soonest-expiring first, then
+        """Every standing approval for the Policies pages, soonest-expiring first, then
         Always, then legacy whole-credential allows. Each row: kind (timed|always|
         legacy), id, name (legacy), secrets, mode, scope, covers, expires_at (None =
         never), left_s, created_by, created_at (text), modes (legacy)."""
@@ -5818,6 +5818,9 @@ def _approve_actions(broker, req):
     e = html.escape
     names = e(", ".join(req.names))                # for attributes (a link cannot sit in an attribute)
     names_html = credlinks_mod.links(req.names)    # for visible text
+    revoke_hint = "Revoke any time on " + (        # where a standing approval for these secrets is listed and revoked
+        credlinks_mod.link(req.names[0], tab="policies", text="the credential's Policies page")
+        if len(req.names) == 1 else "the Policies page") + "."
     if req.mode == "sudo":          # Approve or Deny only: no Always, no timed grant
         return ("<div class=decide-row><button class='btn approve' name=decision value=approve>"
                 "Approve</button><button class='btn deny' name=decision value=deny>Deny</button></div>"
@@ -5846,7 +5849,7 @@ def _approve_actions(broker, req):
         mx = broker.auto_approve_max(req.client["id"])
         tip = (f"Approve this request and approve future requests for this secret without asking: "
                f"{what}, when the request is rated {mx} or lower. "
-               "Applies to the client chosen above. Revoke any time under Policies.")
+               "Applies to the client chosen above. Revoke any time on the credential's Policies page.")
         ask = standing_mod.confirm_html(credlinks_mod.link(req.names[0]), req.mode, scope, mx)
         chips.append(
             f"<details class=alw><summary class='chip always' data-tip='{e(tip)}' "
@@ -5859,7 +5862,7 @@ def _approve_actions(broker, req):
             btip = (f"Approve this request and approve future runs of {b['command']} over exactly this script "
                     f"text (sha256 {b['sha256'][0][:12]}) without asking, when the request is rated {mx} or "
                     "lower. A changed script asks again. Applies to the client chosen above. "
-                    "Revoke any time under Policies.")
+                    "Revoke any time on the credential's Policies page.")
             chips.append(
                 f"<details class=alw><summary class='chip always' data-tip='{e(btip)}' "
                 f"aria-label='Always approve this script: {e(btip)}'>Always, this script</summary>"
@@ -5883,11 +5886,11 @@ def _approve_actions(broker, req):
         out += (f"<p class=scope><small class=muted>Applies to exactly: {names_html}, run-with-secret "
                 "requests only. The secret value will be released to the requesting machine for "
                 "the chosen time without asking. Requests whose script text is not visible "
-                "still ask. Revoke any time under Policies.</small></p>")
+                f"still ask. {revoke_hint}</small></p>")
     if mins and req.mode != "env":
         out += (f"<p class=scope><small class=muted>Applies to exactly: {names_html}. "
                 f"{'Reads only (GET, HEAD, OPTIONS)' if scope == 'read' else 'Any method'}. "
-                "Revoke any time under Policies.</small></p>")
+                f"{revoke_hint}</small></p>")
     return row1 + out + "</div>"
 
 

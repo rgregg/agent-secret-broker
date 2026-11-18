@@ -89,6 +89,34 @@ class Pages(tg.Base):
         self.assertNotIn("href='/credentials/svc", body)
         self.assertGreater(len(bare(body, "svc")), 0)                                    # and it is still shown, as text
 
+    def test_revoke_copy_points_to_the_credentials_policies_page(self):
+        body = self.page("/")
+        self.assertNotIn("under Policies", body)                                         # the old wording is gone everywhere
+        self.assertIn("Revoke any time on the credential&#x27;s Policies page", body)     # the Always chip's tooltip (an attribute)
+        note = body.split("Applies to exactly:")[1].split("</small>")[0]                  # the visible note under the chips
+        self.assertIn("href='/credentials/svc?tab=policies'>the credential&#x27;s Policies page</a>", note)
+        card = self.page(f"/a/{self.broker._by_id[self.pending].nonce}")
+        self.assertNotIn("under Policies", card)
+
+    def test_a_note_for_several_credentials_names_the_policies_tab(self):
+        rid = self.http(("svc", "other"), path="/pair")
+        body = self.page(f"/a/{self.broker._by_id[rid].nonce}")
+        note = body.split("Applies to exactly:")[1].split("</small>")[0]
+        self.assertIn("Revoke any time on the Policies page", note)
+        self.assertNotIn("href='/credentials/svc?tab=policies'>the credential", note)    # no single credential to point at
+
+    def test_the_rename_delete_block_message_names_the_new_places(self):
+        body = self.page("/credentials/svc")
+        self.assertIn("Rename and delete are unavailable while this credential is in use", body)   # the premise: it is bound
+        self.assertNotIn("Policies and Clients tabs", body)
+        self.assertIn("href='/credentials/svc?tab=policies'>this credential&#x27;s Policies page</a>", body)
+        self.assertIn("the Policies tab and the Clients tab", body)
+
+    def test_the_clients_tab_sentence(self):
+        body = self.page("/clients")
+        self.assertIn("in full on each credential&#x27;s Policies page", body.replace("'", "&#x27;"))
+        self.assertNotIn("on the Policies tab", body)
+
     def test_scan_helper_sees_an_unlinked_name(self):
         self.assertEqual(len(bare("<p>svc</p><a href='x'>svc</a><option>svc</option>", "svc")), 1)
         self.assertEqual(bare("<a href='x'>svc</a><script>svc</script><option>svc</option><button>svc</button>", "svc"), [])

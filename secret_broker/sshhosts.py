@@ -1,4 +1,4 @@
-"""The Policies-page editor for an SSH key's `ssh_hosts` policy.
+"""The credential Policies page's editor for an SSH key's `ssh_hosts` policy.
 
 `ssh_hosts` lives in the key item's `broker` metadata (see Broker._ssh_hosts for
 the validator the catalog loader runs, and docs/reference.md for what the policy

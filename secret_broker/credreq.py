@@ -290,7 +290,7 @@ def form_html(req, csrf, values=None, errors=()):
         "<button class='btn deny' type=submit name=decision value=deny formnovalidate>Deny</button></div>"
         "</form>"
         "<p><small class=muted>Stored with approval on every use: no standing approval, grant or Always "
-        "applies to it unless you add one later under Policies. The value is sent only to this page's "
+        "applies to it unless you add one later on its Policies page. The value is sent only to this page's "
         "broker and is not logged.</small></p>")
 
 

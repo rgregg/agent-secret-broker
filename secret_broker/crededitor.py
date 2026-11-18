@@ -12,7 +12,7 @@ import html
 import json
 import re
 
-from . import peek
+from . import credlinks, peek
 from .wssessions import PRESET_DENY
 
 MAX_JSON = 100_000          # the advanced box, in characters
@@ -49,7 +49,6 @@ def tabs_html(name, active, total):
 
 def summary_html(name, counts):
     """The strip at the top of Settings: what policies this credential has, linked to the Policies sub-tab."""
-    from . import credlinks
     n, r = counts["standing"], counts["rules"]
     text = (f"{n} standing approval{'' if n == 1 else 's'}, {r} auto-approve rule{'' if r == 1 else 's'}, "
             f"risk guidance {'set' if counts['guidance'] else 'not set'}")
@@ -554,8 +553,9 @@ def manage_section(name, token, sha, bindings, *, can_write, blocked=""):
         note = f"<p><small class=muted>{e(blocked)}</small></p>"
     elif bound:
         what = ", ".join(f"{v} {k.replace('_', ' ')}" for k, v in sorted(bound.items()))
+        here = credlinks.link(name, tab="policies", text="this credential's Policies page")
         note = (f"<p><small class=muted>Rename and delete are unavailable while this credential is in use "
-                f"({e(what)}). Revoke those on the Policies and Clients tabs first.</small></p>")
+                f"({e(what)}). Revoke those on {here}, the Policies tab and the Clients tab first.</small></p>")
     dis = "" if (can_write and not blocked and not bound) else " disabled"
     return (f"<h2>Rename or delete</h2>{note}"
             f"<form class=cred-form method=post action='/credentials/{e(name)}/rename'>"

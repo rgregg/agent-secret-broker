@@ -1032,5 +1032,5 @@ def clients_section(broker, csrf, now=None, flash=""):
                  "seconds. Check the disk.</div>")
     return (f"<h1>Clients</h1>{note}{hint}<div class=cl>{table}</div>"
             "<p><small class=muted>A rule made for one client never applies to another; rules for "
-            "<i>any client</i> apply to all. Rules are listed per client above and in full on the Policies "
-            "tab.</small></p>")
+            "<i>any client</i> apply to all. Rules are listed per client above and in full on each credential's "
+            "Policies page.</small></p>")
