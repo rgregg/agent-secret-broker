@@ -11,7 +11,8 @@
 
 A request that matches a rule is released without a prompt at any risk level and whatever the secret's
 `approval` setting says: the rule is explicit policy written by the person who runs the broker (it lives in
-the broker's own configuration, which no agent can edit), like a standing SSH rule or a plan. It is audited as
+the broker's own configuration, which no agent can edit, or kept per credential in its vault metadata and
+managed on the Policies tab: see uirules.py), like a standing SSH rule or a plan. It is audited as
 an ordinary approval with `decision_source: config_rule` and the rule's name. Everything else prompts as before.
 
 What a rule can and cannot do:
