@@ -47,6 +47,15 @@ def tabs_html(name, active, total):
             f"Policies ({int(total)})</a></nav>")
 
 
+def summary_html(name, counts):
+    """The strip at the top of Settings: what policies this credential has, linked to the Policies sub-tab."""
+    from . import credlinks
+    n, r = counts["standing"], counts["rules"]
+    text = (f"{n} standing approval{'' if n == 1 else 's'}, {r} auto-approve rule{'' if r == 1 else 's'}, "
+            f"risk guidance {'set' if counts['guidance'] else 'not set'}")
+    return f"<p class=hint>{credlinks.link(name, tab='policies', text=text)}</p>"
+
+
 def tls_mode(meta):
     if meta.get("tls_fingerprint") is not None:
         return "pin"
@@ -631,7 +640,7 @@ def values_section(name, sc, token, sha, *, can_write, revealed=None):
 
 
 def edit_section(name, meta, token, stored, *, can_write, error="", preview=None, widen=(), conflict=False,
-                 extra="", fetched="", values="", flash=""):
+                 extra="", fetched="", values="", flash="", chrome="", summary=""):
     """The edit page. `stored`: the metadata the vault holds (what the diff is against and what the
     concurrency hash covers); `meta`: what the form fields show (the stored metadata, or the human's
     rejected candidate). `preview`: the candidate metadata on the confirm step (diff + save button)."""
@@ -733,4 +742,5 @@ def edit_section(name, meta, token, stored, *, can_write, error="", preview=None
             f"page first and needs your tick.</p>")
     manage = f"<div class='card dzone'>{extra}</div>" if extra else ""
     note = f"<div class=flash>{e(flash)}</div>" if flash else ""
-    return f"<div class=ced><h1>Edit {e(name)}</h1>{note}{err}{off}{fetched}{values}{form}{manage}</div>"
+    return (f"<div class=ced><h1>Edit {e(name)}</h1>{chrome}{summary}{note}{err}{off}{fetched}{values}{form}"
+            f"{manage}</div>")

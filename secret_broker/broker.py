@@ -7189,6 +7189,11 @@ def approval_handler(broker):
             values = "" if kw.get("preview") is not None or broker.is_internal_secret(name) else \
                 crededitor_mod.values_section(name, sc, self._tok(user), crededitor_mod.digest(stored),
                                               can_write=can_write, revealed=revealed)
+            if kw.get("preview") is None:
+                per, _ = broker.standing_by_credential()
+                c = credpolicy_mod.counts(name, sc, per.get(name, []), broker.config_rules_for(name))
+                kw.setdefault("chrome", crededitor_mod.tabs_html(name, "settings", c["total"]))
+                kw.setdefault("summary", crededitor_mod.summary_html(name, c))
             _page(self, status, crededitor_mod.edit_section(
                 name, stored if meta is None else meta, self._tok(user), stored, can_write=can_write,
                 extra=extra, values=values, **kw),
@@ -7201,8 +7206,7 @@ def approval_handler(broker):
             the three states re-render a refused or saved form (see the section cards)."""
             sc = cfg["secrets"].get(name)
             if sc is None:
-                return _page(self, 404, "<h1>Credential not found</h1>", tab="credentials", badge=broker.attention(),
-                             user=user)
+                return _page(self, 404, "<h1>Not found</h1>", tab="credentials", user=user)
             per, _ = broker.standing_by_credential()
             rows, cfg_rules = per.get(name, []), broker.config_rules_for(name)
             c = credpolicy_mod.counts(name, sc, rows, cfg_rules)
@@ -7211,8 +7215,10 @@ def approval_handler(broker):
                 client_names=broker.clients.names(), client_choices=broker.clients.active_choices(),
                 standing_rows=rows, config_rules=cfg_rules,
                 states={"ssh_hosts": ssh_hosts, "ssh_rules": ssh_rules, "auto_rules": auto_rules})
-            page = (f"<div class=ced><h1>Edit {html.escape(name)}</h1>{note}"
-                    f"{crededitor_mod.tabs_html(name, 'policies', c['total'])}"
+            off = ("" if backend_base.CAP_SET_META in broker.backend.capabilities else
+                   "<p class=err>This vault backend cannot store metadata, so policies cannot be changed here.</p>")
+            page = (f"<div class=ced><h1>Edit {html.escape(name)}</h1>"
+                    f"{crededitor_mod.tabs_html(name, 'policies', c['total'])}{note}{off}"
                     f"{credpolicy_mod.body(name, sc, ctx)}</div>")
             _page(self, status, page, tab="credentials", badge=broker.attention(), user=user, wide=True,
                   script=_GRANTS_JS + guidance_mod.JS + sshhosts_mod.JS)
@@ -7438,6 +7444,8 @@ def approval_handler(broker):
                 nm = u.path[len("/credentials/"):]
                 if nm not in cfg["secrets"]:
                     return _page(self, 404, "<h1>Not found</h1>", tab="credentials", user=user)
+                if (urllib.parse.parse_qs(u.query).get("tab") or [""])[0] == "policies":
+                    return self._credential_policies(user, nm)
                 return self._credential_edit(user, nm)
             if self.path.split("?")[0].rstrip("/") == "/clients":
                 q = urllib.parse.parse_qs(u.query)
