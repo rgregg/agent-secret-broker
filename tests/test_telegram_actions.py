@@ -15,6 +15,8 @@ from secret_broker import destguard as _destguard  # noqa: E402
 _destguard.allow_loopback_for_tests()
 from secret_broker import notify  # noqa: E402
 from secret_broker.notify import NotifyError  # noqa: E402
+from secret_broker.broker import CHANNELS, serve  # noqa: E402
+import test_e2e as t  # noqa: E402
 
 TOKEN = "123456:S3CR3T-BOT"
 CHAT = 4242
@@ -126,6 +128,24 @@ class Buttons(Base):
         t.send(self.note(t, risk="high"))
         kb = calls("sendMessage")[0]["reply_markup"]["inline_keyboard"]
         self.assertEqual([b["text"] for b in kb[0]], ["Deny"])
+
+    def test_a_decision_not_rendered_here_is_refused(self):
+        # Telegram narrowed to Deny for high risk, while another transport offers Approve: the shared token then
+        # authorises approve, so the transport itself must refuse an approve tap it never rendered.
+        t = self.tg(policy={"approve_max_risk": "medium", "deny": True})
+        wide = notify.FakeNotifier(supports_actions=("approve", "deny"))
+        n = notify.make_notification(
+            rid=RID, tag="secret-x", title="T", text="x", names=["svc"], risk="high",
+            url="https://secrets.example/a/NONCE", source="host", summary=None, expires_at=1.0,
+            transport=notify.MultiNotifier([t, wide]))
+        self.assertEqual([a.id for a in n.actions], ["deny", "approve"])     # premise: the union has approve
+        t.send(n.for_transport(t))
+        taps = []
+        FakeAPI.updates = [[update(1, f"ASB|approve|{RID}|{n.action_token}")],
+                           [update(2, f"ASB|deny|{RID}|{n.action_token}")]]
+        t.poll_once(lambda x: taps.append(x) or 0, timeout=0)
+        t.poll_once(lambda x: taps.append(x) or 200, timeout=0)
+        self.assertEqual([x["refused"] for x in taps], ["action", None])
 
     def test_overlong_callback_falls_back_to_link(self):
         t = self.tg()
@@ -272,6 +292,164 @@ class PollErrors(Base):
         self.assertFalse(th.is_alive())
         self.assertEqual(logged, ["conflict"])              # once per run of 409s
         self.assertEqual(slept[:3], [1, 2, 4])
+
+
+class BrokerTaps(t.Harness):
+    """A real TelegramNotifier on a real broker; taps are driven with poll_once (no thread)."""
+    decision = None                     # the fake phone does nothing: only Telegram decides
+
+    def setUp(self):
+        super().setUp()
+        FakeAPI.calls, FakeAPI.updates, FakeAPI.fail, FakeAPI.next_mid = [], [], None, 77
+        self.tsrv = ThreadingHTTPServer(("127.0.0.1", 0), FakeAPI)
+        threading.Thread(target=self.tsrv.serve_forever, daemon=True).start()
+        self.tg = notify.TelegramNotifier(TOKEN, CHAT, api_base=f"http://127.0.0.1:{self.tsrv.server_address[1]}",
+                                          allowed_users=(USER,))
+        self.broker.notifier = self.tg
+        self.now = 1000.0
+        self.broker.presence_clock = lambda: self.now
+
+    def tearDown(self):
+        self.tsrv.shutdown()
+        self.tsrv.server_close()
+        super().tearDown()
+
+    def pending(self):
+        code, body = self.create_env()
+        self.assertEqual(code, 202, body)
+        rid = json.loads(body)["id"]
+        kb = calls("sendMessage")[-1]["reply_markup"]["inline_keyboard"]
+        datas = {b["text"]: b["callback_data"] for b in kb[0]}
+        self.assertEqual(sorted(datas), ["Approve", "Deny"])
+        return rid, datas
+
+    def tap(self, data, uid, user=USER):
+        FakeAPI.updates = [[update(uid, data, user=user)]]
+        self.assertEqual(self.tg.poll_once(self.broker.telegram_tap, timeout=0), 1)
+        return calls("answerCallbackQuery")[-1]["text"]
+
+    def status(self, rid, wait=5):
+        return json.loads(self.api("GET", f"/v1/requests/{rid}?wait={wait}")[1])["status"]
+
+    def test_approve_from_telegram_releases(self):
+        rid, d = self.pending()
+        self.assertEqual(self.tap(d["Approve"], 1), "Approved")
+        self.assertEqual(self.status(rid), "approved")
+        (ev,) = self.events("decided")
+        self.assertEqual((ev["channel"], ev["approver"], ev["decision"]), ("telegram", "telegram:111", "approve"))
+        _fast.wait_until(lambda: calls("editMessageText"), what="message edited")
+        edit = calls("editMessageText")[0]
+        self.assertTrue(edit["text"].endswith("-> APPROVED"), edit["text"])
+        self.assertNotIn("reply_markup", edit)
+
+    def test_deny_from_telegram(self):
+        rid, d = self.pending()
+        self.assertEqual(self.tap(d["Deny"], 1), "Denied")
+        self.assertEqual(self.status(rid), "denied")
+        (ev,) = self.events("decided")
+        self.assertEqual((ev["channel"], ev["decision"]), ("telegram", "deny"))
+
+    def test_second_tap_is_already_decided(self):
+        rid, d = self.pending()
+        self.assertEqual(self.tap(d["Approve"], 1), "Approved")
+        self.tg._by_rid[rid] = (77, frozenset({"approve", "deny"}))                   # as if the edit had not landed yet: the broker must refuse
+        self.assertEqual(self.tap(d["Deny"], 2), "Already decided")
+        self.assertEqual(self.status(rid), "approved")
+        self.assertEqual(len(self.events("decided")), 1)
+        (ref,) = self.events("telegram_decide_refused")
+        self.assertEqual((ref["reason"], ref["status"], ref["rid"], ref["user"]),
+                         ("status", 410, rid, "telegram:111"))
+        token = d["Deny"].rsplit("|", 1)[1]
+        text = open(self.audit).read()
+        self.assertIn("telegram_decide_refused", text)                     # positive control
+        self.assertNotIn(token, text)
+
+    def test_refused_tap_is_audited_and_decides_nothing(self):
+        rid, d = self.pending()
+        token = d["Approve"].rsplit("|", 1)[1]
+        self.assertIn(token, json.dumps(calls("sendMessage")))     # positive control: the token was sent
+        self.assertEqual(self.tap(d["Approve"], 1, user=999), "Not allowed")
+        self.assertEqual(self.status(rid, wait=0), "pending")
+        self.assertEqual(self.events("decided"), [])
+        (ref,) = self.events("telegram_decide_refused")
+        self.assertEqual(ref["reason"], "user")
+        self.assertEqual(ref["user"], "telegram:999")
+        self.assertNotIn("rid", ref)
+        text = open(self.audit).read()
+        self.assertNotIn(token, text)
+        self.assertNotIn(d["Approve"], text)
+
+    def test_forged_tap_without_token_is_403(self):
+        rid, d = self.pending()
+        st = self.broker.telegram_tap({"rid": rid, "decision": "approve", "token": "x" * 22, "user": USER,
+                                       "refused": None})
+        self.assertEqual(st, 403)
+        self.assertEqual(self.status(rid, wait=0), "pending")
+        self.assertEqual(self.events("telegram_decide_refused")[0]["status"], 403)
+
+    def test_no_buttons_for_page_only_modes(self):
+        code, body = self.api("POST", "/v1/requests", {
+            "mode": "credential", "names": ["newapi"], "kind": "token", "purpose": "S3CR3T-purpose-text",
+            "hosts": ["127.0.0.1"]})
+        self.assertEqual(code, 202, body)
+        rid = json.loads(body)["id"]
+        sent = calls("sendMessage")[-1]
+        self.assertIn("Credential requested", sent["text"])              # premise: this is the credential card
+        self.assertNotIn("callback_data", json.dumps(sent))
+        req_ = self.broker._by_id[rid]
+        self.assertIsNone(req_.notification.action_token)
+        st = self.broker.telegram_tap({"rid": rid, "decision": "approve", "token": "x" * 22, "user": USER,
+                                       "refused": None})
+        self.assertEqual(st, 403)
+        self.assertEqual(self.status(rid, wait=0), "pending")
+
+    def test_telegram_cannot_create_always(self):
+        self.assertTrue(CHANNELS["telegram"].token_required)
+        self.assertFalse(CHANNELS["telegram"].may_create_always)
+        self.assertFalse(CHANNELS["telegram"].may_create_grant)
+        self.assertFalse(CHANNELS["telegram"].may_create_ssh_rule)
+        rid, d = self.pending()
+        token = d["Approve"].rsplit("|", 1)[1]
+        code, _ = self.broker.decide_via("telegram", rid, "approve", "telegram:111", token=token, always=True)
+        self.assertEqual(code, 200)
+        (ev,) = self.events("decided")                                    # the decision ran
+        self.assertFalse(ev["always_requested"])
+        self.assertEqual(self.events("policy_change"), [])
+        self.assertEqual(self.broker.standing_rows(), [])
+
+    def test_refusal_audit_is_coalesced(self):
+        for i in range(25):
+            self.broker.telegram_tap({"rid": None, "decision": None, "token": None, "user": 999,
+                                      "refused": "user"})
+        self.assertEqual(len(self.events("telegram_decide_refused")), 10)
+        self.now += 61
+        self.broker.telegram_tap({"rid": None, "decision": None, "token": None, "user": None,
+                                  "refused": "malformed"})
+        refs = self.events("telegram_decide_refused")
+        self.assertEqual(len(refs), 11)
+        self.assertEqual((refs[-1]["reason"], refs[-1]["user"], refs[-1]["suppressed"]),
+                         ("malformed", "telegram:unknown", 15))
+        self.assertNotIn("suppressed", refs[0])
+
+    def test_serve_starts_poller_only_when_enabled(self):
+        started = []
+        self.tg.start_polling = lambda on_tap, log, **kw: started.append((on_tap, log))
+        c, a = serve(self.broker, ("127.0.0.1", 0), ("127.0.0.1", 0), t.KEY)
+        for s in (c, a):
+            s.shutdown()
+            s.server_close()
+        self.assertEqual(len(started), 1)
+        self.assertEqual(started[0][0], self.broker.telegram_tap)
+        started[0][1]("conflict")
+        self.assertEqual(self.events("telegram_poll_error")[-1]["error"], "conflict")
+        plain = notify.TelegramNotifier(TOKEN, CHAT, api_base="http://127.0.0.1:9")
+        plain.start_polling = lambda *a, **kw: started.append(a)
+        self.broker.notifier = notify.MultiNotifier([plain, self.tg])
+        c, a = serve(self.broker, ("127.0.0.1", 0), ("127.0.0.1", 0), t.KEY)
+        for s in (c, a):
+            s.shutdown()
+            s.server_close()
+        self.assertEqual(len(started), 2)                                  # only the enabled one, again
 
 
 class Build(unittest.TestCase):

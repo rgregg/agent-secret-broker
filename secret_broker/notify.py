@@ -347,7 +347,7 @@ class TelegramNotifier:
         self._lock = threading.Lock()
         self._msg_ids = {}
         self._texts = {}
-        self._by_rid = {}               # rid -> message id, while the request is open
+        self._by_rid = {}               # rid -> (message id, action ids rendered), while the request is open
         self.allowed_users = tuple(allowed_users)
         self.supports_actions = ("approve", "deny") if self.allowed_users else ()
         self._offset = None
@@ -397,7 +397,8 @@ class TelegramNotifier:
         with self._lock:
             self._msg_ids[n.tag], self._texts[n.tag] = res["message_id"], text
             if len(kb) > 1:
-                self._by_rid[n.rid] = res["message_id"]
+                self._by_rid[n.rid] = (res["message_id"],
+                                       frozenset(b["callback_data"].split("|")[1] for b in kb[0]))
 
     def resolved(self, n, status):
         with self._lock:
@@ -428,9 +429,13 @@ class TelegramNotifier:
             tap["refused"] = "chat"
         else:
             with self._lock:
-                mid = self._by_rid.get(parts[2])
+                mid, shown = self._by_rid.get(parts[2], (None, frozenset()))
             if mid is None or msg.get("message_id") != mid:
                 tap["refused"] = "message"
+            elif parts[1] not in shown:
+                # the shared token may allow an action another transport offered; only what this
+                # message shows can be decided from it
+                tap["refused"] = "action"
             else:
                 tap.update(rid=parts[2], decision=parts[1], token=parts[3])
         return tap
