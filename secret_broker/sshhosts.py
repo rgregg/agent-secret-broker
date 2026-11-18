@@ -203,56 +203,63 @@ def _analysis(raw):
     return "".join(out)
 
 
-def policies_section(secrets_cfg, csrf, state=None):
-    """The 'SSH host policy' cards for the Policies tab: one collapsed card per
-    SSH key. `state` maps a secret name to {"error", "known", "allowed", "fwd",
-    "need_confirm", "need_anyway", "open"} to re-render after a refused or saved
-    form."""
+def card(name, sc, csrf, state=None, idx=0, open_=False):
+    """The SSH host policy editor for one SSH key ("" for any other credential). `state` is this key's
+    re-render state (see policies_section); `idx` keeps the element ids unique; `open_` renders it expanded."""
+    if not sc.get("ssh"):
+        return ""
     esc = html.escape
+    i = idx
+    st = dict(state or {})
+    if open_:
+        st["open"] = True
+    raw = normalize((sc.get("_meta") or {}).get("ssh_hosts"))
+    known = st["known"] if "known" in st else "\n".join(raw.get("known_hosts", []))
+    allowed = st["allowed"] if "allowed" in st else "\n".join(raw.get("allowed_hosts", []))
+    fwd = st["fwd"] if "fwd" in st else bool(raw.get("allow_forwarded"))
+    extra = ""
+    if st.get("error"):
+        extra += f"<div class=err role=alert>{esc(st['error'])}</div>"
+    if st.get("need_confirm"):
+        extra += ("<label class=chk><input type=checkbox name=confirm_weaken value=1> "
+                  "<span>I understand this reduces enforcement</span></label>")
+    if st.get("need_anyway"):
+        extra += ("<label class=chk><input type=checkbox name=save_anyway value=1> "
+                  "<span>Save anyway (I understand this key will be refused for every server)</span></label>")
+    return (
+        f"<details class='card gbox sbox'{' open' if st.get('open') else ''}><summary><b>{esc(name)}</b> "
+        f"{_badge(sc)}<small class=muted>SSH host policy</small></summary>"
+        "<form method=post action='/policies/ssh_hosts'>"
+        f"<input type=hidden name=csrf value='{esc(csrf)}'>"
+        f"<input type=hidden name=secret value='{esc(name)}'>"
+        f"<p class=help>{esc(NOTE_HELP)}</p><div class=lock>{esc(WARNING)}</div>{extra}"
+        f"<label class=l for='sk{i}'>Known hosts</label>"
+        "<p class=help>One OpenSSH known_hosts line per line, pasted from ~/.ssh/known_hosts "
+        "(or ssh-keyscan output). Hashed entries (starting with |1|) are not supported and are ignored; "
+        f"they are listed after saving. Up to {MAX_KNOWN} lines.</p>"
+        f"<textarea id='sk{i}' name=known_hosts rows=6 wrap=off data-scount='skc{i}' "
+        f"aria-label='Known hosts for {esc(name)}'>{esc(known)}</textarea>"
+        f"<small class=muted id='skc{i}'></small>"
+        f"<label class=l for='sa{i}'>Allowed hosts</label>"
+        "<p class=help>One host name (from Known hosts) or SHA256:fingerprint per line. Empty means no "
+        f"enforcement. Up to {MAX_ALLOWED} entries.</p>"
+        f"<textarea id='sa{i}' name=allowed_hosts rows=4 wrap=off data-scount='sac{i}' "
+        f"aria-label='Allowed hosts for {esc(name)}'>{esc(allowed)}</textarea>"
+        f"<small class=muted id='sac{i}'></small>"
+        f"<label class=chk><input type=checkbox name=allow_forwarded value=1{' checked' if fwd else ''}> "
+        "<span>Allow forwarded agent (every hop must also be allowed)</span></label>"
+        "<div class=grow><button>Save</button><small class=muted>Emptying both boxes and clearing the "
+        "checkbox removes the policy.</small></div></form>"
+        + _analysis(raw) + "</details>")
+
+
+def policies_section(secrets_cfg, csrf, state=None):
+    """The 'SSH host policy' cards for the Policies tab: one collapsed card per SSH key. `state` maps a secret
+    name to {"error", "known", "allowed", "fwd", "need_confirm", "need_anyway", "open"} to re-render after a
+    refused or saved form."""
     state = state or {}
-    rows = []
-    for i, (name, sc) in enumerate(sorted(secrets_cfg.items())):
-        if not sc.get("ssh"):
-            continue
-        st = state.get(name) or {}
-        raw = normalize((sc.get("_meta") or {}).get("ssh_hosts"))
-        known = st["known"] if "known" in st else "\n".join(raw.get("known_hosts", []))
-        allowed = st["allowed"] if "allowed" in st else "\n".join(raw.get("allowed_hosts", []))
-        fwd = st["fwd"] if "fwd" in st else bool(raw.get("allow_forwarded"))
-        extra = ""
-        if st.get("error"):
-            extra += f"<div class=err role=alert>{esc(st['error'])}</div>"
-        if st.get("need_confirm"):
-            extra += ("<label class=chk><input type=checkbox name=confirm_weaken value=1> "
-                      "<span>I understand this reduces enforcement</span></label>")
-        if st.get("need_anyway"):
-            extra += ("<label class=chk><input type=checkbox name=save_anyway value=1> "
-                      "<span>Save anyway (I understand this key will be refused for every server)</span></label>")
-        rows.append(
-            f"<details class='card gbox sbox'{' open' if st.get('open') else ''}><summary><b>{esc(name)}</b> "
-            f"{_badge(sc)}<small class=muted>SSH host policy</small></summary>"
-            "<form method=post action='/policies/ssh_hosts'>"
-            f"<input type=hidden name=csrf value='{esc(csrf)}'>"
-            f"<input type=hidden name=secret value='{esc(name)}'>"
-            f"<p class=help>{esc(NOTE_HELP)}</p><div class=lock>{esc(WARNING)}</div>{extra}"
-            f"<label class=l for='sk{i}'>Known hosts</label>"
-            "<p class=help>One OpenSSH known_hosts line per line, pasted from ~/.ssh/known_hosts "
-            "(or ssh-keyscan output). Hashed entries (starting with |1|) are not supported and are ignored; "
-            f"they are listed after saving. Up to {MAX_KNOWN} lines.</p>"
-            f"<textarea id='sk{i}' name=known_hosts rows=6 wrap=off data-scount='skc{i}' "
-            f"aria-label='Known hosts for {esc(name)}'>{esc(known)}</textarea>"
-            f"<small class=muted id='skc{i}'></small>"
-            f"<label class=l for='sa{i}'>Allowed hosts</label>"
-            "<p class=help>One host name (from Known hosts) or SHA256:fingerprint per line. Empty means no "
-            f"enforcement. Up to {MAX_ALLOWED} entries.</p>"
-            f"<textarea id='sa{i}' name=allowed_hosts rows=4 wrap=off data-scount='sac{i}' "
-            f"aria-label='Allowed hosts for {esc(name)}'>{esc(allowed)}</textarea>"
-            f"<small class=muted id='sac{i}'></small>"
-            f"<label class=chk><input type=checkbox name=allow_forwarded value=1{' checked' if fwd else ''}> "
-            "<span>Allow forwarded agent (every hop must also be allowed)</span></label>"
-            "<div class=grow><button>Save</button><small class=muted>Emptying both boxes and clearing the "
-            "checkbox removes the policy.</small></div></form>"
-            + _analysis(raw) + "</details>")
+    rows = [card(name, sc, csrf, state.get(name), i)
+            for i, (name, sc) in enumerate(sorted(secrets_cfg.items())) if sc.get("ssh")]
     head = ("<h3>SSH host policy</h3><p><small class=muted>Restrict an SSH key to the servers it may log in to. "
             "This is never shown to agents.</small></p>")
     if not rows:

@@ -19,16 +19,18 @@ def use(names):
     _linkable.set(None if names is None else frozenset(names))
 
 
-def link(name, tab=None):
-    """`name` as an anchor to its page (`tab="policies"`: its Policies sub-tab), or plain escaped text."""
+def link(name, tab=None, text=None):
+    """`name` as an anchor to its page (`tab="policies"`: its Policies sub-tab), or plain escaped text. `text` is
+    the label to show instead of the name (also what plain text falls back to)."""
     if tab not in _TABS:
         raise ValueError("tab must be None or 'policies'")
     name = str(name)
     allowed = _linkable.get()
+    label = html.escape(name if text is None else str(text))
     if not _NAME.fullmatch(name) or (allowed is not None and name not in allowed):
-        return html.escape(name)
+        return label
     q = "?tab=policies" if tab == "policies" else ""
-    return f"<a class=clink href='/credentials/{html.escape(name, quote=True)}{q}'>{html.escape(name)}</a>"
+    return f"<a class=clink href='/credentials/{html.escape(name, quote=True)}{q}'>{label}</a>"
 
 
 def links(names, tab=None):

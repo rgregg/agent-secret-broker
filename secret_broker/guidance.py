@@ -221,6 +221,29 @@ JS = r"""
 """
 
 
+def card(name, sc, csrf, idx=0, open_=False):
+    """The risk-guidance editor for one credential (`idx` makes the element ids unique on a page that holds
+    several; `open_` renders it expanded)."""
+    esc = html.escape
+    cur = sc.get("guidance") or ""
+    ignored = ("<small class=muted>Stored guidance ignored: " + esc(sc["guidance_invalid"]) + "</small>"
+               if sc.get("guidance_invalid") else "")
+    badge = ignored + (f"<span class='pill ok'>Guidance set ({len(cur)} chars)</span>" if cur
+             else "<span class='pill plain'>No guidance</span>")
+    return (
+        f"<details class='card gbox'{' open' if open_ else ''}><summary><b>{esc(name)}</b> {badge}"
+        "<small class=muted>Risk guidance</small></summary>"
+        "<form method=post action='/policies/guidance'>"
+        f"<input type=hidden name=csrf value='{esc(csrf)}'>"
+        f"<input type=hidden name=name value='{esc(name)}'>"
+        f"<p><small class=muted>{esc(NOTE)}</small></p>"
+        f"<textarea name=guidance maxlength={MAX_LEN} data-gmax={MAX_LEN} data-gcount='gc{idx}' "
+        f"rows=6 aria-label='Risk guidance for {esc(name)}'>{esc(cur)}</textarea>"
+        f"<div class=grow><button>Save</button><small class=muted>"
+        f"<span id='gc{idx}'>{len(cur)} / {MAX_LEN}</span> characters (max {MAX_LEN}). "
+        "Empty removes the guidance.</small></div></form></details>")
+
+
 def policies_section(secrets_cfg, csrf):
     """The 'Risk guidance' editors for the Policies tab: one collapsed card per secret."""
     esc = html.escape
@@ -228,23 +251,5 @@ def policies_section(secrets_cfg, csrf):
             "agents.</small></p>")
     if not secrets_cfg:
         return head + "<div class='card empty'>No secrets.</div>"
-    rows = []
-    for i, (name, sc) in enumerate(sorted(secrets_cfg.items())):
-        cur = sc.get("guidance") or ""
-        ignored = ("<small class=muted>Stored guidance ignored: " + esc(sc["guidance_invalid"]) + "</small>"
-                   if sc.get("guidance_invalid") else "")
-        badge = ignored + (f"<span class='pill ok'>Guidance set ({len(cur)} chars)</span>" if cur
-                 else "<span class='pill plain'>No guidance</span>")
-        rows.append(
-            f"<details class='card gbox'><summary><b>{esc(name)}</b> {badge}"
-            "<small class=muted>Risk guidance</small></summary>"
-            "<form method=post action='/policies/guidance'>"
-            f"<input type=hidden name=csrf value='{esc(csrf)}'>"
-            f"<input type=hidden name=name value='{esc(name)}'>"
-            f"<p><small class=muted>{esc(NOTE)}</small></p>"
-            f"<textarea name=guidance maxlength={MAX_LEN} data-gmax={MAX_LEN} data-gcount='gc{i}' "
-            f"rows=6 aria-label='Risk guidance for {esc(name)}'>{esc(cur)}</textarea>"
-            f"<div class=grow><button>Save</button><small class=muted>"
-            f"<span id='gc{i}'>{len(cur)} / {MAX_LEN}</span> characters (max {MAX_LEN}). "
-            "Empty removes the guidance.</small></div></form></details>")
+    rows = [card(name, sc, csrf, i) for i, (name, sc) in enumerate(sorted(secrets_cfg.items()))]
     return f"<style>{CSS}</style>" + head + "".join(rows)
