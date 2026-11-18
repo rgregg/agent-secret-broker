@@ -213,3 +213,25 @@ class SettingsReview(tce.Base):
         self.assertEqual(pc, 200)
         self.assertIn("Review changes to svc", preview)                                             # the premise: it is the review page
         self.assertNotIn("class=ctabs", preview)
+
+
+class ListCounts(PostBase):
+    def row(self, body, name):
+        rows = [r for r in body.split("<tr class=r") if f"href='/credentials/{name}'" in r]
+        self.assertEqual(len(rows), 1, name)                                                         # the premise: one row per credential
+        return rows[0]
+
+    def test_the_list_shows_each_credentials_policy_count_and_links_to_it(self):
+        self.grant()
+        self.seed(svc_rule(id="l0001", name="one"))
+        code, body = self.get("/credentials")
+        self.assertEqual(code, 200)
+        self.assertIn("<th class=ic>Policies</th>", body)
+        svc = self.row(body, "svc")
+        self.assertIn("data-label=Policies><a class=clink href='/credentials/svc?tab=policies'>3</a>", svc)  # grant + rule + legacy allow
+        self.assertIn("data-label=Policies><small class=muted>-</small>", self.row(body, "other"))
+        self.assertNotIn("?tab=policies", self.row(body, "other"))
+
+    def test_the_search_filter_is_unaffected(self):
+        body = self.get("/credentials?q=svc")[1]
+        self.assertIn("1 of 3 credentials", body)

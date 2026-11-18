@@ -411,8 +411,10 @@ def matches(text, q):
 MAX_CHIPS = 3
 
 
-def list_section(secrets, flash="", q=""):
+def list_section(secrets, flash="", q="", counts=None):
+    """`counts` maps a credential name to its number of standing approvals plus rules (None: none shown)."""
     e = html.escape
+    counts = counts or {}
     q = q[:200]
     rows, shown = [], 0
     for name, sc in sorted(secrets.items()):
@@ -431,6 +433,9 @@ def list_section(secrets, flash="", q=""):
         plans = icon("list", "warn", "Plans allowed") if sc.get("plans") else "<small class=muted>-</small>"
         if meta.get("ws") is not None:
             plans = (plans if sc.get("plans") else "") + icon("ws", "warn", "WebSocket sessions allowed")
+        n_pol = counts.get(name, 0)
+        pol = (f"<a class=clink href='/credentials/{e(name, quote=True)}?tab=policies'>{int(n_pol)}</a>"
+               if n_pol else "<small class=muted>-</small>")
         rows.append(
             f"<tr class=r data-s='{e(s)}'{'' if hit else ' hidden'}>"
             f"<td data-label=Name><div class=cname>{icon(ic, tone, label)}<div><a href='/credentials/{e(name)}'>"
@@ -439,7 +444,8 @@ def list_section(secrets, flash="", q=""):
             f"<td data-label=Hosts>{hosts_html}</td>"
             f"<td class=ic data-label=Approval>{_approval_icon(sc)}</td>"
             f"<td class=ic data-label=TLS>{_tls_icon(meta)}</td>"
-            f"<td class=ic data-label=Plans>{plans}</td></tr>")
+            f"<td class=ic data-label=Plans>{plans}</td>"
+            f"<td class=ic data-label=Policies>{pol}</td></tr>")
     total = len(rows)
     count = f"{shown} of {total} credentials" if q.strip() else f"{total} credential{'s' if total != 1 else ''}"
     none = (f"<p id=cnone{'' if q.strip() and not shown else ' hidden'}><small class=muted>No credentials match "
@@ -449,7 +455,7 @@ def list_section(secrets, flash="", q=""):
             f"placeholder='Search by name, host or kind (ssh, login, allow, pinned...)' aria-label='Search credentials'>"
             f"<span class=n id=cn aria-live=polite>{count}</span></form>")
     table = ("<table class='tbl ctbl' id=ctbl><thead><tr><th>Name</th><th>Hosts</th><th class=ic>Approval</th>"
-             "<th class=ic>TLS</th><th class=ic>Plans / WS</th></tr></thead><tbody>" + "".join(rows) + "</tbody></table>")
+             "<th class=ic>TLS</th><th class=ic>Plans / WS</th><th class=ic>Policies</th></tr></thead><tbody>" + "".join(rows) + "</tbody></table>")
     key = ("<div class=ckey>" + "".join(f"<span>{icon(n, t, l)}{l}</span>" for n, t, l in (
         ("key", "acc", "Token"), ("user", "acc", "Login"), ("term", "acc", "SSH key"),
         ("phone", "", "Asks on your phone"), ("zap", "warn", "Allowed without asking"),

@@ -7166,7 +7166,10 @@ def approval_handler(broker):
 
         def _credentials_page(self, user, note="", status=200, q=""):
             flash = f"<div class=flash>{note}</div>" if note else ""
-            _page(self, status, crededitor_mod.list_section(cfg["secrets"], flash, q), tab="credentials",
+            per, _ = broker.standing_by_credential()
+            counts = {n: credpolicy_mod.counts(n, sc, per.get(n, []), broker.config_rules_for(n))["total"]
+                      for n, sc in cfg["secrets"].items()}
+            _page(self, status, crededitor_mod.list_section(cfg["secrets"], flash, q, counts), tab="credentials",
                   script=crededitor_mod.JS + peek_mod.JS, badge=broker.attention(), user=user, wide=True)
 
         def _credential_edit(self, user, name, meta=None, stored=None, status=200, **kw):
