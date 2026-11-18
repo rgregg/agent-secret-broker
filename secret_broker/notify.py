@@ -23,6 +23,7 @@ detects it once when the transport is registered.
 Configure one or more under `notify` in the broker config; with several, a
 request is delivered if at least one transport succeeds.
 """
+import collections
 import dataclasses
 import inspect
 import json
@@ -307,54 +308,201 @@ class TickerNotifier:
             raise NotifyError("ticker accepted the notification but delivered it to no device")
 
 
-class TelegramNotifier:
-    """Telegram bot: message with a single URL button to the approval page.
+MAX_CALLBACK_BYTES = 64                 # Telegram's limit on callback_data
+MAX_SETTLED = 256                       # settled rid -> message id kept, so a late tap says "Already decided"
+_TG_CHAT_RE = re.compile(r"-?[0-9]{1,20}")
+_TG_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
-    Deliberately no callback buttons: approving from inside the chat would
-    bypass the SSO-gated page. Error text never includes the bot token (it is
-    part of the API URL).
+
+def tap_text(status, decision):
+    """The fixed toast shown after a tap. Never carries request details."""
+    if status == 200:
+        return "Approved" if decision == "approve" else "Denied"
+    return "Already decided" if status == 410 else "Not allowed"
+
+
+def poll_error_label(exc):
+    """A fixed label for a failed Telegram call (never its text, which may echo the API)."""
+    st = getattr(exc, "status", None)
+    if st is None:
+        return "network"
+    return {401: "unauthorized", 409: "conflict"}.get(st, "http")
+
+
+class TelegramNotifier:
+    """Telegram bot: the card text, a URL button to the approval page and, when
+    `allowed_users` is set, Deny/Approve callback buttons.
+
+    A tap arrives through `poll_once` (long-poll `getUpdates`; nothing listens
+    for Telegram) and is passed to the broker only if it comes from a listed
+    user, in the configured chat, on a message this transport sent for that
+    request; the broker then decides it through channel `telegram`, which needs
+    the request's single-use action token. Error text never includes the bot
+    token (it is part of the API URL).
     """
     type_name = "telegram"
 
-    def __init__(self, bot_token, chat_id, api_base="https://api.telegram.org", timeout=15):
+    def __init__(self, bot_token, chat_id, api_base="https://api.telegram.org", timeout=15,
+                 allowed_users=()):
         self._base = f"{api_base.rstrip('/')}/bot{bot_token}"
         self._chat = str(chat_id)
         self._timeout = timeout
+        self._lock = threading.Lock()
         self._msg_ids = {}
         self._texts = {}
+        self._by_rid = {}               # rid -> (message id, action ids rendered), while the request is open
+        self._settled = collections.OrderedDict()   # rid -> message id, after resolved(); bounded
+        self.allowed_users = tuple(allowed_users)
+        self.supports_actions = ("approve", "deny") if self.allowed_users else ()
+        self._offset = None
+        self._stop = threading.Event()
+        self._sleep = self._stop.wait   # injectable (tests)
 
-    def _call(self, method, body):
+    @property
+    def actions_enabled(self):
+        return bool(self.allowed_users)
+
+    def _call(self, method, body, timeout=None):
         req = urllib.request.Request(
             f"{self._base}/{method}", data=json.dumps(body).encode(),
             headers={"Content-Type": "application/json"})
         try:
-            with destguard.operator_urlopen(req, timeout=self._timeout) as r:
+            with destguard.operator_urlopen(req, timeout=timeout or self._timeout) as r:
                 out = json.load(r)
         except urllib.error.HTTPError as e:
-            try:
-                desc = json.load(e).get("description", "")
-            except (ValueError, OSError):
-                desc = ""
-            raise NotifyError(f"telegram {method} failed: HTTP {e.code} {desc}"[:200]) from None
+            err = NotifyError(f"telegram {method} failed: HTTP {e.code}")
+            err.status = e.code
+            raise err from None
         except (urllib.error.URLError, OSError, ValueError):
-            raise NotifyError(f"telegram {method} failed: network error") from None
+            err = NotifyError(f"telegram {method} failed: network error")
+            err.status = None
+            raise err from None
         if not out.get("ok"):
-            raise NotifyError(f"telegram {method} failed: {out.get('description', '')}"[:200])
+            err = NotifyError(f"telegram {method} failed: not ok")
+            err.status = 0
+            raise err
         return out["result"]
+
+    def _buttons(self, n):
+        if not (self.actions_enabled and n.action_token and n.actions):
+            return []
+        row = [{"text": a.label, "callback_data": f"ASB|{a.id}|{n.rid}|{n.action_token}"}
+               for a in n.actions if a.id in self.supports_actions]
+        if any(len(b["callback_data"].encode()) > MAX_CALLBACK_BYTES for b in row):
+            return []                   # cannot carry it: link only
+        return [row] if row else []
 
     def send(self, n):
         text = f"{n.title}\n\n{n.text}"
+        kb = self._buttons(n) + [[{"text": "Review request", "url": n.url}]]
         res = self._call("sendMessage", {
             "chat_id": self._chat, "text": text, "disable_web_page_preview": True,
-            "reply_markup": {"inline_keyboard": [[{"text": "Review request", "url": n.url}]]}})
-        self._msg_ids[n.tag], self._texts[n.tag] = res["message_id"], text
+            "reply_markup": {"inline_keyboard": kb}})
+        with self._lock:
+            self._msg_ids[n.tag], self._texts[n.tag] = res["message_id"], text
+            if len(kb) > 1:
+                self._by_rid[n.rid] = (res["message_id"],
+                                       frozenset(b["callback_data"].split("|")[1] for b in kb[0]))
 
     def resolved(self, n, status):
-        mid, text = self._msg_ids.pop(n.tag, None), self._texts.pop(n.tag, "")
+        with self._lock:
+            mid, text = self._msg_ids.pop(n.tag, None), self._texts.pop(n.tag, "")
+            open_ = self._by_rid.pop(n.rid, None)
+            if open_ is not None:
+                self._settled[n.rid] = open_[0]
+                while len(self._settled) > MAX_SETTLED:
+                    self._settled.popitem(last=False)
         if mid is None:
             return
         self._call("editMessageText", {"chat_id": self._chat, "message_id": mid,
                                        "text": f"{text}\n\n-> {status.upper()}"})
+
+    # -- taps -------------------------------------------------------------
+    def _parse(self, cq):
+        """callback_query -> tap dict. Checks shape, sender, chat and message; the token
+        is checked by the broker. Nothing from a refused tap is kept but the sender id."""
+        frm = cq.get("from") if isinstance(cq.get("from"), dict) else {}
+        user = frm.get("id") if isinstance(frm.get("id"), int) and not isinstance(frm.get("id"), bool) else None
+        tap = {"rid": None, "decision": None, "token": None, "user": user, "refused": None}
+        data, msg = cq.get("data"), cq.get("message")
+        parts = (data.split("|") if isinstance(data, str) and len(data.encode()) <= MAX_CALLBACK_BYTES
+                 else None)
+        if (parts is None or len(parts) != 4 or parts[0] != "ASB" or parts[1] not in ("approve", "deny")
+                or not _TG_ID_RE.fullmatch(parts[2]) or not _TG_ID_RE.fullmatch(parts[3])
+                or not isinstance(msg, dict) or not isinstance(msg.get("chat"), dict)):
+            tap["refused"] = "malformed"
+        elif user is None or user not in self.allowed_users:
+            tap["refused"] = "user"
+        elif str(msg["chat"].get("id")) != self._chat:
+            tap["refused"] = "chat"
+        else:
+            with self._lock:
+                mid, shown = self._by_rid.get(parts[2], (None, frozenset()))
+                settled = self._settled.get(parts[2])
+            if mid is None and settled is not None and msg.get("message_id") == settled:
+                tap["refused"] = "settled"      # our message, already decided: not a forgery
+            elif mid is None or msg.get("message_id") != mid:
+                tap["refused"] = "message"
+            elif parts[1] not in shown:
+                # the shared token may allow an action another transport offered; only what this
+                # message shows can be decided from it
+                tap["refused"] = "action"
+            else:
+                tap.update(rid=parts[2], decision=parts[1], token=parts[3])
+        return tap
+
+    def poll_once(self, on_tap, timeout=30):
+        """One getUpdates call; every callback query is checked, handed to `on_tap` and
+        answered. Returns how many callback queries were handled."""
+        body = {"timeout": timeout, "allowed_updates": ["callback_query"]}
+        if self._offset is not None:
+            body["offset"] = self._offset
+        updates = self._call("getUpdates", body, timeout=timeout + 10)
+        handled = 0
+        for up in updates if isinstance(updates, list) else ():
+            if not isinstance(up, dict) or not isinstance(up.get("update_id"), int):
+                continue
+            self._offset = max(self._offset or 0, up["update_id"] + 1)
+            cq = up.get("callback_query")
+            if not isinstance(cq, dict):
+                continue
+            handled += 1
+            tap = self._parse(cq)
+            status = on_tap(tap)
+            if isinstance(cq.get("id"), str):
+                try:
+                    self._call("answerCallbackQuery", {"callback_query_id": cq["id"],
+                                                       "text": tap_text(status, tap["decision"])})
+                except NotifyError:
+                    pass                # the decision stands; the toast is cosmetic
+        return handled
+
+    def start_polling(self, on_tap, log, timeout=30):
+        """Run poll_once in a daemon thread until stop_polling(). Errors are logged by
+        fixed label (a run of 409s once) and backed off 1, 2, 4 ... 60 s."""
+        def run():
+            delay, last = 1, None
+            while not self._stop.is_set():
+                try:
+                    self.poll_once(on_tap, timeout=timeout)
+                    delay, last = 1, None
+                except NotifyError as e:
+                    label = poll_error_label(e)
+                    if not (label == "conflict" and last == "conflict"):
+                        log(label)
+                    last = label
+                    self._sleep(delay)
+                    delay = min(delay * 2, 60)
+                except Exception:       # noqa: BLE001 -- never let the poller die
+                    log("internal")
+                    self._sleep(delay)
+                    delay = min(delay * 2, 60)
+        th = threading.Thread(target=run, daemon=True, name="telegram-poll")
+        th.start()
+        return th
+
+    def stop_polling(self):
+        self._stop.set()
 
 
 class MultiNotifier:
@@ -404,8 +552,18 @@ def build(cfg, read_secret, push_store=None):
                                       sp.get("category", "general"),
                                       actions_enabled=cfg.get("ha_hook") is not None))
         elif kind == "telegram":
+            users = sp.get("allowed_users", [])
+            if not (isinstance(users, list) and len(users) <= 20 and all(
+                    isinstance(u, int) and not isinstance(u, bool) and u > 0 for u in users)):
+                raise ValueError(f"notify[{i}].allowed_users must be a list of Telegram user ids")
+            chat = sp.get("chat_id")
+            if users and not ((isinstance(chat, int) and not isinstance(chat, bool))
+                              or (isinstance(chat, str) and _TG_CHAT_RE.fullmatch(chat))):
+                # a tap reports the numeric chat id; an @name would never match
+                raise ValueError(f"notify[{i}].chat_id must be a numeric chat id when allowed_users is set")
             out.append(TelegramNotifier(read_secret(sp["bot_token_file"]), sp["chat_id"],
-                                        sp.get("api_base", "https://api.telegram.org")))
+                                        sp.get("api_base", "https://api.telegram.org"),
+                                        allowed_users=tuple(users)))
         elif kind == "webpush":
             if push_store is None:
                 raise ValueError("webpush transport needs a push store")

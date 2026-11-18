@@ -32,7 +32,7 @@ STRIDE = 64                      # one byte offset kept per STRIDE lines
 MAX_REQUEST_IDS = 5000           # requests whose event seqs are indexed (newest kept)
 RATE_PER_MIN = 60                # per client key; `asb audit --tail` polls at 30/min
 VERIFY_BUDGET_S = 20.0
-CHANNELS = ("dashboard", "push", "ha", "link")
+CHANNELS = ("dashboard", "push", "ha", "link", "telegram")
 
 # -- the whitelist ---------------------------------------------------------
 # kind -> sanitizer. Anything that fails its check is dropped, not coerced.
@@ -147,7 +147,7 @@ HIDDEN = frozenset({
     "approval_viewed", "approval_stale", "approval_forbidden", "csrf_refused", "dashboard_viewed",
     "history_viewed", "request_detail_viewed", "client_event_dropped", "push_subscribed",
     "push_revoked", "push_refused",
-    "push_test", "ha_decide_dropped",
+    "push_test", "ha_decide_dropped", "telegram_decide_refused", "telegram_poll_error",
     # server-identity policy (a key's allowed_hosts) is approval context
     "ssh_sign_refused",
     # a credential request: the human's entry and any refused submission are approver activity;

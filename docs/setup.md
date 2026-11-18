@@ -148,7 +148,12 @@ Add transports under `notify`; a request counts as delivered if any one works.
   background. Safari on iOS needs the site added to the home screen first.
 - **Home Assistant** (mobile push): `{"type": "ticker", "ha_url": "...", "ha_token_file": "...", "category": "general"}`
   (needs the Ticker integration).
-- **Telegram**: `{"type": "telegram", "bot_token_file": "...", "chat_id": "..."}`.
+- **Telegram**: `{"type": "telegram", "bot_token_file": "...", "chat_id": "..."}`. Add
+  `"allowed_users": [<your numeric Telegram user id>]` to approve or deny from the chat with
+  buttons (to find your id, message the bot and read `message.from.id` from
+  `https://api.telegram.org/bot<token>/getUpdates` before the broker starts polling). The broker polls Telegram for button taps, so it needs
+  outbound access to api.telegram.org and the bot must not have a webhook set. Whoever
+  controls that Telegram account can approve; see "Telegram action buttons" in the reference.
 
 While you have an approval page open and visible, notifications are held back and sent only
 if you leave or after 60 s (`notify_presence`; see the reference). To always send immediately

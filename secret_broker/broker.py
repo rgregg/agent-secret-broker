@@ -125,6 +125,7 @@ CHANNELS = {
                     may_create_grant=True, may_create_ssh_rule=True),      # POST /a/<nonce>
     "push": Channel(token_required=True, may_create_always=False),        # POST /push/decide
     "ha": Channel(token_required=True, may_create_always=False),          # POST /v1/hooks/ha/decide
+    "telegram": Channel(token_required=True, may_create_always=False),    # Telegram callback button
 }
 
 
@@ -275,6 +276,8 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
         self._ha_rate = {}              # source ip -> {"t", "n", "drop"}; <= RATE_MAP_CAP
         self._ha_unauth = {"t": 0.0, "n": 0, "drop": 0}   # shared bad-key bucket
         self._ha_rate_lock = threading.Lock()
+        self._tg_refusals = {"t": None, "n": 0, "drop": 0}   # coalescing window for telegram_decide_refused
+        self._tg_lock = threading.Lock()
         if self.ha_hook is not None and not self.ha_hook["allowed_devices"]:
             self.log("ha_hook_any_device", warning="ha_hook.allowed_devices is empty: "
                      "any device id is accepted (it is recorded, not verified)")
@@ -3484,6 +3487,41 @@ class Broker(sshrules_mod.SshRulesMixin, clients_mod.ClientsMixin, sessions_mod.
             rows = [r for r in self._by_id.values() if r.status == "pending" and r.session is None]
         return sorted(rows, key=lambda r: r.created)
 
+    TG_REFUSALS_PER_WINDOW, TG_WINDOW_S = 10, 60
+
+    def telegram_tap(self, tap):
+        """One Telegram button tap, already checked by the transport for sender, chat and
+        message. A refused tap decides nothing; an accepted one goes through decide_via on
+        channel `telegram` (token required, never Always or a grant). Returns the status
+        the transport turns into a toast (0 = refused before deciding)."""
+        user = tap.get("user")
+        who = f"telegram:{user}" if isinstance(user, int) and not isinstance(user, bool) else "telegram:unknown"
+        if tap.get("refused"):
+            self._tg_refused(reason=tap["refused"], user=who)
+            return 410 if tap["refused"] == "settled" else 0
+        code, _ = self.decide_via("telegram", tap["rid"], tap["decision"], who, token=tap["token"])
+        if code not in (200, 403):      # decide_via already logs telegram_decide_refused for a 403
+            self._tg_refused(reason="status", status=code, rid=tap["rid"], user=who)
+        return code
+
+    def _tg_refused(self, **fields):
+        """Audit a refused tap; at most TG_REFUSALS_PER_WINDOW lines per window, the rest
+        counted onto the first line of the next window."""
+        now = self.presence_clock()
+        with self._tg_lock:
+            w = self._tg_refusals
+            if w["t"] is None or now - w["t"] >= self.TG_WINDOW_S:
+                w["t"], w["n"], dropped, w["drop"] = now, 0, w["drop"], 0
+            else:
+                dropped = 0
+            if w["n"] >= self.TG_REFUSALS_PER_WINDOW:
+                w["drop"] += 1
+                return
+            w["n"] += 1
+        if dropped:
+            fields["suppressed"] = dropped
+        self.log("telegram_decide_refused", **fields)
+
     def decide_via(self, channel, rid, decision, actor, *, token=None, always=False,
                    nonce=None, peer=None, client_ip=None, grant_minutes=None, ssh_rule=None,
                    apply=None, credential=None, rule_scope="client", plan=None, session_limits=None, **audit_extra):
@@ -5665,7 +5703,7 @@ def _iso(t):
 
 
 _CHANNEL_LABEL = {"dashboard": "web dashboard", "push": "browser push notification",
-                  "ha": "Home Assistant", "link": "approval link"}
+                  "ha": "Home Assistant", "link": "approval link", "telegram": "Telegram"}
 _MODE_LABEL = {"http": "web", "env": "run-with-secret", "ssh_sign": "ssh signing",
                "guidance": "guidance proposal", "credential": "credential request", "plan": "plan",
                "session": "http session", "sudo": "root command"}
@@ -7694,4 +7732,8 @@ def serve(broker, client_addr, approval_addr, client_key):
     for s in (c, a):
         s.daemon_threads = True
         threading.Thread(target=s.serve_forever, daemon=True).start()
+    for leaf in notify_mod.leaves(broker.notifier):
+        if getattr(leaf, "actions_enabled", False) is True and hasattr(leaf, "start_polling"):
+            leaf.start_polling(broker.telegram_tap,
+                               lambda label: broker.log("telegram_poll_error", error=label))
     return c, a
