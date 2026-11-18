@@ -59,6 +59,7 @@ from . import credreq as credreq_mod
 from . import sudomode as sudo_mod
 from . import autorules as autorules_mod
 from . import credlinks as credlinks_mod
+from . import credpolicy as credpolicy_mod
 from . import uirules as uirules_mod
 from . import clients as clients_mod
 from . import clock as clock_mod
@@ -7193,6 +7194,29 @@ def approval_handler(broker):
                 extra=extra, values=values, **kw),
                 tab="credentials", script=crededitor_mod.JS + peek_mod.JS, badge=broker.attention(), user=user, wide=True)
 
+        def _credential_policies(self, user, name, note="", status=200, ssh_hosts=None, ssh_rules=None,
+                                 auto_rules=None):
+            """A credential's page on its Policies sub-tab: every per-credential policy in one place. The policy
+            forms answer with this page (same note, same status). `note` is a ready-made HTML snippet;
+            the three states re-render a refused or saved form (see the section cards)."""
+            sc = cfg["secrets"].get(name)
+            if sc is None:
+                return _page(self, 404, "<h1>Credential not found</h1>", tab="credentials", badge=broker.attention(),
+                             user=user)
+            per, _ = broker.standing_by_credential()
+            rows, cfg_rules = per.get(name, []), broker.config_rules_for(name)
+            c = credpolicy_mod.counts(name, sc, rows, cfg_rules)
+            ctx = credpolicy_mod.PolicyCtx(
+                csrf=self._tok(user), usage_ssh=broker.ssh_rule_usage, usage_auto=broker.auto_rule_usage,
+                client_names=broker.clients.names(), client_choices=broker.clients.active_choices(),
+                standing_rows=rows, config_rules=cfg_rules,
+                states={"ssh_hosts": ssh_hosts, "ssh_rules": ssh_rules, "auto_rules": auto_rules})
+            page = (f"<div class=ced><h1>Edit {html.escape(name)}</h1>{note}"
+                    f"{crededitor_mod.tabs_html(name, 'policies', c['total'])}"
+                    f"{credpolicy_mod.body(name, sc, ctx)}</div>")
+            _page(self, status, page, tab="credentials", badge=broker.attention(), user=user, wide=True,
+                  script=_GRANTS_JS + guidance_mod.JS + sshhosts_mod.JS)
+
         def _credential_value_post(self, name, action, one, user):
             """Show, replace, add or remove one value. A value only ever appears in a reveal reply; every other
             page re-renders from the vault, so nothing the human typed is echoed back."""
@@ -7668,11 +7692,13 @@ def approval_handler(broker):
             if path == "/grants/revoke":
                 gid = form.get("grant", [""])[0][:16]
                 done = broker.revoke_grant(gid, user, self._ip, self._fwd())
-                return self._policies_page(
-                    user, "<p>" + ("Standing approval revoked" if done else
-                                   "That standing approval is no longer active" if done is False else
-                                   "Could not revoke the standing approval") + ".</p>",
-                    status=500 if done is None else 200)
+                note = ("<p>" + ("Standing approval revoked" if done else
+                                 "That standing approval is no longer active" if done is False else
+                                 "Could not revoke the standing approval") + ".</p>")
+                back = form.get("back", [""])[0]
+                if back in cfg["secrets"]:              # an existing credential's page; anything else: the tab
+                    return self._credential_policies(user, back, note, status=500 if done is None else 200)
+                return self._policies_page(user, note, status=500 if done is None else 200)
             if path == "/policies/ssh_rules/revoke":
                 name, rid = form.get("secret", [""])[0], form.get("rule", [""])[0][:16]
                 if name not in cfg["secrets"] or not cfg["secrets"][name].get("ssh"):
@@ -7680,9 +7706,8 @@ def approval_handler(broker):
                 res = broker.revoke_ssh_rule(name, rid, user, self._ip, self._fwd())
                 msg = {"revoked": "SSH rule revoked", "missing": "That SSH rule no longer exists",
                        "failed": "Could not revoke the SSH rule"}[res]
-                return self._policies_page(user, f"<p>{msg}: {html.escape(name)}</p>",
-                                           status=500 if res == "failed" else 200,
-                                           rule_state={name: {"open": True}})
+                return self._credential_policies(user, name, f"<p>{msg}: {html.escape(name)}</p>",
+                                                 status=500 if res == "failed" else 200)
             if path == "/policies/ssh_rules/add":
                 name = form.get("secret", [""])[0]
                 if name not in cfg["secrets"] or not cfg["secrets"][name].get("ssh"):
@@ -7692,13 +7717,12 @@ def approval_handler(broker):
                                           one("confirm") == "1", user, self._ip, self._fwd(),
                                           client=one("client") or clients_mod.ANY)
                 if res["status"] in ("created", "exists"):
-                    return self._policies_page(
-                        user, f"<p>{'SSH rule added' if res['status'] == 'created' else res['message']}: "
-                              f"{html.escape(name)}</p>", rule_state={name: {"open": True}})
-                return self._policies_page(
-                    user, f"<p>Could not add the SSH rule: {html.escape(name)}</p>",
-                    status=400 if res["status"] == "refused" else 500,
-                    rule_state={name: {"open": True, "error": res["message"]}})
+                    return self._credential_policies(
+                        user, name, f"<p>{'SSH rule added' if res['status'] == 'created' else res['message']}: "
+                                    f"{html.escape(name)}</p>")
+                return self._credential_policies(
+                    user, name, f"<p>Could not add the SSH rule: {html.escape(name)}</p>",
+                    status=400 if res["status"] == "refused" else 500, ssh_rules={"error": res["message"]})
             if path == "/policies/auto_rules/revoke":
                 name, rid = form.get("secret", [""])[0], form.get("rule", [""])[0][:16]
                 if name not in cfg["secrets"] or cfg["secrets"][name].get("ssh"):
@@ -7706,9 +7730,8 @@ def approval_handler(broker):
                 res = broker.revoke_auto_rule(name, rid, user, self._ip, self._fwd())
                 msg = {"revoked": "Auto-approve rule revoked", "missing": "That rule no longer exists",
                        "failed": "Could not revoke the rule"}[res]
-                return self._policies_page(user, f"<p>{msg}: {html.escape(name)}</p>",
-                                           status=500 if res == "failed" else 200,
-                                           auto_state={name: {"open": True}})
+                return self._credential_policies(user, name, f"<p>{msg}: {html.escape(name)}</p>",
+                                                 status=500 if res == "failed" else 200)
             if path == "/policies/auto_rules/add":
                 name = form.get("secret", [""])[0]
                 if name not in cfg["secrets"] or cfg["secrets"][name].get("ssh"):
@@ -7721,12 +7744,11 @@ def approval_handler(broker):
                 res = broker.add_auto_rule(name, fields, one("expires"), one("confirm") == "1", user,
                                            self._ip, self._fwd())
                 if res["status"] == "created":
-                    return self._policies_page(user, f"<p>Auto-approve rule added: {html.escape(name)}</p>",
-                                               auto_state={name: {"open": True}})
-                return self._policies_page(
-                    user, f"<p>Could not add the rule: {html.escape(name)}</p>",
-                    status=400 if res["status"] == "refused" else 500,
-                    auto_state={name: {"open": True, "error": res["message"]}})
+                    return self._credential_policies(user, name,
+                                                     f"<p>Auto-approve rule added: {html.escape(name)}</p>")
+                return self._credential_policies(
+                    user, name, f"<p>Could not add the rule: {html.escape(name)}</p>",
+                    status=400 if res["status"] == "refused" else 500, auto_rules={"error": res["message"]})
             if path == "/policies/ssh_hosts":
                 name = form.get("secret", [""])[0]
                 if name not in cfg["secrets"]:
@@ -7742,13 +7764,13 @@ def approval_handler(broker):
                     if res["status"] == "saved" and res["enforcing"]:
                         note += ("<p><small class=muted>Enforcement is on: unbound clients (old OpenSSH, git "
                                  "commit signing) will be refused for this key.</small></p>")
-                    return self._policies_page(user, note, ssh_state={name: {"open": True}})
+                    return self._credential_policies(user, name, note)
                 st = {"open": True, "error": res["message"], "known": one("known_hosts"),
                       "allowed": one("allowed_hosts"), "fwd": one("allow_forwarded") == "1",
                       "need_confirm": res.get("need_confirm"), "need_anyway": res.get("need_anyway")}
-                return self._policies_page(
-                    user, f"<p>Could not save the SSH host policy: {html.escape(name)}</p>",
-                    status=400 if res["status"] == "refused" else 500, ssh_state={name: st})
+                return self._credential_policies(
+                    user, name, f"<p>Could not save the SSH host policy: {html.escape(name)}</p>",
+                    status=400 if res["status"] == "refused" else 500, ssh_hosts=st)
             if path == "/policies/guidance":
                 name = form.get("name", [""])[0]
                 if name not in cfg["secrets"]:
@@ -7761,17 +7783,17 @@ def approval_handler(broker):
                         guidance_mod.validate_text(text)
                     except ValueError as e:
                         why = f" ({html.escape(str(e))})"
-                return self._policies_page(
-                    user, f"<p>{'Guidance saved' if done else 'Could not save guidance'}: "
-                          f"{html.escape(name)}{why}</p>", status=200 if done or not why else 400)
+                return self._credential_policies(
+                    user, name, f"<p>{'Guidance saved' if done else 'Could not save guidance'}: "
+                                f"{html.escape(name)}{why}</p>", status=200 if done or not why else 400)
             if self.path.split("?")[0].rstrip("/") == "/policies":
                 name = form.get("name", [""])[0]
                 # this page can only *tighten*: granting happens in the context of a request
                 if form.get("approval", [""])[0] != "prompt" or name not in cfg["secrets"]:
                     return _page(self, 400, "<h1>Bad request</h1>")
                 done = broker.set_approval(name, "prompt", user, self._ip, self._fwd())
-                return self._policies_page(
-                    user, f"<p>{'Updated' if done else 'Could not update'}: {html.escape(name)}</p>")
+                return self._credential_policies(
+                    user, name, f"<p>{'Updated' if done else 'Could not update'}: {html.escape(name)}</p>")
             nonce = self._nonce()
             decision = form.get("decision", [""])[0]
             rule = sshrules_mod.parse_decision(decision, form)

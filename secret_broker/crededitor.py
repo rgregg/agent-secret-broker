@@ -35,6 +35,18 @@ def pretty(meta):
     return json.dumps(meta, indent=2, sort_keys=True, ensure_ascii=True)
 
 
+def tabs_html(name, active, total):
+    """The `Settings | Policies (n)` link strip shared by both tabs of a credential's page. `active` is
+    "settings" or "policies"; `total` is the count shown on the Policies label."""
+    e = html.escape
+    n = e(name, quote=True)
+    cur = " class=on aria-current=page"
+    return ("<nav class=ctabs aria-label='Credential pages'>"
+            f"<a href='/credentials/{n}'{cur if active == 'settings' else ''}>Settings</a>"
+            f"<a href='/credentials/{n}?tab=policies'{cur if active == 'policies' else ''}>"
+            f"Policies ({int(total)})</a></nav>")
+
+
 def tls_mode(meta):
     if meta.get("tls_fingerprint") is not None:
         return "pin"
@@ -262,6 +274,10 @@ def diff_html(old, new):
 
 
 CSS = """
+.ctabs{display:flex;gap:.3rem;margin:.2rem 0 1rem;border-bottom:1px solid var(--line)}
+.ctabs a{padding:.45rem .9rem;border:1px solid transparent;border-bottom:0;border-radius:.5rem .5rem 0 0;text-decoration:none}
+.ctabs a.on{border-color:var(--line);font-weight:600;background:var(--card,transparent)}
+.clink{text-decoration:underline dotted;text-underline-offset:.15em}
 .df{white-space:pre-wrap}.df.add{background:rgba(40,160,80,.18)}.df.del{background:rgba(220,60,60,.18)}
 .diff{overflow:auto;max-height:24em;padding:.6em;border:1px solid var(--line);border-radius:.5rem;background:var(--card)}
 .cred-form label{display:block;margin:.8em 0 .2em;font-weight:600}
