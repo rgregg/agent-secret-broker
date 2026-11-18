@@ -180,6 +180,11 @@ or reload button, the header shows a small refresh button in this mode.
   (at most once per minute) to start the login; if a menu or confirm step is open it shows the banner
   instead.
 - **Notification taps** open `/` in the app, which goes through the same sign-in when the session has expired.
+  If the app or tab is already open, the tap focuses it and the page reloads itself to sign in (when it is signed
+  out, or the tap's own poll finds it is), so the request shows once you are back instead of a banner. A signed-out
+  tab you return to also starts the sign-in at once (at most once a minute; not with a menu or dialog open).
+  The page already polls every few seconds, so a provider with a sliding session keeps it alive while the page
+  is open; one with a fixed lifetime still ends it, and the page cannot extend that.
   Approve and Deny buttons on the notification need a live session; when it has expired the follow-up says
   "Could not approve - tap to review".
 - **Limits.** The page cannot refresh the SSO session itself, cannot control how iOS presents the login (in the

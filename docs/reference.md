@@ -1375,6 +1375,10 @@ Every page with the header carries the same shell, so the site works as an iOS h
   polling continues. On signed out, a banner "Your session expired. Sign in again." with a **Sign in
   again** button appears at the top (sticky); the button runs `location.assign('/')`, which starts the SSO
   redirect. While signed out the poll, heartbeat and audit beacon stop sending anything.
+- **Notification tap and return.** A notification click focuses the open dashboard tab and asks it to poll. If
+  the tab is signed out, or that poll finds it is, the page reloads at once (no one-a-minute limit: the human
+  asked to see the request) so the SSO login runs. Returning to a tab that is already signed out does the same
+  under the automatic-recovery limits below.
 - **Reload button.** In standalone mode (`navigator.standalone` or `display-mode: standalone`) the header
   shows a refresh button that reloads the page (after a form submission it goes to `/` instead, so a
   POST is never resubmitted). It is hidden in normal tabs.
