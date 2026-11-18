@@ -308,7 +308,7 @@ class StandingScope(ClientMixin, tg.Base):
         a = self.mk("alpha")
         self.broker._add_always("svc", "http", "any", "alice", a.id)
         self.broker.grants.add(["svc"], 15, "any", "alice", "dashboard", "r", mode="http", client=a.id)
-        page = self.get("/clients")[1]
+        page = _fast.unlink_names(self.get("/clients")[1])
         self.assertIn("2 rules", page)
         self.assertIn("always: svc", page)
         self.assertIn("timed: svc", page)

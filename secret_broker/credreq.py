@@ -35,6 +35,7 @@ import time
 from . import peek
 
 from . import clients as clients_mod
+from . import credlinks
 from . import guidance as guidance_mod
 
 KINDS = ("token", "login")
@@ -185,7 +186,7 @@ def describe_html(req):
     if sp.get("ws_change"):
         na = guidance_mod.non_ascii_count(sp["purpose"])
         flag = (f" <span class='pill warn'>Non-ASCII characters: {na} (shown as U+XXXX)</span>" if na else "")
-        return (f"<b>WebSocket setup change</b> for the existing credential {e(req.names[0])}<br>"
+        return (f"<b>WebSocket setup change</b> for the existing credential {credlinks.link(req.names[0])}<br>"
                 f"Purpose, as the agent put it (unverified):<div class=crpurpose>{_esc(sp['purpose'])}</div>{flag}"
                 f"<div>Now: {ws_html(sp['ws_before'])}</div><div>Proposed: {ws_html(sp['ws'])}</div>"
                 f"Stays as it is: the value, allowed hosts ({e(', '.join(sp['hosts']))}) and approval policy.",
@@ -193,7 +194,7 @@ def describe_html(req):
     if sp.get("replace"):
         na = guidance_mod.non_ascii_count(sp["purpose"])
         flag = (f" <span class='pill warn'>Non-ASCII characters: {na} (shown as U+XXXX)</span>" if na else "")
-        return (f"<b>Replacement value requested</b> for the existing credential {e(req.names[0])} "
+        return (f"<b>Replacement value requested</b> for the existing credential {credlinks.link(req.names[0])} "
                 f"(variable {e(sp['var'])})<br>"
                 f"Purpose, as the agent put it (unverified):<div class=crpurpose>{_esc(sp['purpose'])}</div>{flag}"
                 f"Stays as it is: allowed hosts ({e(', '.join(sp['hosts']) or 'none')}), approval policy and "
@@ -201,7 +202,7 @@ def describe_html(req):
     hosts = ", ".join(sp.get("hosts") or []) or "none suggested"
     na = guidance_mod.non_ascii_count(sp["purpose"])
     flag = (f" <span class='pill warn'>Non-ASCII characters: {na} (shown as U+XXXX)</span>" if na else "")
-    what = (f"<b>Credential request</b>: {e(req.names[0])} ({e(sp['kind'])})<br>"
+    what = (f"<b>Credential request</b>: {credlinks.link(req.names[0])} ({e(sp['kind'])})<br>"
             f"Purpose, as the agent put it (unverified):<div class=crpurpose>{_esc(sp['purpose'])}</div>{flag}"
             f"Suggested hosts: {e(hosts)}<br>Suggested mode: {e(sp['cred_mode'])}")
     if sp.get("ws") is not None:

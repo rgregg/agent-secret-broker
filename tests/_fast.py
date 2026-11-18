@@ -5,6 +5,7 @@
 several servers per test). Polling every 10 ms removes that wait without changing what is served.
 Production code is untouched; only the default poll interval used by tests changes.
 """
+import re
 import socketserver
 
 _orig = socketserver.BaseServer.serve_forever
@@ -227,3 +228,8 @@ def read_audit_text(path):
 
 def read_jsonl(path):
     return [__import__("json").loads(x) for x in read_audit_text(path).splitlines() if x.strip()]
+
+
+def unlink_names(page):
+    """Test-only: a page with its credential-name links reduced to their text, for tests that assert on wording."""
+    return re.sub(r"<a class=clink [^>]*>(.*?)</a>", r"\1", page, flags=re.S)

@@ -237,6 +237,7 @@ class AlwaysChip(EnvAutoBase):
     def test_chip_text_and_apply(self):
         self.env()
         page, r = self.page()
+        page = _fast.unlink_names(page)
         self.assertIn("value=approve_always", page)
         self.assertIn("Always approve run-with-secret requests for svc? The secret value will be "
                       "released to the requesting machine without asking "

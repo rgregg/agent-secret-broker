@@ -5684,7 +5684,7 @@ def _describe(req):
     if req.mode == "store":
         sp = req.spec
         if sp.get("hosts_after") is not None:
-            return (f"<b>CHANGE ALLOWED HOSTS</b> of {html.escape(req.names[0])}<br>"
+            return (f"<b>CHANGE ALLOWED HOSTS</b> of {credlinks_mod.link(req.names[0])}<br>"
                     f"{html.escape(_host_change_text(sp)[2:])}<br>"
                     f"Allowed after: {html.escape(', '.join(sp['hosts_after']))}",
                     "The agent will be able to send this credential to the hosts added and no longer to "
@@ -5816,7 +5816,8 @@ def _approve_actions(broker, req):
     if req.mode == "session":       # shorten-only limits, Approve or Deny; no Always, no timed grant
         return (ws_mod if req.spec.get("kind") == "ws" else sessions_mod).actions_html(broker, req)
     e = html.escape
-    names = e(", ".join(req.names))
+    names = e(", ".join(req.names))                # for attributes (a link cannot sit in an attribute)
+    names_html = credlinks_mod.links(req.names)    # for visible text
     if req.mode == "sudo":          # Approve or Deny only: no Always, no timed grant
         return ("<div class=decide-row><button class='btn approve' name=decision value=approve>"
                 "Approve</button><button class='btn deny' name=decision value=deny>Deny</button></div>"
@@ -5846,11 +5847,11 @@ def _approve_actions(broker, req):
         tip = (f"Approve this request and approve future requests for this secret without asking: "
                f"{what}, when the request is rated {mx} or lower. "
                "Applies to the client chosen above. Revoke any time under Policies.")
-        ask = standing_mod.confirm_text(req.names[0], req.mode, scope, mx)
+        ask = standing_mod.confirm_html(credlinks_mod.link(req.names[0]), req.mode, scope, mx)
         chips.append(
             f"<details class=alw><summary class='chip always' data-tip='{e(tip)}' "
             f"aria-label='Always approve {e(req.names[0])}: {e(tip)}'>Always</summary>"
-            f"<div class=confirm><span>{e(ask)}</span>"
+            f"<div class=confirm><span>{ask}</span>"
             "<button class='btn sm approve' name=decision value=approve_always>Confirm</button>"
             "<span class=muted>Click Always again to cancel.</span></div></details>")
         if req.mode == "env" and standing_mod.script_binding(req.spec):
@@ -5862,7 +5863,7 @@ def _approve_actions(broker, req):
             chips.append(
                 f"<details class=alw><summary class='chip always' data-tip='{e(btip)}' "
                 f"aria-label='Always approve this script: {e(btip)}'>Always, this script</summary>"
-                f"<div class=confirm><span>Always approve {e(b['command'])} for {e(req.names[0])} while the "
+                f"<div class=confirm><span>Always approve {e(b['command'])} for {credlinks_mod.link(req.names[0])} while the "
                 f"script is unchanged (sha256 {e(b['sha256'][0][:12])})? Any change to the script asks again.</span>"
                 "<button class='btn sm approve' name=decision value=approve_always_script>Confirm</button>"
                 "<span class=muted>Click again to cancel.</span></div></details>")
@@ -5879,12 +5880,12 @@ def _approve_actions(broker, req):
            "<option value=any>any client (every machine)</option></select></label>"
            f"<div class=chips>{''.join(chips)}</div>")
     if mins and req.mode == "env":
-        out += (f"<p class=scope><small class=muted>Applies to exactly: {names}, run-with-secret "
+        out += (f"<p class=scope><small class=muted>Applies to exactly: {names_html}, run-with-secret "
                 "requests only. The secret value will be released to the requesting machine for "
                 "the chosen time without asking. Requests whose script text is not visible "
                 "still ask. Revoke any time under Policies.</small></p>")
     if mins and req.mode != "env":
-        out += (f"<p class=scope><small class=muted>Applies to exactly: {names}. "
+        out += (f"<p class=scope><small class=muted>Applies to exactly: {names_html}. "
                 f"{'Reads only (GET, HEAD, OPTIONS)' if scope == 'read' else 'Any method'}. "
                 "Revoke any time under Policies.</small></p>")
     return row1 + out + "</div>"
@@ -5982,7 +5983,7 @@ def _detail_html(r, evs, retained=""):
         if v not in (None, "", []):
             rows.append(f"<dt>{e(k)}</dt><dd>{v if raw else e(str(v))}</dd>")
     add("Request id", f"<code>{e(r['id'])}</code>", True)
-    add("Secrets", ", ".join(r["names"]))
+    add("Secrets", credlinks_mod.links(r["names"]), True)
     add("Mode", r["mode"])
     if r["mode"] == "http":
         add("Request", f"{r['method'] or ''} {r['url'] or ''}".strip())
@@ -6171,7 +6172,7 @@ def _detail_html(r, evs, retained=""):
         tl.append(f"<li><time>{e(t)}</time><b>{e(x['event'])}</b>"
                   + (f" <small class=muted>+{e(dt)}</small>" if dt and x.get("ts") != t0 else "")
                   + (f"<span class=ev>{e(extra)}</span>" if extra else "") + "</li>")
-    return (f"<div class=dtitle><b>{e(', '.join(r['names']))}</b>"
+    return (f"<div class=dtitle><b>{credlinks_mod.links(r['names'])}</b>"
             f"<span class='pill {kind}'>{e(label)}</span></div>"
             f"<dl class=kv>{''.join(rows)}</dl>{retained}<h3>Timeline</h3><ol class=tl>{''.join(tl)}</ol>")
 
@@ -6659,7 +6660,7 @@ def approval_handler(broker):
                 cards.append(
                     f"<article class=req data-id='{html.escape(r.id)}'>"
                     f"<div class=reqhead><h2>"
-                    f"{'Guidance proposal' if r.mode == 'guidance' else 'Plan: ' + html.escape(', '.join(r.names)) if r.mode == 'plan' else html.escape(', '.join(r.names))}</h2>"
+                    f"{'Guidance proposal' if r.mode == 'guidance' else 'Plan: ' + credlinks_mod.links(r.names, tab='policies') if r.mode == 'plan' else credlinks_mod.links(r.names)}</h2>"
                     f"<time data-exp='{int(r.expires)}'>expires in "
                     f"{max(0, int(r.expires - time.time()))}s</time></div>{_risk_html(r)}"
                     f"<div class=box>{clients_mod.from_html(r)}<br>{what}</div>"
@@ -6861,7 +6862,7 @@ def approval_handler(broker):
             page has no other way to decide a plan."""
             what, note = _describe(req)
             _page(self, 200,
-                  f"<h1>Plan request</h1><p><b>{html.escape(', '.join(req.names))}</b></p>{_risk_html(req)}"
+                  f"<h1>Plan request</h1><p><b>{credlinks_mod.links(req.names, tab='policies')}</b></p>{_risk_html(req)}"
                   f"<div class=box>{clients_mod.from_html(req)}<br>{what}</div>"
                   f"<p><small>{note}</small></p>"
                   f"<p><small>Expires in {max(0, int(req.expires - time.time()))}s</small></p>"
@@ -6945,10 +6946,10 @@ def approval_handler(broker):
             done.done.wait(15)          # the vault write runs in the background; say how it ended
             if done.status in ("approved", "released"):
                 if done.spec.get("ws_change"):
-                    return _page(self, 200, f"<h1>Saved</h1><p>The WebSocket setup of <b>{html.escape(done.names[0])}"
+                    return _page(self, 200, f"<h1>Saved</h1><p>The WebSocket setup of <b>{credlinks_mod.link(done.names[0])}"
                                  "</b> was changed. You can close this page.</p>", tab="requests",
                                  badge=broker.attention(), user=user)
-                return _page(self, 200, f"<h1>Stored</h1><p>The credential <b>{html.escape(done.names[0])}</b> "
+                return _page(self, 200, f"<h1>Stored</h1><p>The credential <b>{credlinks_mod.link(done.names[0])}</b> "
                              "is in the vault. The agent was told only its name. You can close this page.</p>",
                              tab="requests", badge=broker.attention(), user=user)
             if done.status == "failed":
@@ -7430,7 +7431,7 @@ def approval_handler(broker):
             summary_html = _risk_html(req)
             _page(self, 200, f"""
 <h1>{'Guidance proposal' if req.mode == 'guidance' else 'Secret request'}</h1>
-<p><b>{html.escape(', '.join(req.names))}</b></p>
+<p><b>{credlinks_mod.links(req.names)}</b></p>
 {summary_html}
 <div class=box>{clients_mod.from_html(req)}<br>{what}</div>
 {details_mod.html(broker.details_view(req))}
@@ -7815,7 +7816,7 @@ def approval_handler(broker):
             extra = ""
             if req.always in ("applied", "exists"):
                 what = standing_mod.scope_phrase(req.mode, grants_mod.scope_for(req.mode, req.spec))
-                extra = (f"<p>Always allow saved for <b>{html.escape(req.names[0])}</b> ({html.escape(what)}). "
+                extra = (f"<p>Always allow saved for <b>{credlinks_mod.link(req.names[0], tab='policies')}</b> ({html.escape(what)}). "
                          "Revoke it at <a href='/policies'>/policies</a>.</p>")
             elif req.always:
                 extra = f"<p><small>Always allow {html.escape(req.always)}.</small></p>"
@@ -7825,7 +7826,7 @@ def approval_handler(broker):
             elif req.ssh_rule:
                 extra += "<p><small>The standing rule was not created; this request was approved once.</small></p>"
             if parsed[2] is not None:
-                extra += (f"<p>Further requests for <b>{html.escape(', '.join(req.names))}</b> are "
+                extra += (f"<p>Further requests for <b>{credlinks_mod.links(req.names, tab='policies')}</b> are "
                           f"approved for {parsed[2]} minutes (same secrets only). Revoke it at "
                           "<a href='/policies'>/policies</a>.</p>")
             _page(self, 200, "<h1>Approved</h1><p>Releasing now. You can close this page.</p>" + extra)

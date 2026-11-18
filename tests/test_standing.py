@@ -204,18 +204,18 @@ class AlwaysScope(Base):
 class ChipText(Base):
     def test_confirm_text_per_mode_and_scope(self):
         rid = self.http(method="GET")
-        page = self.card(rid)
+        page = _fast.unlink_names(self.card(rid))
         self.assertIn("Always approve reads-only requests for svc? The secret will be used for "
                       "matching requests without asking again when the request is rated low or lower.", page)
         self.assertIn("value=approve_always", page)
         self.assertIn(">5 min<", page)
         self.assertIn(">30 min<", page)
         rid = self.http(method="POST", path="/p")
-        self.assertIn("Always approve any-method requests for svc?", self.card(rid))
+        self.assertIn("Always approve any-method requests for svc?", _fast.unlink_names(self.card(rid)))
         rid = self.env()
         self.assertIn("Always approve run-with-secret requests for svc? The secret value will be "
                       "released to the requesting machine without asking again when the request is "
-                      "rated low or lower.", self.card(rid))
+                      "rated low or lower.", _fast.unlink_names(self.card(rid)))
 
     def test_chip_not_offered_for_several_secrets_or_invisible_scripts(self):
         rid = self.http(("svc", "other"))

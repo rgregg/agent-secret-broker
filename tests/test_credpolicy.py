@@ -6,7 +6,8 @@ import time
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from secret_broker import autorules, credlinks, credpolicy, guidance, sshhosts, sshrules, uirules  # noqa: E402
+import html as _html  # noqa: E402
+from secret_broker import autorules, credlinks, credpolicy, guidance, sshhosts, sshrules, standing, uirules  # noqa: E402
 
 CSRF = "tok-123"
 NOW = time.time()
@@ -146,6 +147,21 @@ class Link(unittest.TestCase):
         out = credlinks.link("svc", text="<Settings>")
         self.assertEqual(out, "<a class=clink href='/credentials/svc'>&lt;Settings&gt;</a>")
         self.assertEqual(credlinks.link("<x>", text="Settings"), "Settings")             # invalid name: plain label
+
+
+class ConfirmHtml(unittest.TestCase):
+    def test_it_is_the_plain_question_with_only_the_name_swapped_for_html(self):
+        for mode, scope in (("http", "read"), ("http", "any"), ("env", "any")):
+            plain = standing.confirm_text("svc", mode, scope, "low")
+            self.assertEqual(standing.confirm_html("svc", mode, scope, "low"), _html.escape(plain), (mode, scope))
+            linked = standing.confirm_html("<a href='x'>svc</a>", mode, scope, "low")
+            self.assertIn("<a href='x'>svc</a>", linked)                                   # the name HTML goes in verbatim
+            self.assertEqual(linked.replace("<a href='x'>svc</a>", "svc"), _html.escape(plain))   # and nothing else changed
+
+    def test_everything_but_the_name_is_escaped(self):
+        out = standing.confirm_html("N", "http", "read", "<low>")
+        self.assertIn("rated &lt;low&gt; or lower", out)
+        self.assertNotIn("<low>", out)
 
 
 if __name__ == "__main__":

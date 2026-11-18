@@ -572,7 +572,7 @@ class CardLayout(Base):
         self.assertIn("name=decision value=approve_always>Confirm", det)
         self.assertEqual(card.count("value=approve_always"), 1)
         self.assertNotRegex(card.replace(det, ""), "value=approve_always")
-        self.assertIn("Applies to exactly: svc. Reads only (GET, HEAD, OPTIONS).", card)
+        self.assertIn("Applies to exactly: svc. Reads only (GET, HEAD, OPTIONS).", _fast.unlink_names(card))
         self.assertNotIn(" title=", card[card.index("<div class=decide-row>"):])
         for m in re.findall(r"<(?:button|summary|span) class=[^>]*>", card):
             if "chip" in m:
@@ -589,7 +589,7 @@ class CardLayout(Base):
     def test_non_read_method_says_any_method(self):
         self.http(method="POST")
         _, page = self.get("/")
-        self.assertIn("Applies to exactly: svc. Any method.", page)
+        self.assertIn("Applies to exactly: svc. Any method.", _fast.unlink_names(page))
 
     def test_ssh_sign_has_chips_and_a_disabled_always(self):
         self.sign()
