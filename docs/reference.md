@@ -1740,7 +1740,7 @@ restart and no redeploy. They differ from configuration rules in four ways:
 
   (`env` rules have `argv` instead of `host`, `methods` and `path_prefix`; `scheme` appears only when it is not
   `https`.) At most 50 per credential, names unique within a credential. An expired rule never matches, even before
-  it is dropped; it is dropped lazily and by a 60 s sweep, and audited once. If the vault write that drops it
+  it is dropped; it is dropped by a 60 s sweep (until then it is just ignored) and audited once. If the vault write that drops it
   fails, the rule stays stored but still never matches, and `auto_rule_change_failed` is audited once.
 - **"Any client" means any enrolled client**, never the legacy shared key, exactly as for configuration rules
   (an empty `clients`). The form offers enrolled clients only. A rule pinned to a client that is later revoked
@@ -1753,7 +1753,7 @@ approval, at any risk level and whatever the credential's `approval` says. A bla
 path prefix means `/`. `POST /policies/auto_rules/revoke` takes `secret` and `rule`. Both are guarded like the SSH
 rule forms (SSO identity, trusted peer, CSRF token, same-origin check) and are not reachable with an agent key.
 Whoever can use the Policies tab or edit the vault collection can add one: the same trust level as `approval`.
-Configuration rules appear in the same table, read-only and marked "config", beside the credential they cover.
+Configuration rules appear in the same table, read-only and marked "config", beside the credential they cover. Every non-SSH credential has a card, including one with no allowed hosts (an env-only credential can still get an `env` rule). The Credentials editor's advanced JSON box can also carry an `auto_rules` list; a save that adds or changes a rule there needs the same "this widens access" confirmation tick as turning on `approval: allow`. Use counts are pruned of vanished rules after each successful catalog refresh, and a refresh whose vault read overlapped an add, revoke or expiry is read again, so a revoked rule cannot come back from a stale snapshot.
 
 **Refusals** are one of a closed set of reasons, audited as `auto_rule_refused` with `reason`: `invalid` (the page
 names the field, never the value), `not_confirmed`, `duplicate_name`, `cap`, `backend` (the vault backend cannot
@@ -1765,10 +1765,10 @@ active. Nothing typed into the form is echoed into a message, event or log line.
 | Event | Fields |
 | --- | --- |
 | `auto_rule_created` | `credential`, `rule_id`, `rule_name`, `rule_mode`, `rule_client`, `rule_host` (http only), `expires_at`, `created_by`, `channel` (`policies`), `approver_peer`, `approver_ip` |
-| `auto_rule_revoked` | `credential`, `rule_id`, `rule_name`, `created_by`, `revoked_by`, `channel` |
+| `auto_rule_revoked` | `credential`, `rule_id`, `rule_name`, `created_by`, `revoked_by`, `user`, `peer`, `client_ip`, `channel` |
 | `auto_rule_expired` | `credential`, `rule_id`, `rule_name`, `expires_at`, `created_by` |
 | `auto_rule_refused` | `reason`, `credential`, `user`, `peer`, `client_ip`, `channel` |
-| `auto_rule_change_failed` | `op` (`create`, `revoke`, `expire`), `credential`, `rule_id` (not for `create`), `error_class` |
+| `auto_rule_change_failed` | `op` (`create`, `revoke`, `expire`), `credential`, `error_class`; `rule_id` for `revoke` and `expire`; `user`, `peer`, `client_ip` for `create` and `revoke` (`channel` too for `create`) |
 | `auto_rule_used` | the request `id`, `source` (`config` or `ui`), `rule_name`, and for a stored rule `rule_id` |
 | `auto_rules_state_corrupt`, `auto_rules_state_write_failed` | `warning`, `error` (as for the SSH rule counters) |
 

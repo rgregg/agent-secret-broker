@@ -17,8 +17,9 @@ import urllib.request
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import test_e2e as t  # noqa: E402
+import test_credential_editor as tce  # noqa: E402
 import test_grants as tg  # noqa: E402
-from secret_broker import audit_api, autorules, sshrules  # noqa: E402
+from secret_broker import audit_api, autorules, crededitor, sshrules  # noqa: E402
 from secret_broker.backends import MemoryBackend  # noqa: E402
 from secret_broker.broker import Broker  # noqa: E402
 from secret_broker.notify import FakeNotifier  # noqa: E402
@@ -28,6 +29,7 @@ from test_ssh_rules import NoMeta  # noqa: E402
 FUTURE = sshrules.iso(time.time() + 86400 * 30)
 PAST = sshrules.iso(time.time() - 3600)
 BOX = "c-0a0b0c0d"
+AGENT_CODE = 404          # what the agent listener answers for a path it does not serve
 
 
 def http_rule(**kw):
@@ -224,6 +226,16 @@ class Match(Enrolled, t.Harness):
             self.assertTrue(self.prompted(rid), label)
         self.assertEqual(len(self.notifier.sent), len(cases))
         self.assertEqual(self.approved_without_asking(self.call())["decision_source"], "ui_rule")   # control
+
+    def test_a_multipart_body_never_matches(self):
+        rid = self.call(method="POST", body="x", headers={"Content-Type": "multipart/form-data; boundary=b"})
+        self.assertTrue(self.prompted(rid))
+        self.assertFalse(self.prompted(self.call(method="POST", body="x")))            # control: a plain body does
+
+    def test_the_legacy_key_never_matches_even_a_rule_pinned_to_a_client(self):
+        self.set_stored(svc_rule(clients=[self.client.id]))
+        self.assertTrue(self.prompted(self.call(key=t.KEY)))
+        self.assertFalse(self.prompted(self.call()))                                   # control: the pinned client does
 
     def test_empty_clients_means_an_enrolled_client_and_never_the_legacy_key(self):
         self.assertTrue(self.prompted(self.call(key=t.KEY)))
@@ -547,7 +559,7 @@ class Manage(ManageBase):
         self.assertEqual([(e["credential"], e["rule_id"], e["rule_name"]) for e in gone], [("svc", "old01", "old")])
 
     def test_a_failed_expiry_write_is_reported_once_and_the_rule_stays_ignored(self):
-        self.seed(http_rule(id="old01", name="old", expires_at=PAST))
+        self.seed(svc_rule(id="old01", name="old", expires_at=PAST))
 
         def boom(*a):
             raise OSError("disk")
@@ -558,7 +570,10 @@ class Manage(ManageBase):
         self.assertEqual(self.events("auto_rule_change_failed")[0]["op"], "expire")
         self.assertEqual(self.events("auto_rule_expired"), [])
         self.assertEqual(len(self.live()), 1)                                         # still stored, but never matches
-        self.assertIsNone(autorules.find(self.live(), "http", ["svc"], {"url": "http://127.0.0.1/x"}, {"id": BOX}))
+        spec = {"url": "http://127.0.0.1/x", "method": "GET", "headers": {}}
+        self.assertIsNone(autorules.find(self.live(), "http", ["svc"], spec, {"id": BOX}))
+        fresh = autorules.parse_stored([svc_rule(expires_at=FUTURE)], "svc")           # control: this spec does match
+        self.assertIsNotNone(autorules.find(fresh, "http", ["svc"], spec, {"id": BOX}))
 
     def test_usage_of_rules_that_no_longer_exist_is_pruned(self):
         self.seed(http_rule(id="keep01", name="keep"))
@@ -567,6 +582,97 @@ class Manage(ManageBase):
         self.broker.prune_auto_rule_usage()
         self.assertEqual(self.broker.auto_rule_usage.get("svc", "keep01")["uses"], 1)
         self.assertEqual(self.broker.auto_rule_usage.get("svc", "gone01")["uses"], 0)
+
+
+class Persistence(ManageBase):
+    """Use counts and rules across restarts and catalog refreshes."""
+
+    def restart(self):
+        return Broker({"approve_base_url": "https://s.example"}, self.broker.backend, FakeNotifier(), self.audit)
+
+    def test_use_counts_survive_a_restart(self):
+        self.seed(svc_rule(id="keep01", name="keep"))
+        self.broker.auto_rule_usage.record("svc", "keep01", time.time())
+        b = self.restart()
+        self.assertEqual([r["id"] for r in b.cfg["secrets"]["svc"]["auto_rules"]], ["keep01"])   # the rule loaded
+        self.assertEqual(b.auto_rule_usage.get("svc", "keep01")["uses"], 1)
+
+    def test_a_refresh_prunes_counts_of_rules_that_are_gone(self):
+        self.seed(svc_rule(id="keep01", name="keep"))
+        self.broker.auto_rule_usage.record("svc", "keep01", time.time())
+        self.broker.auto_rule_usage.record("svc", "gone01", time.time())
+        self.broker.refresh_catalog()
+        self.assertEqual(self.broker.auto_rule_usage.get("svc", "keep01")["uses"], 1)
+        self.assertEqual(self.broker.auto_rule_usage.get("svc", "gone01")["uses"], 0)
+
+    def test_a_refresh_that_read_the_vault_before_a_revoke_does_not_bring_the_rule_back(self):
+        self.seed(svc_rule(id="rev001", name="to revoke"))
+        real, fired = self.broker.backend.catalog, []
+
+        def racing():
+            rows = real()                                   # the snapshot the refresh will build from
+            if not fired:
+                fired.append(1)
+                self.assertEqual(self.broker.revoke_auto_rule("svc", "rev001", "alice"), "revoked")
+            return rows
+        self.broker.backend.catalog = racing
+        self.broker.refresh_catalog()
+        self.assertEqual(fired, [1])                        # the premise: the revoke did land mid-refresh
+        self.assertEqual((self.live(), self.stored()), ([], []))
+        before = len(self.events("auto_rule_used"))
+        port = self.up.server_address[1]
+        self.api("POST", "/v1/requests", {"mode": "http", "names": ["svc"], "method": "GET",
+                                          "url": f"http://127.0.0.1:{port}/x",
+                                          "headers": {"Authorization": "Bearer {{SVC_TOKEN}}"}})
+        self.assertEqual(len(self.events("auto_rule_used")), before)                  # and it does not approve
+
+
+class HostlessCredential(ManageBase):
+    """An env-only credential has no allowed hosts but can still get an env rule from the page."""
+
+    def tweak(self, cfg):
+        super().tweak(cfg)
+        cfg["_vault"]["Envonly"] = {"token": "S3CR3T-envonly"}
+        cfg["secrets"]["envonly"] = {"vars": {"ENVONLY_TOKEN": {"item": "Envonly", "field": "token"}},
+                                     "allowed_hosts": []}
+
+    def test_it_has_a_card_and_an_env_rule_can_be_added(self):
+        page = t.req(self.abase + "/policies", headers={"X-authentik-username": "alice"})[1]
+        self.assertIn("name=secret value='envonly'", page.split("Auto-approve rules")[1])
+        res = self.add(cred="envonly", name="greet", mode="env", argv=["echo", "hi"])
+        self.assertEqual(res["status"], "created")
+        self.assertEqual(self.stored("envonly")[0]["argv"], ["echo", "hi"])
+
+
+class EditorTouchesRules(tce.Base):
+    """The Credentials editor's advanced JSON box is a second route to `auto_rules`: it needs the same tick."""
+
+    def with_rule(self):
+        adv = json.loads(self.form()["advanced"])
+        adv["auto_rules"] = [http_rule(id="ed0001", name="from editor")]
+        return crededitor.pretty(adv)
+
+    def test_widened_names_a_new_or_changed_rule_and_not_a_removed_one(self):
+        rule, other = http_rule(), http_rule(id="r0009", name="other")
+        self.assertEqual(crededitor.widened({}, {"auto_rules": [rule]}), ["auto_rules_added"])
+        self.assertEqual(crededitor.widened({"auto_rules": [rule]}, {"auto_rules": [rule, other]}),
+                         ["auto_rules_added"])
+        self.assertEqual(crededitor.widened({"auto_rules": [rule]}, {"auto_rules": [dict(rule, host="x.example.com")]}),
+                         ["auto_rules_added"])
+        self.assertEqual(crededitor.widened({"auto_rules": [rule, other]}, {"auto_rules": [rule]}), [])
+        self.assertEqual(crededitor.widened({"auto_rules": [rule]}, {"auto_rules": [rule]}), [])
+        self.assertEqual(crededitor.widened({}, {}), [])
+
+    def test_adding_a_rule_through_the_advanced_box_needs_the_tick(self):
+        before = self.stored()
+        pc, sc, body = self.save(advanced=self.with_rule())
+        self.assertEqual((pc, sc), (200, 400))
+        self.assertIn("This change widens access", body)
+        self.assertEqual(self.stored(), before)                                       # refused: nothing written
+        pc, sc, body = self.save(confirm=True, advanced=self.with_rule())
+        self.assertEqual(sc, 200)
+        self.assertEqual([r["name"] for r in self.stored()["auto_rules"]], ["from editor"])
+        self.assertIn("auto_rules_added", self.events("credential_changed")[-1]["widened"])
 
 
 class PoliciesTab(ManageBase):
@@ -584,7 +690,7 @@ class PoliciesTab(ManageBase):
         try:
             r = urllib.request.urlopen(urllib.request.Request(
                 (base or self.abase) + path, data=urllib.parse.urlencode(form, doseq=True).encode(),
-                headers={"X-authentik-username": user}, method="POST"), timeout=10)
+                headers={"X-authentik-username": user} if user else {}, method="POST"), timeout=10)
             return r.status, r.read().decode()
         except urllib.error.HTTPError as e:
             return e.code, e.read().decode()
@@ -653,6 +759,20 @@ class PoliciesTab(ManageBase):
             self.assertEqual(self.post(self.REVOKE, secret=cred, rule="abcd1234")[0], 400, cred)
         self.assertEqual(self.stored(), [])
 
+    def test_a_revoke_failure_is_500_and_the_rule_stays_active(self):
+        self.seed(svc_rule(id="v0001", name="stays"))
+
+        def boom(*a):
+            raise OSError("disk")
+        real = self.broker.backend.set_meta
+        self.broker.backend.set_meta = boom
+        code, body = self.post(self.REVOKE, rule="v0001")
+        self.assertEqual(code, 500)
+        self.assertIn("Could not revoke the rule", body)
+        self.assertEqual([r["id"] for r in self.live()], ["v0001"])
+        self.broker.backend.set_meta = real
+        self.assertIn("Auto-approve rule revoked", self.post(self.REVOKE, rule="v0001")[1])     # control
+
     def test_a_write_failure_is_500_and_nothing_is_active(self):
         def boom(*a):
             raise OSError("disk")
@@ -688,6 +808,7 @@ class PoliciesTab(ManageBase):
             self.assertEqual(self.post(path, csrf=False, **form)[0], 403, path)
             self.assertEqual(self.post(path, csrf="bad", **form)[0], 403, path)
             self.assertEqual(self.post(path, user="mallory", **form)[0], 403, path)
+            self.assertEqual(self.post(path, user=None, **form)[0], 403, path)           # no SSO identity at all
             r = urllib.request.Request(
                 self.abase + path, method="POST",
                 headers={"X-authentik-username": "alice", "Origin": "https://evil.example"},
@@ -712,7 +833,7 @@ class PoliciesTab(ManageBase):
                 code = urllib.request.urlopen(req, timeout=10).status
             except urllib.error.HTTPError as e:
                 code = e.code
-            self.assertIn(code, (403, 404, 405), path)
+            self.assertEqual(code, AGENT_CODE, path)
         self.assertEqual(self.stored(), [])
         self.assertEqual(self.post(self.ADD, **self.form())[0], 200)                    # control: the approver can
 

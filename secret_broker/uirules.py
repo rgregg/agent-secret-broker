@@ -62,7 +62,6 @@ class UiRulesMixin:
 
     def _init_ui_rules(self):
         self._auto_expire_failed = set()
-        self.prune_auto_rule_usage()
         threading.Thread(target=self._auto_rule_sweeper, daemon=True).start()
 
     def _auto_rule_sweeper(self):
@@ -91,6 +90,7 @@ class UiRulesMixin:
         else:
             meta.pop("auto_rules", None)
         self.backend.set_meta(sc["_item"], meta)
+        self._cfg_gen += 1              # a catalog refresh that read the vault before this write must not swap in
         sc["_meta"] = meta
         if rules:
             sc["auto_rules"] = list(rules)
@@ -249,10 +249,8 @@ def policies_section(secrets_cfg, config_rules, csrf, usage, now=None, state=Non
     for i, (name, sc) in enumerate(sorted(secrets_cfg.items())):
         if sc.get("ssh"):
             continue
-        stored = sc.get("auto_rules") or []
+        stored = sc.get("auto_rules") or []     # every credential gets a card: an env-only one has no hosts
         cfg_rules = [r for r in config_rules if name in r["secrets"]]
-        if not (stored or cfg_rules or sc.get("allowed_hosts") or name in state):
-            continue
         st = state.get(name) or {}
         rows = []
         for r in cfg_rules:

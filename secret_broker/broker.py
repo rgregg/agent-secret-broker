@@ -246,6 +246,7 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
         self._backend_ok = True         # False while the last vault read failed
         self._refreshing = threading.Lock()
         self._cfg_lock = threading.Lock()
+        self._cfg_gen = 0               # bumped by every write of a credential's rules; see refresh_catalog
         self.summarizer = summarizer
         self._kp_seen = set()           # summary key credentials seen in the catalog (see _summary_key_read)
         self._desc_lock = threading.Lock()
@@ -595,7 +596,7 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
                          secret=name, host=h[:100])
         entry["allowed_hosts"] = keep
 
-    def refresh_catalog(self, fresh=False):
+    def refresh_catalog(self, fresh=False, _retries=2):
         """Rebuild the secret catalog from the vault's items. Raises if the vault
         cannot be read, leaving the previous catalog in place. `fresh` first pulls the
         latest from a remote vault (a request named something the catalog lacks, so a
@@ -605,6 +606,7 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
                 self.backend.sync(min_age=self.FORCED_SYNC_MIN_AGE)
             except BackendError as e:
                 self.log("vault_sync_failed", error=type(e).__name__)   # the catalog read below reports a real outage
+        gen = self._cfg_gen
         rows = self.backend.catalog()
         out, bad, owners, autos = {}, [], {}, []
         for row in rows:
@@ -652,11 +654,18 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
                 bad.extend({"item": i, "reason": f"duplicate secret name {name!r}"} for i in items)
         out.update(adopted)
         with self._cfg_lock:
-            self.cfg["secrets"] = out
-            self._catalog_at = time.time()
-            self._backend_ok = True
-            self._catalog_stats = {"count": len(out), "invalid": len(bad), "adopted": len(adopted),
-                                   "loaded_at": _iso(self._catalog_at)}
+            moved = self._cfg_gen != gen
+            if not moved or _retries <= 0:
+                self.cfg["secrets"] = out
+                self._catalog_at = time.time()
+                self._backend_ok = True
+                self._catalog_stats = {"count": len(out), "invalid": len(bad), "adopted": len(adopted),
+                                       "loaded_at": _iso(self._catalog_at)}
+        if moved and _retries > 0:
+            # A rule was added, revoked or expired while the vault was being read: this snapshot may still
+            # hold the old rule list (a revoked rule would come back). Read again.
+            return self.refresh_catalog(False, _retries - 1)
+        self.prune_auto_rule_usage()
         self._sync_summary_key(out)
         ginv = {n: e["guidance_invalid"] for n, e in sorted(out.items()) if e.get("guidance_invalid")}
         sig = json.dumps([sorted(out), bad, ginv], sort_keys=True)
