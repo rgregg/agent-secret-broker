@@ -8,13 +8,22 @@ its own ports (all bound to port 0) and temp dirs. `-j` runs that many units at 
 the I-th of N balanced groups of units (the split is a pure function of the test ids and timings.json, so
 every CI job computes the same one). `--record` rewrites tests/timings.json, the per-test cost estimates
 used for balancing. Exit status is non-zero if any test fails or errors.
+
+Temp dirs: tests make directories with `tempfile.mkdtemp()` and nothing removes them (about 3,300 per full run). The runner
+therefore gives every unit's process a private TMPDIR inside one directory it creates under the normal temp dir
+(`$TMPDIR`, so point that at a roomy disk to keep the whole run there) and deletes it when it ends, including on
+Ctrl-C and SIGTERM (running test processes are stopped first). Runs that do not go through this runner
+(plain `pytest` or `python -m unittest`) still leave their directories behind.
 """
 import argparse
 import concurrent.futures
 import json
 import os
+import signal
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 import unittest
 
@@ -113,19 +122,47 @@ def child(argv):
     return 0 if r.wasSuccessful() else 1
 
 
+_live = set()               # the test processes running now, so a termination can stop them
+_live_lock = threading.Lock()
+
+
+def stop_live():
+    with _live_lock:
+        procs = list(_live)
+    for p in procs:
+        try:
+            p.terminate()
+        except OSError:
+            pass
+    for p in procs:
+        try:
+            p.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            p.kill()
+
+
 def run_unit(unit, tmp):
     cost, ids = unit
     dur = os.path.join(tmp, f"{abs(hash(tuple(ids)))}.json")
+    child_tmp = os.path.join(tmp, "t")          # what the unit's tests put in their temp dir lives (and dies) here
+    os.makedirs(child_tmp, exist_ok=True)
     t = time.time()
-    p = subprocess.run([sys.executable, os.path.abspath(__file__), "--child", *ids], cwd=ROOT,
-                       env=dict(os.environ, ASB_TEST_DURATIONS=dur), stdout=subprocess.PIPE,
-                       stderr=subprocess.STDOUT, text=True)
+    p = subprocess.Popen([sys.executable, os.path.abspath(__file__), "--child", *ids], cwd=ROOT,
+                         env=dict(os.environ, ASB_TEST_DURATIONS=dur, TMPDIR=child_tmp), stdout=subprocess.PIPE,
+                         stderr=subprocess.STDOUT, text=True)
+    with _live_lock:
+        _live.add(p)
+    try:
+        out, _ = p.communicate()
+    finally:
+        with _live_lock:
+            _live.discard(p)
     try:
         with open(dur) as f:
             d = json.load(f)
     except (OSError, ValueError):
         d = {}
-    return ids, p.returncode, time.time() - t, p.stdout, d
+    return ids, p.returncode, time.time() - t, out, d
 
 
 def main():
@@ -145,16 +182,21 @@ def main():
     print(f"shard {i}/{n}: {sum(len(u[1]) for u in units)} tests in {len(units)} units, -j {a.j}", flush=True)
     start = time.time()
     failed, measured = [], {}
-    import tempfile
-    with tempfile.TemporaryDirectory() as tmp, concurrent.futures.ThreadPoolExecutor(a.j) as ex:
-        for ids_, rc, secs, out, d in ex.map(lambda u: run_unit(u, tmp), units):
-            measured.update(d)
-            tail = out.strip().splitlines()[-1] if out.strip() else "(no output)"
-            print(f"{'ok  ' if rc == 0 else 'FAIL'} {ids_[0].split('.')[0]} ({len(ids_)} tests, {secs:.1f}s) {tail}",
-                  flush=True)
-            if rc != 0:
-                failed.append(ids_[0])
-                print(out, flush=True)
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))        # run the cleanup below, like Ctrl-C does
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        ex = concurrent.futures.ThreadPoolExecutor(a.j)
+        try:
+            for ids_, rc, secs, out, d in ex.map(lambda u: run_unit(u, tmp), units):
+                measured.update(d)
+                tail = out.strip().splitlines()[-1] if out.strip() else "(no output)"
+                print(f"{'ok  ' if rc == 0 else 'FAIL'} {ids_[0].split('.')[0]} ({len(ids_)} tests, {secs:.1f}s) {tail}",
+                      flush=True)
+                if rc != 0:
+                    failed.append(ids_[0])
+                    print(out, flush=True)
+        finally:
+            ex.shutdown(wait=False, cancel_futures=True)
+            stop_live()
     slow = sorted(measured.items(), key=lambda kv: -kv[1])[:a.durations]
     if slow:
         print("slowest tests:")
