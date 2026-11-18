@@ -58,6 +58,7 @@ from . import proposals as proposals_mod
 from . import credreq as credreq_mod
 from . import sudomode as sudo_mod
 from . import autorules as autorules_mod
+from . import credlinks as credlinks_mod
 from . import uirules as uirules_mod
 from . import clients as clients_mod
 from . import clock as clock_mod
@@ -598,6 +599,11 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
                 self.log("dest_guard_config_error", error="allowed host removed: not an allowed destination",
                          secret=name, host=h[:100])
         entry["allowed_hosts"] = keep
+
+    def linkable_names(self):
+        """The credential names a page may link to: everything in the catalog right now."""
+        with self._cfg_lock:
+            return frozenset(self.cfg["secrets"])
 
     def refresh_catalog(self, fresh=False, _retries=2):
         """Rebuild the secret catalog from the vault's items. Raises if the vault
@@ -7338,6 +7344,7 @@ def approval_handler(broker):
             user = self._user()
             if user is None:
                 return
+            credlinks_mod.use(broker.linkable_names())      # names this page may link to (the catalog now)
             u = urllib.parse.urlsplit(self.path)
             if u.path == "/sw.js" and broker.push is not None:
                 return self._service_worker()
@@ -7554,6 +7561,7 @@ def approval_handler(broker):
             user = self._user()
             if user is None:
                 return
+            credlinks_mod.use(broker.linkable_names())
             if self.path.split("?")[0].rstrip("/") == "/push/event":
                 return self._client_event(user)
             if self.path.split("?")[0].rstrip("/") == "/presence":
