@@ -4764,12 +4764,16 @@ _SESSION_JS = r'''
     try{sessionStorage.setItem('asb_auto_reload',String(now));}catch(e){return false;}
     reload();return true;}
   A.auto=auto;
+  // The user asked to see the page now (tapped a notification): sign in again at once, no one-a-minute limit
+  A.reload=reload;
   if(btn)btn.addEventListener('click',function(){location.assign('/');});
   if(rl){if(A.standalone())rl.hidden=false;rl.addEventListener('click',reload);}
   document.addEventListener('visibilitychange',function(){
     if(document.hidden){hiddenAt=Date.now();return;}
     var gap=hiddenAt?Date.now()-hiddenAt:0;hiddenAt=null;
-    if(gap<LONG||A.out)return;
+    // already signed out (the polls stopped): coming back to the tab starts the sign-in, whatever the absence
+    if(A.out){if(cfg.get!==false&&!A.busy())auto();return;}
+    if(gap<LONG)return;
     A.probe().then(function(bad){
       if(!bad)return;
       if(cfg.get!==false&&!A.busy()&&auto())return;
@@ -5123,7 +5127,10 @@ _DASH_JS = r'''
     if(!document.hidden)poll();});
   if('serviceWorker' in navigator)navigator.serviceWorker.addEventListener('message',function(m){
     if(m.data&&m.data.type&&m.data.type!=='version'&&m.data.type!=='diaglog')report('sw_message',{note:String(m.data.type),v:String(m.data.v||'')},2000);
-    if(m.data&&m.data.type==='poll'){report('poll_requested',{},2000);poll();}
+    if(m.data&&m.data.type==='poll'){report('poll_requested',{},2000);
+      // A notification tap means "show me this request". A tab whose SSO session ended (or ends now, as
+      // this poll finds out) signs in again at once instead of showing a banner.
+      Promise.resolve(poll()).then(function(){if(A.out&&A.reload)A.reload();});}
     if(m.data&&m.data.type==='diag')why('Service worker v'+m.data.v+': '+m.data.what+' at '
       +new Date().toLocaleTimeString()+'.');});
 })();

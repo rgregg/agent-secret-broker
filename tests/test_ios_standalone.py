@@ -440,3 +440,64 @@ out.reloads=state.reloads;out.assigns=state.assigns;
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StaleTabRecovery(NodeBase):
+    """A tab left open past the SSO session: returning to it, or tapping a notification, signs in again
+    instead of leaving a dead page with a button."""
+    SW = """
+const swl={};sb.navigator.serviceWorker={addEventListener(t,f){swl[t]=f;},removeEventListener(){},
+  getRegistration(){return Promise.resolve(null);},controller:null};
+sb.ASB_PAGE={get:state.get};run('session');const sessVis=L.visibilitychange;run('dash');await tick();
+const poll=()=>state.timers.find(t=>t.ms===3000).f();
+const login=()=>{routes['/?fragment=1']=()=>resp({type:'opaqueredirect',status:0});};
+const click=async()=>{swl.message({data:{type:'poll'}});await tick();};
+"""
+
+    def test_notification_click_on_a_tab_already_signed_out_reloads(self):
+        o = self.js(self.SW + """
+login();poll();await tick();
+out.markedOut=sb.asbAuth.out;out.before=state.reloads;
+await click();
+out.reloads=state.reloads;
+""")
+        self.assertTrue(o["markedOut"], o)            # premise: the page really is signed out
+        self.assertEqual(o["before"], 0)
+        self.assertEqual(o["reloads"], 1)
+
+    def test_notification_click_finds_the_session_expired_and_reloads(self):
+        o = self.js(self.SW + """
+login();                                              // expired, but no poll has noticed yet
+out.before=sb.asbAuth.out;
+await click();
+out.reloads=state.reloads;out.out=sb.asbAuth.out;
+""")
+        self.assertFalse(o["before"], o)              # premise: not yet marked
+        self.assertTrue(o["out"], o)                  # the click's own poll saw the redirect
+        self.assertEqual(o["reloads"], 1)
+
+    def test_notification_click_with_a_live_session_does_not_reload(self):
+        o = self.js(self.SW + """
+await click();
+out.reloads=state.reloads;out.out=sb.asbAuth.out;out.polled=state.fetches.filter(u=>u==='/?fragment=1').length;
+""")
+        self.assertEqual((o["reloads"], o["out"]), (0, False))
+        self.assertGreaterEqual(o["polled"], 1)       # positive control: the click did poll
+
+    def test_returning_to_a_signed_out_tab_after_a_short_absence_reloads(self):
+        o = self.js(self.SW + """
+login();poll();await tick();
+state.hidden=true;sessVis();clock.t+=10000;state.hidden=false;sessVis();await tick();
+out.markedOut=sb.asbAuth.out;out.reloads=state.reloads;
+""")
+        self.assertTrue(o["markedOut"], o)
+        self.assertEqual(o["reloads"], 1)
+
+    def test_signed_out_tab_with_a_menu_open_is_not_reloaded_on_return(self):
+        o = self.js(self.SW + """
+login();poll();await tick();state.open=true;
+state.hidden=true;sessVis();clock.t+=10000;state.hidden=false;sessVis();await tick();
+out.markedOut=sb.asbAuth.out;out.reloads=state.reloads;
+""")
+        self.assertTrue(o["markedOut"], o)
+        self.assertEqual(o["reloads"], 0)
