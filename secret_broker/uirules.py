@@ -10,6 +10,7 @@ same trust level as `approval` and the SSH host rules. An agent can neither crea
 Nothing typed into the form is ever echoed into a message, an event or a log line: refusals are one of a closed set
 of reasons and the page names at most a field, taken from this module's own list.
 """
+import html
 import re
 import secrets
 import threading
@@ -197,3 +198,127 @@ class UiRulesMixin:
                 self.auto_rule_usage.forget(name, r["id"])
                 self.log("auto_rule_expired", credential=name, rule_id=r["id"], rule_name=r["name"],
                          expires_at=r["expires_at"], created_by=r["by"])
+
+
+# ---------------------------------------------------------------- Policies page
+METHODS = ("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS")
+CSS = """
+.arules .mono{font-family:ui-monospace,monospace;font-size:.82rem;word-break:break-all}
+.arules form.add{margin-top:.8rem;display:grid;gap:.5rem;max-width:34rem}
+.arules fieldset{border:1px solid var(--line,#8884);border-radius:.5rem;padding:.5rem .7rem}
+.arules .meth label{display:inline-block;margin-right:.8rem}
+.arules .err{border:1px solid var(--bad);background:var(--badbg);color:var(--bad);border-radius:.5rem;padding:.5rem .7rem;margin:.5rem 0}
+"""
+
+
+def _client_label(ids, names, active):
+    if not ids:
+        return "any client"
+    out = []
+    for cid in sorted(ids):
+        nm = names.get(cid)
+        out.append(f"{nm} (revoked)" if nm and cid not in active else nm or f"{cid} (removed)")
+    return ", ".join(out)
+
+
+def _matches(rule):
+    if rule["mode"] == "env":
+        return "run: " + " ".join(rule["argv"])
+    return f"{rule['scheme']}://{rule['host']}{rule['path_prefix']} ({', '.join(sorted(rule['methods']))})"
+
+
+def _when(t):
+    try:
+        return sshrules.iso(t) if isinstance(t, (int, float)) else ""
+    except (OverflowError, ValueError, OSError):
+        return ""
+
+
+def policies_section(secrets_cfg, config_rules, csrf, usage, now=None, state=None, client_names=None,
+                     client_choices=()):
+    """'Auto-approve rules' for the Policies tab: per credential a table of the rules that can approve its
+    requests (stored ones with Revoke, config ones read-only) and an 'Add rule' form. `state` maps a credential
+    name to {"error", "open"}. Everything shown is escaped; nothing from a failed add is echoed back."""
+    e = html.escape
+    now = time.time() if now is None else now
+    state = state or {}
+    names = client_names or {}
+    active = {cid for cid, _ in client_choices}
+    choices = [(cid, nm) for cid, nm in client_choices if cid != clients_mod.LEGACY_ID]
+    cards = []
+    for i, (name, sc) in enumerate(sorted(secrets_cfg.items())):
+        if sc.get("ssh"):
+            continue
+        stored = sc.get("auto_rules") or []
+        cfg_rules = [r for r in config_rules if name in r["secrets"]]
+        if not (stored or cfg_rules or sc.get("allowed_hosts") or name in state):
+            continue
+        st = state.get(name) or {}
+        rows = []
+        for r in cfg_rules:
+            rows.append(
+                f"<tr><td data-label=Name>{e(r['name'])}</td><td data-label=Mode>{e(r['mode'])}</td>"
+                f"<td data-label=Matches><span class=mono>{e(_matches(r))}</span></td>"
+                f"<td data-label=Client>{e(_client_label(r['clients'], names, active))}</td>"
+                "<td data-label=Source>config</td><td data-label=Created>-</td><td data-label=Expires>never</td>"
+                "<td data-label='Last used'>-</td><td><small class=muted>edit the configuration</small></td></tr>")
+        for r in stored:
+            u = usage.get(name, r["id"])
+            expired = autorules.is_expired(r, now)
+            exp = (e(r["expires_at"]) + (" <b>(expired)</b>" if expired else "")) if r["expires_at"] else "never"
+            rows.append(
+                f"<tr><td data-label=Name>{e(r['name'])}</td><td data-label=Mode>{e(r['mode'])}</td>"
+                f"<td data-label=Matches><span class=mono>{e(_matches(r))}</span></td>"
+                f"<td data-label=Client>{e(_client_label(r['clients'], names, active))}</td>"
+                "<td data-label=Source>UI</td>"
+                f"<td data-label=Created>{e(r['by'])}<br><small class=muted>{e(r['at'])}</small></td>"
+                f"<td data-label=Expires>{exp}</td>"
+                f"<td data-label='Last used'>{e(_when(u['last_used']) or 'never')}"
+                f"<br><small class=muted>{int(u['uses'])} uses</small></td>"
+                "<td><form method=post action='/policies/auto_rules/revoke' class=inline>"
+                f"<input type=hidden name=csrf value='{e(csrf, quote=True)}'>"
+                f"<input type=hidden name=secret value='{e(name, quote=True)}'>"
+                f"<input type=hidden name=rule value='{e(r['id'], quote=True)}'>"
+                "<button>Revoke</button></form></td></tr>")
+        table = ("<table class=tbl><thead><tr><th>Name</th><th>Mode</th><th>Matches</th><th>Client</th>"
+                 "<th>Source</th><th>Created</th><th>Expires</th><th>Last used</th><th></th></tr></thead><tbody>"
+                 + "".join(rows) + "</tbody></table>") if rows else "<div class='card empty'>No rules</div>"
+        err = f"<div class=err role=alert>{e(st['error'])}</div>" if st.get("error") else ""
+        meth = "".join(f"<label><input type=checkbox name=methods value='{m}'"
+                       f"{' checked' if m in ('GET', 'HEAD') else ''}> {m}</label>" for m in METHODS)
+        opts = "<option value='*' selected>Any enrolled client</option>" + "".join(
+            f"<option value='{e(cid, quote=True)}'>Only {e(cn)}</option>" for cid, cn in choices)
+        cards.append(
+            f"<details class='card gbox arules'{' open' if st.get('open') else ''}><summary><b>{e(name)}</b> "
+            f"<small class=muted>{len(stored)} of {autorules.MAX_STORED} stored</small></summary>{err}{table}"
+            "<form method=post action='/policies/auto_rules/add' class=add>"
+            f"<input type=hidden name=csrf value='{e(csrf, quote=True)}'>"
+            f"<input type=hidden name=secret value='{e(name, quote=True)}'>"
+            f"<b>Add rule</b><label for='arn{i}'>Name (shown in the audit log)</label>"
+            f"<input id='arn{i}' name=name maxlength={autorules.MAX_NAME} autocomplete=off>"
+            f"<label for='arm{i}'>Kind</label><select id='arm{i}' name=mode>"
+            "<option value=http selected>Web request (http)</option><option value=env>Run with secret (env)</option>"
+            "</select>"
+            f"<fieldset><legend>Web request</legend><label for='arh{i}'>Host (no scheme or port)</label>"
+            f"<input id='arh{i}' name=host autocomplete=off placeholder='api.example.com'>"
+            f"<label for='ars{i}'>Scheme</label><select id='ars{i}' name=scheme>"
+            "<option value=https selected>https</option><option value=http>http</option></select>"
+            f"<div class=meth><span>Methods</span> {meth}</div>"
+            f"<label for='arp{i}'>Path prefix</label>"
+            f"<input id='arp{i}' name=path_prefix autocomplete=off placeholder='/ (everything under the host)'>"
+            "</fieldset>"
+            f"<fieldset><legend>Run with secret</legend><label for='ara{i}'>Exact command, one word per line</label>"
+            f"<textarea id='ara{i}' name=argv rows=3 autocomplete=off></textarea></fieldset>"
+            f"<label for='arc{i}'>Applies to</label><select id='arc{i}' name=client>{opts}</select>"
+            f"<label for='are{i}'>Expires</label><select id='are{i}' name=expires>"
+            "<option value=never selected>Never expires (default)</option><option value=30>30 days</option>"
+            "<option value=90>90 days</option></select>"
+            "<label class=chk><input type=checkbox name=confirm value=1> <span>I understand matching requests "
+            "will be released with no approval, at any risk level</span></label>"
+            "<div class=grow><button>Add rule</button></div></form></details>")
+    if not cards:
+        return ""
+    head = ("<h3>Auto-approve rules</h3><p><small class=muted>A request that matches is released without asking, "
+            "at any risk level. Each rule belongs to one credential and names exactly what it covers. Never shown "
+            "to agents.</small></p>")
+    return f"<style>{CSS}</style>" + head + "".join(cards)

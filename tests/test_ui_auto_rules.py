@@ -11,6 +11,9 @@ import os
 import sys
 import time
 import unittest
+import urllib.error
+import urllib.parse
+import urllib.request
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import test_e2e as t  # noqa: E402
@@ -344,8 +347,8 @@ class Loading(unittest.TestCase):
         self.assertEqual(b._catalog_stats["invalid"], 1)
 
 
-class Manage(Enrolled, tg.Base):
-    """Adding, revoking and expiring stored rules through the Broker methods the Policies tab calls."""
+class ManageBase(Enrolled, tg.Base):
+    """Helpers for tests that add, revoke and expire stored rules (no tests of its own: subclasses add them)."""
     risk = "high"
 
     def tweak(self, cfg):
@@ -379,6 +382,10 @@ class Manage(Enrolled, tg.Base):
     def seed(self, *raw, name="svc"):
         """Rules already in the vault (as an earlier session left them)."""
         self.broker._persist_auto_rules(name, autorules.parse_stored(list(raw), name), "seed")
+
+
+class Manage(ManageBase):
+    """Adding, revoking and expiring stored rules through the Broker methods the Policies tab calls."""
 
     # -- add
     def test_add_http_rule_persists_is_live_and_approves(self):
@@ -560,6 +567,179 @@ class Manage(Enrolled, tg.Base):
         self.broker.prune_auto_rule_usage()
         self.assertEqual(self.broker.auto_rule_usage.get("svc", "keep01")["uses"], 1)
         self.assertEqual(self.broker.auto_rule_usage.get("svc", "gone01")["uses"], 0)
+
+
+class PoliciesTab(ManageBase):
+    """The Policies page section and its two POST endpoints."""
+    H = {"X-authentik-username": "alice"}
+    ADD = "/policies/auto_rules/add"
+    REVOKE = "/policies/auto_rules/revoke"
+
+    def post(self, path, user="alice", csrf=True, base=None, **form):
+        if csrf is True:
+            form["csrf"] = self.broker.csrf_token("alice")
+        elif isinstance(csrf, str):
+            form["csrf"] = csrf
+        form.setdefault("secret", "svc")
+        try:
+            r = urllib.request.urlopen(urllib.request.Request(
+                (base or self.abase) + path, data=urllib.parse.urlencode(form, doseq=True).encode(),
+                headers={"X-authentik-username": user}, method="POST"), timeout=10)
+            return r.status, r.read().decode()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode()
+
+    def form(self, **over):
+        return {**{k: v for k, v in self.FIELDS.items() if k != "argv"}, "argv": "", "expires": "never",
+                "confirm": "1", **over}
+
+    def page(self):
+        return t.req(self.abase + "/policies", headers=self.H)[1]
+
+    def section(self):
+        page = self.page()
+        self.assertIn("Auto-approve rules", page)
+        return page.split("Auto-approve rules")[1]
+
+    def test_listing_shows_stored_and_config_rules(self):
+        self.seed(http_rule(id="ui001", name="stored one", expires_at=FUTURE, by="carol"))
+        self.broker.auto_rules = autorules.parse([{"name": "from config", "mode": "http", "secret": "svc",
+                                                   "host": "cfg.example.com"}])
+        sec = self.section()
+        for text in ("stored one", "api.example.com", "GET, POST", "/v1", "carol", "any client", "from config",
+                     "cfg.example.com"):
+            self.assertIn(text, sec)
+        self.assertEqual(sec.count(f"action='{self.REVOKE}'"), 1)                    # only the stored rule can be revoked
+        self.assertIn("config", sec)
+        self.assertIn("never", sec)
+
+    def test_add_and_revoke_through_the_page(self):
+        code, body = self.post(self.ADD, **self.form())
+        self.assertEqual(code, 200, body)
+        self.assertIn("Auto-approve rule added", body)
+        self.assertEqual([r["name"] for r in self.stored()], ["news"])
+        self.assertIn("news", self.section())
+        rid = self.live()[0]["id"]
+        code, body = self.post(self.REVOKE, rule=rid)
+        self.assertEqual(code, 200, body)
+        self.assertIn("Auto-approve rule revoked", body)
+        self.assertEqual(self.stored(), [])
+        self.assertIn("no longer exists", self.post(self.REVOKE, rule=rid)[1])
+
+    def test_an_env_rule_takes_one_word_per_line(self):
+        code, _ = self.post(self.ADD, **self.form(name="greet", mode="env", argv="echo\r\n\r\nhi there\n"))
+        self.assertEqual(code, 200)
+        self.assertEqual(self.stored()[0]["argv"], ["echo", "hi there"])
+
+    def test_each_refusal_is_400_with_a_fixed_text_and_no_write(self):
+        self.assertEqual(self.post(self.ADD, **self.form(name="first"))[0], 200)       # control: the form works
+        cases = {"not confirmed": (dict(confirm=""), "Tick the box"),
+                 "bad expiry": (dict(expires="7"), "Not a valid value for expires_at"),
+                 "unknown client": (dict(client="c-deadbeef"), "Not a valid value for clients"),
+                 "bad mode": (dict(mode="ssh_sign"), "Not a valid value for mode"),
+                 "lowercase method": (dict(methods=["get"]), "Not a valid value for methods"),
+                 "no method": (dict(methods=[]), "Not a valid value for methods"),
+                 "duplicate": (dict(name="First"), "already has a rule with that name")}
+        before = self.stored()
+        for label, (over, text) in cases.items():
+            code, body = self.post(self.ADD, **self.form(**over))
+            self.assertEqual(code, 400, label)
+            self.assertIn(text, body, label)
+            self.assertEqual(self.stored(), before, label)
+
+    def test_unknown_and_ssh_credentials_are_400(self):
+        for cred in ("nope", "deploy"):
+            self.assertEqual(self.post(self.ADD, secret=cred, **self.form())[0], 400, cred)
+            self.assertEqual(self.post(self.REVOKE, secret=cred, rule="abcd1234")[0], 400, cred)
+        self.assertEqual(self.stored(), [])
+
+    def test_a_write_failure_is_500_and_nothing_is_active(self):
+        def boom(*a):
+            raise OSError("disk")
+        self.broker.backend.set_meta = boom
+        code, body = self.post(self.ADD, **self.form())
+        self.assertEqual(code, 500)
+        self.assertIn("Could not save the rule", body)
+        self.assertEqual(self.live(), [])
+
+    def test_the_legacy_client_is_not_offered_but_an_enrolled_one_is(self):
+        sec = self.section()
+        self.assertIn(f"value='{self.client.id}'", sec)                                # control
+        self.assertNotIn("value='legacy'", sec)
+        self.assertEqual(self.post(self.ADD, **self.form(client="legacy"))[0], 400)
+
+    def test_a_pinned_client_shows_its_name_and_a_revoked_one_says_so(self):
+        gone = self.mk("gone-box")
+        self.seed(http_rule(id="a0001", name="mine", clients=[self.client.id]),
+                  http_rule(id="a0002", name="theirs", clients=[gone.id]))
+        self.assertIn("data-label=Client>box<", self.section())                          # the table cell, not the form option
+        self.broker.revoke_client(gone.id, "alice")
+        self.assertIn("gone-box (revoked)", self.section())
+
+    def test_an_expired_row_is_marked(self):
+        self.seed(http_rule(id="o0001", name="old", expires_at=PAST))
+        self.assertIn("(expired)", self.section())
+
+    def test_guards_csrf_origin_identity_and_peer(self):
+        self.seed(http_rule(id="g0001", name="guarded"))
+        before = self.stored()
+        forms = {self.REVOKE: dict(rule="g0001"), self.ADD: self.form(name="evil")}
+        for path, form in forms.items():
+            self.assertEqual(self.post(path, csrf=False, **form)[0], 403, path)
+            self.assertEqual(self.post(path, csrf="bad", **form)[0], 403, path)
+            self.assertEqual(self.post(path, user="mallory", **form)[0], 403, path)
+            r = urllib.request.Request(
+                self.abase + path, method="POST",
+                headers={"X-authentik-username": "alice", "Origin": "https://evil.example"},
+                data=urllib.parse.urlencode({"secret": "svc", "csrf": self.broker.csrf_token("alice"), **form},
+                                            doseq=True).encode())
+            with self.assertRaises(urllib.error.HTTPError) as cm:
+                urllib.request.urlopen(r, timeout=10)
+            self.assertEqual(cm.exception.code, 403, path)
+            self.broker.cfg["approval_trusted_peers"] = ["10.9.9.0/24"]
+            self.assertEqual(self.post(path, **form)[0], 403, path)
+            del self.broker.cfg["approval_trusted_peers"]
+        self.assertEqual(self.stored(), before)
+        self.assertEqual(self.post(self.ADD, **self.form(name="fine"))[0], 200)          # control: the guards let a good POST in
+
+    def test_an_agent_key_cannot_reach_the_endpoints(self):
+        for path, form in ((self.ADD, self.form()), (self.REVOKE, dict(rule="x"))):
+            req = urllib.request.Request(
+                self.base + path, method="POST", headers={"X-Client-Key": self.client.secret},
+                data=urllib.parse.urlencode({"secret": "svc", "csrf": self.broker.csrf_token("alice"), **form},
+                                            doseq=True).encode())
+            try:
+                code = urllib.request.urlopen(req, timeout=10).status
+            except urllib.error.HTTPError as e:
+                code = e.code
+            self.assertIn(code, (403, 404, 405), path)
+        self.assertEqual(self.stored(), [])
+        self.assertEqual(self.post(self.ADD, **self.form())[0], 200)                    # control: the approver can
+
+    def test_hostile_values_are_escaped_even_from_the_vault(self):
+        evil = "<img/src=x/onerror=alert(1)>"
+        self.seed(http_rule(id="h0001", name=evil, by="<b>bob</b>"),
+                  env_rule(id="h0002", name="e", argv=["<script>x</script>", "a'\"b"]))
+        page = self.page()
+        for raw in ("<img/src", "<script>x", "<b>bob"):
+            self.assertNotIn(raw, page)
+        self.assertIn("&lt;img/src=x/onerror=alert(1)&gt;", page)
+        self.assertIn("&lt;script&gt;x&lt;/script&gt;", page)
+
+    def test_form_values_never_reach_the_audit_log_the_agent_or_the_page(self):
+        canary = "S3CR3T-canary"
+        code, body = self.post(self.ADD, **self.form(name=canary, mode="env", argv=f"{canary}\n" * 65,
+                                                     path_prefix=canary))
+        self.assertEqual(code, 400)
+        self.assertIn("Not a valid value for argv", body)                                # the refusal reached the page
+        self.assertNotIn(canary, body)
+        self.assertEqual(self.events("auto_rule_refused")[-1]["reason"], "invalid")
+        with open(self.audit) as f:
+            self.assertNotIn(canary, f.read())
+        code, agent = self.api("GET", "/v1/audit")
+        self.assertEqual(code, 200)
+        self.assertNotIn(canary, agent)
+        self.assertNotIn("auto_rule_refused", agent)
 
 
 if __name__ == "__main__":

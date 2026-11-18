@@ -7054,14 +7054,18 @@ def approval_handler(broker):
             parts = self.path.split("?")[0].strip("/").split("/")
             return parts[1] if len(parts) == 2 and parts[0] == "a" else None
 
-        def _policies_page(self, user, note="", status=200, ssh_state=None, rule_state=None):
+        def _policies_page(self, user, note="", status=200, ssh_state=None, rule_state=None, auto_state=None):
             _page(self, status, f"<h1>Policies</h1>{note}{self._standing_section(user)}"
                   + guidance_mod.policies_section(cfg["secrets"], self._tok(user))
                   + sshhosts_mod.policies_section(cfg["secrets"], self._tok(user), ssh_state)
                   + sshrules_mod.policies_section(cfg["secrets"], self._tok(user),
                                                   broker.ssh_rule_usage, state=rule_state,
                                                   client_names=broker.clients.names(),
-                                                  client_choices=broker.clients.active_choices()),
+                                                  client_choices=broker.clients.active_choices())
+                  + uirules_mod.policies_section(cfg["secrets"], broker.auto_rules, self._tok(user),
+                                                 broker.auto_rule_usage, state=auto_state,
+                                                 client_names=broker.clients.names(),
+                                                 client_choices=broker.clients.active_choices()),
                   script=_GRANTS_JS + guidance_mod.JS + sshhosts_mod.JS, tab="policies", badge=broker.attention(), user=user)
 
         def _credentials_page(self, user, note="", status=200, q=""):
@@ -7513,7 +7517,8 @@ def approval_handler(broker):
             link = path.startswith("/a/") and not broker.dest_guard.allow_loopback   # the notification link page
             if (link or cred_edit or path in ("/decide", "/credential", "/request/retry", "/policies", "/policies/guidance", "/policies/ssh_hosts", "/grants/revoke",
                         "/enroll/decide", "/clients/rename", "/clients/revoke", "/clients/remove", "/sessions/revoke",
-                        "/policies/ssh_rules/add", "/policies/ssh_rules/revoke", "/push/subscribe",
+                        "/policies/ssh_rules/add", "/policies/ssh_rules/revoke", "/policies/auto_rules/add",
+                        "/policies/auto_rules/revoke", "/push/subscribe",
                         "/push/revoke", "/push/test", "/plans/decide", "/plans/revoke")) and not (
                     self._csrf_ok(user, form.get("csrf", [""])[0]) and (not link or bool(self.headers.get("Origin")))):
                 broker.log("csrf_refused", path=path, peer=self._ip,
@@ -7597,6 +7602,34 @@ def approval_handler(broker):
                     user, f"<p>Could not add the SSH rule: {html.escape(name)}</p>",
                     status=400 if res["status"] == "refused" else 500,
                     rule_state={name: {"open": True, "error": res["message"]}})
+            if path == "/policies/auto_rules/revoke":
+                name, rid = form.get("secret", [""])[0], form.get("rule", [""])[0][:16]
+                if name not in cfg["secrets"] or cfg["secrets"][name].get("ssh"):
+                    return _page(self, 400, "<h1>Bad request</h1>")
+                res = broker.revoke_auto_rule(name, rid, user, self._ip, self._fwd())
+                msg = {"revoked": "Auto-approve rule revoked", "missing": "That rule no longer exists",
+                       "failed": "Could not revoke the rule"}[res]
+                return self._policies_page(user, f"<p>{msg}: {html.escape(name)}</p>",
+                                           status=500 if res == "failed" else 200,
+                                           auto_state={name: {"open": True}})
+            if path == "/policies/auto_rules/add":
+                name = form.get("secret", [""])[0]
+                if name not in cfg["secrets"] or cfg["secrets"][name].get("ssh"):
+                    return _page(self, 400, "<h1>Bad request</h1>")
+                one = lambda k: form.get(k, [""])[0]  # noqa: E731
+                fields = dict(name=one("name"), mode=one("mode"), host=one("host"), scheme=one("scheme"),
+                              methods=form.get("methods", []), path_prefix=one("path_prefix"),
+                              argv=[w.strip() for w in one("argv").splitlines() if w.strip()],
+                              client=one("client") or clients_mod.ANY)
+                res = broker.add_auto_rule(name, fields, one("expires"), one("confirm") == "1", user,
+                                           self._ip, self._fwd())
+                if res["status"] == "created":
+                    return self._policies_page(user, f"<p>Auto-approve rule added: {html.escape(name)}</p>",
+                                               auto_state={name: {"open": True}})
+                return self._policies_page(
+                    user, f"<p>Could not add the rule: {html.escape(name)}</p>",
+                    status=400 if res["status"] == "refused" else 500,
+                    auto_state={name: {"open": True, "error": res["message"]}})
             if path == "/policies/ssh_hosts":
                 name = form.get("secret", [""])[0]
                 if name not in cfg["secrets"]:
