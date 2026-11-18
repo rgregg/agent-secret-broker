@@ -1581,10 +1581,11 @@ class AlwaysAllow(Harness):
 
     def test_policies_page_can_only_tighten(self):
         self.assertTrue(self.broker.set_approval("svc", "allow", "alice"))
-        status, body = req(self.abase + "/policies", headers={"X-authentik-username": "alice"})
+        status, body = req(self.abase + "/credentials/svc?tab=policies", headers={"X-authentik-username": "alice"})
         self.assertEqual(status, 200)
-        self.assertIn("Revoke", body)
+        self.assertIn("approval: allow", body)                  # shown read-only here: it is changed under Settings
         self.assertNotIn("Nothing is always allowed", body)
+        self.assertNotIn("name=approval value=prompt>Revoke", body)
         # granting is refused here
         tok = self.broker.csrf_token("alice")
         self.assertEqual(self.post("/policies", name="svc", approval="allow", csrf=tok)[0], 400)

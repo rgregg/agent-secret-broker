@@ -53,6 +53,7 @@ from . import placeholders as placeholders_mod
 from . import httpcheck
 from . import masking
 from . import clients as clients_mod
+from . import credlinks
 from . import clock as clock_mod
 from . import credreq as credreq_mod
 from . import guidance as guidance_mod
@@ -946,7 +947,7 @@ def describe_html(req):
     meth = ", ".join(sp["methods"])
     if extra:
         meth += (f" <span class='pill warn'>changes things: {e(', '.join(extra))}</span>")
-    what = (f"<b>HTTP session</b> with credential <b>{e(req.names[0])}</b><br>"
+    what = (f"<b>HTTP session</b> with credential <b>{credlinks.link(req.names[0])}</b><br>"
             f"Purpose, as the agent put it (unverified):<div class=crpurpose>{credreq_mod._esc(sp['purpose'])}</div>{flag}"
             f"Hosts and ports: {e('; '.join(host_label(h) for h in sp['hosts']))}<br>Methods: {meth}<br>"
             f"Time limit: {e(_fmt_ttl(sp['ttl_s']))} from the moment you approve (fixed, never extended)<br>"

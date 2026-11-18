@@ -65,9 +65,8 @@ Then:
 ## The web app
 
 `https://<your approval site>/` has these tabs: **Requests** (what is waiting, and
-recent history), **Policies** (active plans and standing approvals, each with Revoke, plus the auto-approve rules you can add and revoke),
-**Credentials** (edit a credential's hosts, TLS pin and approval mode, and show, replace or add its values,
-without opening the vault), and
+recent history), **Policies** (only policies that cover several credentials, each with Revoke),
+**Credentials** (open a credential to edit its hosts, TLS pin and approval mode and its values on **Settings**, and on **Policies** its standing approvals, auto-approve rules, risk guidance and SSH host policy and rules, without opening the vault), and
 **Settings** (browser and push notifications). It follows your system light or
 dark setting and works on small screens.
 

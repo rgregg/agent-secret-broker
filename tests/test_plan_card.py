@@ -371,6 +371,7 @@ class Pages(CardBase):
         self.call(pid, body=self.ok_note())
         st, h, _ = self.get("/clients")
         self.assertEqual(st, 200)
+        h = _fast.unlink_names(h)
         for frag in ("Active plans", TASK_CANARY, "build-box", "ledger, svc", "1 / 10", "active",
                      "action='/plans/revoke'", f"value='{pid}'", self.broker.csrf_token("alice"), "Revoke"):
             self.assertIn(frag, h, frag)
@@ -380,7 +381,7 @@ class Pages(CardBase):
 
     def test_the_clients_tab_lists_the_clients_active_plans(self):
         self.approve()
-        h = self.get("/clients")[1]
+        h = _fast.unlink_names(self.get("/clients")[1])
         self.assertIn("plan: ledger, svc", h)
         self.assertIn("calls used", h)
 
@@ -417,7 +418,7 @@ class Pages(CardBase):
     def test_a_pending_plan_shows_on_the_dashboard_and_counts_as_attention(self):
         self.submit()
         self.assertEqual(self.broker.attention(), 1)
-        self.assertIn("Plan: ledger, svc", self.get("/")[1])
+        self.assertIn("Plan: ledger, svc", _fast.unlink_names(self.get("/")[1]))
 
 
 class Audit(PBase):

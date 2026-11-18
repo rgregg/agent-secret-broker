@@ -204,18 +204,18 @@ class AlwaysScope(Base):
 class ChipText(Base):
     def test_confirm_text_per_mode_and_scope(self):
         rid = self.http(method="GET")
-        page = self.card(rid)
+        page = _fast.unlink_names(self.card(rid))
         self.assertIn("Always approve reads-only requests for svc? The secret will be used for "
                       "matching requests without asking again when the request is rated low or lower.", page)
         self.assertIn("value=approve_always", page)
         self.assertIn(">5 min<", page)
         self.assertIn(">30 min<", page)
         rid = self.http(method="POST", path="/p")
-        self.assertIn("Always approve any-method requests for svc?", self.card(rid))
+        self.assertIn("Always approve any-method requests for svc?", _fast.unlink_names(self.card(rid)))
         rid = self.env()
         self.assertIn("Always approve run-with-secret requests for svc? The secret value will be "
                       "released to the requesting machine without asking again when the request is "
-                      "rated low or lower.", self.card(rid))
+                      "rated low or lower.", _fast.unlink_names(self.card(rid)))
 
     def test_chip_not_offered_for_several_secrets_or_invisible_scripts(self):
         rid = self.http(("svc", "other"))
@@ -572,7 +572,7 @@ class AutoModes(Base):
         self.assertEqual(self.pushes(), n + 1)
         sk = self.events("grant_skipped")[-1]
         self.assertEqual((sk["kind"], sk["reason"]), ("always", "auto_modes"))
-        self.assertIn("not active: mode not enabled", req_text(self, "/policies"))
+        self.assertIn("not active: mode not enabled", req_text(self, "/credentials/svc?tab=policies"))
 
     def test_global_risk_auto_modes(self):
         self.always_it(mode="env")
@@ -597,18 +597,22 @@ class AutoModes(Base):
 
 class Pages(Base):
     def test_empty_state_and_single_section(self):
-        pol = req_text(self, "/policies")
-        self.assertIn("Standing approvals", pol)
+        pol = req_text(self, "/credentials/svc?tab=policies")
+        self.assertIn("<h3>Standing approvals (0)", pol)
         self.assertIn("No standing approvals", pol)
         self.assertNotIn("Active grants", pol)
         self.assertNotIn("Always allowed", pol)
-        self.assertEqual(pol.count("<h3 style='margin-top:0'>"), 1)
+        self.assertEqual(pol.count("<h3>Standing approvals"), 1)
+        tab = req_text(self, "/policies")                      # nothing spans credentials either
+        self.assertIn("No policy covers more than one credential.", tab)
+        self.assertNotIn("Standing approvals", tab)
 
     def test_table_buttons_never_wrap_letter_by_letter(self):
         # the Revoke button in a narrow last column used to stack its letters vertically
+        self.assertIn(".tbl td button{white-space:nowrap}", req_text(self, "/credentials/svc?tab=policies"))
         self.assertIn(".tbl td button{white-space:nowrap}", req_text(self, "/policies"))
 
-    def test_one_table_for_all_three_kinds_with_escaping(self):
+    def test_each_kind_on_its_credentials_page_with_escaping(self):
         self.always_it("GET")
         evil = "<script>x</script>"
         self.broker._persist_standing(
@@ -617,19 +621,26 @@ class Pages(Base):
                                        "created_at": "2026-10-19T12:00:00Z"}], evil)
         self.broker.grants.add(["other"], 15, "any", evil, "dashboard", "r", mode="http")
         self.broker.set_approval("other", "allow", evil)
-        pol = req_text(self, "/policies")
-        self.assertNotIn("<script>x", pol)
-        self.assertIn("&lt;script&gt;x&lt;/script&gt;", pol)
-        self.assertIn("<td data-label=Covers>web reads only</td>", pol)
-        self.assertIn("<td data-label=Covers>run-with-secret</td>", pol)
-        self.assertIn("<td data-label=Covers>web any method</td>", pol)
-        self.assertIn("whole credential, any method, any covered mode (web, run-with-secret)", pol)
-        self.assertEqual(pol.count("<td data-label=Expires>never</td>"), 3)
-        self.assertRegex(pol, r"<td data-label=Expires><time data-gexp='\d+'>in 15 min</time></td>")
-        self.assertEqual(pol.count(">Revoke</button>"), 4)
-        self.assertEqual(pol.count("action='/grants/revoke'"), 3)
-        self.assertIn("name=approval value=prompt>Revoke", pol)
-        self.assertIn("<th>Secrets</th><th>Covers</th><th>Expires</th><th>Created by</th>", pol)
+        svc = req_text(self, "/credentials/svc?tab=policies")           # two Always entries
+        other = req_text(self, "/credentials/other?tab=policies")       # a timed grant and the legacy allow
+        for pol in (svc, other):
+            self.assertNotIn("<script>x", pol)
+            self.assertIn("&lt;script&gt;x&lt;/script&gt;", pol)
+            self.assertIn("<th>Covers</th><th>Expires</th><th>Created by</th><th>Applies to</th>", pol)
+        self.assertIn("<td data-label=Covers>web reads only</td>", svc)
+        self.assertIn("<td data-label=Covers>run-with-secret</td>", svc)
+        self.assertEqual(svc.count("<td data-label=Expires>never</td>"), 2)
+        self.assertEqual(svc.count(">Revoke</button>"), 2)
+        self.assertEqual(svc.count("action='/grants/revoke'"), 2)
+        self.assertIn("<td data-label=Covers>web any method</td>", other)
+        self.assertRegex(other, r"<td data-label=Expires><time data-gexp='\d+'>in 15 min</time></td>")
+        self.assertIn("whole credential, any method, any covered mode (web, run-with-secret)", other)
+        self.assertIn("approval: allow", other)                         # the legacy allow is a read-only line here
+        self.assertNotIn("name=approval value=prompt>Revoke", other)    # (it is changed under Settings)
+        self.assertEqual(other.count(">Revoke</button>"), 1)            # only the timed grant
+        self.assertEqual(other.count("action='/grants/revoke'"), 1)
+        self.assertEqual(svc.count("name=back value='svc'"), 2)
+        self.assertIn("No policy covers more than one credential.", req_text(self, "/policies"))
 
     def test_settings_line(self):
         s = req_text(self, "/settings")

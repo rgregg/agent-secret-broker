@@ -13,7 +13,7 @@ always `any`). Two kinds exist:
            No risk ceiling: the human chose it explicitly for a short time.
 
 This module holds the metadata schema and validator plus the display helpers used
-by the Policies page and the approval card. The decision hooks live in broker.py
+by the Policies pages and the approval card. The decision hooks live in broker.py
 (`Broker._standing_claim`, `Broker._always_create`, `Broker.revoke_grant`).
 
 Audit note for anything that exposes audit events to the agent side: standing
@@ -165,15 +165,29 @@ def decided_by(kind, minutes, mode, scope):
     return f"standing approval ({how}, {what})"
 
 
+def _confirm_parts(mode, scope, auto_max):
+    """The text of the Always chip's question as (before the name, after the name)."""
+    if mode == "env":
+        return ("Always approve run-with-secret requests for ",
+                "? The secret value will be released to the requesting machine without asking again when "
+                f"the request is rated {auto_max} or lower.")
+    what = "reads-only" if scope == "read" else "any-method"
+    return (f"Always approve {what} requests for ",
+            f"? The secret will be used for matching requests without asking again when the request is "
+            f"rated {auto_max} or lower.")
+
+
 def confirm_text(name, mode, scope, auto_max):
     """The question behind the Always chip."""
-    if mode == "env":
-        return (f"Always approve run-with-secret requests for {name}? The secret value will be "
-                "released to the requesting machine without asking again when the request is "
-                f"rated {auto_max} or lower.")
-    what = "reads-only" if scope == "read" else "any-method"
-    return (f"Always approve {what} requests for {name}? The secret will be used for matching "
-            f"requests without asking again when the request is rated {auto_max} or lower.")
+    before, after = _confirm_parts(mode, scope, auto_max)
+    return before + name + after
+
+
+def confirm_html(name_html, mode, scope, auto_max):
+    """The same question as HTML: `name_html` (already escaped, or a link) goes in verbatim, the rest is escaped."""
+    import html
+    before, after = _confirm_parts(mode, scope, auto_max)
+    return html.escape(before) + name_html + html.escape(after)
 
 
 def scope_phrase(mode, scope):

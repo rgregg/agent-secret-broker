@@ -206,7 +206,7 @@ class HiddenChars(Base):
 
     def test_editor_page_notes_ignored_guidance(self):
         self.broker.cfg["secrets"]["alpha"]["guidance_invalid"] = "guidance contains hidden characters (x at offset 1)"
-        self.assertIn("Stored guidance ignored", self.get("/policies")[1])
+        self.assertIn("Stored guidance ignored", self.get("/credentials/alpha?tab=policies")[1])
 
     def test_card_warns_about_non_ascii_and_shows_escaped(self):
         rid = self.one("caf\u00e9 \u201cquote\u201d <b>")

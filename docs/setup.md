@@ -334,7 +334,7 @@ You are notified; approve; the call returns.
 ### Optional: tie an SSH key to servers
 
 An SSH key (`asb store NAME --ssh`) can say which servers it may log in to. The
-easiest way is the **SSH host policy** card for the key on the **Policies** tab: paste
+easiest way is the **SSH host policy** card on the key's **Policies** page (open the credential, then its Policies tab): paste
 lines from `~/.ssh/known_hosts` into Known hosts, list the allowed names or `SHA256:`
 fingerprints in Allowed hosts (empty means no enforcement), and save. After saving the
 card shows each line's fingerprint and warns about entries that can never match. The
@@ -364,7 +364,7 @@ confirm step and an optional 30 or 90 day expiry). From then on, logins with tha
 to that server (identified by its verified host key, not by name) as that account are
 signed without a prompt, at any `risk.auto_approve_max`. Other servers, other accounts
 and anything the broker cannot verify (old OpenSSH, forwarded agents, commit signing)
-still ask. You can list, add and revoke these rules on the **Policies** tab under
+still ask. You can list, add and revoke these rules on the key's **Policies** page under
 "SSH host rules"; they are stored in the key's vault item (`ssh_rules`). They are never
 visible to agents, and a rule cannot override `allowed_hosts`. See
 [reference.md](reference.md#standing-per-host-rules-ssh_rules).

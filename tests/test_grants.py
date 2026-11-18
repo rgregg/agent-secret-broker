@@ -426,6 +426,8 @@ class Disabled(Base):
         self.assertEqual(self.status_of(rid), "pending")
         _, pol = self.get("/policies")
         self.assertIn("turned off", pol)
+        _, cred = self.get("/credentials/svc?tab=policies")
+        self.assertIn("Time-boxed grants are turned off", cred)
         self.assertFalse(json.loads(self.api("GET", "/v1/status")[1])["features"]["timed_grants"])
 
     def test_persisted_grants_ignored(self):
@@ -570,7 +572,7 @@ class CardLayout(Base):
         self.assertIn("name=decision value=approve_always>Confirm", det)
         self.assertEqual(card.count("value=approve_always"), 1)
         self.assertNotRegex(card.replace(det, ""), "value=approve_always")
-        self.assertIn("Applies to exactly: svc. Reads only (GET, HEAD, OPTIONS).", card)
+        self.assertIn("Applies to exactly: svc. Reads only (GET, HEAD, OPTIONS).", _fast.unlink_names(card))
         self.assertNotIn(" title=", card[card.index("<div class=decide-row>"):])
         for m in re.findall(r"<(?:button|summary|span) class=[^>]*>", card):
             if "chip" in m:
@@ -587,7 +589,7 @@ class CardLayout(Base):
     def test_non_read_method_says_any_method(self):
         self.http(method="POST")
         _, page = self.get("/")
-        self.assertIn("Applies to exactly: svc. Any method.", page)
+        self.assertIn("Applies to exactly: svc. Any method.", _fast.unlink_names(page))
 
     def test_ssh_sign_has_chips_and_a_disabled_always(self):
         self.sign()
@@ -639,22 +641,24 @@ class Pages(Base):
     grants_cfg = {"durations": [10, 60, 120], "max_minutes": 120}
 
     def test_policies_empty_then_listed_with_revoke(self):
-        _, pol = self.get("/policies")
+        _, pol = self.get("/credentials/svc?tab=policies")
         self.assertIn("No standing approvals", pol)
         self.assertIn("Standing approvals", pol)
         self.assertNotIn("Active grants", pol)
         self.assertNotIn("Always allowed", pol)
         self.grant_it(minutes=60)
-        _, pol = self.get("/policies")
+        _, pol = self.get("/credentials/svc?tab=policies")              # a one-credential grant lives on that page
         self.assertIn("data-gexp", pol)
         self.assertIn("/grants/revoke", pol)
-        self.assertIn("<b>svc</b>", pol)
         self.assertIn("web reads only", pol)
         self.assertRegex(pol, r"<time data-gexp='\d+'>in (59|60) min</time>")
+        self.assertIn("No policy covers more than one credential.", self.get("/policies")[1])
         self.grant_it(("svc", "other"), 10, method="POST")
-        _, pol = self.get("/policies")
-        self.assertIn("<b>other, svc</b>", pol)
-        self.assertIn("web any method", pol)
+        _, tab = self.get("/policies")                                  # a two-credential grant lives on the Policies tab
+        self.assertIn("<b><a class=clink href='/credentials/other?tab=policies'>other</a>, "
+                      "<a class=clink href='/credentials/svc?tab=policies'>svc</a></b>", tab)
+        self.assertIn("web any method", tab)
+        self.assertNotIn("web any method", self.get("/credentials/svc?tab=policies")[1])
         gid = next(g["id"] for g in self.broker.active_grants() if g["scope"] == "read")
         form = {"grant": gid, "csrf": "bad"}
         def post(form):
@@ -680,9 +684,11 @@ class Pages(Base):
 
     def test_creator_name_is_escaped(self):
         self.broker.grants.add(["svc"], 5, "any", "<script>x</script>", "dashboard", "r")
-        _, pol = self.get("/policies")
-        self.assertNotIn("<script>x", pol)
-        self.assertIn("&lt;script&gt;", pol)
+        self.broker.grants.add(["svc", "other"], 5, "read", "<script>x</script>", "dashboard", "r")
+        for path in ("/credentials/svc?tab=policies", "/policies"):
+            _, pol = self.get(path)
+            self.assertNotIn("<script>x", pol, path)
+            self.assertIn("&lt;script&gt;", pol, path)
 
 
 class NoLeak(Base):

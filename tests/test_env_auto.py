@@ -237,6 +237,7 @@ class AlwaysChip(EnvAutoBase):
     def test_chip_text_and_apply(self):
         self.env()
         page, r = self.page()
+        page = _fast.unlink_names(page)
         self.assertIn("value=approve_always", page)
         self.assertIn("Always approve run-with-secret requests for svc? The secret value will be "
                       "released to the requesting machine without asking "
@@ -288,7 +289,8 @@ class AlwaysChip(EnvAutoBase):
 
 class PoliciesList(EnvAutoBase):
     def policies(self):
-        return req(self.abase + "/policies", headers={"X-authentik-username": "alice"})[1]
+        """svc's Policies page (where its legacy allow line lives now)."""
+        return req(self.abase + "/credentials/svc?tab=policies", headers={"X-authentik-username": "alice"})[1]
 
     def test_shows_eligible_modes(self):
         self.assertIn("web, run-with-secret", self.policies())
@@ -432,9 +434,12 @@ class EnvGrants(tg.Base):
     def test_policies_page_lists_the_modes(self):
         self.grant_env()
         self.grant_it(("other",))
-        page = self.get("/policies")[1]
-        self.assertIn("<td data-label=Covers>run-with-secret</td>", page)
-        self.assertIn("<td data-label=Covers>web reads only</td>", page)
+        svc = self.get("/credentials/svc?tab=policies")[1]
+        other = self.get("/credentials/other?tab=policies")[1]
+        self.assertIn("<td data-label=Covers>run-with-secret</td>", svc)
+        self.assertIn("<td data-label=Covers>web reads only</td>", other)
+        self.assertNotIn("<td data-label=Covers>web reads only</td>", svc)                  # each on its own credential's page
+        self.assertNotIn("<td data-label=Covers>run-with-secret</td>", other)
 
     def test_history_wording(self):
         self.grant_env()

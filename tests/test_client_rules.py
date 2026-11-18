@@ -283,13 +283,15 @@ class StandingScope(ClientMixin, tg.Base):
         self.broker._add_always("svc", "http", "any", "alice", a.id)
         self.broker._add_always("svc", "env", "any", "alice", ANY)
         self.broker.grants.add(["other"], 15, "any", "alice", "dashboard", "r", mode="http", client="legacy")
-        pol = self.get("/policies")[1]
+        pol = self.get("/credentials/svc?tab=policies")[1]                      # svc's two Always entries
         self.assertIn("<th>Applies to</th>", pol)
         self.assertIn("<td data-label='Applies to'>alpha</td>", pol)
         self.assertIn("<td data-label='Applies to'>any client</td>", pol)
-        self.assertIn("<td data-label='Applies to'>shared key (legacy)</td>", pol)
+        other = self.get("/credentials/other?tab=policies")[1]                  # other's timed grant
+        self.assertIn("<td data-label='Applies to'>shared key (legacy)</td>", other)
+        self.assertNotIn("shared key (legacy)", pol)                            # each on its own credential's page
         self.broker.revoke_client(a.id, "alice")
-        self.assertNotIn("<td data-label='Applies to'>alpha</td>", self.get("/policies")[1])
+        self.assertNotIn("<td data-label='Applies to'>alpha</td>", self.get("/credentials/svc?tab=policies")[1])
 
     def test_card_offers_the_choice_with_the_client_name(self):
         a = self.mk("alpha")
@@ -306,7 +308,7 @@ class StandingScope(ClientMixin, tg.Base):
         a = self.mk("alpha")
         self.broker._add_always("svc", "http", "any", "alice", a.id)
         self.broker.grants.add(["svc"], 15, "any", "alice", "dashboard", "r", mode="http", client=a.id)
-        page = self.get("/clients")[1]
+        page = _fast.unlink_names(self.get("/clients")[1])
         self.assertIn("2 rules", page)
         self.assertIn("always: svc", page)
         self.assertIn("timed: svc", page)
@@ -618,7 +620,7 @@ class SshScope(ClientMixin, sr.Base):
     def test_policies_page_has_the_client_column_and_choice(self):
         a = self.mk("alpha")
         self.broker._add_rule("deploy", sr.HOST.fp, "deploy", "web", "alice", None, a.id)
-        page = t.req(self.abase + "/policies", headers={"X-authentik-username": "alice"})[1]
+        page = t.req(self.abase + "/credentials/deploy?tab=policies", headers={"X-authentik-username": "alice"})[1]
         self.assertIn("<th>Account</th><th>Client</th>", page)
         self.assertIn("<td data-label=Client>alpha</td>", page)
         self.assertIn("name=client", page)

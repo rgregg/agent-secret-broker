@@ -58,6 +58,8 @@ from . import proposals as proposals_mod
 from . import credreq as credreq_mod
 from . import sudomode as sudo_mod
 from . import autorules as autorules_mod
+from . import credlinks as credlinks_mod
+from . import credpolicy as credpolicy_mod
 from . import uirules as uirules_mod
 from . import clients as clients_mod
 from . import clock as clock_mod
@@ -598,6 +600,11 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
                 self.log("dest_guard_config_error", error="allowed host removed: not an allowed destination",
                          secret=name, host=h[:100])
         entry["allowed_hosts"] = keep
+
+    def linkable_names(self):
+        """The credential names a page may link to: everything in the catalog right now."""
+        with self._cfg_lock:
+            return frozenset(self.cfg["secrets"])
 
     def refresh_catalog(self, fresh=False, _retries=2):
         """Rebuild the secret catalog from the vault's items. Raises if the vault
@@ -2049,7 +2056,7 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
     def _rule_claim(self, req):
         """Approve `req` from a matching `auto_approve` rule: one in the broker's configuration (see
         autorules.py), or, for a request naming a single credential, one kept in that credential's vault
-        metadata and managed on the Policies tab. Config rules are tried first. Called from create() after the
+        metadata and managed on the credential's Policies page. Config rules are tried first. Called from create() after the
         assessment, beside the standing SSH rules. Returns True when the request was finished here."""
         stored = []
         if len(req.names) == 1:
@@ -3791,14 +3798,43 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
             return []
         return [{**g, "left_s": self.grants.left_s(g)} for g in self.grants.active()]
 
+    def standing_by_credential(self):
+        """(per_credential, shared): the standing approvals split by where they are shown. A row belongs to a
+        credential's page only when its set of secret names is exactly one credential that exists in the catalog;
+        every other row (two or more names, or a name that is gone) is shared and carries `orphan` (True when a
+        name is missing from the catalog)."""
+        with self._cfg_lock:
+            known = set(self.cfg["secrets"])
+        per, shared = {}, []
+        for r in self.standing_rows():
+            names = set(r["names"])
+            if len(names) == 1 and next(iter(names)) in known:
+                per.setdefault(next(iter(names)), []).append(r)
+            else:
+                shared.append({**r, "orphan": bool(names - known)})
+        return per, shared
+
+    def config_rules_for(self, name):
+        """The `auto_approve` config rules that name this credential (a pair rule is listed for each of its names)."""
+        return [r for r in self.auto_rules if name in r["secrets"]]
+
+    def shared_config_rules(self):
+        """Config rules that stay on the Policies tab: two or more credentials, or a credential that is gone
+        (those carry `orphan`)."""
+        with self._cfg_lock:
+            known = set(self.cfg["secrets"])
+        return [{**r, "orphan": bool(r["secrets"] - known)} for r in self.auto_rules
+                if len(r["secrets"]) >= 2 or r["secrets"] - known]
+
     def standing_rows(self):
-        """Every standing approval for the Policies page, soonest-expiring first, then
+        """Every standing approval for the Policies pages, soonest-expiring first, then
         Always, then legacy whole-credential allows. Each row: kind (timed|always|
         legacy), id, name (legacy), secrets, mode, scope, covers, expires_at (None =
         never), left_s, created_by, created_at (text), modes (legacy)."""
         rows = []
         for g in self.active_grants():
-            rows.append({"kind": "timed", "id": g["id"], "secrets": g["secrets"], "mode": g["mode"],
+            rows.append({"kind": "timed", "id": g["id"], "secrets": g["secrets"], "names": list(g["secrets"]),
+                         "mode": g["mode"],
                          "client": g["client"], "scope": g["scope"],
                          "covers": standing_mod.covers_label(g["mode"], g["scope"]),
                          "expires_at": g["expires_at"], "left_s": g["left_s"],
@@ -3812,7 +3848,8 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
             for e in sc.get("standing") or []:
                 off = e["mode"] not in self._effective_auto_modes(sc, e.get("client") if e.get("client", clients_mod.ANY) != clients_mod.ANY
                                                                    else None)
-                rows.append({"kind": "always", "id": e["id"], "secrets": [name + internal_tag(name)], "mode": e["mode"],
+                rows.append({"kind": "always", "id": e["id"], "secrets": [name + internal_tag(name)], "names": [name],
+                             "mode": e["mode"],
                              "client": e.get("client", clients_mod.ANY), "scope": e["scope"], "covers": standing_mod.covers_label(e["mode"], e["scope"], e.get("scripts"))
                              + (" (not active: mode not enabled)" if off else ""),
                              "expires_at": None, "left_s": None, "created_by": e["created_by"],
@@ -3823,7 +3860,8 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
             ch = sc.get("approval_changed") or {}
             at = ch.get("at") or ""
             modes = ", ".join(_MODE_LABEL.get(m, m) for m in self._auto_modes(sc)) or "none"
-            rows.append({"kind": "legacy", "id": "", "name": name, "secrets": [name + internal_tag(name)], "mode": None,
+            rows.append({"kind": "legacy", "id": "", "name": name, "secrets": [name + internal_tag(name)], "names": [name],
+                         "mode": None,
                          "client": clients_mod.ANY, "scope": "any", "covers": f"whole credential, any method, any covered mode ({modes})",
                          "expires_at": None, "left_s": None, "created_by": ch.get("by") or "",
                          "created_at": at.replace("T", " ").replace("Z", " UTC")})
@@ -5646,7 +5684,7 @@ def _describe(req):
     if req.mode == "store":
         sp = req.spec
         if sp.get("hosts_after") is not None:
-            return (f"<b>CHANGE ALLOWED HOSTS</b> of {html.escape(req.names[0])}<br>"
+            return (f"<b>CHANGE ALLOWED HOSTS</b> of {credlinks_mod.link(req.names[0])}<br>"
                     f"{html.escape(_host_change_text(sp)[2:])}<br>"
                     f"Allowed after: {html.escape(', '.join(sp['hosts_after']))}",
                     "The agent will be able to send this credential to the hosts added and no longer to "
@@ -5778,7 +5816,11 @@ def _approve_actions(broker, req):
     if req.mode == "session":       # shorten-only limits, Approve or Deny; no Always, no timed grant
         return (ws_mod if req.spec.get("kind") == "ws" else sessions_mod).actions_html(broker, req)
     e = html.escape
-    names = e(", ".join(req.names))
+    names = e(", ".join(req.names))                # for attributes (a link cannot sit in an attribute)
+    names_html = credlinks_mod.links(req.names)    # for visible text
+    revoke_hint = "Revoke any time on " + (        # where a standing approval for these secrets is listed and revoked
+        credlinks_mod.link(req.names[0], tab="policies", text="the credential's Policies page")
+        if len(req.names) == 1 else "the Policies page") + "."
     if req.mode == "sudo":          # Approve or Deny only: no Always, no timed grant
         return ("<div class=decide-row><button class='btn approve' name=decision value=approve>"
                 "Approve</button><button class='btn deny' name=decision value=deny>Deny</button></div>"
@@ -5807,12 +5849,12 @@ def _approve_actions(broker, req):
         mx = broker.auto_approve_max(req.client["id"])
         tip = (f"Approve this request and approve future requests for this secret without asking: "
                f"{what}, when the request is rated {mx} or lower. "
-               "Applies to the client chosen above. Revoke any time under Policies.")
-        ask = standing_mod.confirm_text(req.names[0], req.mode, scope, mx)
+               "Applies to the client chosen above. Revoke any time on the credential's Policies page.")
+        ask = standing_mod.confirm_html(credlinks_mod.link(req.names[0]), req.mode, scope, mx)
         chips.append(
             f"<details class=alw><summary class='chip always' data-tip='{e(tip)}' "
             f"aria-label='Always approve {e(req.names[0])}: {e(tip)}'>Always</summary>"
-            f"<div class=confirm><span>{e(ask)}</span>"
+            f"<div class=confirm><span>{ask}</span>"
             "<button class='btn sm approve' name=decision value=approve_always>Confirm</button>"
             "<span class=muted>Click Always again to cancel.</span></div></details>")
         if req.mode == "env" and standing_mod.script_binding(req.spec):
@@ -5820,11 +5862,11 @@ def _approve_actions(broker, req):
             btip = (f"Approve this request and approve future runs of {b['command']} over exactly this script "
                     f"text (sha256 {b['sha256'][0][:12]}) without asking, when the request is rated {mx} or "
                     "lower. A changed script asks again. Applies to the client chosen above. "
-                    "Revoke any time under Policies.")
+                    "Revoke any time on the credential's Policies page.")
             chips.append(
                 f"<details class=alw><summary class='chip always' data-tip='{e(btip)}' "
                 f"aria-label='Always approve this script: {e(btip)}'>Always, this script</summary>"
-                f"<div class=confirm><span>Always approve {e(b['command'])} for {e(req.names[0])} while the "
+                f"<div class=confirm><span>Always approve {e(b['command'])} for {credlinks_mod.link(req.names[0])} while the "
                 f"script is unchanged (sha256 {e(b['sha256'][0][:12])})? Any change to the script asks again.</span>"
                 "<button class='btn sm approve' name=decision value=approve_always_script>Confirm</button>"
                 "<span class=muted>Click again to cancel.</span></div></details>")
@@ -5841,14 +5883,14 @@ def _approve_actions(broker, req):
            "<option value=any>any client (every machine)</option></select></label>"
            f"<div class=chips>{''.join(chips)}</div>")
     if mins and req.mode == "env":
-        out += (f"<p class=scope><small class=muted>Applies to exactly: {names}, run-with-secret "
+        out += (f"<p class=scope><small class=muted>Applies to exactly: {names_html}, run-with-secret "
                 "requests only. The secret value will be released to the requesting machine for "
                 "the chosen time without asking. Requests whose script text is not visible "
-                "still ask. Revoke any time under Policies.</small></p>")
+                f"still ask. {revoke_hint}</small></p>")
     if mins and req.mode != "env":
-        out += (f"<p class=scope><small class=muted>Applies to exactly: {names}. "
+        out += (f"<p class=scope><small class=muted>Applies to exactly: {names_html}. "
                 f"{'Reads only (GET, HEAD, OPTIONS)' if scope == 'read' else 'Any method'}. "
-                "Revoke any time under Policies.</small></p>")
+                f"{revoke_hint}</small></p>")
     return row1 + out + "</div>"
 
 
@@ -5885,6 +5927,14 @@ def _parse_decision(decision):
     if decision.startswith("approve_grant_") and decision[14:].isascii() and decision[14:].isdigit() and len(decision) < 22:
         return "approve", False, int(decision[14:])
     return None
+
+
+def _revoke_where(names):
+    """Where a standing approval for these secrets is listed and revoked: the credential's Policies page for one
+    secret, the Policies tab for several."""
+    if len(names) == 1:
+        return credlinks_mod.link(names[0], tab="policies", text="the credential's Policies page")
+    return "<a href='/policies'>the Policies page</a>"
 
 
 def _in_min(s):
@@ -5944,7 +5994,7 @@ def _detail_html(r, evs, retained=""):
         if v not in (None, "", []):
             rows.append(f"<dt>{e(k)}</dt><dd>{v if raw else e(str(v))}</dd>")
     add("Request id", f"<code>{e(r['id'])}</code>", True)
-    add("Secrets", ", ".join(r["names"]))
+    add("Secrets", credlinks_mod.links(r["names"]), True)
     add("Mode", r["mode"])
     if r["mode"] == "http":
         add("Request", f"{r['method'] or ''} {r['url'] or ''}".strip())
@@ -6133,7 +6183,7 @@ def _detail_html(r, evs, retained=""):
         tl.append(f"<li><time>{e(t)}</time><b>{e(x['event'])}</b>"
                   + (f" <small class=muted>+{e(dt)}</small>" if dt and x.get("ts") != t0 else "")
                   + (f"<span class=ev>{e(extra)}</span>" if extra else "") + "</li>")
-    return (f"<div class=dtitle><b>{e(', '.join(r['names']))}</b>"
+    return (f"<div class=dtitle><b>{credlinks_mod.links(r['names'])}</b>"
             f"<span class='pill {kind}'>{e(label)}</span></div>"
             f"<dl class=kv>{''.join(rows)}</dl>{retained}<h3>Timeline</h3><ol class=tl>{''.join(tl)}</ol>")
 
@@ -6621,7 +6671,7 @@ def approval_handler(broker):
                 cards.append(
                     f"<article class=req data-id='{html.escape(r.id)}'>"
                     f"<div class=reqhead><h2>"
-                    f"{'Guidance proposal' if r.mode == 'guidance' else 'Plan: ' + html.escape(', '.join(r.names)) if r.mode == 'plan' else html.escape(', '.join(r.names))}</h2>"
+                    f"{'Guidance proposal' if r.mode == 'guidance' else 'Plan: ' + credlinks_mod.links(r.names, tab='policies') if r.mode == 'plan' else credlinks_mod.links(r.names)}</h2>"
                     f"<time data-exp='{int(r.expires)}'>expires in "
                     f"{max(0, int(r.expires - time.time()))}s</time></div>{_risk_html(r)}"
                     f"<div class=box>{clients_mod.from_html(r)}<br>{what}</div>"
@@ -6823,7 +6873,7 @@ def approval_handler(broker):
             page has no other way to decide a plan."""
             what, note = _describe(req)
             _page(self, 200,
-                  f"<h1>Plan request</h1><p><b>{html.escape(', '.join(req.names))}</b></p>{_risk_html(req)}"
+                  f"<h1>Plan request</h1><p><b>{credlinks_mod.links(req.names, tab='policies')}</b></p>{_risk_html(req)}"
                   f"<div class=box>{clients_mod.from_html(req)}<br>{what}</div>"
                   f"<p><small>{note}</small></p>"
                   f"<p><small>Expires in {max(0, int(req.expires - time.time()))}s</small></p>"
@@ -6907,10 +6957,10 @@ def approval_handler(broker):
             done.done.wait(15)          # the vault write runs in the background; say how it ended
             if done.status in ("approved", "released"):
                 if done.spec.get("ws_change"):
-                    return _page(self, 200, f"<h1>Saved</h1><p>The WebSocket setup of <b>{html.escape(done.names[0])}"
+                    return _page(self, 200, f"<h1>Saved</h1><p>The WebSocket setup of <b>{credlinks_mod.link(done.names[0])}"
                                  "</b> was changed. You can close this page.</p>", tab="requests",
                                  badge=broker.attention(), user=user)
-                return _page(self, 200, f"<h1>Stored</h1><p>The credential <b>{html.escape(done.names[0])}</b> "
+                return _page(self, 200, f"<h1>Stored</h1><p>The credential <b>{credlinks_mod.link(done.names[0])}</b> "
                              "is in the vault. The agent was told only its name. You can close this page.</p>",
                              tab="requests", badge=broker.attention(), user=user)
             if done.status == "failed":
@@ -7112,23 +7162,32 @@ def approval_handler(broker):
             parts = self.path.split("?")[0].strip("/").split("/")
             return parts[1] if len(parts) == 2 and parts[0] == "a" else None
 
-        def _policies_page(self, user, note="", status=200, ssh_state=None, rule_state=None, auto_state=None):
-            _page(self, status, f"<h1>Policies</h1>{note}{self._standing_section(user)}"
-                  + guidance_mod.policies_section(cfg["secrets"], self._tok(user))
-                  + sshhosts_mod.policies_section(cfg["secrets"], self._tok(user), ssh_state)
-                  + sshrules_mod.policies_section(cfg["secrets"], self._tok(user),
-                                                  broker.ssh_rule_usage, state=rule_state,
-                                                  client_names=broker.clients.names(),
-                                                  client_choices=broker.clients.active_choices())
-                  + uirules_mod.policies_section(cfg["secrets"], broker.auto_rules, self._tok(user),
-                                                 broker.auto_rule_usage, state=auto_state,
-                                                 client_names=broker.clients.names(),
-                                                 client_choices=broker.clients.active_choices()),
-                  script=_GRANTS_JS + guidance_mod.JS + sshhosts_mod.JS, tab="policies", badge=broker.attention(), user=user)
+        def _policies_page(self, user, note="", status=200):
+            """The Policies tab: only what spans credentials (or names one that is gone). Everything that belongs
+            to one credential is on that credential's page."""
+            _, shared = broker.standing_by_credential()
+            rules = broker.shared_config_rules()
+            cnames = broker.clients.names()
+            body = ("<p class=hint>Policies for a single credential live on that credential's page "
+                    "(<a href='/credentials'>Credentials</a>, then its Policies tab). This page lists only "
+                    "policies that cover several credentials, or name one that no longer exists.</p>")
+            if shared:
+                body += credpolicy_mod.shared_standing_section(shared, self._tok(user), cnames)
+            if rules:
+                body += credpolicy_mod.shared_rules_section(rules, cnames)
+            if not shared and not rules:
+                body += "<div class='card empty'>No policy covers more than one credential.</div>"
+            if not broker.grants_cfg["enabled"]:
+                body += "<p><small class=muted>Time-boxed grants are turned off.</small></p>"
+            _page(self, status, f"<h1>Policies</h1>{note}{body}", script=_GRANTS_JS, tab="policies",
+                  badge=broker.attention(), user=user)
 
         def _credentials_page(self, user, note="", status=200, q=""):
             flash = f"<div class=flash>{note}</div>" if note else ""
-            _page(self, status, crededitor_mod.list_section(cfg["secrets"], flash, q), tab="credentials",
+            per, _ = broker.standing_by_credential()
+            counts = {n: credpolicy_mod.counts(n, sc, per.get(n, []), broker.config_rules_for(n))["total"]
+                      for n, sc in cfg["secrets"].items()}
+            _page(self, status, crededitor_mod.list_section(cfg["secrets"], flash, q, counts), tab="credentials",
                   script=crededitor_mod.JS + peek_mod.JS, badge=broker.attention(), user=user, wide=True)
 
         def _credential_edit(self, user, name, meta=None, stored=None, status=200, **kw):
@@ -7151,10 +7210,39 @@ def approval_handler(broker):
             values = "" if kw.get("preview") is not None or broker.is_internal_secret(name) else \
                 crededitor_mod.values_section(name, sc, self._tok(user), crededitor_mod.digest(stored),
                                               can_write=can_write, revealed=revealed)
+            if kw.get("preview") is None:
+                per, _ = broker.standing_by_credential()
+                c = credpolicy_mod.counts(name, sc, per.get(name, []), broker.config_rules_for(name))
+                kw.setdefault("chrome", crededitor_mod.tabs_html(name, "settings", c["total"]))
+                kw.setdefault("summary", crededitor_mod.summary_html(name, c))
             _page(self, status, crededitor_mod.edit_section(
                 name, stored if meta is None else meta, self._tok(user), stored, can_write=can_write,
                 extra=extra, values=values, **kw),
                 tab="credentials", script=crededitor_mod.JS + peek_mod.JS, badge=broker.attention(), user=user, wide=True)
+
+        def _credential_policies(self, user, name, note="", status=200, ssh_hosts=None, ssh_rules=None,
+                                 auto_rules=None):
+            """A credential's page on its Policies sub-tab: every per-credential policy in one place. The policy
+            forms answer with this page (same note, same status). `note` is a ready-made HTML snippet;
+            the three states re-render a refused or saved form (see the section cards)."""
+            sc = cfg["secrets"].get(name)
+            if sc is None:
+                return _page(self, 404, "<h1>Not found</h1>", tab="credentials", user=user)
+            per, _ = broker.standing_by_credential()
+            rows, cfg_rules = per.get(name, []), broker.config_rules_for(name)
+            c = credpolicy_mod.counts(name, sc, rows, cfg_rules)
+            ctx = credpolicy_mod.PolicyCtx(
+                csrf=self._tok(user), usage_ssh=broker.ssh_rule_usage, usage_auto=broker.auto_rule_usage,
+                client_names=broker.clients.names(), client_choices=broker.clients.active_choices(),
+                standing_rows=rows, config_rules=cfg_rules, grants_enabled=broker.grants_cfg["enabled"],
+                states={"ssh_hosts": ssh_hosts, "ssh_rules": ssh_rules, "auto_rules": auto_rules})
+            off = ("" if backend_base.CAP_SET_META in broker.backend.capabilities else
+                   "<p class=err>This vault backend cannot store metadata, so policies cannot be changed here.</p>")
+            page = (f"<div class=ced><h1>Edit {html.escape(name)}</h1>"
+                    f"{crededitor_mod.tabs_html(name, 'policies', c['total'])}{note}{off}"
+                    f"{credpolicy_mod.body(name, sc, ctx)}</div>")
+            _page(self, status, page, tab="credentials", badge=broker.attention(), user=user, wide=True,
+                  script=_GRANTS_JS + guidance_mod.JS + sshhosts_mod.JS)
 
         def _credential_value_post(self, name, action, one, user):
             """Show, replace, add or remove one value. A value only ever appears in a reveal reply; every other
@@ -7289,55 +7377,11 @@ def approval_handler(broker):
                   + sessions_mod.sessions_section(broker, token),
                   script=_GRANTS_JS, tab="clients", badge=broker.attention(), user=user)
 
-        def _standing_section(self, user):
-            """'Standing approvals' on the Policies tab: every timed grant, Always
-            approval and legacy always-allowed credential, with Revoke."""
-            e = html.escape
-            token = self._tok(user)
-            head = ("<h3 style='margin-top:0'>Standing approvals</h3><p><small class=muted>Requests "
-                    "these cover are approved without asking. A time-boxed approval has no risk limit "
-                    "and ends at its deadline. An Always approval never expires and is used only when the "
-                    f"request is within the auto-approve limit ({_AUTO_LABEL[broker.auto_approve_max()]}). "
-                    "Each covers exactly the secrets, mode and method class shown. Revoke to ask every "
-                    "time again.</small></p>")
-            if not broker.grants_cfg["enabled"]:
-                head += "<p><small class=muted>Time-boxed grants are turned off.</small></p>"
-            rows = []
-            cnames = broker.clients.names()
-            for r in broker.standing_rows():
-                if r["expires_at"] is None:
-                    exp = "never"
-                else:
-                    exp = (f"<time data-gexp='{int(r['expires_at'])}'>"
-                           f"{e(_in_min(r['left_s']))}</time>")
-                who = e(r["created_by"]) + (f" <small class=muted>{e(r['created_at'])}</small>"
-                                            if r["created_at"] else "")
-                if r["kind"] == "legacy":
-                    form = ("<form method=post class=inline>"
-                            f"<input type=hidden name=csrf value='{token}'>"
-                            f"<input type=hidden name=name value='{e(r['name'])}'>"
-                            "<button name=approval value=prompt>Revoke</button></form>")
-                else:
-                    form = ("<form method=post action='/grants/revoke' class=inline>"
-                            f"<input type=hidden name=csrf value='{token}'>"
-                            f"<input type=hidden name=grant value='{e(r['id'])}'>"
-                            "<button>Revoke</button></form>")
-                rows.append(
-                    f"<tr><td data-label=Secrets><b>{e(', '.join(r['secrets']))}</b></td>"
-                    f"<td data-label=Covers>{e(r['covers'])}</td>"
-                    f"<td data-label=Expires>{exp}</td>"
-                    f"<td data-label='Created by'>{who}</td>"
-                    f"<td data-label='Applies to'>{e(clients_mod.scope_label(r['client'], cnames))}</td>"
-                    f"<td>{form}</td></tr>")
-            if not rows:
-                return head + "<div class='card empty'>No standing approvals</div>"
-            return (head + "<table class=tbl><thead><tr><th>Secrets</th><th>Covers</th><th>Expires</th>"
-                    "<th>Created by</th><th>Applies to</th><th></th></tr></thead><tbody>" + "".join(rows) + "</tbody></table>")
-
         def do_GET(self):
             user = self._user()
             if user is None:
                 return
+            credlinks_mod.use(broker.linkable_names())      # names this page may link to (the catalog now)
             u = urllib.parse.urlsplit(self.path)
             if u.path == "/sw.js" and broker.push is not None:
                 return self._service_worker()
@@ -7376,6 +7420,8 @@ def approval_handler(broker):
                 nm = u.path[len("/credentials/"):]
                 if nm not in cfg["secrets"]:
                     return _page(self, 404, "<h1>Not found</h1>", tab="credentials", user=user)
+                if (urllib.parse.parse_qs(u.query).get("tab") or [""])[0] == "policies":
+                    return self._credential_policies(user, nm)
                 return self._credential_edit(user, nm)
             if self.path.split("?")[0].rstrip("/") == "/clients":
                 q = urllib.parse.parse_qs(u.query)
@@ -7396,7 +7442,7 @@ def approval_handler(broker):
             summary_html = _risk_html(req)
             _page(self, 200, f"""
 <h1>{'Guidance proposal' if req.mode == 'guidance' else 'Secret request'}</h1>
-<p><b>{html.escape(', '.join(req.names))}</b></p>
+<p><b>{credlinks_mod.links(req.names)}</b></p>
 {summary_html}
 <div class=box>{clients_mod.from_html(req)}<br>{what}</div>
 {details_mod.html(broker.details_view(req))}
@@ -7554,6 +7600,7 @@ def approval_handler(broker):
             user = self._user()
             if user is None:
                 return
+            credlinks_mod.use(broker.linkable_names())
             if self.path.split("?")[0].rstrip("/") == "/push/event":
                 return self._client_event(user)
             if self.path.split("?")[0].rstrip("/") == "/presence":
@@ -7629,11 +7676,13 @@ def approval_handler(broker):
             if path == "/grants/revoke":
                 gid = form.get("grant", [""])[0][:16]
                 done = broker.revoke_grant(gid, user, self._ip, self._fwd())
-                return self._policies_page(
-                    user, "<p>" + ("Standing approval revoked" if done else
-                                   "That standing approval is no longer active" if done is False else
-                                   "Could not revoke the standing approval") + ".</p>",
-                    status=500 if done is None else 200)
+                note = ("<p>" + ("Standing approval revoked" if done else
+                                 "That standing approval is no longer active" if done is False else
+                                 "Could not revoke the standing approval") + ".</p>")
+                back = form.get("back", [""])[0]
+                if back in cfg["secrets"]:              # an existing credential's page; anything else: the tab
+                    return self._credential_policies(user, back, note, status=500 if done is None else 200)
+                return self._policies_page(user, note, status=500 if done is None else 200)
             if path == "/policies/ssh_rules/revoke":
                 name, rid = form.get("secret", [""])[0], form.get("rule", [""])[0][:16]
                 if name not in cfg["secrets"] or not cfg["secrets"][name].get("ssh"):
@@ -7641,9 +7690,8 @@ def approval_handler(broker):
                 res = broker.revoke_ssh_rule(name, rid, user, self._ip, self._fwd())
                 msg = {"revoked": "SSH rule revoked", "missing": "That SSH rule no longer exists",
                        "failed": "Could not revoke the SSH rule"}[res]
-                return self._policies_page(user, f"<p>{msg}: {html.escape(name)}</p>",
-                                           status=500 if res == "failed" else 200,
-                                           rule_state={name: {"open": True}})
+                return self._credential_policies(user, name, f"<p>{msg}: {html.escape(name)}</p>",
+                                                 status=500 if res == "failed" else 200)
             if path == "/policies/ssh_rules/add":
                 name = form.get("secret", [""])[0]
                 if name not in cfg["secrets"] or not cfg["secrets"][name].get("ssh"):
@@ -7653,13 +7701,12 @@ def approval_handler(broker):
                                           one("confirm") == "1", user, self._ip, self._fwd(),
                                           client=one("client") or clients_mod.ANY)
                 if res["status"] in ("created", "exists"):
-                    return self._policies_page(
-                        user, f"<p>{'SSH rule added' if res['status'] == 'created' else res['message']}: "
-                              f"{html.escape(name)}</p>", rule_state={name: {"open": True}})
-                return self._policies_page(
-                    user, f"<p>Could not add the SSH rule: {html.escape(name)}</p>",
-                    status=400 if res["status"] == "refused" else 500,
-                    rule_state={name: {"open": True, "error": res["message"]}})
+                    return self._credential_policies(
+                        user, name, f"<p>{'SSH rule added' if res['status'] == 'created' else res['message']}: "
+                                    f"{html.escape(name)}</p>")
+                return self._credential_policies(
+                    user, name, f"<p>Could not add the SSH rule: {html.escape(name)}</p>",
+                    status=400 if res["status"] == "refused" else 500, ssh_rules={"error": res["message"]})
             if path == "/policies/auto_rules/revoke":
                 name, rid = form.get("secret", [""])[0], form.get("rule", [""])[0][:16]
                 if name not in cfg["secrets"] or cfg["secrets"][name].get("ssh"):
@@ -7667,9 +7714,8 @@ def approval_handler(broker):
                 res = broker.revoke_auto_rule(name, rid, user, self._ip, self._fwd())
                 msg = {"revoked": "Auto-approve rule revoked", "missing": "That rule no longer exists",
                        "failed": "Could not revoke the rule"}[res]
-                return self._policies_page(user, f"<p>{msg}: {html.escape(name)}</p>",
-                                           status=500 if res == "failed" else 200,
-                                           auto_state={name: {"open": True}})
+                return self._credential_policies(user, name, f"<p>{msg}: {html.escape(name)}</p>",
+                                                 status=500 if res == "failed" else 200)
             if path == "/policies/auto_rules/add":
                 name = form.get("secret", [""])[0]
                 if name not in cfg["secrets"] or cfg["secrets"][name].get("ssh"):
@@ -7682,12 +7728,11 @@ def approval_handler(broker):
                 res = broker.add_auto_rule(name, fields, one("expires"), one("confirm") == "1", user,
                                            self._ip, self._fwd())
                 if res["status"] == "created":
-                    return self._policies_page(user, f"<p>Auto-approve rule added: {html.escape(name)}</p>",
-                                               auto_state={name: {"open": True}})
-                return self._policies_page(
-                    user, f"<p>Could not add the rule: {html.escape(name)}</p>",
-                    status=400 if res["status"] == "refused" else 500,
-                    auto_state={name: {"open": True, "error": res["message"]}})
+                    return self._credential_policies(user, name,
+                                                     f"<p>Auto-approve rule added: {html.escape(name)}</p>")
+                return self._credential_policies(
+                    user, name, f"<p>Could not add the rule: {html.escape(name)}</p>",
+                    status=400 if res["status"] == "refused" else 500, auto_rules={"error": res["message"]})
             if path == "/policies/ssh_hosts":
                 name = form.get("secret", [""])[0]
                 if name not in cfg["secrets"]:
@@ -7703,13 +7748,13 @@ def approval_handler(broker):
                     if res["status"] == "saved" and res["enforcing"]:
                         note += ("<p><small class=muted>Enforcement is on: unbound clients (old OpenSSH, git "
                                  "commit signing) will be refused for this key.</small></p>")
-                    return self._policies_page(user, note, ssh_state={name: {"open": True}})
+                    return self._credential_policies(user, name, note)
                 st = {"open": True, "error": res["message"], "known": one("known_hosts"),
                       "allowed": one("allowed_hosts"), "fwd": one("allow_forwarded") == "1",
                       "need_confirm": res.get("need_confirm"), "need_anyway": res.get("need_anyway")}
-                return self._policies_page(
-                    user, f"<p>Could not save the SSH host policy: {html.escape(name)}</p>",
-                    status=400 if res["status"] == "refused" else 500, ssh_state={name: st})
+                return self._credential_policies(
+                    user, name, f"<p>Could not save the SSH host policy: {html.escape(name)}</p>",
+                    status=400 if res["status"] == "refused" else 500, ssh_hosts=st)
             if path == "/policies/guidance":
                 name = form.get("name", [""])[0]
                 if name not in cfg["secrets"]:
@@ -7722,17 +7767,17 @@ def approval_handler(broker):
                         guidance_mod.validate_text(text)
                     except ValueError as e:
                         why = f" ({html.escape(str(e))})"
-                return self._policies_page(
-                    user, f"<p>{'Guidance saved' if done else 'Could not save guidance'}: "
-                          f"{html.escape(name)}{why}</p>", status=200 if done or not why else 400)
+                return self._credential_policies(
+                    user, name, f"<p>{'Guidance saved' if done else 'Could not save guidance'}: "
+                                f"{html.escape(name)}{why}</p>", status=200 if done or not why else 400)
             if self.path.split("?")[0].rstrip("/") == "/policies":
                 name = form.get("name", [""])[0]
                 # this page can only *tighten*: granting happens in the context of a request
                 if form.get("approval", [""])[0] != "prompt" or name not in cfg["secrets"]:
                     return _page(self, 400, "<h1>Bad request</h1>")
                 done = broker.set_approval(name, "prompt", user, self._ip, self._fwd())
-                return self._policies_page(
-                    user, f"<p>{'Updated' if done else 'Could not update'}: {html.escape(name)}</p>")
+                return self._credential_policies(
+                    user, name, f"<p>{'Updated' if done else 'Could not update'}: {html.escape(name)}</p>")
             nonce = self._nonce()
             decision = form.get("decision", [""])[0]
             rule = sshrules_mod.parse_decision(decision, form)
@@ -7782,19 +7827,19 @@ def approval_handler(broker):
             extra = ""
             if req.always in ("applied", "exists"):
                 what = standing_mod.scope_phrase(req.mode, grants_mod.scope_for(req.mode, req.spec))
-                extra = (f"<p>Always allow saved for <b>{html.escape(req.names[0])}</b> ({html.escape(what)}). "
-                         "Revoke it at <a href='/policies'>/policies</a>.</p>")
+                extra = (f"<p>Always allow saved for <b>{credlinks_mod.link(req.names[0], tab='policies')}</b> ({html.escape(what)}). "
+                         f"Revoke it on {_revoke_where(req.names)}.</p>")
             elif req.always:
                 extra = f"<p><small>Always allow {html.escape(req.always)}.</small></p>"
             if req.ssh_rule in ("created", "exists"):
-                extra += ("<p>Always approved for this account on this server with this key. Revoke it at "
-                          "<a href='/policies'>/policies</a>.</p>")
+                extra += ("<p>Always approved for this account on this server with this key. Revoke it on "
+                          f"{_revoke_where(req.names)}.</p>")
             elif req.ssh_rule:
                 extra += "<p><small>The standing rule was not created; this request was approved once.</small></p>"
             if parsed[2] is not None:
-                extra += (f"<p>Further requests for <b>{html.escape(', '.join(req.names))}</b> are "
-                          f"approved for {parsed[2]} minutes (same secrets only). Revoke it at "
-                          "<a href='/policies'>/policies</a>.</p>")
+                extra += (f"<p>Further requests for <b>{credlinks_mod.links(req.names, tab='policies')}</b> are "
+                          f"approved for {parsed[2]} minutes (same secrets only). Revoke it on "
+                          f"{_revoke_where(req.names)}.</p>")
             _page(self, 200, "<h1>Approved</h1><p>Releasing now. You can close this page.</p>" + extra)
 
     return H

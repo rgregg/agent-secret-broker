@@ -45,6 +45,7 @@ import threading
 import time
 
 from . import risk as risk_mod
+from . import credlinks
 
 ANY = "*"                       # a rule scope that applies to every client
 LEGACY_ID = "legacy"
@@ -959,7 +960,8 @@ def clients_section(broker, csrf, now=None, flash=""):
         if not rr:
             return "no rules of its own"
         return (f"<details><summary>{len(rr)} rule{'' if len(rr) == 1 else 's'}</summary><ul class=rules>"
-                + "".join(f"<li>{esc(k)}: {esc(s)} - {esc(c)}</li>" for k, s, c in rr) + "</ul></details>")
+                + "".join(f"<li>{esc(k)}: {credlinks.links(s.split(', '), tab='policies')} - {esc(c)}</li>"
+                          for k, s, c in rr) + "</ul></details>")
 
     rows = []
     leg = broker.clients.legacy_row()
@@ -1030,5 +1032,5 @@ def clients_section(broker, csrf, now=None, flash=""):
                  "seconds. Check the disk.</div>")
     return (f"<h1>Clients</h1>{note}{hint}<div class=cl>{table}</div>"
             "<p><small class=muted>A rule made for one client never applies to another; rules for "
-            "<i>any client</i> apply to all. Rules are listed per client above and in full on the Policies "
-            "tab.</small></p>")
+            "<i>any client</i> apply to all. Rules are listed per client above and in full on each credential's "
+            "Policies page.</small></p>")

@@ -5,7 +5,7 @@ to tell the risk classifier (and the description writer) how to think about
 requests made with THAT credential ("PullStack only downloads images: low ...").
 
 Trust model: guidance is POLICY CONTEXT, at the same trust level as ``approval``.
-Whoever can edit the vault collection or use the Policies tab can change ratings
+Whoever can edit the vault collection or use the approval site can change ratings
 with it. It is therefore never shown to the agent: not by discovery, `which`,
 `/v1/secrets`, `/v1/status`, request results, notifications or the agent audit
 API. The classifier sees it in the trusted instruction part of the prompt, never
@@ -15,7 +15,7 @@ change their forced HIGH rating, and the deterministic floors in risk.assess are
 untouched.
 
 This module holds the validation, the prompt sections, the analyzer-keyword
-compatibility shim and the Policies-page editor, so the core files only need
+compatibility shim and the credential page's editor, so the core files only need
 small hooks.
 """
 import hashlib
@@ -221,30 +221,24 @@ JS = r"""
 """
 
 
-def policies_section(secrets_cfg, csrf):
-    """The 'Risk guidance' editors for the Policies tab: one collapsed card per secret."""
+def card(name, sc, csrf, idx=0, open_=False):
+    """The risk-guidance editor for one credential (`idx` makes the element ids unique on a page that holds
+    several; `open_` renders it expanded)."""
     esc = html.escape
-    head = ("<h3>Risk guidance</h3><p><small class=muted>" + esc(NOTE) + " Guidance is never shown to "
-            "agents.</small></p>")
-    if not secrets_cfg:
-        return head + "<div class='card empty'>No secrets.</div>"
-    rows = []
-    for i, (name, sc) in enumerate(sorted(secrets_cfg.items())):
-        cur = sc.get("guidance") or ""
-        ignored = ("<small class=muted>Stored guidance ignored: " + esc(sc["guidance_invalid"]) + "</small>"
-                   if sc.get("guidance_invalid") else "")
-        badge = ignored + (f"<span class='pill ok'>Guidance set ({len(cur)} chars)</span>" if cur
-                 else "<span class='pill plain'>No guidance</span>")
-        rows.append(
-            f"<details class='card gbox'><summary><b>{esc(name)}</b> {badge}"
-            "<small class=muted>Risk guidance</small></summary>"
-            "<form method=post action='/policies/guidance'>"
-            f"<input type=hidden name=csrf value='{esc(csrf)}'>"
-            f"<input type=hidden name=name value='{esc(name)}'>"
-            f"<p><small class=muted>{esc(NOTE)}</small></p>"
-            f"<textarea name=guidance maxlength={MAX_LEN} data-gmax={MAX_LEN} data-gcount='gc{i}' "
-            f"rows=6 aria-label='Risk guidance for {esc(name)}'>{esc(cur)}</textarea>"
-            f"<div class=grow><button>Save</button><small class=muted>"
-            f"<span id='gc{i}'>{len(cur)} / {MAX_LEN}</span> characters (max {MAX_LEN}). "
-            "Empty removes the guidance.</small></div></form></details>")
-    return f"<style>{CSS}</style>" + head + "".join(rows)
+    cur = sc.get("guidance") or ""
+    ignored = ("<small class=muted>Stored guidance ignored: " + esc(sc["guidance_invalid"]) + "</small>"
+               if sc.get("guidance_invalid") else "")
+    badge = ignored + (f"<span class='pill ok'>Guidance set ({len(cur)} chars)</span>" if cur
+             else "<span class='pill plain'>No guidance</span>")
+    return (
+        f"<details class='card gbox'{' open' if open_ else ''}><summary><b>{esc(name)}</b> {badge}"
+        "<small class=muted>Risk guidance</small></summary>"
+        "<form method=post action='/policies/guidance'>"
+        f"<input type=hidden name=csrf value='{esc(csrf)}'>"
+        f"<input type=hidden name=name value='{esc(name)}'>"
+        f"<p><small class=muted>{esc(NOTE)}</small></p>"
+        f"<textarea name=guidance maxlength={MAX_LEN} data-gmax={MAX_LEN} data-gcount='gc{idx}' "
+        f"rows=6 aria-label='Risk guidance for {esc(name)}'>{esc(cur)}</textarea>"
+        f"<div class=grow><button>Save</button><small class=muted>"
+        f"<span id='gc{idx}'>{len(cur)} / {MAX_LEN}</span> characters (max {MAX_LEN}). "
+        "Empty removes the guidance.</small></div></form></details>")

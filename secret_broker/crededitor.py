@@ -12,7 +12,7 @@ import html
 import json
 import re
 
-from . import peek
+from . import credlinks, peek
 from .wssessions import PRESET_DENY
 
 MAX_JSON = 100_000          # the advanced box, in characters
@@ -33,6 +33,27 @@ def digest(meta):
 
 def pretty(meta):
     return json.dumps(meta, indent=2, sort_keys=True, ensure_ascii=True)
+
+
+def tabs_html(name, active, total):
+    """The `Settings | Policies (n)` link strip shared by both tabs of a credential's page. `active` is
+    "settings" or "policies"; `total` is the count shown on the Policies label."""
+    e = html.escape
+    n = e(name, quote=True)
+    cur = " class=on aria-current=page"
+    return ("<nav class=ctabs aria-label='Credential pages'>"
+            f"<a href='/credentials/{n}'{cur if active == 'settings' else ''}>Settings</a>"
+            f"<a href='/credentials/{n}?tab=policies'{cur if active == 'policies' else ''}>"
+            f"Policies ({int(total)})</a></nav>")
+
+
+def summary_html(name, counts):
+    """The strip at the top of Settings: what policies this credential has, linked to the Policies sub-tab."""
+    n, r, k = counts["standing"], counts["rules"], counts["ssh_rules"]
+    ssh = f"{k} SSH host rule{'' if k == 1 else 's'}, " if k else ""
+    text = (f"{n} standing approval{'' if n == 1 else 's'}, {r} auto-approve rule{'' if r == 1 else 's'}, {ssh}"
+            f"risk guidance {'set' if counts['guidance'] else 'not set'}")
+    return f"<p class=hint>{credlinks.link(name, tab='policies', text=text)}</p>"
 
 
 def tls_mode(meta):
@@ -262,6 +283,10 @@ def diff_html(old, new):
 
 
 CSS = """
+.ctabs{display:flex;gap:.3rem;margin:.2rem 0 1rem;border-bottom:1px solid var(--line)}
+.ctabs a{padding:.45rem .9rem;border:1px solid transparent;border-bottom:0;border-radius:.5rem .5rem 0 0;text-decoration:none}
+.ctabs a.on{border-color:var(--line);font-weight:600;background:var(--card,transparent)}
+.clink{text-decoration:underline dotted;text-underline-offset:.15em}
 .df{white-space:pre-wrap}.df.add{background:rgba(40,160,80,.18)}.df.del{background:rgba(220,60,60,.18)}
 .diff{overflow:auto;max-height:24em;padding:.6em;border:1px solid var(--line);border-radius:.5rem;background:var(--card)}
 .cred-form label{display:block;margin:.8em 0 .2em;font-weight:600}
@@ -386,8 +411,10 @@ def matches(text, q):
 MAX_CHIPS = 3
 
 
-def list_section(secrets, flash="", q=""):
+def list_section(secrets, flash="", q="", counts=None):
+    """`counts` maps a credential name to its number of standing approvals plus rules (None: none shown)."""
     e = html.escape
+    counts = counts or {}
     q = q[:200]
     rows, shown = [], 0
     for name, sc in sorted(secrets.items()):
@@ -406,6 +433,9 @@ def list_section(secrets, flash="", q=""):
         plans = icon("list", "warn", "Plans allowed") if sc.get("plans") else "<small class=muted>-</small>"
         if meta.get("ws") is not None:
             plans = (plans if sc.get("plans") else "") + icon("ws", "warn", "WebSocket sessions allowed")
+        n_pol = counts.get(name, 0)
+        pol = (f"<a class=clink href='/credentials/{e(name, quote=True)}?tab=policies'>{int(n_pol)}</a>"
+               if n_pol else "<small class=muted>-</small>")
         rows.append(
             f"<tr class=r data-s='{e(s)}'{'' if hit else ' hidden'}>"
             f"<td data-label=Name><div class=cname>{icon(ic, tone, label)}<div><a href='/credentials/{e(name)}'>"
@@ -414,7 +444,8 @@ def list_section(secrets, flash="", q=""):
             f"<td data-label=Hosts>{hosts_html}</td>"
             f"<td class=ic data-label=Approval>{_approval_icon(sc)}</td>"
             f"<td class=ic data-label=TLS>{_tls_icon(meta)}</td>"
-            f"<td class=ic data-label=Plans>{plans}</td></tr>")
+            f"<td class=ic data-label=Plans>{plans}</td>"
+            f"<td class=ic data-label=Policies>{pol}</td></tr>")
     total = len(rows)
     count = f"{shown} of {total} credentials" if q.strip() else f"{total} credential{'s' if total != 1 else ''}"
     none = (f"<p id=cnone{'' if q.strip() and not shown else ' hidden'}><small class=muted>No credentials match "
@@ -424,7 +455,7 @@ def list_section(secrets, flash="", q=""):
             f"placeholder='Search by name, host or kind (ssh, login, allow, pinned...)' aria-label='Search credentials'>"
             f"<span class=n id=cn aria-live=polite>{count}</span></form>")
     table = ("<table class='tbl ctbl' id=ctbl><thead><tr><th>Name</th><th>Hosts</th><th class=ic>Approval</th>"
-             "<th class=ic>TLS</th><th class=ic>Plans / WS</th></tr></thead><tbody>" + "".join(rows) + "</tbody></table>")
+             "<th class=ic>TLS</th><th class=ic>Plans / WS</th><th class=ic>Policies</th></tr></thead><tbody>" + "".join(rows) + "</tbody></table>")
     key = ("<div class=ckey>" + "".join(f"<span>{icon(n, t, l)}{l}</span>" for n, t, l in (
         ("key", "acc", "Token"), ("user", "acc", "Login"), ("term", "acc", "SSH key"),
         ("phone", "", "Asks on your phone"), ("zap", "warn", "Allowed without asking"),
@@ -523,8 +554,9 @@ def manage_section(name, token, sha, bindings, *, can_write, blocked=""):
         note = f"<p><small class=muted>{e(blocked)}</small></p>"
     elif bound:
         what = ", ".join(f"{v} {k.replace('_', ' ')}" for k, v in sorted(bound.items()))
+        here = credlinks.link(name, tab="policies", text="this credential's Policies page")
         note = (f"<p><small class=muted>Rename and delete are unavailable while this credential is in use "
-                f"({e(what)}). Revoke those on the Policies and Clients tabs first.</small></p>")
+                f"({e(what)}). Revoke those on {here}, the Policies tab and the Clients tab first.</small></p>")
     dis = "" if (can_write and not blocked and not bound) else " disabled"
     return (f"<h2>Rename or delete</h2>{note}"
             f"<form class=cred-form method=post action='/credentials/{e(name)}/rename'>"
@@ -615,7 +647,7 @@ def values_section(name, sc, token, sha, *, can_write, revealed=None):
 
 
 def edit_section(name, meta, token, stored, *, can_write, error="", preview=None, widen=(), conflict=False,
-                 extra="", fetched="", values="", flash=""):
+                 extra="", fetched="", values="", flash="", chrome="", summary=""):
     """The edit page. `stored`: the metadata the vault holds (what the diff is against and what the
     concurrency hash covers); `meta`: what the form fields show (the stored metadata, or the human's
     rejected candidate). `preview`: the candidate metadata on the confirm step (diff + save button)."""
@@ -717,4 +749,5 @@ def edit_section(name, meta, token, stored, *, can_write, error="", preview=None
             f"page first and needs your tick.</p>")
     manage = f"<div class='card dzone'>{extra}</div>" if extra else ""
     note = f"<div class=flash>{e(flash)}</div>" if flash else ""
-    return f"<div class=ced><h1>Edit {e(name)}</h1>{note}{err}{off}{fetched}{values}{form}{manage}</div>"
+    return (f"<div class=ced><h1>Edit {e(name)}</h1>{chrome}{summary}{note}{err}{off}{fetched}{values}{form}"
+            f"{manage}</div>")

@@ -288,6 +288,14 @@ class CardCreate(Base):
         self.assertIsNone(got["unever"])
         self.assertTrue(89.9 * 86400 < sshrules.to_epoch(got["u90"]) - time.time() < 90.1 * 86400)
 
+    def test_the_approved_page_says_where_to_revoke_the_rule(self):
+        rid = self.ask_ok(login(SID_A), [HOST.bind(SID_A)])
+        status, _, body = self.decide(rid, "approve_ssh_rule", "link")
+        self.assertEqual(status, 200)
+        self.assertIn("Always approved for this account on this server", body)           # the premise: the rule was made
+        self.assertIn("href='/credentials/deploy?tab=policies'", body)
+        self.assertNotIn("href='/policies'", body)
+
     def test_bad_expiry_changes_nothing(self):
         rid = self.ask_ok(login(SID_A), [HOST.bind(SID_A)])
         self.assertEqual(self.decide(rid, "approve_ssh_rule", expiry="7")[1], "/?note=stale")
@@ -440,7 +448,7 @@ class Match(Base):
         # nothing about use is written into the vault
         self.assertEqual(self.stored_rules(), self.live_rules())
         self.assertNotIn("last_used", json.dumps(self.stored_rules()))
-        page = t.req(self.abase + "/policies", headers=self.H)[1]
+        page = t.req(self.abase + "/credentials/deploy?tab=policies", headers=self.H)[1]
         self.assertIn("3 uses", page)
 
     def test_corrupt_state_file_only_loses_last_used(self):
@@ -557,7 +565,7 @@ class RefusalsFirst(Base):
         self.assertEqual(len(self.stored_rules()), 2)                  # the rule is still stored
 
     def test_policies_page_warns_about_blocked_rules(self):
-        page = t.req(self.abase + "/policies", headers=self.H)[1]
+        page = t.req(self.abase + "/credentials/deploy?tab=policies", headers=self.H)[1]
         row = [x for x in page.split("<tr>") if HOST.fp[:19] in x and "Revoke" in x][0]
         self.assertIn("blocked by the allowed hosts list", row)
         other = [x for x in page.split("<tr>") if OTHER.fp[:19] in x and "Revoke" in x][0]
@@ -709,11 +717,12 @@ class PoliciesBase(Base):
         except urllib.error.HTTPError as e:
             return e.code, e.read().decode()
 
-    def page(self):
-        return t.req(self.abase + "/policies", headers=self.H)[1]
+    def page(self, cred="deploy"):
+        """A credential's Policies page (where the SSH rules live now)."""
+        return t.req(self.abase + f"/credentials/{cred}?tab=policies", headers=self.H)[1]
 
-    def section(self):
-        return self.page().split("SSH host rules")[1]
+    def section(self, cred="deploy"):
+        return self.page(cred).split("SSH host rules")[1]
 
 
 class PoliciesTab(PoliciesBase):
@@ -730,12 +739,13 @@ class PoliciesTab(PoliciesBase):
         self.assertIn(f"value='{OTHER.fp}'", sec)                        # host dropdown from known_hosts
         self.assertIn("db.example.com", sec)
         self.assertIn("name=confirm", sec)
-        self.assertNotIn("No standing SSH rules", sec.split("deploy2")[0])
-        self.assertEqual(sec.count("No standing SSH rules"), 1)           # deploy2 is empty
+        self.assertNotIn("No standing SSH rules", sec)                    # this key has a rule
+        self.assertEqual(self.section("deploy2").count("No standing SSH rules"), 1)   # deploy2 is empty (its own page)
 
     def test_empty_state(self):
         self.broker.revoke_ssh_rule("deploy", self.live_rules()[0]["id"], "alice")
-        self.assertEqual(self.section().count("No standing SSH rules"), 2)
+        self.assertEqual(self.section().count("No standing SSH rules"), 1)
+        self.assertEqual(self.section("deploy2").count("No standing SSH rules"), 1)
 
     def test_revoke(self):
         rid = self.live_rules()[0]["id"]
@@ -846,7 +856,10 @@ class PoliciesTab(PoliciesBase):
         self.assertIn("&lt;svg onload=alert(2)&gt;", page)
 
     def test_not_shown_without_ssh_keys(self):
-        self.assertEqual(sshrules.policies_section({"svc": {"vars": {}}}, "tok", self.broker.ssh_rule_usage), "")
+        self.assertEqual(sshrules.card("svc", {"vars": {}}, "tok", self.broker.ssh_rule_usage), "")
+        self.assertNotEqual(sshrules.card("deploy", self.broker.cfg["secrets"]["deploy"], "tok",
+                                          self.broker.ssh_rule_usage), "")             # control: an ssh key has one
+        self.assertNotIn("SSH host rules", self.page("svc"))                           # nor does its page
 
 
 # ------------------------------------------------------------------ audit and hiding

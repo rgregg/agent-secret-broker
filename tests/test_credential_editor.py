@@ -9,6 +9,7 @@ import re
 import socket
 import ssl
 import tempfile
+import time
 import threading
 import sys
 import unittest
@@ -456,7 +457,10 @@ class Manage(Base):
         self.assertEqual(b.credential_bindings("svc"), {"timed_grants": 0, "always": 0, "plans": 0,
                                                         "sessions": 0, "pending": 0})     # nothing bound yet
         kinds = {
-            "timed_grants": mock.patch.object(b, "active_grants", return_value=[{"secrets": ["svc", "x"]}]),
+            "timed_grants": mock.patch.object(b, "active_grants", return_value=[{
+                "id": "g1", "secrets": ["svc", "x"], "mode": "http", "client": "*", "scope": "any",
+                "expires_at": time.time() + 300, "left_s": 300, "created_by": "alice", "created_at": time.time(),
+                "minutes": 5}]),
             "plans": mock.patch.object(b, "active_plans", return_value=[{"names": ["svc"]}]),
             "sessions": mock.patch.object(b, "active_sessions", return_value=[{"cred": "svc"}]),
         }
@@ -476,7 +480,8 @@ class Manage(Base):
                     self.assertEqual(self.delete()[0], 400)
                     self.assertEqual(self.last_reason(), "bound")
         with self.subTest(kind="always"):
-            sc["standing"] = [{"id": "a1"}]
+            sc["standing"] = [{"id": "a1", "mode": "http", "scope": "any", "created_by": "alice",
+                               "created_at": "2026-11-18T00:00:00Z", "client": "*"}]
             self.assertEqual(b.credential_bindings("svc")["always"], 1)
             self.assertEqual(self.rename("svc2")[0], 400)
             self.assertEqual(self.last_reason(), "bound")

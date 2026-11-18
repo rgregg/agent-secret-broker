@@ -1124,7 +1124,7 @@ class Approval(SBase):
     def test_the_card_shows_everything_and_offers_no_chips(self):
         r = self.ask(purpose="update the n\u00e4me", methods=["GET", "DELETE"], ttl_s=1200, max_calls=40)
         status, page, _ = self.get("/")
-        self.assertIn("HTTP session</b> with credential <b>unifi</b>", page)
+        self.assertIn("HTTP session</b> with credential <b>unifi</b>", _fast.unlink_names(page))
         self.assertIn("127.0.0.1", page)
         self.assertIn("GET, DELETE", page)
         self.assertIn("changes things: DELETE", page)

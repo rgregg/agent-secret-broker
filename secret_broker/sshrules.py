@@ -18,7 +18,7 @@ Server-side refusals (`ssh_hosts`) run in Broker.create() before a request
 exists, so a rule can never release anything they refuse.
 
 This module holds the rule schema/validator, the matching helpers, the small
-last-used state file, the Policies-page section, the approval-card chip and the
+last-used state file, the credential Policies page's section, the approval-card chip and the
 Broker mixin (rule creation, revoke, expiry, claim). Audit note for anything that
 exposes audit events to the agent: every `ssh_rule_*` event and the `rule_id`
 field are policy context (hidden in audit_api); a rule-approved request shows
@@ -430,7 +430,7 @@ class SshRulesMixin:
 
     def add_ssh_rule(self, name, fp, account, expiry, confirm, user, peer=None, client_ip=None,
                      client=clients_mod.ANY):
-        """Policies-page 'Add rule' for one client (or `*` = any client). Returns {"status":
+        """credential-Policies-page 'Add rule' for one client (or `*` = any client). Returns {"status":
         created|exists|refused|failed, "message"}; raises ValueError for an unknown or non-ssh
         secret."""
         sc = self.cfg["secrets"].get(name)
@@ -563,7 +563,7 @@ def chip_html(account, server, fp):
     e = html.escape
     shown = f"{account}@{server}"
     tip = (f"Approve this request and always approve this key for {shown} "
-           f"({fp}) without asking. Revoke any time under Policies.")
+           f"({fp}) without asking. Revoke any time on the credential's Policies page.")
     return (f"<details class='alw sshrule'><summary class='chip always' data-tip='{e(tip, quote=True)}' "
             f"aria-label='Always approve {e(shown, quote=True)} with this key: {e(tip, quote=True)}'>"
             "Always: this host</summary>"
@@ -591,75 +591,70 @@ def _when(t):
         return ""
 
 
-def policies_section(secrets_cfg, csrf, usage, now=None, state=None, client_names=None, client_choices=()):
-    """'SSH host rules' for the Policies tab: per SSH key a table of its rules with
-    Revoke and an 'Add rule' form. `state` maps a secret name to {"error", "open"}."""
+def card(name, sc, csrf, usage, now=None, state=None, client_names=None, client_choices=(), idx=0, open_=False):
+    """The SSH host rules table and 'Add rule' form for one SSH key ("" for any other credential). `state` is
+    this key's {"error", "open"}; `idx` keeps the element ids unique; `open_` renders it expanded."""
+    if not sc.get("ssh"):
+        return ""
     e = html.escape
     now = time.time() if now is None else now
-    state = state or {}
+    st = dict(state or {})
+    if open_:
+        st["open"] = True
     client_names = client_names or {}
-    keys = [(n, sc) for n, sc in sorted(secrets_cfg.items()) if sc.get("ssh")]
-    head = ("<h3>SSH host rules</h3><p><small class=muted>Standing approvals: a key may sign "
-            "logins to one verified server as one account without asking, whatever the auto-approve "
-            "limit. Everything else still asks. Never shown to agents.</small></p>")
-    if not keys:
-        return ""
-    cards = []
-    for i, (name, sc) in enumerate(keys):
-        rules = sc.get("ssh_rules") or []
-        policy = sc.get("ssh_hosts") or {}
-        known = policy.get("known") or {}
-        allowed = policy.get("allowed")
-        st = state.get(name) or {}
-        rows = []
-        for r in rules:
-            u = usage.get(name, r["id"])
-            warn = ""
-            if allowed and not (r["fp"] in allowed or any(n in allowed for n in known.get(r["fp"], []))):
-                warn = ("<br><span class=warnline>Not on the allowed hosts list: blocked by the "
-                        "allowed hosts list, so this rule has no effect.</span>")
-            expired = is_expired(r, now)
-            exp = (e(r["expires_at"]) + (" <b>(expired)</b>" if expired else "")) if r["expires_at"] else "never"
-            rows.append(
-                f"<tr><td data-label=Host>{e(r['host'] or '(no name)')}{warn}</td>"
-                f"<td data-label=Fingerprint><span class=fp title='{e(r['fp'], quote=True)}'>{e(short_fp(r['fp']))}...</span></td>"
-                f"<td data-label=Account><code>{e(r['user'])}</code></td>"
-                f"<td data-label=Client>{e(clients_mod.scope_label(r.get('client', clients_mod.ANY), client_names))}</td>"
-                f"<td data-label=Created>{e(r['by'])}<br><small class=muted>{e(r['at'])}</small></td>"
-                f"<td data-label=Expires>{exp}</td>"
-                f"<td data-label='Last used'>{e(_when(u['last_used']) or 'never')}"
-                f"<br><small class=muted>{int(u['uses'])} uses</small></td>"
-                "<td><form method=post action='/policies/ssh_rules/revoke' class=inline>"
-                f"<input type=hidden name=csrf value='{e(csrf, quote=True)}'>"
-                f"<input type=hidden name=secret value='{e(name, quote=True)}'>"
-                f"<input type=hidden name=rule value='{e(r['id'], quote=True)}'>"
-                "<button>Revoke</button></form></td></tr>")
-        table = ("<table class=tbl><thead><tr><th>Host</th><th>Fingerprint</th><th>Account</th><th>Client</th>"
-                 "<th>Created</th><th>Expires</th><th>Last used</th><th></th></tr></thead><tbody>"
-                 + "".join(rows) + "</tbody></table>") if rows else "<div class='card empty'>No standing SSH rules</div>"
-        opts = "<option value=''>Enter a fingerprint below</option>" + "".join(
-            f"<option value='{e(fp, quote=True)}'>{e(', '.join(ns) or '(no name)')} - {e(short_fp(fp))}...</option>"
-            for fp, ns in sorted(known.items(), key=lambda kv: kv[1]))
-        err = f"<div class=err role=alert>{e(st['error'])}</div>" if st.get("error") else ""
-        cards.append(
-            f"<details class='card gbox srules'{' open' if st.get('open') else ''}><summary><b>{e(name)}</b> "
-            f"<small class=muted>{len(rules)} of {MAX_RULES} rules</small></summary>{err}{table}"
-            "<form method=post action='/policies/ssh_rules/add' class=add>"
+    i = idx
+    rules = sc.get("ssh_rules") or []
+    policy = sc.get("ssh_hosts") or {}
+    known = policy.get("known") or {}
+    allowed = policy.get("allowed")
+    rows = []
+    for r in rules:
+        u = usage.get(name, r["id"])
+        warn = ""
+        if allowed and not (r["fp"] in allowed or any(n in allowed for n in known.get(r["fp"], []))):
+            warn = ("<br><span class=warnline>Not on the allowed hosts list: blocked by the "
+                    "allowed hosts list, so this rule has no effect.</span>")
+        expired = is_expired(r, now)
+        exp = (e(r["expires_at"]) + (" <b>(expired)</b>" if expired else "")) if r["expires_at"] else "never"
+        rows.append(
+            f"<tr><td data-label=Host>{e(r['host'] or '(no name)')}{warn}</td>"
+            f"<td data-label=Fingerprint><span class=fp title='{e(r['fp'], quote=True)}'>{e(short_fp(r['fp']))}...</span></td>"
+            f"<td data-label=Account><code>{e(r['user'])}</code></td>"
+            f"<td data-label=Client>{e(clients_mod.scope_label(r.get('client', clients_mod.ANY), client_names))}</td>"
+            f"<td data-label=Created>{e(r['by'])}<br><small class=muted>{e(r['at'])}</small></td>"
+            f"<td data-label=Expires>{exp}</td>"
+            f"<td data-label='Last used'>{e(_when(u['last_used']) or 'never')}"
+            f"<br><small class=muted>{int(u['uses'])} uses</small></td>"
+            "<td><form method=post action='/policies/ssh_rules/revoke' class=inline>"
             f"<input type=hidden name=csrf value='{e(csrf, quote=True)}'>"
             f"<input type=hidden name=secret value='{e(name, quote=True)}'>"
-            f"<b>Add rule</b><label for='srh{i}'>Server from this key's known hosts</label>"
-            f"<select id='srh{i}' name=host>{opts}</select>"
-            f"<label for='srf{i}'>or a SHA256: fingerprint</label>"
-            f"<input id='srf{i}' name=fp placeholder='SHA256:...' autocomplete=off>"
-            f"<label for='sra{i}'>Account</label><input id='sra{i}' name=account maxlength=64 autocomplete=off>"
-            f"<label for='src{i}'>Applies to</label><select id='src{i}' name=client>"
-            "<option value='*' selected>Any client (every machine)</option>"
-            + "".join(f"<option value='{e(cid, quote=True)}'>Only {e(cn)}</option>" for cid, cn in client_choices)
-            + "</select>"
-            f"<label for='sre{i}'>Expires</label><select id='sre{i}' name=expires>"
-            "<option value=never selected>Never expires (default)</option><option value=30>30 days</option>"
-            "<option value=90>90 days</option></select>"
-            "<label class=chk><input type=checkbox name=confirm value=1> <span>I understand this key will "
-            "sign for that server and account without asking</span></label>"
-            "<div class=grow><button>Add rule</button></div></form></details>")
-    return f"<style>{CSS}</style>" + head + "".join(cards)
+            f"<input type=hidden name=rule value='{e(r['id'], quote=True)}'>"
+            "<button>Revoke</button></form></td></tr>")
+    table = ("<table class=tbl><thead><tr><th>Host</th><th>Fingerprint</th><th>Account</th><th>Client</th>"
+             "<th>Created</th><th>Expires</th><th>Last used</th><th></th></tr></thead><tbody>"
+             + "".join(rows) + "</tbody></table>") if rows else "<div class='card empty'>No standing SSH rules</div>"
+    opts = "<option value=''>Enter a fingerprint below</option>" + "".join(
+        f"<option value='{e(fp, quote=True)}'>{e(', '.join(ns) or '(no name)')} - {e(short_fp(fp))}...</option>"
+        for fp, ns in sorted(known.items(), key=lambda kv: kv[1]))
+    err = f"<div class=err role=alert>{e(st['error'])}</div>" if st.get("error") else ""
+    return (
+        f"<details class='card gbox srules'{' open' if st.get('open') else ''}><summary><b>{e(name)}</b> "
+        f"<small class=muted>{len(rules)} of {MAX_RULES} rules</small></summary>{err}{table}"
+        "<form method=post action='/policies/ssh_rules/add' class=add>"
+        f"<input type=hidden name=csrf value='{e(csrf, quote=True)}'>"
+        f"<input type=hidden name=secret value='{e(name, quote=True)}'>"
+        f"<b>Add rule</b><label for='srh{i}'>Server from this key's known hosts</label>"
+        f"<select id='srh{i}' name=host>{opts}</select>"
+        f"<label for='srf{i}'>or a SHA256: fingerprint</label>"
+        f"<input id='srf{i}' name=fp placeholder='SHA256:...' autocomplete=off>"
+        f"<label for='sra{i}'>Account</label><input id='sra{i}' name=account maxlength=64 autocomplete=off>"
+        f"<label for='src{i}'>Applies to</label><select id='src{i}' name=client>"
+        "<option value='*' selected>Any client (every machine)</option>"
+        + "".join(f"<option value='{e(cid, quote=True)}'>Only {e(cn)}</option>" for cid, cn in client_choices)
+        + "</select>"
+        f"<label for='sre{i}'>Expires</label><select id='sre{i}' name=expires>"
+        "<option value=never selected>Never expires (default)</option><option value=30>30 days</option>"
+        "<option value=90>90 days</option></select>"
+        "<label class=chk><input type=checkbox name=confirm value=1> <span>I understand this key will "
+        "sign for that server and account without asking</span></label>"
+        "<div class=grow><button>Add rule</button></div></form></details>")

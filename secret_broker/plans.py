@@ -38,6 +38,7 @@ from collections import deque
 
 from . import httpcheck
 from . import clock as clock_mod
+from . import credlinks
 from . import guidance as guidance_mod
 from . import sessions as sessions_mod     # the header, Content-Type and override rules are shared, not copied
 
@@ -1759,7 +1760,7 @@ def active_table_html(rows, token, names=None):
         body.append(
             f"<tr><td data-label=Task>{_esc(r['task'])}</td>"
             f"<td data-label=Client>{e(r['client_name'])}</td>"
-            f"<td data-label=Secrets>{e(', '.join(r['names']))}</td>"
+            f"<td data-label=Secrets>{credlinks.links(r['names'], tab='policies')}</td>"
             f"<td data-label=Ends><time data-gexp='{int(r['expires_at'] or 0)}'>in {_hm(left) if left >= 60 else 'under a minute'}</time></td>"
             f"<td data-label=Used>{r['uses']} / {r['uses_max']}</td>"
             f"<td data-label=State>{e(r['state'])}</td>"
