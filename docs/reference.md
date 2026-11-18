@@ -957,15 +957,17 @@ delivered if at least one succeeds.
 
     "notify": [
       {"type": "ticker",   "ha_url": "...", "ha_token_file": "...", "category": "general"},
-      {"type": "telegram", "bot_token_file": "...", "chat_id": "123456789"}
+      {"type": "telegram", "bot_token_file": "...", "chat_id": "123456789", "allowed_users": [123456789]}
     ]
 
 - `ticker`: Home Assistant `ticker.notify`; delivery is verified, since
   Ticker returns 200 even when it drops a notification. With `ha_hook`
   configured (below) it also renders Approve/Deny buttons.
-- `telegram`: message with one URL button to the approval page (no callback
-  buttons, so nothing can be approved from inside the chat). The message is
-  edited to APPROVED/DENIED/EXPIRED when settled.
+- `telegram`: message with a URL button to the approval page. With
+  `allowed_users` set it also carries Deny/Approve buttons that decide the
+  request in the chat (see Telegram action buttons below); without it nothing
+  can be approved from inside the chat. The message is edited to
+  APPROVED/DENIED/EXPIRED when settled, which removes the buttons.
 - `webpush`: browser push, described under Web Push below.
 
 ### Notifier contract
@@ -985,8 +987,8 @@ A transport implements:
   on `n.tag`).
 - `supports_actions = ("approve", "deny")` (optional, default none): the action
   ids it can render. Each transport only receives the actions it supports, so
-  Telegram always gets none, and ticker gets some only when `ha_hook` is
-  configured. The token exists only if at least one
+  Telegram gets some only when `allowed_users` is set, and ticker only when
+  `ha_hook` is configured. The token exists only if at least one
   transport carries actions; the broker keeps just its SHA-256.
 - `action_policy` (optional): per-transport override, see below.
 
@@ -1051,6 +1053,7 @@ own authentication (SSO header, CSRF/origin, `X-Requested-With`):
 | `link` (`/a/<nonce>`) | no | yes | yes | yes |
 | `push` | yes | no | no | no |
 | `ha` (`/v1/hooks/ha/decide`) | yes | no | no | no |
+| `telegram` (callback button) | yes | no | no | no |
 
 ### Home Assistant action buttons (`ha_hook`)
 
@@ -1150,6 +1153,49 @@ Home Assistant example (placeholders only). `secrets.yaml`: `asb_hook_key`.
 (approver `ha:unknown`; refused if `allowed_devices` is set). The companion-app docs do not document `device_id` in the event
 data; check the event in Developer Tools before relying on it.
 
+
+### Telegram action buttons (`allowed_users`)
+
+Deny and Approve buttons on the Telegram message. The broker long-polls
+`getUpdates` (only `callback_query` updates) over an outbound connection, so
+nothing listens for Telegram and no path is opened through the SSO proxy. The bot
+must not have a webhook set (Telegram then answers `getUpdates` with 409, logged
+once as `telegram_poll_error` `conflict`). Config, inside the `telegram` entry:
+
+    "allowed_users": [123456789]      // Telegram numeric user ids, 1 to 20
+
+- Without `allowed_users` (or with an empty list) the transport is link only and
+  no polling runs. Startup refuses anything but a list of positive integers
+  (`notify[i].allowed_users`).
+- Buttons follow the usual action policy; a per-entry `actions` object narrows
+  Telegram alone, e.g. `{"approve_max_risk": "medium"}` for Deny only on high risk.
+  Requests that never get buttons on any channel (credential entry, plans,
+  guidance proposals, sessions, root commands) get none here, and no tap can create
+  an Always, timed approval or SSH rule.
+- Button data is `ASB|<approve|deny>|<rid>|<token>` with the same single-use
+  token as Web Push and the HA hook (at most 64 bytes; if it would be longer the
+  message is sent with the link only).
+- A tap counts only if it comes from a listed user, in the configured chat, on the
+  message the broker sent for that request, for a button that message shows. It is
+  then decided through `decide_via("telegram", ...)` with approver
+  `telegram:<user id>`. Anything else decides nothing and is audited as
+  `telegram_decide_refused` with `reason` (`malformed`, `user`, `chat`, `message`,
+  `action`, or `status` with the decide `status` and `rid`) and `user`; at most
+  10 such lines a minute, the rest counted as `suppressed` on the next one. The
+  token and button data are never logged.
+- The tap is answered with a fixed toast: Approved, Denied, Already decided or
+  Not allowed.
+- Poll failures back off (1 s doubling to 60 s) and are logged as
+  `telegram_poll_error` with a fixed `error` (`unauthorized`, `conflict`, `http`,
+  `network`, `internal`); the bot token is part of the API URL and never appears.
+
+Security: whoever controls a listed Telegram account can approve any request that
+gets buttons, without the SSO session the approval page needs. Bot chats are not
+end-to-end encrypted, so the request text (secret names, method, URL, summary)
+is stored on Telegram's servers, as it already is for the link-only message.
+Telegram cannot approve credential entry, plans, guidance, sessions, root
+commands, Always or timed approvals. Buttons from before a broker restart are
+refused (`message`).
 
 Messages cross whatever service carries them and include secret names, the
 method and URL, and the approval link (single use, expires with the request,
@@ -3107,7 +3153,8 @@ policy, approver, reported client IP, latency), `http_executed`, `delivered`,
 text), `guidance_change_refused`, `guidance_change_failed`, and
 security events `auth_failed` (Home Assistant hook), `client_auth_failed`, `rejected`, `approval_viewed`,
 `approval_forbidden`, `approval_stale`, `bad_request`, `discovery`,
-`ha_decide_refused`, `ha_decide_dropped`, `ha_hook_any_device`.
+`ha_decide_refused`, `ha_decide_dropped`, `ha_hook_any_device`, `telegram_decide_refused`,
+`telegram_poll_error`.
 
     python -m secret_broker.audit verify audit.jsonl
     python -m secret_broker.audit show audit.jsonl approved names=example-api
