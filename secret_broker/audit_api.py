@@ -161,7 +161,7 @@ HIDDEN = frozenset({
     "ssh_rule_change_failed", "ssh_rules_state_corrupt", "ssh_rules_state_write_failed",
     # rules kept in a credential's metadata and managed from the Policies tab: approval policy, like the above
     "auto_rule_created", "auto_rule_revoked", "auto_rule_expired", "auto_rule_refused", "auto_rule_change_failed",
-    "auto_rules_state_corrupt", "auto_rules_state_write_failed",
+    "auto_rules_state_corrupt", "auto_rules_state_write_failed", "catalog_refresh_deferred",
     # per-client credentials: enrolling, renaming and revoking clients is approver activity, and an
     # authentication failure can name a revoked client; none of it is the agent's business
     "enroll_requested", "enroll_decided", "enroll_refused", "enroll_notify_failed",

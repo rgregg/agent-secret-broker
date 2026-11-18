@@ -655,16 +655,20 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
         out.update(adopted)
         with self._cfg_lock:
             moved = self._cfg_gen != gen
-            if not moved or _retries <= 0:
+            if not moved:
                 self.cfg["secrets"] = out
                 self._catalog_at = time.time()
                 self._backend_ok = True
                 self._catalog_stats = {"count": len(out), "invalid": len(bad), "adopted": len(adopted),
                                        "loaded_at": _iso(self._catalog_at)}
-        if moved and _retries > 0:
+        if moved:
             # A rule was added, revoked or expired while the vault was being read: this snapshot may still
-            # hold the old rule list (a revoked rule would come back). Read again.
-            return self.refresh_catalog(False, _retries - 1)
+            # hold the old rule list (a revoked rule would come back). Read again; if the writes keep
+            # overlapping, fail closed: keep the catalog in memory (it has those writes) and try next time.
+            if _retries > 0:
+                return self.refresh_catalog(False, _retries - 1)
+            self.log("catalog_refresh_deferred", reason="rules changed while the vault was being read")
+            return
         self.prune_auto_rule_usage()
         self._sync_summary_key(out)
         ginv = {n: e["guidance_invalid"] for n, e in sorted(out.items()) if e.get("guidance_invalid")}

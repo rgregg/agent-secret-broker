@@ -626,6 +626,23 @@ class Persistence(ManageBase):
                                           "headers": {"Authorization": "Bearer {{SVC_TOKEN}}"}})
         self.assertEqual(len(self.events("auto_rule_used")), before)                  # and it does not approve
 
+    def test_a_refresh_that_keeps_overlapping_writes_keeps_the_current_catalog(self):
+        self.seed(svc_rule(id="rev002", name="to revoke"))
+        real = self.broker.backend.catalog
+        stale = real()                                      # a snapshot that still holds the rule
+        self.assertEqual(self.broker.revoke_auto_rule("svc", "rev002", "alice"), "revoked")
+
+        def always_racing():
+            self.broker._cfg_gen += 1                       # a rule write overlaps every read, retries included
+            return stale
+        self.broker.backend.catalog = always_racing
+        self.broker.refresh_catalog()
+        self.assertEqual(self.live(), [])                   # the stale snapshot was not installed
+        self.assertEqual(len(self.events("catalog_refresh_deferred")), 1)            # and it was said once
+        self.broker.backend.catalog = real
+        self.broker.refresh_catalog()                       # control: a calm refresh installs the vault's view
+        self.assertEqual(self.live(), [])
+
 
 class HostlessCredential(ManageBase):
     """An env-only credential has no allowed hosts but can still get an env rule from the page."""
