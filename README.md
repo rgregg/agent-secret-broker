@@ -39,10 +39,13 @@ push notification or the dashboard.
 - **Multi-step API flows stay in the safe mode.** `asb session open` asks you once for a time-boxed,
   host- and method-limited session (it cannot be extended); `asb http --session` then logs in, keeps the cookies and
   CSRF values inside the broker, and never shows them to the agent
-  ([docs](docs/reference.md#http-sessions-multi-step-flows-with-one-approval)).
+  ([docs](docs/reference.md#http-sessions-multi-step-flows-with-one-approval)). For unattended jobs, an
+  `http_session` rule opens a session with no tap, but only inside the hosts, methods and caps the rule names
+  ([docs](docs/reference.md#auto-approving-sessions-http_session-and-ws_session)).
 - **WebSocket services too.** `asb ws` has the broker hold a `ws://`/`wss://` connection and sign in itself (a
   per-credential handshake set by the operator), so the token never reaches the agent; one always-high approval,
   fixed deadline, frame and byte caps ([docs](docs/reference.md#websocket-sessions-the-broker-holds-the-connection)).
+  A `ws_session` rule can approve a session for one server and path with capped time and frames.
 - **Every use is approved or explicitly allow-listed**, rated by a risk model, and
   written to a hash-chained audit log.
 
