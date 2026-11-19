@@ -3193,9 +3193,38 @@ client id and name).
 
 `clients.json` next to the audit log (0600, atomic write with fsync of the file and its directory):
 id (`c-` + 8 hex, random, never reused), name, hash, created, approved_by, last_seen, last_source,
-request count, state (`active`/`revoked`), the unverified claim, the enrolling address. Hashes only;
-nothing secret. Statistics are buffered and written at most every 30 s. The legacy key is one
-pseudo-client `legacy` / "shared key (legacy)" whose counters are kept in the same file.
+request count, state (`active`/`disabled`/`revoked`), the unverified claim, the enrolling address, the last
+reported `asb` version, and when and by whom it was disabled. Hashes only; nothing secret. Statistics (counts, last
+seen, version) are held in memory exactly and written at most every 5 minutes (a revoke, disable, rename or
+enrollment writes at once). The legacy key is one pseudo-client `legacy` / "shared key (legacy)" whose counters and
+version are kept in the same file.
+
+The file is `"version": 2`. Older files (no version, or 1, without the version and disabled fields) load unchanged;
+an unknown `state` still makes the whole list unreadable (fail closed). **Rolling the broker back to a build before
+the `disabled` state, while a client is disabled, therefore makes the list unreadable** until the file is fixed:
+enable (or revoke) disabled clients first.
+
+- **Disable** is reversible and means *auto-deny*. The client's key still identifies it, so the door answers, but
+  every endpoint of the client API returns `403 {"error": "this client is disabled"}`: one fixed label, nothing
+  else (no name, id or state of anything). It is checked before any request is created, so no standing approval,
+  Always, timed grant, SSH rule, auto-approve rule, plan, session or enrollment is ever evaluated for it, and
+  nobody is notified. One `client_disabled_denied` audit event per client per 30 s (with a `suppressed` count)
+  records it; the row's last seen and version keep updating (so you can see it still tries) but the request count
+  does not. Disabling denies the client's waiting requests (reason "this client is disabled", no name cooldown) and
+  ends its open sessions; its rules and plans are **kept** (they cannot be used, and plans still end at their
+  deadline) and everything that has not expired applies again after **Enable**. A disabled client keeps its name
+  (a new enrollment cannot take it) and is not offered as a scope for new rules. Like revoke it takes effect in
+  memory first; if the write fails it is retried (an enable that is not yet saved is lost by a restart, which leaves
+  the client disabled, the safe side). Revoke still works on a disabled client and wins. The legacy shared key has no
+  row state: `legacy_client_key` stays its only switch.
+- **Version tracking.** `asb` names its version in its `User-Agent` (`asb/1.1 (+https://...)`; the Python and Rust
+  CLIs send the same). On every authenticated request the broker keeps the version it reports, parsed strictly
+  (`asb/` then digits and dots, at most four fields) and never stored in any other form, so no client-chosen text
+  reaches a page or the audit log. A request without a well-formed one (another tool, a missing header) leaves
+  the last known version alone. The Clients tab shows it, and an **upgrade recommended** icon when it is older than
+  the threshold: `clients.min_version` in the config when set (`"1.2"`; `"none"` turns the recommendation off),
+  else the newest version this broker build knows. Comparison is numeric field by field. A client whose version is
+  unknown shows "version unknown" and is never flagged. The icon is informational; nothing is refused for it.
 
 - **Revoke** takes effect on the next request and sets state in memory under the lock before
   anything else; `Broker.create` re-checks the client under the request lock, so no request of a
@@ -3216,10 +3245,12 @@ pseudo-client `legacy` / "shared key (legacy)" whose counters are kept in the sa
 
     "legacy_client_key": "allow",                       // allow (default) | deny
     "enrollment": {"enabled": true, "ttl_s": 600, "max_pending": 3},
-    "clients": {"c-1a2b3c4d": {"risk": {"auto_approve_max": "none", "auto_modes": ["http"]}}}
+    "clients": {"min_version": "1.1",                   // optional: flag clients older than this; "none" = never
+                "c-1a2b3c4d": {"risk": {"auto_approve_max": "none", "auto_modes": ["http"]}}}
 
 The override block is keyed by client id (shown on the Clients tab; ids are random, so set it after
-enrolling and restart) or `legacy`. Validated at startup, naming the field.
+enrolling and restart) or `legacy`. `min_version` (digits and dots, or `none`) sits beside the ids. Validated at
+startup, naming the field.
 
 ### Per-client rules
 
@@ -3248,11 +3279,39 @@ client id.
 - The credential Policies pages show who each rule applies to; the Clients tab lists each client's own rules.
   Revoking a client removes them.
 
+### The Clients tab
+
+One compact row per client (the legacy shared key first): a **status icon** (active, disabled, revoked; the legacy
+row shows allowed/denied), the name, when it was last seen, the `asb` version with an upgrade icon when due, a
+**rules count**, and icon controls: rules, rename (pencil), disable/enable, revoke (X), and for a revoked row a
+trash icon that removes it from the list. Every icon is a labelled control (`aria-label` and tooltip, keyboard
+focus, a visible focus ring); colours come from the theme variables. Everything else is in four pop-over dialogs
+per client, opened from the row:
+
+- **Details** (click the name): id, the unverified host it claimed, who approved it and from where, last seen and
+  source, request count, version, effective ceiling, and the controls with a one-line explanation of disable
+  versus revoke.
+- **Rules**: every rule scoped to that client: timed approvals, Always approvals, SSH host rules, Policies-tab
+  auto-approve rules, `auto_approve` config rules (read-only: "set in the configuration file") and active plans.
+  Credential names link to the credential's Policies page. Each revocable rule has a revoke control that posts
+  to the existing endpoint (`/grants/revoke`, `/policies/ssh_rules/revoke`, `/policies/auto_rules/revoke`,
+  `/plans/revoke`) with its CSRF, same-origin and SSO checks, plus `back=clients` so you land on this tab. Rules for
+  any client are on the credentials' Policies pages, not here.
+- **Rename** and **Revoke** (which asks for confirmation).
+
+The list is plain HTML. The icon controls are links to the dialogs; with script they open modally (focus moves in,
+Escape or the backdrop closes, focus returns to the control) and without it the dialog's `:target` style shows it in
+place with a Close link. Scripts run under the page's nonce CSP. Pending enrollments stay on the Requests tab (their
+card has a pending icon); the Clients tab says how many are waiting. The Active plans and Active sessions tables
+follow the list. `POST /clients/disable` and `/clients/enable` follow the rename/revoke pattern (SSO identity,
+trusted peer, CSRF, same-origin, fixed result notes).
+
 ### Audit events
 
 `enroll_requested` (name, claim, peer, code), `enroll_decided` (approved/denied/expired, approver),
 `enroll_refused`, `enroll_notify_failed`, `client_revoked` (counts of denied requests and removed
-rules), `client_renamed`, `client_rename_refused`, `client_removed`, `client_auth_failed` (reason
+rules), `client_disabled` (denied requests, ended sessions), `client_enabled`, `client_disabled_denied` (one per
+client per 30 s window; `suppressed` count), `client_renamed`, `client_rename_refused`, `client_removed`, `client_auth_failed` (reason
 `bad_key`/`revoked`/`legacy_denied`/`clients_unavailable`; one record per source per 30 s with a
 `suppressed` count; never key material), `clients_file_corrupt`, `clients_file_write_failed`,
 `clients_file_recovered`. Request events gain `client_id` and `client_name`; `grant_created` and
@@ -3266,6 +3325,21 @@ stamped with its own `client_id` (so other clients' requests, names and ids, and
 are not returned, whatever the filters, `--request`, `--after` or `--tail`), plus its own name on
 `requested`. The legacy shared key keeps the previous, unscoped view (it is many machines) but is
 told no client names at all.
+
+## Identities on pages and edge proxies
+
+SSH identities (`user@host`, `account@server`) and the SSO user look like email addresses. An edge proxy in front of the
+approval site, notably Cloudflare's **Email Address Obfuscation** (Scrape Shield), rewrites anything of that shape in
+HTML text and the page then shows `[email protected]`. The broker does not depend on the proxy's behaviour: every
+page and fragment passes through `emailsafe.shield`, and the known identity sites call `emailsafe.text`, which emit
+
+    <!--email_off-->bob<span>@</span>laptop<!--/email_off-->
+
+so no single text node matches an address (the `<span>` is inline: the text selects, copies and is read as `bob@laptop`)
+and the proxy's documented opt-out comment is there as well. Only text nodes are touched, never attributes, scripts,
+styles, textareas or titles. If you would rather turn the proxy feature off: Cloudflare dashboard, the zone, **Scrape
+Shield**, **Email Address Obfuscation** off (or a Configuration Rule for the approval hostname). Not verified against
+a live Cloudflare zone: the tests scan every page for an address-shaped text node.
 
 ## Audit
 

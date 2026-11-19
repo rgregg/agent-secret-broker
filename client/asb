@@ -595,7 +595,8 @@ def config():
     return url.rstrip("/"), key
 
 
-USER_AGENT = "asb/1 (+https://github.com/rgregg/agent-secret-broker)"     # not urllib's default: Cloudflare blocks that
+CLI_VERSION = "1.1"       # what the Clients tab shows; keep in step with USER_AGENT in crates/asb-cli/src/broker.rs and secret_broker/clientver.py
+USER_AGENT = f"asb/{CLI_VERSION} (+https://github.com/rgregg/agent-secret-broker)"     # not urllib's default: Cloudflare blocks that
 
 
 def call(base, key, path, body=None, timeout=40):

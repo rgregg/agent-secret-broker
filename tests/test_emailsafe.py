@@ -8,7 +8,6 @@ themselves are scanned in test_clients_page.py.
 import _fast  # noqa: F401  (test-only: prompt server shutdown, fake-clock helpers)
 import html
 import os
-import re
 import sys
 import time
 import unittest
@@ -16,27 +15,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from secret_broker import emailsafe  # noqa: E402
-
-_SKIP = re.compile(r"<!--.*?-->|<script\b.*?</script\s*>|<style\b.*?</style\s*>|<textarea\b.*?</textarea\s*>"
-                   r"|<title\b.*?</title\s*>", re.S | re.I)
-
-
-def text_nodes(page):
-    """The visible text pieces of a page: comments, scripts, styles, textareas and every tag are cut out and
-    replaced by a NUL, so two pieces that a tag or comment separates never read as adjacent. This does not
-    look at the shield's own markup at all, so it cannot pass because the shield said it had run."""
-    return [p for p in re.sub(r"<[^>]*>", "\0", _SKIP.sub("\0", page)).split("\0") if p]
-
-
-def raw_email_shapes(page):
-    """Every `\\w@\\w` that a proxy could match in the text of `page`."""
-    return [m.group(0) for node in text_nodes(page) for m in re.finditer(r"\w@\w", node)]
-
-
-def visible(markup):
-    """What a reader sees and copies from `markup`."""
-    return html.unescape("".join(text_nodes(markup)))
-
+from _pagetext import raw_email_shapes, text_nodes, unshield, visible  # noqa: E402,F401
 
 class Scanner(unittest.TestCase):
     def test_the_scan_finds_a_planted_address_and_ignores_split_ones(self):
