@@ -803,6 +803,20 @@ credentials with `"risk": {"auto_modes": ["http"]}` in the broker config.
 - A credential's Policies page shows its `approval: allow` as a read-only line (changed under Settings), with the modes that are auto-eligible (for example `web,
   run-with-secret`); see "Standing approvals".
 
+### How a request approved by policy is answered
+
+A request that policy approves (an `auto_approve` rule, a standing approval, `approval: allow`, a standing SSH rule)
+does not make the agent wait on the upstream call. `POST /v1/requests` answers `202` with `status: "approved"` at once
+and the call runs on its own thread, exactly as for a request a human approved; the client collects the result with
+`GET /v1/requests/ID?wait=...`. While it runs the poll says `deciding` (the request is no longer `pending`, so no human
+can decide it and it is not shown as waiting), and a failure arrives through the poll as the usual fixed message.
+
+This matters for slow upstreams. The CLI waits 40 to 60 seconds for the POST to answer. Before this change a
+policy-approved call held the POST open until the upstream call returned, so a call that ran longer (an LLM request of
+79 seconds, say) made the client report a connection error while the broker went on to finish it (the audit shows the
+HTTP 200 after the client had gone), and a retry hit the same wall. Two paths still run on the request thread and are
+bounded by the client's wait: calls made with a plan (`--plan`) and calls made inside an open session.
+
 ### Auto-approve level: `risk.auto_approve_max`
 
     "risk": {"auto_approve_max": "low"}      # none | low | medium | high, default low

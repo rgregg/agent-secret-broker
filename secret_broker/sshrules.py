@@ -547,13 +547,7 @@ class SshRulesMixin:
         self.audit("ssh_rule_used", req, credential=name, account=account, rule_id=rule["id"],
                    rule_host=rule["host"])
         self.ssh_rule_usage.record(name, rule["id"], now)
-        extra = dict(rule_id=rule["id"], decision_source="rule")
-        try:
-            result = self._release(req)
-        except Exception as e:  # noqa: BLE001 -- the request must always settle; a fixed label only
-            self._finish(req, "failed", error=errclass.release_text(e), via="policy", **extra)
-        else:
-            self._finish(req, "approved", result=result, via="policy", **extra)
+        self._release_by_policy(req, rule_id=rule["id"], decision_source="rule")
         return True
 
 
