@@ -408,9 +408,9 @@ class Manage(Base):
 
     def test_the_edit_page_offers_rename_and_delete(self):
         code, body = self.get("/credentials/svc")
-        self.assertIn("action='/credentials/svc/rename'", body)
+        self.assertIn("action='/credentials/svc/rename'", body)             # in the dialogs the buttons open
         self.assertIn("action='/credentials/svc/delete'", body)
-        self.assertNotIn("disabled", body.split("Rename or delete")[1])
+        self.assertNotRegex(body, r"data-dlg-open='dlg-(rename|delete)' disabled")
 
     def test_rename_changes_the_name_and_leaves_the_item_and_value(self):
         code, body = self.rename("svc2")
@@ -449,7 +449,7 @@ class Manage(Base):
         self.assertIn("Still in use by 1 pending", body)
         self.assertEqual(self.stored(), before)
         self.assertIn("Svc", self.broker.backend._data)
-        self.assertIn("disabled", self.get("/credentials/svc")[1].split("Rename or delete")[1])
+        self.assertRegex(self.get("/credentials/svc")[1], r"data-dlg-open='dlg-rename' disabled")
 
     def test_each_kind_of_binding_is_counted_and_blocks_rename_and_delete(self):
         b = self.broker
@@ -879,7 +879,7 @@ class WebSocketCard(Base):
         return self.post("/credentials/svc/save", **self.form(**over))
 
     def card(self, body):
-        return body[body.index("<h2>WebSocket</h2>"):body.index("Advanced: the whole metadata")]
+        return body[body.index("<span class=ft>WebSocket</span>"):body.index("Advanced: the whole metadata")]
 
     def test_the_card_shows_off_for_a_credential_without_ws(self):
         code, body = self.get("/credentials/svc")
@@ -993,7 +993,7 @@ class Units(unittest.TestCase):
 
     def test_the_card_explains_when_ws_cannot_apply(self):
         page = crededitor.edit_section("x", {"vars": {}}, "tok", {"vars": {}}, can_write=True)
-        card = page[page.index("<h2>WebSocket</h2>"):page.index("Advanced: the whole")]
+        card = page[page.index("<span class=ft>WebSocket</span>"):page.index("Advanced: the whole")]
         self.assertIn("needs allowed hosts", card)
         self.assertIn("<input type=radio name=ws value=home-assistant disabled>", card)
 

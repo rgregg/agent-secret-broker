@@ -349,7 +349,7 @@ class Pages(Base):
         self.assertEqual(hdr["Cache-Control"], "no-store")
         esc = "S3CR3T-&#x27;&lt;b&gt;x&lt;/b&gt;&lt;/script&gt;"
         self.assertEqual(body.count(esc), 1)                             # in one box: M_ID's
-        self.assertRegex(body, r"<textarea readonly id='val-M_ID' [^>]*>\n" + re.escape(esc) + "</textarea>")
+        self.assertRegex(body, r"<input type=text name=value id='val-M_ID' form='sv-M_ID' value='" + re.escape(esc) + "'")
         self.assertNotIn(tricky, body)
         self.assertNotIn(MULTI_SEC, body)                                # only the one asked for
 
@@ -419,12 +419,14 @@ class Pages(Base):
 
 
 class Peek(Base):
-    def test_every_value_box_on_the_editor_has_the_toggle(self):
+    def test_every_box_that_takes_a_new_value_has_the_toggle(self):
+        # the in-place editor of an existing value holds only the placeholder dots (its Show button is the
+        # reveal flow, not this toggle); the Add box and the New credential box take typed text and keep it
         code, body = self.get("/credentials/svc")
         self.assertEqual(code, 200)
-        boxes = body.count("type=password name=value")
-        self.assertEqual(boxes, 2)                                       # Replace (one variable) and Add
-        self.assertEqual(body.count("<span class=peek><input type=password name=value"), boxes)
+        self.assertEqual(body.count("type=password name=value"), 2)       # the in-place box (one variable) and Add
+        self.assertEqual(body.count("<span class=peek><input type=password name=value"), 1)
+        self.assertIn("<span class=peek><input type=password name=value id='val-ADD'", body)
         self.assertIn("querySelectorAll('button[data-peek]')", body)
         code, body = self.get("/credentials/new")
         self.assertIn("<span class=peek><input type=password name=value", body)
@@ -490,7 +492,8 @@ class MultiLine(Base):
         code, _, body = self.raw_post("/credentials/svc/reveal", var="SVC_TOKEN")
         self.assertEqual(code, 200)
         # a textarea, with the leading newline the HTML parser drops, so the value's own first line survives
-        self.assertIn("rows=4 spellcheck=false placeholder='hidden'>\n-----BEGIN KEY-----\nS3CR3T-line-one\n", body)
+        self.assertIn("rows=4 spellcheck=false autocomplete=off aria-label='Value of SVC_TOKEN'>\n"
+                      "-----BEGIN KEY-----\nS3CR3T-line-one\n", body)
 
     def test_replace_and_add_take_a_multi_line_value_with_lf_line_ends(self):
         crlf = self.PEM.replace("\n", "\r\n")                           # what a browser submits from a textarea
@@ -508,9 +511,11 @@ class MultiLine(Base):
         self.assertEqual(code, 200)
         self.assertEqual(self.vault("Svc", "token"), NEW_VALUE)
 
-    def test_the_page_offers_the_multi_line_box(self):
+    def test_the_page_offers_the_multi_line_toggle_not_an_open_box(self):
         code, body = self.get("/credentials/svc")
-        self.assertEqual(body.count("<textarea name=value_ml"), 2)       # Replace and Add
+        self.assertEqual(body.count("<textarea name=value_ml"), 2)       # one per value box and Add, both off
+        self.assertEqual(body.count("data-ml="), 2)
+        self.assertEqual(len(re.findall(r"<textarea name=value_ml[^>]* hidden disabled", body)), 2)
 
 
 class Adopted(unittest.TestCase):

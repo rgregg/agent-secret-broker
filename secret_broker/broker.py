@@ -1510,6 +1510,7 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
         "unsupported": "This vault backend cannot store metadata",
         "internal": "This is the broker's own key and cannot be shown or changed here",
         "no_delete": "This vault backend cannot delete a single value, so nothing was removed",
+        "placeholder": "That is the placeholder shown in the box, not a value: type the value",
         "confirm_delete": "Confirm that the value is deleted from the vault for good",
     }
 
@@ -1574,13 +1575,18 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
         """Replace one variable's value (the old one is kept as previous_value, as `asb store --replace` does)."""
         res = functools.partial(self._value_result, "replace", name, user, peer, client_ip)
         sc, ref, bad = self._value_ref(name, var)
+        if not bad and value == crededitor_mod.SENTINEL:
+            return res(unchanged=True)          # the box still shows its placeholder: the human typed nothing
         if bad or self._value_problem(value):
             return res(bad or self._value_problem(value))
         field = ref.get("field") or "auto"
         try:
+            old = self.backend.get(ref["item"], field)
+            if value == (structured.get(old, ref["key"]) if ref.get("key") else old):
+                return res(unchanged=True)      # saved as it already is: no write, no previous_value churn
             new = value
             if ref.get("key"):
-                new = structured.set_key(self.backend.get(ref["item"], field), ref["key"], value)
+                new = structured.set_key(old, ref["key"], value)
             self.backend.put(ref["item"], field, new, create=False, keep_previous=True)
         except structured.StructuredError:
             return res("invalid")
@@ -1630,6 +1636,8 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
                 return refusal
             if var in (stored.get("vars") or {}):
                 return res("exists")
+            if value == crededitor_mod.SENTINEL:
+                return res("placeholder")
             if self._value_problem(value):
                 return res(self._value_problem(value))
             new_meta = copy.deepcopy(stored)
@@ -7363,13 +7371,15 @@ def approval_handler(broker):
             blocked = ("This is the broker's own key and cannot be changed here" if broker.is_internal_secret(name)
                        else "This item has no broker metadata yet (adopted with defaults): save it once above "
                             "to give it its own, then it can be renamed or deleted" if sc.get("auto") else "")
+            dialog = kw.pop("dialog", None)     # (which, message): a refused rename/delete/remove, re-opened
             extra = "" if kw.get("preview") is not None else crededitor_mod.manage_section(
                 name, self._tok(user), crededitor_mod.digest(stored), broker.credential_bindings(name),
-                can_write=can_write, blocked=blocked)
+                can_write=can_write, blocked=blocked, aliases=stored.get("aliases") or [], dialog=dialog,
+                new_name=kw.pop("new_name", ""))
             revealed = kw.pop("revealed", None)
             values = "" if kw.get("preview") is not None or broker.is_internal_secret(name) else \
                 crededitor_mod.values_section(name, sc, self._tok(user), crededitor_mod.digest(stored),
-                                              can_write=can_write, revealed=revealed)
+                                              can_write=can_write, revealed=revealed, dialog=dialog)
             if kw.get("preview") is None:
                 per, _ = broker.standing_by_credential()
                 c = credpolicy_mod.counts(name, sc, per.get(name, []), broker.config_rules_for(name))
@@ -7424,7 +7434,7 @@ def approval_handler(broker):
                     return self._credential_edit(user, name, revealed=(var, res["value"]))
             elif action == "value":
                 res = broker.replace_value(name, var, value, user, **who)
-                flash = f"Value replaced: {var}"
+                flash = f"No change: {var}" if res.get("unchanged") else f"Value replaced: {var}"
             elif action == "value/add":
                 res = broker.add_value(name, var, value, one("old_sha"), user,
                                        confirm=one("confirm") == "1", **who)
@@ -7437,6 +7447,8 @@ def approval_handler(broker):
             if res["status"] == "ok":
                 return self._credential_edit(user, name, flash=flash)
             code = {"conflict": 409, "failed": 500}.get(res["status"], 429 if res["reason"] == "rate_limited" else 400)
+            if action == "value/remove" and res["status"] != "conflict":
+                return self._credential_edit(user, name, status=code, dialog=(f"remove:{var}", res["message"]))
             return self._credential_edit(user, name, status=code, error=res["message"])
 
         def _credential_new(self, user, status=200, **kw):
@@ -7457,13 +7469,23 @@ def approval_handler(broker):
             name = parts[2] if len(parts) >= 4 else ""
             action = "/".join(parts[3:])
             if name not in cfg["secrets"] or action not in ("preview", "save", "rename", "delete", "fingerprint",
-                                                            "reveal", "value", "value/add", "value/remove"):
+                                                            "reveal", "value", "value/add", "value/remove",
+                                                            "alias/remove"):
                 return _page(self, 404, "<h1>Not found</h1>")
             if action in ("reveal", "value", "value/add", "value/remove"):
                 return self._credential_value_post(name, action, one, user)
+            if action == "alias/remove":
+                res = broker.remove_alias(name, one("alias"), one("old_sha"), user, peer=self._ip,
+                                          client_ip=self._fwd())
+                if res["status"] == "ok":
+                    return self._credential_edit(user, name, flash=f"Alias removed: {one('alias')[:64]}")
+                code = 409 if res["status"] == "conflict" else 500 if res["status"] == "failed" else 400
+                return self._credential_edit(user, name, status=code, error=res["message"],
+                                             conflict=res["status"] == "conflict")
             if action in ("rename", "delete"):
                 if action == "rename":
                     res = broker.rename_credential(name, one("new_name"), one("old_sha"), user,
+                                                   keep_alias=one("keep_alias") == "1",
                                                    peer=self._ip, client_ip=self._fwd())
                     done, flash = res["status"] == "renamed", f"Renamed {html.escape(name)} to {html.escape(one('new_name'))}"
                 else:
@@ -7472,8 +7494,11 @@ def approval_handler(broker):
                 if done:
                     return self._credentials_page(user, flash)
                 code = 409 if res["status"] == "conflict" else 500 if res["status"] == "failed" else 400
-                return self._credential_edit(user, name, status=code, error=res["message"],
-                                             conflict=res["status"] == "conflict")
+                if res["status"] == "conflict":
+                    return self._credential_edit(user, name, status=code, error=res["message"], conflict=True)
+                # the refusal's fixed message goes inside the dialog it came from, which is shown open again
+                return self._credential_edit(user, name, status=code, dialog=(action, res["message"]),
+                                             new_name=one("new_name")[:41] if action == "rename" else "")
             try:
                 stored = broker.credential_stored_meta(name)
             except (OSError, ValueError, KeyError, BackendError):
