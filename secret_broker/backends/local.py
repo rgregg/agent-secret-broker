@@ -5,11 +5,11 @@ including `broker` metadata and adoption of items without it. See
 docs/reference.md ("Local encrypted backend")."""
 import copy
 
-from .base import (AUTO_ALIASES, check_new_field, as_uris, merge_uri_hosts, CAP_ADOPTS, CAP_CREATE_LOGIN, CAP_EDIT_ITEM, CAP_EXPORT_ITEMS,
+from .base import (AUTO_ALIASES, check_new_field, as_uris, merge_uri_hosts, CAP_ADOPTS, CAP_CREATE_LOGIN, CAP_DELETE_FIELD, CAP_EDIT_ITEM, CAP_EXPORT_ITEMS,
                    CAP_IMPORT_ITEMS, CAP_ON_EVENT, CAP_SET_META, CAP_WARM, LOGIN, META_FIELD, NOTE,
                    PREVIOUS_FIELDS, RESERVED_FIELDS, SSH_KEY, BackendConfigError, BackendConflict,
                    BackendInvalid, BackendNotFound, BackendSpec, Item, VaultBackend, auto_field_for,
-                   auto_shape, check_item_args, clean_meta, lookup_name, now_iso)
+                   auto_shape, check_delete_field_args, check_item_args, clean_meta, lookup_name, now_iso)
 from .localstore import LocalStore, key_source_from_config
 
 
@@ -22,7 +22,7 @@ class LocalBackend(VaultBackend):
     file, raises `StoreError` (a `BackendUnavailable`) from every call that needs
     the contents; nothing is read partially and nothing is overwritten."""
     kind = "local"
-    capabilities = frozenset({CAP_SET_META, CAP_CREATE_LOGIN, CAP_EDIT_ITEM, CAP_WARM, CAP_ON_EVENT,
+    capabilities = frozenset({CAP_SET_META, CAP_CREATE_LOGIN, CAP_EDIT_ITEM, CAP_DELETE_FIELD, CAP_WARM, CAP_ON_EVENT,
                               CAP_ADOPTS, CAP_EXPORT_ITEMS, CAP_IMPORT_ITEMS})
 
     def __init__(self, path, key_source, idle_timeout=300):
@@ -173,6 +173,25 @@ class LocalBackend(VaultBackend):
 
         def apply(items):
             items[self._require(items, item)][META_FIELD] = meta
+        self._store.mutate(apply)
+
+    def delete_field(self, item, field, meta=None):
+        check_delete_field_args(item, field)
+        meta = clean_meta(meta) if meta is not None else None
+
+        def apply(items):
+            it = items[self._require(items, item)]
+            if field in PREVIOUS_FIELDS:
+                for f in PREVIOUS_FIELDS:
+                    it.pop(f, None)
+            elif field in ("password", "username") and _kind(it) == LOGIN:
+                it[field] = None
+            elif field == "notes":
+                it["notes"] = None
+            else:
+                (it.get("fields") or {}).pop(field, None)
+            if meta is not None:
+                it[META_FIELD] = meta
         self._store.mutate(apply)
 
     def create_login(self, item, username, password, uri=None, notes=None, meta=None):

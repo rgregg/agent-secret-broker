@@ -16,7 +16,7 @@ import urllib.request
 from .. import destguard
 
 from .. import sshkey
-from .base import (as_uris, check_new_field, merge_uri_hosts, CAP_ADOPTS, CAP_CREATE_LOGIN, CAP_EDIT_ITEM, CAP_EXPORT_ITEMS, CAP_ON_EVENT,
+from .base import (as_uris, check_delete_field_args, check_new_field, merge_uri_hosts, CAP_ADOPTS, CAP_CREATE_LOGIN, CAP_DELETE_FIELD, CAP_EDIT_ITEM, CAP_EXPORT_ITEMS, CAP_ON_EVENT,
                    CAP_SET_META, CAP_WARM, LOGIN, META_FIELD, NOTE, RESERVED_FIELDS, SSH_KEY,
                    BackendConfigError, BackendConflict, BackendError, BackendInvalid,
                    BackendNotFound, BackendRateLimited, BackendSpec, BackendUnavailable, Item,
@@ -24,6 +24,7 @@ from .base import (as_uris, check_new_field, merge_uri_hosts, CAP_ADOPTS, CAP_CR
                    clean_meta, error_class, now_iso)
 
 _RESERVED_FIELDS = RESERVED_FIELDS      # kept for older imports
+_PREVIOUS = ("previous_value", "previous_replaced_at")
 
 
 def _bw_error(message):
@@ -82,7 +83,7 @@ class BwBackend(VaultBackend):
 
     def __init__(self, server_url, master_password_file, bw="bw", sync_interval=60,
                  idle_timeout=300, organization=None, collection=None, prewarm=True, personal=False):
-        caps = {CAP_SET_META, CAP_CREATE_LOGIN, CAP_EDIT_ITEM, CAP_ON_EVENT, CAP_EXPORT_ITEMS}
+        caps = {CAP_SET_META, CAP_CREATE_LOGIN, CAP_EDIT_ITEM, CAP_DELETE_FIELD, CAP_ON_EVENT, CAP_EXPORT_ITEMS}
         if prewarm:
             caps.add(CAP_WARM)              # `backend.prewarm: false` turns request-time unlock off
         if personal and (organization or collection):
@@ -415,6 +416,30 @@ class BwBackend(VaultBackend):
             if existing is None:
                 raise BackendNotFound(f"item {item!r} not found")
             self._with_meta(existing, meta)
+            self._submit("edit", existing, existing["id"])
+            self._synced = 0.0
+            self._touch()
+
+    def delete_field(self, item, field, meta=None):
+        """Remove one field's value from an existing item in ONE edit (see VaultBackend.delete_field)."""
+        check_delete_field_args(item, field)
+        meta = clean_meta(meta) if meta is not None else None
+        with self._lock:
+            existing = self._find(item)
+            if existing is None:
+                raise BackendNotFound(f"item {item!r} not found")
+            fields = existing.get("fields") or []
+            if field in _PREVIOUS:
+                fields = [f for f in fields if f.get("name") not in _PREVIOUS]
+            elif field in ("password", "username") and existing.get("login") is not None:
+                existing["login"][field] = ""
+            elif field == "notes":
+                existing["notes"] = ""
+            else:
+                fields = [f for f in fields if f.get("name") != field]
+            existing["fields"] = fields
+            if meta is not None:
+                self._with_meta(existing, meta)
             self._submit("edit", existing, existing["id"])
             self._synced = 0.0
             self._touch()

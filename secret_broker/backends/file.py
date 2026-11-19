@@ -3,14 +3,14 @@ only; it never writes the file back, so changes last as long as the process."""
 import json
 import threading
 
-from .base import (AUTO_ALIASES, check_new_field, CAP_SET_META, META_FIELD, RESERVED_FIELDS, BackendConfigError,
+from .base import (AUTO_ALIASES, check_delete_field_args, check_new_field, CAP_DELETE_FIELD, CAP_SET_META, PREVIOUS_FIELDS, META_FIELD, RESERVED_FIELDS, BackendConfigError,
                    BackendConflict, BackendInvalid, BackendNotFound, BackendSpec, VaultBackend,
                    catalog_rows, check_item_args, clean_meta, lookup_name, now_iso)
 
 
 class FileBackend(VaultBackend):
     kind = "file"
-    capabilities = frozenset({CAP_SET_META})
+    capabilities = frozenset({CAP_SET_META, CAP_DELETE_FIELD})
     _lock = threading.RLock()           # class-level: instances built with __new__ in tests work too
 
     def __init__(self, path):
@@ -88,6 +88,22 @@ class FileBackend(VaultBackend):
         meta = clean_meta(meta)
         with self._lock:
             self._data[self._find(item)][META_FIELD] = json.dumps(meta)
+
+    def delete_field(self, item, field, meta=None):
+        check_delete_field_args(item, field)
+        meta = clean_meta(meta) if meta is not None else None
+        with self._lock:
+            rec = self._data[self._find(item)]
+            if field in PREVIOUS_FIELDS:
+                for f in PREVIOUS_FIELDS:
+                    rec.pop(f, None)
+            elif field in ("password", "username", "notes"):
+                if field in rec:
+                    rec[field] = ""
+            else:
+                rec.pop(field, None)
+            if meta is not None:
+                rec[META_FIELD] = json.dumps(meta)
 
     def delete(self, item):
         with self._lock:
