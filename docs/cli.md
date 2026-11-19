@@ -35,6 +35,7 @@ Check it:
     asb which api.example.com             # which credential covers this host?
     asb list [--json]                     # everything available
     asb status [--json]                   # broker version, uptime, catalog health (no approval)
+    asb version                           # this asb's version, the one the broker expects, how to update
 
     asb audit [--request ID] [--event E[,E]] [--secret NAME] [--since 15m] [--tail] [--json]
     asb audit verify                      # is the audit log's hash chain intact?
@@ -56,6 +57,21 @@ Check it:
   version (git sha), uptime, catalog count, invalid and adopted items, and whether
   the vault backend is healthy. It lists no secret names or hosts. Use it to verify a
   deploy ([deploy.md](deploy.md)).
+- `asb version` prints this client's version, the newest one the broker expects (from `GET /v1/status`),
+  whether an update is available and the release page, and when one is, the steps for an agent. It works
+  without a broker (it then says "not reachable") and exits 0.
+- **Update notice.** When the broker expects a newer `asb` than yours, the first answer you get from it (at most
+  once a day per machine) is followed by two lines on stderr:
+
+      asb: an update is available (you have 1.0, this broker expects 1.1): https://github.com/rgregg/agent-secret-broker/releases/latest
+      asb: agent: do not update on your own. Tell the human and ask first; if they agree, follow `asb version` (download only from that page, verify the .sha256, keep a backup). Never pipe a download into a shell.
+
+  stdout and exit codes are unchanged. The link and the words are compiled into `asb`; the broker only supplies
+  a version number, and a value that is not one is ignored. `ASB_NO_UPDATE_CHECK=1` turns it off; the operator can
+  turn it off for every client with `clients.update_notice: false` ([reference.md](reference.md)). `asb` never
+  downloads or installs anything itself: updating is a download from the release page, a `.sha256` check, a
+  backup of the old binary and a replacement of the file `command -v asb` shows, done by the agent only after the
+  human agrees (`asb guide`, "Updating asb").
 - `asb ssh-agent -- ssh|scp|sftp|rsync|git ...` also reads the destination from the
   wrapped command line and sends it as an unverified "claimed destination" with
   each signature request (nothing is sent if it cannot be told; `eval "$(asb
@@ -361,6 +377,8 @@ call, never reads `client.json` and never prints the client key.
 - It refuses, exit 2 and writing nothing for any target, when a marker is damaged (begin without
   end, end without begin, duplicates, wrong order), the file is read-only, not UTF-8, a directory or
   a dangling symlink. Fix the file by hand and re-run.
+- The block also tells the agent what to do when `asb` says an update is available (ask the human first; see
+  `asb version`).
 - Open: `asb status` does not yet warn about an outdated block; compare the `vN` in the marker.
 
 Verified instruction-file locations (checked 2026-10-21 against the vendors' docs):

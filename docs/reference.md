@@ -3375,6 +3375,25 @@ enable (or revoke) disabled clients first.
   the threshold: `clients.min_version` in the config when set (`"1.2"`; `"none"` turns the recommendation off),
   else the newest version this broker build knows. Comparison is numeric field by field. A client whose version is
   unknown shows "version unknown" and is never flagged. The icon is informational; nothing is refused for it.
+- **Update notice.** The same threshold drives a notice in `asb` itself. The broker adds one field,
+  `latest_client_version`, to the answers a client already reads (`GET /v1/status`, `GET /v1/secrets`, and the
+  `202` answer to `POST /v1/requests`), built in one place (`clientver.expected`, `Broker.with_client_version`). It
+  is the threshold above (`clients.min_version`, else `LATEST_CLIENT_VERSION`), the same for every client, and only
+  a digits-and-dots version of the grammar the Clients tab parses; it is left out when `clients.min_version` is
+  `"none"`, when `clients.update_notice` is `false`, or when the configured value is not a version. The broker sends
+  no URL, text or instruction: a client that is older than the version prints its own compiled-in release link
+  (`https://github.com/rgregg/agent-secret-broker/releases/latest`) and its own instructions, so a compromised or
+  impersonating broker can neither point an agent at a hostile download nor hand it commands. The client treats the
+  broker's value as untrusted: anything that fails the grammar is ignored without a notice or an error. The notice
+  is two lines on **stderr** only (stdout and exit codes never change), at most once a day per machine (state in
+  `$XDG_STATE_HOME/asb/update-notice`, else `~/.local/state/asb/`, written atomically; if it cannot be written the
+  notice is skipped rather than repeated), and never from `asb status`, `asb version` or `asb guide`, which show the
+  state deliberately. `ASB_NO_UPDATE_CHECK=1` turns it off on a machine. It makes no request of its own. The second
+  line tells the *agent* to ask the human first and not to update on its own; `asb version`, `asb guide` and the
+  `asb agent-setup` block carry the steps (download only from the release page, verify the `.sha256`, keep a backup,
+  replace the binary at `command -v asb`, confirm with `asb version`, never pipe a download into a shell). No part
+  of `asb` downloads or installs anything. A fork changes the release URL in `client/asb` and
+  `crates/asb-cli` (`RELEASE_URL`); it is deliberately not configurable at run time.
 
 - **Revoke** takes effect on the next request and sets state in memory under the lock before
   anything else; `Broker.create` re-checks the client under the request lock, so no request of a
@@ -3396,11 +3415,12 @@ enable (or revoke) disabled clients first.
     "legacy_client_key": "allow",                       // allow (default) | deny
     "enrollment": {"enabled": true, "ttl_s": 600, "max_pending": 3},
     "clients": {"min_version": "1.1",                   // optional: flag clients older than this; "none" = never
+                "update_notice": true,                  // false: do not tell clients which version is current
                 "c-1a2b3c4d": {"risk": {"auto_approve_max": "none", "auto_modes": ["http"]}}}
 
 The override block is keyed by client id (shown on the Clients tab; ids are random, so set it after
-enrolling and restart) or `legacy`. `min_version` (digits and dots, or `none`) sits beside the ids. Validated at
-startup, naming the field.
+enrolling and restart) or `legacy`. `min_version` (digits and dots, or `none`) and `update_notice` (true or false) sit beside the ids.
+Validated at startup, naming the field.
 
 ### Per-client rules
 

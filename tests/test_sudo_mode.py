@@ -282,7 +282,8 @@ class Contract(SudoBase):
         code, b = self.api("POST", "/v1/requests", fixture("request.json"), key=self.helper.secret)
         self.assertEqual(code, 202, b)
         created, want = json.loads(b), fixture("created.json")
-        self.assertEqual(set(created), set(want))
+        # the fixture is what the Rust helpers read; the broker also tells every client the version it expects
+        self.assertEqual(set(created) - {"latest_client_version"}, set(want))
         self.assertEqual((created["status"], created["error"]), (want["status"], want["error"]))
         self.assertTrue(0 < created["expires_in"] <= want["expires_in"])
         self.decide(created["id"], "approve")

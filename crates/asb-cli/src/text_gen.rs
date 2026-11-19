@@ -11,8 +11,12 @@ pub const AGENT_BLOCK_BODY: &str = include_str!("../text/agent_block_body.txt");
 pub const AGENT_MARK: &str = "asb:agent-setup";
 pub const AGENT_BLOCK_VERSION: u32 = 1;
 
+/// Where an update comes from, and the steps an agent follows: compiled in, never read from the broker.
+pub const RELEASE_URL: &str = "https://github.com/rgregg/agent-secret-broker/releases/latest";
+pub const UPDATE_STEPS: &str = include_str!("../text/update_steps.txt");
+
 /// The commands that have `asb help COMMAND` text, in the order the Python CLI lists them.
-pub const HELP_TOPICS: &[&str] = &["ws", "plan", "list", "which", "status", "audit", "http", "session", "sudo", "run", "store", "request-credential", "update", "ssh-agent", "fingerprint", "guidance", "enroll", "agent-setup", "guide"];
+pub const HELP_TOPICS: &[&str] = &["ws", "plan", "list", "which", "status", "version", "audit", "http", "session", "sudo", "run", "store", "request-credential", "update", "ssh-agent", "fingerprint", "guidance", "enroll", "agent-setup", "guide"];
 
 /// The text of `asb help COMMAND`.
 pub fn help(topic: &str) -> Option<&'static str> {
@@ -22,6 +26,7 @@ pub fn help(topic: &str) -> Option<&'static str> {
         "list" => Some(include_str!("../text/help/list.txt")),
         "which" => Some(include_str!("../text/help/which.txt")),
         "status" => Some(include_str!("../text/help/status.txt")),
+        "version" => Some(include_str!("../text/help/version.txt")),
         "audit" => Some(include_str!("../text/help/audit.txt")),
         "http" => Some(include_str!("../text/help/http.txt")),
         "session" => Some(include_str!("../text/help/session.txt")),

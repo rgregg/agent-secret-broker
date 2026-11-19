@@ -92,6 +92,7 @@ class SendersAgree(unittest.TestCase):
         self.assertRegex(py, r'USER_AGENT = f"asb/\{CLI_VERSION\} ')
         m = re.search(r'pub const USER_AGENT: &str = "(asb/[^"]*)";', rs)
         self.assertIsNotNone(m)                                 # premise: the Rust constant was found
+        self.assertIn(f'pub const CLI_VERSION: &str = "{v}";', rs)     # the notice compares this one
         self.assertTrue(m.group(1).startswith(f"asb/{v} "), m.group(1))
         # and what each sends parses back to exactly that version
         self.assertEqual(clientver.parse_user_agent(m.group(1)), v)

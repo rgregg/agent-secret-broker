@@ -65,6 +65,10 @@ Then:
         -H 'Authorization: Bearer {{EXAMPLE_TOKEN}}'
     # you are notified and approve; the response comes back
 
+When the broker expects a newer `asb` than the one on a machine, `asb` says so on stderr (at most once a day)
+and points at the [release page](https://github.com/rgregg/agent-secret-broker/releases/latest); `asb version`
+shows where you stand. The agent is told to ask you first and never to update on its own.
+
 ## The web app
 
 `https://<your approval site>/` has these tabs: **Requests** (what is waiting, and

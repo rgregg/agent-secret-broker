@@ -28,7 +28,8 @@ def load_python_cli():
 def generate():
     """{relative path: file content} for everything this tool owns."""
     cli = load_python_cli()
-    files = {"text/doc.txt": cli.__doc__, "text/guide.txt": cli.GUIDE, "text/agent_block_body.txt": cli.AGENT_BLOCK_BODY}
+    files = {"text/doc.txt": cli.__doc__, "text/guide.txt": cli.GUIDE, "text/agent_block_body.txt": cli.AGENT_BLOCK_BODY,
+             "text/update_steps.txt": cli.UPDATE_STEPS}
     for name, text in cli.HELP.items():
         files[f"text/help/{name}.txt"] = text
     arms = "\n".join(f'        "{name}" => Some(include_str!("../text/help/{name}.txt")),' for name in cli.HELP)
@@ -45,6 +46,10 @@ pub const GUIDE: &str = include_str!("../text/guide.txt");
 pub const AGENT_BLOCK_BODY: &str = include_str!("../text/agent_block_body.txt");
 pub const AGENT_MARK: &str = "{cli.AGENT_MARK}";
 pub const AGENT_BLOCK_VERSION: u32 = {cli.AGENT_BLOCK_VERSION};
+
+/// Where an update comes from, and the steps an agent follows: compiled in, never read from the broker.
+pub const RELEASE_URL: &str = "{cli.RELEASE_URL}";
+pub const UPDATE_STEPS: &str = include_str!("../text/update_steps.txt");
 
 /// The commands that have `asb help COMMAND` text, in the order the Python CLI lists them.
 pub const HELP_TOPICS: &[&str] = &[{order}];

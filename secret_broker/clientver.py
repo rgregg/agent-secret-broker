@@ -49,5 +49,16 @@ def threshold(configured):
     return None if configured == "none" else configured
 
 
+def expected(configured, notice_enabled=True):
+    """The one version string the broker tells clients (`latest_client_version` in its answers), or None to say nothing.
+
+    It is the version a client is judged against (see `threshold`), the same for every client. Clients print an
+    "update is available" notice from it, with their own compiled-in URL and text: the broker sends no text, no link.
+    `clients.update_notice: false`, `clients.min_version: "none"` or an invalid value send nothing.
+    """
+    t = threshold(configured) if notice_enabled else None
+    return t if valid(t) else None
+
+
 def label(version):
     return version if valid(version) else "unknown"

@@ -1,0 +1,8 @@
+usage: asb version
+
+Show this client's version, the newest version the broker expects, whether an update is
+available, and the release page to get it from. Asks the broker one status question (no
+approval); if the broker cannot be reached it still shows the client version. When an
+update is available it prints the steps for an agent: ask the human first, download only
+the release page's asset, verify the .sha256, keep a backup, never pipe a download into a shell.
+example: asb version
