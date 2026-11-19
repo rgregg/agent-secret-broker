@@ -7,6 +7,8 @@ use asb_client::{Client, Config, Error};
 use serde_json::Value;
 use std::time::Duration;
 
+/// Keep in step with `CLI_VERSION` in client/asb, `USER_AGENT` below and secret_broker/clientver.py (a test pins all).
+pub const CLI_VERSION: &str = "1.1";
 pub const USER_AGENT: &str = "asb/1.1 (+https://github.com/rgregg/agent-secret-broker)";
 
 /// `SECRET_BROKER_URL` and `SECRET_BROKER_KEY`, else `~/.config/secret-broker/client.json`.
@@ -67,6 +69,11 @@ pub fn call(
     if let Some(previous) = restore {
         // SAFETY: `previous` is the handler this process had a moment ago.
         unsafe { libc::signal(libc::SIGPIPE, previous) };
+    }
+    if let Ok((code, answer)) = &result {
+        if (200..300).contains(code) {
+            crate::update_notice::maybe_notice(answer);
+        }
     }
     result.map_err(|e| match e {
         Error::Unreachable(m) => die(format!("cannot reach broker: {m}"), BROKER),

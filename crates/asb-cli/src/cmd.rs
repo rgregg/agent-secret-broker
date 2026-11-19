@@ -52,6 +52,7 @@ fn dispatch(argv: &[String]) -> R {
     match cmd {
         "list" => list(&argv[1..]),
         "status" => status(&argv[1..]),
+        "version" => crate::update_notice::run(&argv[1..]),
         "which" => which(argv),
         "http" => cmd_http::run(argv),
         "agent-setup" => cmd_agent_setup::run(&argv[1..]),
@@ -69,7 +70,7 @@ fn dispatch(argv: &[String]) -> R {
         _ if argv.iter().any(|a| a == "--") => cmd_env::run(argv),
         _ => Err(die(
             format!(
-                "unknown command {}.\ncommands: list, which, status, audit, http, session, ws, plan, sudo, store, update, request-credential, guidance, enroll, ssh-agent, fingerprint, help, guide; or: asb NAME -- command\nstart with `asb guide`",
+                "unknown command {}.\ncommands: list, which, status, version, audit, http, session, ws, plan, sudo, store, update, request-credential, guidance, enroll, ssh-agent, fingerprint, help, guide; or: asb NAME -- command\nstart with `asb guide`",
                 repr(cmd)
             ),
             USAGE,
@@ -153,6 +154,7 @@ fn status(rest: &[String]) -> R {
         [flag] if flag == "--json" => true,
         _ => return Err(die_help("status")),
     };
+    crate::update_notice::silence(); // it shows the field itself; the notice is for other commands
     let client = broker::client()?;
     let (code, r) = broker::call(&client, "/v1/status", None, 15)?;
     if code != 200 {
