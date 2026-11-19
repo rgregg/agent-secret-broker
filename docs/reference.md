@@ -1868,7 +1868,7 @@ changes once it is open: the same masking, header allowlists, scope checks, caps
 
 | Field | Modes | Meaning |
 |---|---|---|
-| `hosts` | http_session | Required, 1 to 5 entries, each `host` or `host:port` exactly as a session manifest writes them: a bare host means ports 80 **and** 443 (plain http included), `host:443` means https only. |
+| `hosts` | http_session | Required, 1 to 5 entries, each `host` or `host:port` exactly as a session manifest writes them: a bare host means ports 80 **and** 443 (plain http included), `host:443` means exactly port 443 on any scheme (the session's scope check compares host and port, never the scheme of each call, so an explicit port does not by itself keep calls on https; this is how human-approved sessions behave too). |
 | `methods` | http_session | Upper-case methods, default `["GET", "HEAD"]`. |
 | `host`, `scheme`, `port` | ws_session | The one server: `wss` (default) or `ws`, port 443 or 80 by scheme unless given. |
 | `path_prefix` | ws_session | Required (`/` for any path). The manifest's path must be plain (no `%` escape, `;`, backslash or dot segment) and at or below it. A http session manifest carries no path, so an `http_session` rule has no `path_prefix` (it could not be verified); path-bounded unattended work is what plans are for. |

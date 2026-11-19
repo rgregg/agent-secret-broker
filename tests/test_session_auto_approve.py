@@ -318,6 +318,15 @@ class SessionRulePage(PoliciesTab):
         return self.form(**{"name": "svc session", "mode": "http_session", "shosts": "127.0.0.1:8080",
                             "smethods": ["GET", "HEAD"], "ttl_min": "10", "max_calls": "40", **over})
 
+    def test_the_form_text_does_not_promise_https_only_for_an_explicit_port(self):
+        """The session's scope check compares host and port, never the scheme of each call, so `host:443` means exactly
+        port 443 on any scheme. The form must say that, not that it keeps calls on https."""
+        sess = self.section().split("<legend>HTTP session</legend>")[1].split("</fieldset>")[0]
+        self.assertNotIn("https only", sess)
+        self.assertIn("host:443 allows exactly port 443", sess)
+        self.assertIn("does not check the scheme of each call", sess)
+        self.assertIn("a bare host allows ports 80 and 443", sess)                    # control: the form still explains it
+
     def test_the_form_offers_the_session_kinds_with_narrow_defaults_and_a_plain_tick(self):
         sec = self.section()
         self.assertIn("<option value=http_session>", sec)
