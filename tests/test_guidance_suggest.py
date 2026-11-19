@@ -390,6 +390,8 @@ class Suggest(t.Harness):
         self.assertNotIn(CANARY, both)
         self.assertNotIn(t.SECRET, both)                        # no value of any credential
         self.assertNotIn("X-Evil", both)
+        self.assertNotIn("Svc", both)                           # the vault item that holds the value
+        self.assertNotIn("'item'", both)                        # no variable reference, only its name
 
     def test_no_model_configured_refuses_with_a_fixed_message(self):
         class NoChat:
