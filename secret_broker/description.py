@@ -30,6 +30,7 @@ from . import destguard
 from . import guidance as guidance_mod
 from . import keyprovider
 from . import scripts as scripts_mod
+from . import summarize as summarize_mod
 from .riskmodel import deterministic_summary, request_fields
 
 MAX_LEN = 320                  # a description longer than this is rejected, not cut
@@ -534,6 +535,15 @@ class Describer:
             return text, None, cost
         finally:
             self._sem.release()
+
+    @property
+    def completion_model(self):
+        return self._model
+
+    def complete(self, system, user, max_tokens):
+        """A free-form chat reply for the human-only guidance drafter -> (text, None) | (None, reason)."""
+        return summarize_mod.chat_complete(self._key, self._base, self._model, system, user, max_tokens,
+                                           max(float(self._hard), summarize_mod.SUGGEST_TIMEOUT))
 
     def finish(self, text, reason, mode, names, spec):
         """Sanitize + consistency-check a raw reply (or a failure reason). The result's
