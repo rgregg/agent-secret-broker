@@ -676,12 +676,15 @@ Policies tab, and no route on the agent-facing port. Agents cannot reach it, and
     removal and the new metadata are one vault write (the previous slot goes first, so a failure in between
     leaves the variable listed and the removal can be repeated). It needs the backend capability
     `delete_field`: a backend without it refuses (`no_delete`) and changes nothing; it never falls back to
-    leaving the value in the vault. The audit event carries `outcome` and `previous_dropped`, never a value.
+    leaving the value in the vault. Another variable that reads the same key (or the whole field) keeps it
+    (`field_kept`). A vault product's own history of a login password (Bitwarden's password history) is out of
+    the broker's reach and is not cleared. The audit event carries `outcome` and `previous_dropped`, never a value.
   - Refusals are fixed messages: `unknown_var`, `ssh`, `internal`, `invalid` (the field is not structured),
     `empty`, `too_large`, `bad_value` (control characters other than tab and newlines), `placeholder`, `exists`,
     `field_exists`, `invalid_name` (the loader's rule about the name), `adopted` (add/remove need the item's own
     metadata: save it once), `needs_confirmation`, `confirm_delete`, `no_delete`, `conflict`, `last`,
-    `unsupported`, `rate_limited`, `vault_read`, `vault_write`.
+    `private_key` (a variable on a `private_key` field is not deleted), `unsupported`, `rate_limited`,
+    `vault_read`, `vault_write`.
   - An SSH key's private key is never shown, replaced or added here (the public key is shown); use
     `asb store --replace`. The broker's own summary key is not offered.
 - **Not here.** Creating an SSH key or a login with two values (use `request-credential` or `asb store`).

@@ -1512,6 +1512,7 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
         "no_delete": "This vault backend cannot delete a single value, so nothing was removed",
         "placeholder": "That is the placeholder shown in the box, not a value: type the value",
         "confirm_delete": "Confirm that the value is deleted from the vault for good",
+        "private_key": "A private key cannot be deleted here; replace it with asb store --replace",
     }
 
     def _value_result(self, action, name, user, peer, client_ip, reason="", status=None, **extra):
@@ -1698,6 +1699,8 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
                          peer=peer, client_ip=client_ip)
                 return {"status": "refused", "reason": "invalid", "message": str(e)[:200]}
             outcome, field = valueremoval_mod.plan(vars_, var)
+            if outcome != valueremoval_mod.FIELD_KEPT and field == "private_key":
+                return res("private_key")      # delete_field never deletes a private key: refuse before touching anything
             ref = self.cfg["secrets"][name]["vars"][var]
             try:
                 if outcome == valueremoval_mod.FIELD_KEPT:

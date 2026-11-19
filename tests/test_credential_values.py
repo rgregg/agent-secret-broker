@@ -299,6 +299,29 @@ class Remove(Base):
         self.assertIn("SVC_EXTRA", self.stored()["vars"])
         self.assertNotIn(EXTRA, self.audit_text())
 
+    def test_a_key_that_another_variable_reads_stays_in_the_vault(self):
+        meta = self.broker.credential_stored_meta("multi")
+        meta["vars"]["M_COPY"] = {"item": "Multi", "field": "notes", "key": "SECRET"}
+        self.broker.backend.set_meta("Multi", meta)
+        self.broker._refresh_if(0)
+        r = self.remove("multi", "M_SEC")
+        self.assertEqual((r["status"], r["outcome"]), ("ok", "field_kept"))
+        self.assertEqual(json.loads(self.vault("Multi", "notes")), {"ID": MULTI_ID, "SECRET": MULTI_SEC})
+        self.assertEqual(self.broker.reveal_value("multi", "M_COPY", "alice")["value"], MULTI_SEC)
+
+    def test_a_private_key_field_is_refused_before_anything_is_deleted(self):
+        self.add_extra()
+        self.assertEqual(self.broker.replace_value("svc", "SVC_EXTRA", NEW_VALUE, "alice")["status"], "ok")
+        meta = self.broker.credential_stored_meta("svc")
+        meta["vars"]["SVC_EXTRA"] = {"field": "private_key"}
+        self.broker.backend.set_meta("Svc", meta)
+        self.broker._refresh_if(0)
+        self.assertEqual(self.vault("Svc", "previous_value"), EXTRA)           # premise: a previous copy exists
+        r = self.remove("svc", "SVC_EXTRA")
+        self.assertEqual((r["status"], r["reason"]), ("refused", "private_key"))
+        self.assertEqual(self.vault("Svc", "previous_value"), EXTRA)           # nothing was touched, not even this
+        self.assertIn("SVC_EXTRA", self.stored()["vars"])
+
     def test_refusals(self):
         self.assertEqual(self.remove("svc", "SVC_TOKEN")["reason"], "last")
         self.assertEqual(self.remove("multi", "NOPE")["reason"], "unknown_var")
@@ -324,6 +347,14 @@ class RemovalPlan(unittest.TestCase):
                          ("key_dropped", "n"))
         self.assertEqual(self.plan({"A": {"field": "n", "key": "K"}, "B": {"field": "y"}}, "A"),
                          ("key_dropped", "n"))
+
+    def test_a_key_another_variable_also_reads_is_never_dropped(self):
+        shared_key = {"A": {"field": "cfg", "key": "x"}, "B": {"field": "cfg", "key": "x"}}
+        self.assertEqual(self.plan(shared_key, "A"), ("field_kept", "cfg"))
+        whole = {"A": {"field": "cfg", "key": "x"}, "B": {"field": "cfg"}}      # B reads the whole field
+        self.assertEqual(self.plan(whole, "A"), ("field_kept", "cfg"))
+        self.assertEqual(self.plan({"A": {"field": "cfg", "key": "x"}, "B": {"field": "cfg", "key": "y"}}, "A"),
+                         ("key_dropped", "cfg"))                               # a different key: only A's goes
 
     def test_the_items_natural_slot_has_several_names_and_counts_as_one(self):
         for other in ("auto", "notes", "password", "private_key", None, {}):
