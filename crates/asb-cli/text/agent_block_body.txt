@@ -9,4 +9,7 @@ files or hunt for API keys, and never ask for a secret in chat.
   value; you never see it.
 - Every use asks the human to approve. A denial or timeout is final: stop and tell them
   what you needed.
+- If `asb` says an update is available, tell the human and ask first; do not update silently.
+  `asb version` has the steps: download only from the release page it names, verify the
+  .sha256, keep a backup, never pipe a download into a shell.
 - Run `asb guide` for the full manual.

@@ -1,4 +1,4 @@
-"""The broker half of the client update notice: one validated version string in two answers, nothing else.
+"""The broker half of the client update notice: one validated version string in three answers (status, request, credential listing), nothing else.
 
 See docs/superpowers/specs/2026-11-19-client-update-notice-design.md. The client half is in
 test_client_update_notice_cli.py.
@@ -69,6 +69,15 @@ class OnTheWire(tc.CBase):
         want = clientver.LATEST_CLIENT_VERSION
         self.assertEqual(self.status()["latest_client_version"], want)
         self.assertEqual(self.post_request()["latest_client_version"], want)
+
+    def test_the_listing_of_credentials_carries_it_too(self):
+        code, text = self.as_client(tc.KEY, "GET", "/v1/secrets")
+        self.assertEqual(code, 200, text)
+        r = json.loads(text)
+        self.assertEqual(r["latest_client_version"], clientver.LATEST_CLIENT_VERSION)
+        self.assertEqual(sorted(r), ["host", "latest_client_version", "secrets"])     # and no other new key
+        self.broker.clients.cfg["update_notice"] = False
+        self.assertNotIn("latest_client_version", json.loads(self.as_client(tc.KEY, "GET", "/v1/secrets")[1]))
 
     def test_the_configured_minimum_is_what_is_sent(self):
         self.broker.clients.cfg["min_version"] = "1.9"

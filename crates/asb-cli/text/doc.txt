@@ -10,6 +10,7 @@ asb: ask the broker for a secret, wait for approval, use it.
                                               ask the human to enter a NEW credential (you never see it)
   asb which HOST|URL                          is a credential available? (no approval)
   asb status [--json]                         broker version, uptime, catalog health (no approval)
+  asb version                                 this asb's version, the broker's expected one, how to update
   asb audit [--request ID] [--event E[,E]] [--secret NAME] [--since 15m] [--tail] [--json]
                                               what happened to my requests? (redacted; no approval)
   asb audit verify                            is the broker's audit log intact?

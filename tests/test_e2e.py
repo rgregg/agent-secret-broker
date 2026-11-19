@@ -2904,7 +2904,8 @@ class StatusEndpoint(Harness):
     def test_shape_and_values(self):
         st, _ = self.status()
         self.assertEqual(set(st), {"version", "build_time", "started_at", "uptime_s", "catalog",
-                                   "backend", "notifiers", "features"})
+                                   "backend", "notifiers", "features", "latest_client_version"})
+        self.assertRegex(st["latest_client_version"], r"^[0-9]+(\.[0-9]+)*$")
         self.assertEqual(set(st["catalog"]), {"count", "invalid", "adopted", "loaded_at"})
         self.assertEqual(st["catalog"]["count"], 1)
         self.assertEqual(st["catalog"]["invalid"], 1)

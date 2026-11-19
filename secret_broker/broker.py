@@ -6677,7 +6677,7 @@ def client_handler(broker, client_key):
                 broker.log("discovery", peer=self._ip, host=host,
                            found=[f["name"] for f in found], client_id=self.client["id"],
                            client_name=self.client["name"])
-                return _json(self, 200, {"host": host, "secrets": found})
+                return _json(self, 200, broker.with_client_version({"host": host, "secrets": found}))
             if not u.path.startswith("/v1/requests/"):
                 return _json(self, 404, {"error": "not found"})
             q = urllib.parse.parse_qs(u.query)

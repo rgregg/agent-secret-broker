@@ -12,7 +12,7 @@ pub const AGENT_MARK: &str = "asb:agent-setup";
 pub const AGENT_BLOCK_VERSION: u32 = 1;
 
 /// The commands that have `asb help COMMAND` text, in the order the Python CLI lists them.
-pub const HELP_TOPICS: &[&str] = &["ws", "plan", "list", "which", "status", "audit", "http", "session", "sudo", "run", "store", "request-credential", "update", "ssh-agent", "fingerprint", "guidance", "enroll", "agent-setup", "guide"];
+pub const HELP_TOPICS: &[&str] = &["ws", "plan", "list", "which", "status", "version", "audit", "http", "session", "sudo", "run", "store", "request-credential", "update", "ssh-agent", "fingerprint", "guidance", "enroll", "agent-setup", "guide"];
 
 /// The text of `asb help COMMAND`.
 pub fn help(topic: &str) -> Option<&'static str> {
@@ -22,6 +22,7 @@ pub fn help(topic: &str) -> Option<&'static str> {
         "list" => Some(include_str!("../text/help/list.txt")),
         "which" => Some(include_str!("../text/help/which.txt")),
         "status" => Some(include_str!("../text/help/status.txt")),
+        "version" => Some(include_str!("../text/help/version.txt")),
         "audit" => Some(include_str!("../text/help/audit.txt")),
         "http" => Some(include_str!("../text/help/http.txt")),
         "session" => Some(include_str!("../text/help/session.txt")),
