@@ -21,6 +21,7 @@ reports the proposals review's flagged phrases. A rejected reply is described by
 Pure functions only, so the whole thing is easy to test; the model call and the audit live in the broker.
 """
 import re
+import threading
 import urllib.parse
 
 from . import crededitor, guidance, proposals
@@ -241,3 +242,69 @@ def check_reply(text):
     return draft, {"length": len(draft), "non_ascii": guidance.non_ascii_count(draft),
                    "flags": proposals.lint(draft),
                    "default_high": draft.rstrip().lower().endswith(DEFAULT_LINE)}
+
+
+# ------------------------------------------------------------ the action (called by Broker.suggest_guidance)
+RATE = (3, 10, 300)        # per credential, in total, per window (seconds)
+HISTORY_ROWS = 200         # newest rows of the credential's history that are looked at
+_LOCK = threading.Lock()
+
+
+def _result(status, label, **extra):
+    return {"status": status, "reason": label, "message": MESSAGES[label], **extra}
+
+
+def suggest(broker, name, user, peer=None, client_ip=None):
+    """Ask the configured model for a draft of guidance for `name`. Returns {"status": "ok", "draft", "length",
+    "non_ascii", "flags", "default_high", "model"} or {"status": "refused" | "failed" | "rate_limited", "reason",
+    "message"} (reason is a label from MESSAGES). Audits the outcome with counts, the model and a closed
+    reason, never any prompt or reply text. Never writes guidance. Human-only: the caller is the authenticated
+    Policies handler."""
+    sc = broker.cfg["secrets"].get(name)
+    if sc is None:
+        return _result("refused", "unknown_credential")
+    who = dict(secret=name, user=user, peer=peer, client_ip=client_ip)
+
+    def refuse(label, status="refused"):
+        broker.log("guidance_suggest_refused", reason=label, **who)
+        return _result(status, label)
+    if broker.is_internal_secret(name):
+        return refuse("internal")
+    model = getattr(broker.summarizer, "completion_model", None)
+    complete = getattr(broker.summarizer, "complete", None)
+    if not model or not callable(complete):
+        return refuse("unavailable")
+    per_cred, total, window = broker.SUGGEST_RATE
+    now = broker._mono()
+    with _LOCK:
+        times = getattr(broker, "_suggest_times", None)
+        if times is None:
+            times = broker._suggest_times = {}
+        for k in list(times):
+            times[k] = [x for x in times[k] if now - x < window]
+        if len(times.get(name, ())) >= per_cred or len(times.get("", ())) >= total:
+            return refuse("rate_limited", "rate_limited")
+        times.setdefault(name, []).append(now)
+        times.setdefault("", []).append(now)
+    f = facts(name, sc, broker.history.rows(secret=name)[:HISTORY_ROWS])
+    system, user_msg = build_prompt(f)
+    counts = dict(model=model, http_rows=f["digest"]["http_rows"], groups=len(f["digest"]["groups"]),
+                  prompt_chars=len(system) + len(user_msg))
+    try:
+        text, reason = complete(system, user_msg, MAX_TOKENS)
+    except Exception:  # noqa: BLE001 -- the class is all that is kept
+        text, reason = None, "error"
+    label = None
+    if reason:
+        label = reason if reason in MESSAGES else "error"
+    else:
+        try:
+            draft, rev = check_reply(text)
+        except Refused as e:
+            label = e.label
+    if label:
+        broker.log("guidance_suggest_failed", reason_class=label, **counts, **who)
+        return _result("failed", label)
+    broker.log("guidance_suggested", length=rev["length"], flags=len(rev["flags"]), non_ascii=rev["non_ascii"],
+               **counts, **who)
+    return {"status": "ok", "reason": "", "message": "", "draft": draft, "model": model, **rev}

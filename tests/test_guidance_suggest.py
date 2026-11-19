@@ -5,6 +5,8 @@ import json
 import os
 import sys
 import unittest
+import unittest.mock
+import urllib.parse
 from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
@@ -12,7 +14,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from secret_broker import destguard as _destguard  # noqa: E402
 _destguard.allow_loopback_for_tests()
-from secret_broker import description, guidance, guidancesuggest as gs, keyprovider, riskmodel, summarize  # noqa: E402
+import test_e2e as t  # noqa: E402
+from secret_broker import audit_api, description, guidance, guidancesuggest as gs, keyprovider, riskmodel, summarize  # noqa: E402
 
 
 class _Resp:
@@ -279,6 +282,210 @@ class CheckReply(unittest.TestCase):
         for label in gs.LABELS:
             self.assertIsInstance(gs.MESSAGES[label], str)
         self.assertEqual(set(gs.MESSAGES), set(gs.LABELS))
+
+
+REPLY = "GET /v1/emails: low (read only)\nDELETE /v1/emails: high (destroys mail)\nunknown operations: high"
+
+
+class Model:
+    """A fake configured model: records every prompt, answers with a canned reply or a closed reason."""
+    completion_model = "model-x"
+
+    def __init__(self, text=REPLY, reason=None):
+        self.text, self.reason, self.calls = text, reason, []
+
+    def analyze(self, mode, names, spec, guidance=None):
+        return {"summary": "Test summary " + CANARY, "risk": "low"}
+
+    def complete(self, system, user, max_tokens):
+        self.calls.append((system, user, max_tokens))
+        return self.text, self.reason
+
+
+class Suggest(t.Harness):
+    decision = None
+
+    def tweak(self, cfg):
+        cfg["secrets"]["svc"]["guidance"] = "Existing owner text"
+
+    def setUp(self):
+        super().setUp()
+        self.model = Model()
+        self.broker.summarizer = self.model
+
+    def tok(self):
+        return self.broker.csrf_token("alice")
+
+    def post(self, path="/policies/guidance/suggest", user="alice", json_reply=True, **form):
+        form.setdefault("name", "svc")
+        form.setdefault("csrf", self.tok())
+        hdr = {"X-authentik-username": user}
+        if json_reply:
+            hdr["Accept"] = "application/json"
+        r = t.urllib.request.Request(self.abase + path, data=urllib.parse.urlencode(form).encode(), headers=hdr,
+                                     method="POST")
+        try:
+            resp = t.urllib.request.urlopen(r, timeout=10)
+            code, body = resp.status, resp.read().decode()
+        except t.urllib.error.HTTPError as e:
+            code, body = e.code, e.read().decode()
+        return code, (json.loads(body) if json_reply and body.startswith("{") else body)
+
+    def stored(self):
+        return self.disk()["secrets"]["svc"]
+
+    def audit_text(self):
+        return _fast.read_audit_text(self.audit)
+
+    def test_draft_is_returned_unsaved_with_review_aids_and_audited_by_counts(self):
+        code, got = self.post()
+        self.assertEqual(code, 200)
+        self.assertEqual(got["draft"], REPLY)
+        self.assertEqual((got["length"], got["non_ascii"], got["flags"], got["default_high"], got["model"]),
+                         (len(REPLY), 0, [], True, "model-x"))
+        self.assertEqual(len(self.model.calls), 1)
+        self.assertEqual(self.stored()["guidance"], "Existing owner text")           # never applied
+        self.assertEqual(self.broker.cfg["secrets"]["svc"]["guidance"], "Existing owner text")
+        self.assertEqual(self.events("guidance_changed"), [])
+        ev = self.events("guidance_suggested")
+        self.assertEqual(len(ev), 1)
+        self.assertEqual((ev[0]["secret"], ev[0]["user"], ev[0]["model"], ev[0]["length"]),
+                         ("svc", "alice", "model-x", len(REPLY)))
+        self.assertEqual((ev[0]["http_rows"], ev[0]["flags"], ev[0]["non_ascii"]), (0, 0, 0))
+        self.assertGreater(ev[0]["prompt_chars"], 100)
+        self.assertIn("peer", ev[0])
+        raw = self.audit_text()
+        self.assertNotIn("DELETE /v1/emails", raw)                # the reply text is never logged
+        self.assertNotIn("Existing owner text", raw)             # nor any of the prompt
+
+    def test_flagged_phrases_in_the_draft_are_reported(self):
+        self.model.text = "Reads are always low.\nunknown operations: high"
+        code, got = self.post()
+        self.assertEqual((code, got["flags"]), (200, ["always low"]))
+        self.assertEqual(self.events("guidance_suggested")[0]["flags"], 1)
+
+    def test_prompt_has_the_allowed_facts_and_none_of_the_agent_text(self):
+        # a real request whose every agent-written field carries the canary
+        up = f"http://127.0.0.1:{self.up.server_address[1]}"
+        code, body = self.api("POST", "/v1/requests", {
+            "mode": "http", "names": ["svc"], "method": "POST",
+            "url": up + "/v1/emails/12345/send?token=" + CANARY,
+            "headers": {"Authorization": "Bearer {{SVC_TOKEN}}", "X-Evil": CANARY},
+            "body": json.dumps({"note": CANARY}), "reason": CANARY, "purpose": CANARY, "task": CANARY,
+            "source": CANARY})
+        self.assertEqual(code, 202, body)
+        rid = json.loads(body)["id"]
+        self.broker.history.refresh()
+        self.assertTrue(any(r["id"] == rid for r in self.broker.history.rows(secret="svc")))   # premise: in history
+        self.assertIn(CANARY, self.audit_text())                # premise: the canary is in the log somewhere
+        code, got = self.post()
+        self.assertEqual(code, 200)
+        system, user = self.model.calls[0][:2]
+        both = system + user
+        for want in ("svc", "token", "127.0.0.1", "SVC_TOKEN", "Existing owner text", "POST", "/v1/emails/{id}/send",
+                     "unknown operations: high"):
+            self.assertIn(want, both, want)
+        self.assertNotIn(CANARY, both)
+        self.assertNotIn(t.SECRET, both)                        # no value of any credential
+        self.assertNotIn("X-Evil", both)
+
+    def test_no_model_configured_refuses_with_a_fixed_message(self):
+        class NoChat:
+            def analyze(self, *a, **k):
+                return None
+        self.broker.summarizer = NoChat()
+        code, got = self.post()
+        self.assertEqual((code, got["reason"]), (400, "unavailable"))
+        self.assertEqual(got["error"], gs.MESSAGES["unavailable"])
+        self.assertEqual(self.model.calls, [])
+        ev = self.events("guidance_suggest_refused")
+        self.assertEqual((len(ev), ev[0]["reason"], ev[0]["secret"]), (1, "unavailable", "svc"))
+        self.assertEqual(self.events("guidance_suggested"), [])
+
+    def test_unknown_credential_is_400_without_calling_the_model(self):
+        self.assertEqual(self.post(name="nope")[0], 400)
+        self.assertEqual(self.model.calls, [])
+
+    def test_the_brokers_own_key_credential_is_refused(self):
+        with unittest.mock.patch.object(self.broker, "is_internal_secret", lambda n: n == "svc"):
+            code, got = self.post()
+        self.assertEqual((code, got["reason"]), (400, "internal"))
+        self.assertEqual(self.model.calls, [])
+
+    def test_failures_are_500_with_a_closed_class_and_no_text(self):
+        cases = ((None, "timeout", "timeout"), (None, "error", "error"), (None, "truncated", "truncated"),
+                 (None, "empty", "empty"), (None, "unavailable", "unavailable"),
+                 ("bad​ " + CANARY, None, "invalid"), ("x" * 2500 + CANARY, None, "too_long"),
+                 (None, "S3CR3T-odd-reason", "error"))
+        for text, reason, label in cases:
+            self.model.text, self.model.reason = text, reason
+            self.broker._suggest_times = {}
+            code, got = self.post()
+            self.assertEqual((code, got["reason"], got["error"]), (500, label, gs.MESSAGES[label]), label)
+            self.assertNotIn("draft", got)
+        ev = self.events("guidance_suggest_failed")
+        self.assertEqual([e["reason_class"] for e in ev], [c[2] for c in cases])
+        raw = self.audit_text()
+        self.assertNotIn(CANARY, raw)
+        self.assertNotIn("S3CR3T-odd", raw)
+        self.assertEqual(self.events("guidance_suggested"), [])
+
+    def test_a_model_that_raises_is_a_closed_error(self):
+        def boom(*a):
+            raise RuntimeError("S3CR3T-boom")
+        self.model.complete = boom
+        code, got = self.post()
+        self.assertEqual((code, got["reason"]), (500, "error"))
+        self.assertNotIn("S3CR3T-boom", json.dumps(got) + self.audit_text())
+
+    def test_rate_limits_per_credential_and_global(self):
+        per, glob, _ = self.broker.SUGGEST_RATE
+        for _ in range(per):
+            self.assertEqual(self.post()[0], 200)
+        code, got = self.post()
+        self.assertEqual((code, got["reason"]), (429, "rate_limited"))
+        self.assertEqual(len(self.model.calls), per)               # the refused one never reached the model
+        self.assertEqual(self.events("guidance_suggest_refused")[-1]["reason"], "rate_limited")
+        self.broker._suggest_times = {"": [self.broker._mono()] * glob}     # the global budget is used up
+        self.assertEqual(self.post()[0], 429)
+
+    def test_rate_limit_window_expires(self):
+        per, _, window = self.broker.SUGGEST_RATE
+        now = [1000.0]
+        self.broker._mono = lambda: now[0]
+        for _ in range(per):
+            self.assertEqual(self.post()[0], 200)
+        self.assertEqual(self.post()[0], 429)
+        now[0] += window + 1
+        self.assertEqual(self.post()[0], 200)
+
+    def test_csrf_identity_origin_and_peer_are_enforced(self):
+        self.assertEqual(self.post(csrf="bad")[0], 403)
+        self.assertEqual(self.post(user="mallory")[0], 403)
+        r = t.urllib.request.Request(
+            self.abase + "/policies/guidance/suggest", method="POST",
+            headers={"X-authentik-username": "alice", "Origin": "https://evil.example"},
+            data=urllib.parse.urlencode({"name": "svc", "csrf": self.tok()}).encode())
+        with self.assertRaises(t.urllib.error.HTTPError) as cm:
+            t.urllib.request.urlopen(r, timeout=10)
+        self.assertEqual(cm.exception.code, 403)
+        self.broker.cfg["approval_trusted_peers"] = ["10.9.9.0/24"]
+        self.assertEqual(self.post()[0], 403)
+        self.assertEqual(self.model.calls, [])                       # none of the refused POSTs reached the model
+
+    def test_agent_port_has_no_route(self):
+        for path in ("/v1/policies/guidance/suggest", "/policies/guidance/suggest", "/v1/guidance/suggest"):
+            for method in ("POST", "GET"):
+                code, _ = t.req(self.base + path, method, {"name": "svc"} if method == "POST" else None,
+                                {"X-Client-Key": t.KEY, "Content-Type": "application/json"})
+                self.assertIn(code, (404, 405), (path, method))
+        self.assertEqual(self.model.calls, [])
+
+    def test_audit_events_are_hidden_from_agents(self):
+        for ev in ("guidance_suggested", "guidance_suggest_refused", "guidance_suggest_failed"):
+            self.assertIn(ev, audit_api.HIDDEN)
+            self.assertIsNone(audit_api.redact({"seq": 1, "ts": 1.0, "event": ev, "secret": "svc", "model": "m",
+                                                "reason": "x", "reason_class": "x", "request": "r"}))
 
 
 if __name__ == "__main__":

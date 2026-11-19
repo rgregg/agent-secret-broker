@@ -54,6 +54,7 @@ from . import grants as grants_mod
 from . import icon as icon_mod
 from . import standing as standing_mod
 from . import guidance as guidance_mod
+from . import guidancesuggest as guidancesuggest_mod
 from . import proposals as proposals_mod
 from . import credreq as credreq_mod
 from . import sudomode as sudo_mod
@@ -1183,6 +1184,12 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
         self.log("guidance_changed", length=len(new), old_sha256=guidance_mod.digest(old),
                  new_sha256=guidance_mod.digest(new), **who)
         return True, None, None
+
+    SUGGEST_RATE = guidancesuggest_mod.RATE   # guidance drafts: per credential, in total, per window (s)
+
+    def suggest_guidance(self, name, user, peer=None, client_ip=None):
+        """A model-written DRAFT of guidance for the Policies editor (human-only; never saved). See guidancesuggest."""
+        return guidancesuggest_mod.suggest(self, name, user, peer, client_ip)
 
     def set_guidance(self, name, text, user, peer=None, client_ip=None, **audit_extra):
         """Set (or, when empty, remove) a secret's risk guidance: vault first, then
@@ -7221,7 +7228,7 @@ def approval_handler(broker):
                 tab="credentials", script=crededitor_mod.JS + peek_mod.JS, badge=broker.attention(), user=user, wide=True)
 
         def _credential_policies(self, user, name, note="", status=200, ssh_hosts=None, ssh_rules=None,
-                                 auto_rules=None):
+                                 auto_rules=None, guidance_draft=None):
             """A credential's page on its Policies sub-tab: every per-credential policy in one place. The policy
             forms answer with this page (same note, same status). `note` is a ready-made HTML snippet;
             the three states re-render a refused or saved form (see the section cards)."""
@@ -7235,7 +7242,9 @@ def approval_handler(broker):
                 csrf=self._tok(user), usage_ssh=broker.ssh_rule_usage, usage_auto=broker.auto_rule_usage,
                 client_names=broker.clients.names(), client_choices=broker.clients.active_choices(),
                 standing_rows=rows, config_rules=cfg_rules, grants_enabled=broker.grants_cfg["enabled"],
-                states={"ssh_hosts": ssh_hosts, "ssh_rules": ssh_rules, "auto_rules": auto_rules})
+                states={"ssh_hosts": ssh_hosts, "ssh_rules": ssh_rules, "auto_rules": auto_rules,
+                        "guidance": {"draft": guidance_draft,
+                                     "available": bool(getattr(broker.summarizer, "completion_model", None))}})
             off = ("" if backend_base.CAP_SET_META in broker.backend.capabilities else
                    "<p class=err>This vault backend cannot store metadata, so policies cannot be changed here.</p>")
             page = (f"<div class=ced><h1>Edit {html.escape(name)}</h1>"
@@ -7609,18 +7618,19 @@ def approval_handler(broker):
                 return self._push_decide(user)
             path = self.path.split("?")[0].rstrip("/")
             # a guidance form can hold 2000 characters of percent-encoded text
-            limit = {"/policies/guidance": 40000, "/policies/ssh_hosts": sshhosts_mod.FORM_LIMIT,
+            limit = {"/policies/guidance": 40000, "/policies/guidance/suggest": 40000, "/policies/ssh_hosts": sshhosts_mod.FORM_LIMIT,
                      "/credential": credreq_mod.FORM_LIMIT}.get(path, 8192)
             cred_edit = path.startswith("/credentials/")
             if cred_edit:
                 limit = crededitor_mod.FORM_LIMIT
             if (int(self.headers.get("Content-Length", 0)) > limit
-                    and (cred_edit or path in ("/policies/guidance", "/policies/ssh_hosts", "/credential"))):
+                    and (cred_edit or path in ("/policies/guidance", "/policies/guidance/suggest",
+                                               "/policies/ssh_hosts", "/credential"))):
                 return _page(self, 413, "<h1>Too large</h1>")
             form = urllib.parse.parse_qs(
                 self.rfile.read(min(int(self.headers.get("Content-Length", 0)), limit)).decode())
             link = path.startswith("/a/") and not broker.dest_guard.allow_loopback   # the notification link page
-            if (link or cred_edit or path in ("/decide", "/credential", "/request/retry", "/policies", "/policies/guidance", "/policies/ssh_hosts", "/grants/revoke",
+            if (link or cred_edit or path in ("/decide", "/credential", "/request/retry", "/policies", "/policies/guidance", "/policies/guidance/suggest", "/policies/ssh_hosts", "/grants/revoke",
                         "/enroll/decide", "/clients/rename", "/clients/revoke", "/clients/remove", "/sessions/revoke",
                         "/policies/ssh_rules/add", "/policies/ssh_rules/revoke", "/policies/auto_rules/add",
                         "/policies/auto_rules/revoke", "/push/subscribe",
@@ -7755,6 +7765,20 @@ def approval_handler(broker):
                 return self._credential_policies(
                     user, name, f"<p>Could not save the SSH host policy: {html.escape(name)}</p>",
                     status=400 if res["status"] == "refused" else 500, ssh_hosts=st)
+            if path == "/policies/guidance/suggest":
+                name = form.get("name", [""])[0]
+                if name not in cfg["secrets"]:
+                    return _page(self, 400, "<h1>Bad request</h1>")
+                res = broker.suggest_guidance(name, user, self._ip, self._fwd())
+                code = {"ok": 200, "failed": 500, "rate_limited": 429}.get(res["status"], 400)
+                if "application/json" in (self.headers.get("Accept") or ""):
+                    return self._json(code, {k: res[k] for k in ("draft", "length", "non_ascii", "flags",
+                                                                  "default_high", "model") if k in res}
+                                      | ({} if res["status"] == "ok" else {"error": res["message"],
+                                                                             "reason": res["reason"]}))
+                note = ("<p>Draft below: not saved. Edit it, then press Save.</p>" if code == 200 else
+                        f"<p class=err>{html.escape(res['message'])}</p>")
+                return self._credential_policies(user, name, note, status=code, guidance_draft=res)
             if path == "/policies/guidance":
                 name = form.get("name", [""])[0]
                 if name not in cfg["secrets"]:
