@@ -160,10 +160,19 @@ class Harness(unittest.TestCase):
         if req_ is not None:
             req_.done.wait(10)          # accepted: release runs asynchronously
 
+    settle_auto = True      # act like a polling client: a request policy approved is settled when api() returns
+
     def api(self, method, path, body=None, key=KEY):
         out = req(self.base + path, method, body, {"X-Client-Key": key, "Content-Type": "application/json"})
         if method == "POST" and path == "/v1/requests":
             self.broker.flush_notifications(10)     # sends run on a worker, not the request thread
+            if self.settle_auto and out[0] == 202:
+                # A request policy approved is released on its own thread (Broker._release_by_policy), so the POST
+                # answers before the call has run. A real client collects the result with a poll; the tests
+                # that read state right after a POST wait for it here (test_auto_release_async turns this off).
+                held = self.broker._by_id.get(json.loads(out[1]).get("id"))
+                if held is not None and held.auto:
+                    held.done.wait(10)
         return out
 
     def create_env(self, names=("svc",)):

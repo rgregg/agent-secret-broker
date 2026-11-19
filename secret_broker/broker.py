@@ -191,6 +191,8 @@ _CLAIM_RE = re.compile(r"[A-Za-z0-9@._:\[\]%,()+ -]{1,200}")
 
 
 class Request:
+    auto = False        # True once policy approved it and its release runs on its own thread (_release_by_policy)
+
     def __init__(self, mode, names, spec, source, ttl, peer=None, client=None):
         self.id = secrets.token_urlsafe(16)
         # who authenticated this request: {"id", "name", "legacy"}. Verified (it comes from the
@@ -2047,13 +2049,9 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
         if auto:
             if mode == "store":
                 req.approver = "policy:auto-create"
-            try:
-                result = self._release(req)
-            except Exception as e:  # noqa: BLE001 -- the request must always settle; a fixed label only
-                self._finish(req, "failed", error=errclass.release_text(e), via="policy",
-                             auto_max=auto_max)
-            else:
-                self._finish(req, "approved", result=result, via="policy", auto_max=auto_max)
+            with self._lock:                # no longer pending: a human cannot decide it while it is released
+                req.status = "deciding"
+            self._release_by_policy(req, auto_max=auto_max)
             return req
         if not never and self._standing_claim(req):   # Always (auto_approve_max ceiling), then timed (none)
             return req
@@ -2086,12 +2084,7 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
         else:
             self.audit("auto_rule_used", req, source="config", rule_name=rule["name"])
             extra = dict(decision_source="config_rule", rule_name=rule["name"])
-        try:
-            result = self._release(req)
-        except Exception as e:  # noqa: BLE001 -- the request must always settle; a fixed label only
-            self._finish(req, "failed", error=errclass.release_text(e), via="policy", **extra)
-        else:
-            self._finish(req, "approved", result=result, via="policy", **extra)
+        self._release_by_policy(req, **extra)
         return True
 
     def details_view(self, req):
@@ -4028,14 +4021,7 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
             left = self.grants.left_s(g) if kind == "timed" else None
             self.audit("grant_used", req, kind=kind, grant_id=g["id"], scope=g["scope"],
                        grant_minutes=g.get("minutes") if kind == "timed" else None, grant_left_s=left)
-            try:
-                result = self._release(req)
-            except Exception as e:  # noqa: BLE001 -- the request must always settle; a fixed label only
-                self._finish(req, "failed", error=errclass.release_text(e), via="policy",
-                             grant_id=g["id"], grant_left_s=left)
-            else:
-                self._finish(req, "approved", result=result, via="policy",
-                             grant_id=g["id"], grant_left_s=left)
+            self._release_by_policy(req, grant_id=g["id"], grant_left_s=left)
             return True
         return False
 
@@ -4330,6 +4316,24 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
         self.audit("stored", req, op="replace", item=fin["item"], field=fin["field"], hosts=fin["hosts"],
                    value_bytes=len(sec["token"].encode()), duration_ms=int((time.time() - t0) * 1000))
         return {"stored": {"name": name, "op": "replace", "item": fin["item"], "field": fin["field"]}}
+
+    def _release_by_policy(self, req, **extra):
+        """Release a request that policy approved (an `auto_approve` rule, a standing approval, `approval: allow`) and
+        settle it, on its own thread. The upstream call can take a minute or more; it must not hold the agent's
+        `POST /v1/requests` open (a client gives up after 40 to 60 s and reports a connection error while the broker
+        goes on to finish the call). The POST answers at once ("approved": nobody is being waited for) and the result
+        reaches the client through its poll, as for a request a human approved. The caller has already moved the
+        request out of `pending`, so no human can decide it meanwhile. `extra` is added to the settling event."""
+        req.auto = True
+
+        def run():
+            try:
+                result = self._release(req)
+            except Exception as e:  # noqa: BLE001 -- the request must always settle; a fixed label only
+                self._finish(req, "failed", error=errclass.release_text(e), via="policy", **extra)
+            else:
+                self._finish(req, "approved", result=result, via="policy", **extra)
+        threading.Thread(target=run, daemon=True).start()
 
     def _release(self, req):
         if not self.clients.is_active(req.client["id"]):
@@ -6448,7 +6452,10 @@ def client_handler(broker, client_key):
                 return _json(self, e.code, e.body, e.headers)
             except PermissionError as e:
                 return _json(self, 403, {"error": httpcheck.clip(e)})
-            _json(self, 202, {"id": req.id, "status": req.status, "error": req.error,
+            # a request policy approved is "approved" at once (its release runs on its own thread; see
+            # Broker._release_by_policy): the client then collects the result with its poll
+            st = "approved" if req.auto and req.status == "deciding" else req.status
+            _json(self, 202, {"id": req.id, "status": st, "error": req.error,
                               "expires_in": int(req.expires - time.time())})
 
         def _ws_api(self, path):
