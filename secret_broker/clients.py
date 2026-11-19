@@ -46,6 +46,7 @@ import time
 
 from . import risk as risk_mod
 from . import credlinks
+from . import emailsafe
 
 ANY = "*"                       # a rule scope that applies to every client
 LEGACY_ID = "legacy"
@@ -915,7 +916,7 @@ def enroll_card_html(e, csrf, now, clash):
         f"Confirmation code: <span class=code>{esc(e['code'])}</span><br>"
         "Match it with the code printed in your terminal. If it differs, press Deny.<br>"
         f"Source address: {esc(e['source'])}<br>"
-        f"Claims to be (unverified, typed by the client): {esc(e['claim'])}</div>"
+        f"Claims to be (unverified, typed by the client): {emailsafe.text(e['claim'])}</div>"
         f"{warn}"
         "<form method=post action='/enroll/decide' class=decide>"
         f"<input type=hidden name=id value='{esc(e['id'])}'>"
@@ -936,7 +937,7 @@ def from_html(req):
     esc = html.escape
     c = getattr(req, "client", None) or ClientStore.LEGACY_VIEW
     return (f"Client: <b>{esc(c['name'])}</b> <span class=muted>({esc(c['id'])})</span><br>"
-            f"Claimed source (unverified): {esc(req.source)}")
+            f"Claimed source (unverified): {emailsafe.text(req.source)}")
 
 
 def _ago(t, now):

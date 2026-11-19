@@ -63,6 +63,7 @@ from . import credlinks as credlinks_mod
 from . import credpolicy as credpolicy_mod
 from . import uirules as uirules_mod
 from . import clients as clients_mod
+from . import emailsafe as emailsafe_mod
 from . import clock as clock_mod
 from . import plans as plans_mod
 from . import planflow
@@ -5628,7 +5629,7 @@ _TABS = (("requests", "/", "Requests"), ("policies", "/policies", "Policies"),
 
 
 def _chrome(tab, badge, user):
-    who = f"<span class=who>{html.escape(user)}</span>" if user else ""
+    who = f"<span class=who>{emailsafe_mod.text(user)}</span>" if user else ""
     head = ("<header class=top><div class=bar><span class=logo>A</span>"
             "<b class=brand>Agent Secret Broker</b><span class='pill ok'>&#9679; online</span>"
             f"{who}{_RELOAD_BTN}</div></header>")
@@ -5665,7 +5666,8 @@ def _page(h, code, body, wide=False, nav=True, script=None, tab=None, badge=0, u
            f"<link rel=apple-touch-icon sizes=180x180 href=\"{_ICON_PNG_URI}\">"
            "<link rel=manifest href=/manifest.webmanifest crossorigin=use-credentials>"
            f"<style>{_CSS}{scripts_mod.CSS}{details_mod.CSS}{proposals_mod.CSS}{credreq_mod.CSS}{crededitor_mod.CSS}{peek_mod.CSS}{clients_mod.CSS}{sessions_mod.CSS}{plans_mod.CSS}</style><body>{_chrome(tab, badge, user) if nav else ''}"
-           f"<main class='{'wide' if wide else 'narrow'}'>{_SIGNED_OUT if nav else ''}{body}</main>{scr}</body></html>").encode()
+           f"<main class='{'wide' if wide else 'narrow'}'>{_SIGNED_OUT if nav else ''}{body}</main>{scr}</body></html>")
+    raw = emailsafe_mod.shield(raw).encode()        # user@host text must survive an address-rewriting edge proxy
     h.send_response(code)
     h.send_header("Content-Type", "text/html; charset=utf-8")
     h.send_header("Content-Length", str(len(raw)))
@@ -6129,9 +6131,9 @@ def _detail_html(r, evs, retained=""):
         + (f" {e(r['error'])}" if r["error"] else ""), True)
     if r["via"] == "policy" and r.get("rule_id"):
         used = first("ssh_rule_used") or {}
-        add("Decided by", "standing SSH rule (auto-approved): "
+        add("Decided by", "standing SSH rule (auto-approved): " + emailsafe_mod.text(
             f"{used.get('account') or '?'}@{used.get('rule_host') or sshrules_mod.short_fp(used.get('host_fp')) or '?'}"
-            f", rule {str(r['rule_id'])[:16]}")
+            f", rule {str(r['rule_id'])[:16]}"), True)
     elif r["via"] == "policy" and r.get("rule_name"):
         which = "Policies rule" if r.get("decision_source") == "ui_rule" else "configuration rule"
         add("Decided by", f"{which} \"{e(str(r['rule_name']))}\" (auto-approved)", True)
@@ -7007,7 +7009,7 @@ def approval_handler(broker):
             return self._redirect("/clients?note=" + tag)
 
         def _fragment(self, code, body):
-            raw = body.encode()
+            raw = emailsafe_mod.shield(body).encode()
             self.send_response(code)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(raw)))
