@@ -72,6 +72,46 @@ audit API. The proposal text is shown only on the approval card and dropped once
 decided; the audit log keeps names, lengths and short hashes. Details and the audit events:
 [reference.md](reference.md#guidance-proposals-agent-written-human-approved).
 
+## Suggest guidance (a model drafts it, you decide)
+
+On a credential's Policies page the Risk guidance card has a **Suggest guidance** button. It asks the model the
+broker already uses for descriptions and ratings (the `summary` block: same provider, key and timeout rules, no new
+setting) to draft guidance for THAT credential. The draft appears in the editor box as an unsaved draft, with the
+character count and the same review notes a proposal gets: **Flagged:** phrases like "always low", a count and the
+code points of non-ASCII characters, and a note when the text does not end with `unknown operations: high`. Nothing is
+applied: edit it, then press the ordinary **Save**. Leaving the page loses the draft.
+
+It is for you only. There is no agent route, no `asb` command and no API key that reaches it: it is a POST on the
+approval site, behind your signed-in session, the CSRF token, the same-origin check and the trusted-peer check, like
+the other policy forms.
+
+Requirements and limits:
+
+- A chat model must be configured: `summary.type: openrouter` (any prompt), or `jev` with `summary_text: chat`
+  (the description model, `summary_model`, writes the draft). Otherwise the button is disabled and says why.
+- The call may take up to 30 seconds (never less than the configured `summary.timeout`).
+- At most 3 suggestions per credential and 10 in all per 5 minutes (HTTP 429 after that).
+- An SSH key can be asked too, but guidance never affects SSH signing (always high), so the draft says so.
+- The broker's own summary key credential is refused.
+
+**What leaves the broker (exactly).** The model is sent: the credential's name and kind (token, login or SSH key),
+its allowed hosts (`host[:port]`), its variable names, the guidance it already has (yours), the risk rubric from
+[risk.md](risk.md), and a digest of up to the 200 newest HTTP requests made with this credential, at most 25 lines of
+`count x METHOD host path -> outcome, rated level`. In the path every segment that is not a short plain word is
+replaced (`{id}` for anything with a digit, `{other}` for the rest) and only 6 segments are kept; a host that is not
+one of the credential's allowed hosts shows as `other`. It is never sent: a credential value (or the vault item and
+field that hold it), request or response bodies, headers, query strings, client ids or names, anything about another
+credential, or any text an agent wrote (summaries, purposes, task text, commands). Agent text could be crafted to bias
+the draft, so none of it is included. The digest is in its own block marked untrusted, and the reply is treated as
+untrusted too: it goes through the same check as the editor (hidden characters are refused, at most 2000
+characters), and a refused reply is described by a fixed message, never shown or logged.
+
+Audit: `guidance_suggested`, `guidance_suggest_refused` and `guidance_suggest_failed` (credential, user, model,
+counts, a closed reason; never a prompt or reply), all hidden from the agent audit API.
+
+Treat the draft like a proposal from someone with an interest in the outcome: it can lower ratings once saved.
+Read all of it, and check it against operations you actually use. The model may not know your service.
+
 ## Komodo
 
     Komodo executes actions through POST /execute with the action name in the path or body.

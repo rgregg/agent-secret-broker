@@ -149,6 +149,10 @@ can change ratings, the same trust level as `approval`. It is not shown to
 agents on any surface (discovery, status, results, notifications, agent audit
 API); changes are audited with hashes only.
 
+A model can draft guidance for you (the **Suggest guidance** button; see
+[guidance.md](guidance.md#suggest-guidance-a-model-drafts-it-you-decide)). The draft is only text in the editor
+until you save it; it reaches the classifier only as guidance you saved.
+
 ## The AI description (display only)
 
 With `summary_text: chat` (the jev default) a chat model (`summary_model`,

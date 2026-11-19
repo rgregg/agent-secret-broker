@@ -1843,7 +1843,8 @@ shown (request cards, history details, the Clients tab, the Policies tab, plans)
 - **Policies** (`/credentials/NAME?tab=policies`) holds everything that belongs to this credential alone, one
   independent form per section (own CSRF field, hidden field naming the credential, never inside the Settings form):
   **Standing approvals** (timed and Always, with Revoke; the legacy `approval: allow` is a read-only line),
-  **Auto-approve rules** (not for SSH keys), **Risk guidance**, and for SSH keys **SSH host policy** and
+  **Auto-approve rules** (not for SSH keys), **Risk guidance** (with a **Suggest guidance** button: a model drafts
+  it into the box, unsaved; see Suggest guidance below), and for SSH keys **SSH host policy** and
   **SSH host rules**. An SSH key's page also lists, read-only, any config `auto_approve` rule that names it. The tab
   label shows the number of standing approvals plus auto-approve rules plus SSH host rules (guidance is not counted).
   A refused or saved form answers with this page (same notes, same status codes: 400 for a refusal, 500 for a
@@ -2211,6 +2212,35 @@ The agent audit API shows only the `requested` event (names and mode, never text
 other guidance events are hidden. The history pop-over for such a request shows the names,
 counts, per-entry outcome, lengths and hash prefixes, and "Proposal text: not retained after
 the decision".
+
+## Suggest guidance (a model drafts it; human-only)
+
+`POST /policies/guidance/suggest` (form fields `csrf`, `name`; the approval port only, behind the same session, CSRF,
+Origin and trusted-peer checks as `POST /policies/guidance`; no route exists on the agent port) asks the configured
+chat model for a DRAFT of guidance for one credential. With `Accept: application/json` (what the page's script sends)
+the reply is `{"draft", "length", "non_ascii", "flags", "default_high", "notes", "model"}` or `{"error", "reason"}`;
+otherwise the Policies page is rendered with the draft in the editor box and a "not saved" note. Status: 200 draft,
+400 refused (`unavailable`: no chat model; `internal`; unknown credential), 429 `rate_limited` (3 per credential and 10
+in total per 5 minutes, `Broker.SUGGEST_RATE`), 500 failed (`timeout`, `error`, `empty`, `truncated`,
+`unavailable`, `invalid` for hidden characters, `too_long`). The messages are fixed text, never built from the reply or
+an exception. The draft is never saved: only the existing Save writes guidance.
+
+The model: `complete(system, user, max_tokens)` on the `openrouter` classifier, or on the `jev` description model
+(`summary_text: chat`; otherwise none, and the button is disabled). The timeout is the configured one but at least 30 s.
+No new key or provider.
+
+What is sent: credential name, kind, allowed hosts, variable names, the existing guidance (delimited, defanged), the
+generic rubric and a digest of the newest 200 HTTP rows of that credential: method, host (an allowed host, else
+`other`), path with every segment that is not a short plain word replaced by `{id}` or `{other}` (6 segments at most),
+outcome, risk level and a count, 25 lines at most, in a block marked untrusted. Never sent: values, the vault item or
+field, bodies, headers, query strings, client ids or names, other credentials, summaries, purposes, task text or any
+other text an agent wrote (tests plant canaries in all of them). The reply is checked with `guidance.validate_text`;
+flagged phrases and non-ASCII characters are reported with the draft.
+
+Audit events (all hidden from the agent API): `guidance_suggested` (`secret`, `user`, `peer`, `client_ip`, `model`,
+`http_rows`, `groups`, `prompt_chars`, `length`, `flags`, `non_ascii`), `guidance_suggest_refused` (`secret`, `user`,
+`peer`, `client_ip`, `reason`: `unavailable`, `internal` or `rate_limited`), `guidance_suggest_failed` (as suggested,
+with `reason_class` in place of `length`). Neither the prompt nor the reply is ever logged.
 
 ## Credential requests (the agent asks, the human supplies the value)
 
@@ -3280,6 +3310,7 @@ decision. Hidden on purpose:
 - Notification holding (`notify_held`, `notify_released`, `notify_dropped`): shows when the
   approver had a page open.
 - Guidance proposals: `guidance_proposed`, `guidance_proposal_result` and `guidance_changed`
+- Guidance drafts: `guidance_suggested`, `guidance_suggest_refused` and `guidance_suggest_failed`
   (the `requested` event for mode `guidance` shows names and mode only, never text).
 - Credential requests: `credential_provided` and `credential_refused` (the human's entry and refused forms).
 - Policy and risk: `startup`, `assessed`, `escalated`, `policy_changed`,
