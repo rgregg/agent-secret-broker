@@ -9,9 +9,11 @@ inside the session's scope. The broker keeps a per-session cookie jar and captur
 memory; neither ever reaches the agent.
 
 Invariants (enforced in broker.py and here, tested in tests/test_sessions.py):
-  * a session is always opened by a human: the open request is HIGH by code (no model call),
-    never auto-approved (policy allow, Always, timed grants, SSH rules), and no notification
-    button, token or hook can decide it; only the authenticated approval site can;
+  * a session is opened by a human: the open request is HIGH by code (no model call),
+    never auto-approved by policy allow, Always, timed grants or SSH rules, and no notification
+    button, token or hook can decide it; only the authenticated approval site can. The one other
+    way in is an explicit `http_session` / `ws_session` rule (sessionrules.py) that bounds the
+    whole manifest and caps the limits;
   * absolute expiry: the deadline is fixed at approval time (default 15 minutes, hard maximum
     configurable). No sliding extension, no renewal, no idle refresh: use never moves it. At the
     deadline the session is abandoned: jar and captured values are dropped, it is marked expired,
@@ -57,6 +59,7 @@ from . import credlinks
 from . import clock as clock_mod
 from . import credreq as credreq_mod
 from . import guidance as guidance_mod
+from . import sessionrules
 
 DEFAULTS = {"enabled": True, "default_ttl_s": 900, "max_ttl_s": 3600, "max_calls": 200, "max_per_client": 3}
 TTL_FLOOR = 30                  # seconds: the shortest session
@@ -1197,11 +1200,47 @@ class SessionsMixin:
         self.audit("ws_session_requested" if sp.get("kind") == "ws" else "session_requested", req,
                    hosts=sp["hosts"], methods=sp["methods"], ttl_s=sp["ttl_s"], max_calls=sp["max_calls"],
                    **(ws_mod.target_audit(sp) if sp.get("kind") == "ws" else {}))
+        if self._session_rule_claim(req):
+            return req
         try:
             self._push(req)
         except Exception:  # noqa: BLE001 -- the card is on the page whatever the transport does
             self._finish(req, "failed", error="could not notify")
         return req
+
+    def _session_rule_claim(self, req):
+        """Approve a session open request from a matching `http_session` / `ws_session` rule (see sessionrules.py):
+        a config rule, or one stored on the credential. Runs after every request-time refusal (the request is
+        already validated against the credential's hosts, the destination guard and the internal key) and only for
+        a client that may be auto-approved; the legacy key never matches. The session gets the LOWER of what it
+        asked for and what the rule allows, set where a human's shortened limits go. Returns True when the request
+        was finished here."""
+        from . import autorules
+        if self.client_never_auto(req.client["id"]):
+            return False
+        mode = "ws_session" if req.spec.get("kind") == "ws" else "http_session"
+        stored = (self.cfg["secrets"].get(req.names[0]) or {}).get("auto_rules") or []
+        now = time.time()
+        rule = autorules.find(self.auto_rules + stored, mode, req.names, req.spec, req.client, now)
+        limits = sessionrules.within(rule, mode, req.spec) if rule is not None else None
+        if limits is None:
+            return False
+        with self._lock:                # a human decision and a rule never both act
+            if req.status != "pending":
+                return False
+            req.status = "deciding"
+            req.spec["final"] = limits
+        asked = (req.spec["ttl_s"], req.spec["max_calls"])
+        fields = dict(rule_name=rule["name"], ttl_s=limits[0], max_calls=limits[1], shortened=limits != asked)
+        if rule["source"] == "ui":
+            self.audit("auto_rule_used", req, source="ui", rule_id=rule["id"], **fields)
+            self.auto_rule_usage.record(req.names[0], rule["id"], now)
+            who = dict(decision_source="ui_rule", rule_name=rule["name"])
+        else:
+            self.audit("auto_rule_used", req, source="config", **fields)
+            who = dict(decision_source="config_rule", rule_name=rule["name"])
+        self._release_and_finish(req, dict(via="policy", **who))
+        return True
 
     def _session_open(self, req, who):
         """The human approved: create the session. Returns the result handed to the agent once."""

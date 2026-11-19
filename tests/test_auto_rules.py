@@ -68,7 +68,7 @@ class Parse(unittest.TestCase):
         self.assertEqual(r["path_prefix"], "/")
 
     def test_human_only_modes_are_refused_at_load(self):
-        for mode in ("sudo", "credential", "guidance", "plan", "session", "store"):
+        for mode in ("sudo", "credential", "guidance", "plan", "session_close", "store"):
             with self.assertRaises(ValueError) as cm:
                 autorules.parse([{"name": "x", "mode": mode, "secret": "a"}])
             self.assertIn("always needs a human", str(cm.exception), mode)

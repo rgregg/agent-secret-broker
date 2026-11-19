@@ -16,8 +16,10 @@ managed on its Policies page: see uirules.py), like a standing SSH rule or a pla
 an ordinary approval with `decision_source: config_rule` and the rule's name. Everything else prompts as before.
 
 What a rule can and cannot do:
-  * Modes: `ssh_sign`, `http`, `env`. Root commands (`sudo`), credential requests, guidance proposals, plans
-    and sessions are decided by a human by design and are refused at load, so a typo cannot open them.
+  * Modes: `ssh_sign`, `http`, `env`, and `http_session` / `ws_session` (a session open request whose whole
+    manifest lies inside the rule's bounds, opened with the rule's caps: see sessionrules.py). Root commands
+    (`sudo`), credential requests, guidance proposals, plans and stores are decided by a human by design and are
+    refused at load, so a typo cannot open them.
   * Every rule names the secret(s) it covers and says exactly what it matches. There is no "any host" or "any
     command": ssh needs an account and a server, http a host, env the full argv.
   * `clients` (names or ids) limits which enrolled clients a rule applies to. Leave it out for any enrolled
@@ -34,20 +36,22 @@ import time
 import urllib.parse
 
 from . import clients as clients_mod
+from . import sessionrules
 from . import sshrules
 from . import scripts as scripts_mod
 
-MODES = ("ssh_sign", "http", "env")
-STORED_MODES = ("http", "env")          # what a rule kept in a credential's vault metadata may be
+MODES = ("ssh_sign", "http", "env") + sessionrules.MODES
+STORED_MODES = ("http", "env") + sessionrules.MODES          # what a rule kept in a credential's vault metadata may be
 STORED_KEYS = frozenset({"id", "by", "at", "expires_at"})
 MAX_STORED = 50
-HUMAN_ONLY = ("sudo", "credential", "guidance", "plan", "session", "session_close", "store")
+HUMAN_ONLY = ("sudo", "credential", "guidance", "plan", "session_close", "store")
 MAX_RULES = 200
 MAX_NAME = 80
 KEYS = {
     "ssh_sign": {"name", "mode", "secret", "secrets", "clients", "host", "host_fp", "account"},
     "http": {"name", "mode", "secret", "secrets", "clients", "scheme", "host", "methods", "path_prefix"},
     "env": {"name", "mode", "secret", "secrets", "clients", "argv"},
+    **{m: sessionrules.COMMON | sessionrules.KEYS[m] for m in sessionrules.MODES},
 }
 _SECRET = re.compile(r"[A-Za-z0-9_.-]{1,64}")
 _HOST = re.compile(r"[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?")
@@ -73,6 +77,9 @@ def _parse_rule(r, where, *, implicit_secret=None, extra_keys=()):
     if not isinstance(r, dict):
         raise ValueError(f"{where} must be an object")
     mode = r.get("mode")
+    if mode == "session":
+        raise ValueError(f"{where}.mode \"session\" is not a rule mode: use http_session or ws_session "
+                         "(a session open request is matched against the rule's limits, never released as it is)")
     if mode in HUMAN_ONLY:
         raise ValueError(f"{where}.mode {mode!r} always needs a human and cannot be auto-approved by a rule")
     if mode not in MODES or (implicit_secret is not None and mode not in STORED_MODES):
@@ -127,10 +134,11 @@ def _parse_rule(r, where, *, implicit_secret=None, extra_keys=()):
         if not all(_METHOD.fullmatch(m) for m in methods):
             raise ValueError(f"{where}.methods must be upper-case HTTP methods such as GET")
         prefix = r.get("path_prefix", "/")
-        if not isinstance(prefix, str) or not prefix.startswith("/") or len(prefix) > 255 or "?" in prefix \
-                or re.search(r"[\x00-\x20\x7f]", prefix) or ".." in prefix.split("/"):
+        if not sessionrules.valid_prefix(prefix):
             raise ValueError(f"{where}.path_prefix must start with '/' (a path, no query, no '..')")
         rule.update(host=host.lower(), scheme=scheme, methods=frozenset(methods), path_prefix=prefix)
+    elif mode in sessionrules.MODES:
+        rule.update(sessionrules.parse(mode, r, where))
     else:
         argv = r.get("argv")
         if (not isinstance(argv, list) or not argv or len(argv) > 64
@@ -211,6 +219,8 @@ def serialize_stored(rules):
             d.update(host=r["host"], methods=sorted(r["methods"]), path_prefix=r["path_prefix"])
             if r["scheme"] != "https":
                 d["scheme"] = r["scheme"]
+        elif r["mode"] in sessionrules.MODES:
+            d.update(sessionrules.serialize(r))
         else:
             d["argv"] = list(r["argv"])
         if r["clients"]:
@@ -226,11 +236,7 @@ def is_expired(rule, now):
     return bool(exp) and sshrules.to_epoch(exp) <= now
 
 
-def _path_ok(path, prefix):
-    if prefix == "/":
-        return True
-    prefix = prefix.rstrip("/")
-    return path == prefix or path.startswith(prefix + "/")
+_path_ok = sessionrules.path_under
 
 
 def _client_ok(rule, client):
@@ -277,12 +283,7 @@ def _names_a_method_override(text):
     return False
 
 
-def _not_plain(text):
-    """True for text a rule cannot reason about, so the request never matches: it still changes when decoded a
-    second time (`%255f`), carries a JSON or unicode escape (`\\u005f`), or is not plain printable ASCII."""
-    once = urllib.parse.unquote_plus(text)
-    return (once != text and urllib.parse.unquote_plus(once) != once) or "\\u" in text.lower() \
-        or not all(c in "\t\r\n" or " " <= c <= "~" for c in text)
+_not_plain = sessionrules.not_plain
 
 
 def _http_ok(rule, spec):
@@ -341,7 +342,10 @@ def find(rules, mode, names, spec, client, now=None):
         if (rule["mode"] != mode or not wanted <= rule["secrets"] or not _client_ok(rule, client)
                 or is_expired(rule, now)):
             continue
-        ok = {"ssh_sign": _ssh_ok, "http": _http_ok, "env": _env_ok}[mode](rule, spec or {})
+        if mode in sessionrules.MODES:
+            ok = sessionrules.within(rule, mode, spec or {})
+        else:
+            ok = {"ssh_sign": _ssh_ok, "http": _http_ok, "env": _env_ok}[mode](rule, spec or {})
         if ok:
             return rule
     return None

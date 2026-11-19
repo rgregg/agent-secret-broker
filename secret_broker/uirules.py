@@ -11,6 +11,7 @@ Nothing typed into the form is ever echoed into a message, an event or a log lin
 of reasons and the page names at most a field, taken from this module's own list.
 """
 import html
+import math
 import re
 import secrets
 import threading
@@ -18,12 +19,16 @@ import time
 
 from . import autorules
 from . import clients as clients_mod
+from . import destguard
+from . import sessionrules
+from . import sessions as S
 from . import sshrules
 from .backends import BackendError
 from .backends import base as backend_base
 
 REASONS = ("invalid", "not_confirmed", "cap", "backend", "duplicate_name")
-FIELDS = ("name", "mode", "host", "scheme", "methods", "path_prefix", "argv", "clients", "expires_at")
+FIELDS = ("name", "mode", "host", "scheme", "methods", "path_prefix", "argv", "clients", "expires_at",
+          "hosts", "port", "allow_query", "max_ttl_s", "max_calls", "max_frames")
 _CATCH = (OSError, ValueError, KeyError, BackendError)
 _FIELD_IN_ERROR = re.compile(r"auto_rules\[0\]\.([a-z_]+)")
 MESSAGES = {
@@ -42,11 +47,45 @@ def _invalid(field=None):
     return MESSAGES["invalid"]
 
 
+def _secs(minutes):
+    """Minutes typed in the form -> whole seconds; anything else is passed on as it is, and the shared parser
+    refuses it (a blank or unreadable cap is never turned into a default)."""
+    try:
+        m = float(minutes)
+    except (TypeError, ValueError):
+        return minutes or None
+    return int(round(m * 60)) if math.isfinite(m) and 0 < m <= 24 * 60 else minutes
+
+
+def _count(v):
+    return int(v) if isinstance(v, str) and v.isascii() and v.isdigit() and len(v) <= 6 else (v or None)
+
+
+def fields_from_form(form):
+    """The `fields` dict `add_auto_rule` takes, from a parsed POST body (`form`: name -> list of str). The one
+    place that knows the form's input names; the stored-rule names are used inside."""
+    one = lambda k: form.get(k, [""])[0]  # noqa: E731
+    f = dict(name=one("name"), mode=one("mode"), host=one("host"), scheme=one("scheme"),
+             methods=form.get("methods", []), path_prefix=one("path_prefix"),
+             argv=[w.strip() for w in one("argv").splitlines() if w.strip()],
+             client=one("client") or clients_mod.ANY)
+    if f["mode"] == "http_session":
+        f.update(hosts=one("shosts").split(), methods=form.get("smethods", []),
+                 max_ttl_s=_secs(one("ttl_min")), max_calls=_count(one("max_calls")))
+    elif f["mode"] == "ws_session":
+        f.update(host=one("whost").strip(), scheme=one("wscheme"), path_prefix=one("wpath"),
+                 port=_count(one("wport")) if one("wport").strip() else None, allow_query=one("wquery") == "1",
+                 max_ttl_s=_secs(one("ttl_min")), max_frames=_count(one("max_frames")))
+    return f
+
+
 def _raw_rule(fields, rid, by, now, days, client):
     """The stored form of a new rule from the form's fields (unvalidated: parse_stored does that)."""
     mode = fields.get("mode")
     raw = {"id": rid, "name": fields.get("name"), "mode": mode}
-    if mode == "http":
+    if mode in sessionrules.MODES:
+        raw.update({k: fields[k] for k in sessionrules.KEYS[mode] if fields.get(k) is not None})
+    elif mode == "http":
         raw.update(host=fields.get("host"), scheme=fields.get("scheme") or "https",
                    methods=list(fields.get("methods") or []), path_prefix=fields.get("path_prefix") or "/")
     elif mode == "env":
@@ -133,6 +172,12 @@ class UiRulesMixin:
             except ValueError as e:
                 m = _FIELD_IN_ERROR.match(str(e))
                 return refused("invalid", _invalid(m.group(1) if m else None))
+            if rule["mode"] in sessionrules.MODES:      # a rule for a host the credential does not allow could never match
+                allowed = destguard.host_parts(sc.get("allowed_hosts") or [])
+                names = ([h.rsplit(":", 1)[0] for h in rule["hosts"]] if rule["mode"] == "http_session"
+                         else [rule["host"]])
+                if not all(n in allowed for n in names):
+                    return refused("invalid", _invalid("hosts" if rule["mode"] == "http_session" else "host"))
             if any(r["name"].lower() == rule["name"].lower() for r in existing):
                 return refused("duplicate_name", MESSAGES["duplicate_name"])
             if len(existing) >= autorules.MAX_STORED:
@@ -145,6 +190,10 @@ class UiRulesMixin:
                 self.log("auto_rule_change_failed", op="create", error_class=backend_base.error_class(e), **who)
                 return {"status": "failed", "message": "Could not save the rule."}
         extra = {"rule_host": rule["host"]} if rule["mode"] == "http" else {}
+        if rule["mode"] in sessionrules.MODES:
+            extra = {"rule_hosts": list(rule["hosts"]) if rule["mode"] == "http_session"
+                     else [f"{rule['host']}:{rule['port']}"],
+                     "rule_max_ttl_s": rule["max_ttl_s"], "rule_max_calls": rule["max_calls"]}
         self.log("auto_rule_created", credential=name, rule_id=rule["id"], rule_name=rule["name"],
                  rule_mode=rule["mode"], rule_client=client, expires_at=rule["expires_at"], created_by=user,
                  channel="policies", approver_peer=peer, approver_ip=client_ip, **extra)
@@ -222,6 +271,8 @@ def _client_label(ids, names, active):
 
 
 def _matches(rule):
+    if rule["mode"] in sessionrules.MODES:
+        return sessionrules.describe(rule)
     if rule["mode"] == "ssh_sign":
         return f"sign in as {rule['account']} on {rule['host'] or rule['host_fp']}"
     if rule["mode"] == "env":
@@ -305,6 +356,8 @@ def card(name, sc, config_rules, csrf, usage, now=None, state=None, client_names
     err = f"<div class=err role=alert>{e(st['error'])}</div>" if st.get("error") else ""
     meth = "".join(f"<label><input type=checkbox name=methods value='{m}'"
                    f"{' checked' if m in ('GET', 'HEAD') else ''}> {m}</label>" for m in METHODS)
+    smeth = "".join(f"<label><input type=checkbox name=smethods value='{m}'"
+                    f"{' checked' if m in ('GET', 'HEAD') else ''}> {m}</label>" for m in METHODS)
     opts = "<option value='*' selected>Any enrolled client</option>" + "".join(
         f"<option value='{e(cid, quote=True)}'>Only {e(cn)}</option>" for cid, cn in choices)
     return (
@@ -317,6 +370,7 @@ def card(name, sc, config_rules, csrf, usage, now=None, state=None, client_names
         f"<input id='arn{i}' name=name maxlength={autorules.MAX_NAME} autocomplete=off>"
         f"<label for='arm{i}'>Kind</label><select id='arm{i}' name=mode>"
         "<option value=http selected>Web request (http)</option><option value=env>Run with secret (env)</option>"
+        "<option value=http_session>HTTP session</option><option value=ws_session>WebSocket session</option>"
         "</select>"
         f"<fieldset><legend>Web request</legend><label for='arh{i}'>Host (no scheme or port)</label>"
         f"<input id='arh{i}' name=host autocomplete=off placeholder='api.example.com'>"
@@ -328,10 +382,36 @@ def card(name, sc, config_rules, csrf, usage, now=None, state=None, client_names
         "</fieldset>"
         f"<fieldset><legend>Run with secret</legend><label for='ara{i}'>Exact command, one word per line</label>"
         f"<textarea id='ara{i}' name=argv rows=3 autocomplete=off></textarea></fieldset>"
+        "<fieldset><legend>HTTP session</legend><small class=muted>A session opened by this rule may use only "
+        "these hosts and methods, for at most the time and calls below, with no approval and no further prompt. "
+        "host:443 allows exactly port 443 on any scheme (a session does not check the scheme of each call, so this does "
+        "not by itself keep calls on https); a bare host allows ports 80 and 443.</small>"
+        f"<label for='arsh{i}'>Hosts, one per line (host or host:port)</label>"
+        f"<textarea id='arsh{i}' name=shosts rows=2 autocomplete=off placeholder='api.example.com:443'></textarea>"
+        f"<div class=meth><span>Methods</span> {smeth}</div></fieldset>"
+        "<fieldset><legend>WebSocket session</legend><small class=muted>Only this server and path, for at most the "
+        "time and frames below. Message types the credential blocks stay blocked.</small>"
+        f"<label for='arwh{i}'>Host (no scheme or port)</label>"
+        f"<input id='arwh{i}' name=whost autocomplete=off placeholder='ha.example.com'>"
+        f"<label for='arws{i}'>Scheme</label><select id='arws{i}' name=wscheme>"
+        "<option value=wss selected>wss (encrypted)</option><option value=ws>ws (plain, not encrypted)</option></select>"
+        f"<label for='arwp{i}'>Port (blank: 443 for wss, 80 for ws)</label>"
+        f"<input id='arwp{i}' name=wport inputmode=numeric autocomplete=off>"
+        f"<label for='arwx{i}'>Path prefix</label>"
+        f"<input id='arwx{i}' name=wpath autocomplete=off placeholder='/api/websocket'>"
+        "<label class=chk><input type=checkbox name=wquery value=1> <span>Allow a query string</span></label>"
+        f"<label for='arwf{i}'>Most frames the session may send</label>"
+        f"<input id='arwf{i}' name=max_frames type=number min=1 max={sessionrules.WS_FRAMES_CEIL} value=500></fieldset>"
+        "<fieldset><legend>Session limits (HTTP and WebSocket session)</legend>"
+        f"<label for='artl{i}'>Longest session, minutes</label>"
+        f"<input id='artl{i}' name=ttl_min type=number min=0.5 max=1440 step=any value=15>"
+        f"<label for='arcl{i}'>Most calls (HTTP session)</label>"
+        f"<input id='arcl{i}' name=max_calls type=number min=1 max={S.CALLS_CEIL} value=100></fieldset>"
         f"<label for='arc{i}'>Applies to</label><select id='arc{i}' name=client>{opts}</select>"
         f"<label for='are{i}'>Expires</label><select id='are{i}' name=expires>"
         "<option value=never selected>Never expires (default)</option><option value=30>30 days</option>"
         "<option value=90>90 days</option></select>"
         "<label class=chk><input type=checkbox name=confirm value=1> <span>I understand matching requests "
-        "will be released with no approval, at any risk level</span></label>"
+        "will be released with no approval, at any risk level. For a session kind: a matching session opens with no "
+        "approval and keeps running, unattended, until its time or call limit</span></label>"
         "<div class=grow><button>Add rule</button></div></form></details>")

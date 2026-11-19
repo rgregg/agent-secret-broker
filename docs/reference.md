@@ -1762,7 +1762,7 @@ guess, and the message names the field, such as `auto_approve[2].host`):
 | Field | Modes | Meaning |
 |---|---|---|
 | `name` | all | Required, unique. What the audit log and the history show. |
-| `mode` | all | `ssh_sign`, `http` or `env`. |
+| `mode` | all | `ssh_sign`, `http`, `env`, `http_session` or `ws_session` (the last two: [Auto-approving sessions](#auto-approving-sessions-http_session-and-ws_session)). |
 | `secret` or `secrets` | all | The credential name(s) the rule covers. A request that names several credentials (`asb a,b -- cmd`, or two placeholders in one call) is matched only by a rule that lists **all** of them; a rule for one of them does not cover the pair. A rule listing `[a, b]` also covers a request for just `a`. |
 | `clients` | all | Optional list of client **ids** (`c-1a2b3c4d`, shown in the Clients tab). Ids only: a name can be reused by another client, an id cannot. Leave it out for any enrolled client. The legacy shared key never matches. |
 | `host` / `host_fp` | ssh_sign | Exactly one. The server: a name the key's `ssh_hosts.known_hosts` gives the server's **verified** host key, or the `SHA256:` fingerprint itself. |
@@ -1775,8 +1775,10 @@ guess, and the message names the field, such as `auto_approve[2].host`):
 
 What a rule will not do:
 
-- **Human-only modes.** Root commands (`sudo`), credential requests, guidance proposals, plans, sessions and
-  credential stores are decided by a person by design; a rule with one of those modes is refused at load.
+- **Human-only modes.** Root commands (`sudo`), credential requests, guidance proposals, plans, `session_close` and
+  credential stores are decided by a person by design (or, for `session_close`, are not approvals at all); a rule
+  with one of those modes is refused at load. A session open request can be approved by a rule only through the
+  two session modes below, never by `mode: session`.
 - **Match loosely.** There is no "any host" or "any command". An SSH rule needs an account and one server; an SSH
   server is matched on what the broker verified (the host key behind the session), never on a destination the
   client merely claimed, and not at all for forwarded or unverified connections.
@@ -1795,7 +1797,7 @@ restart and no redeploy. They differ from configuration rules in four ways:
 - **They belong to one credential.** A rule is stored in that credential's `broker` metadata (vault field
   `auto_rules`), so it survives restarts, redeploys and vault rebuilds, and applies only to requests that name
   that credential alone. A request naming two credentials is matched only by a configuration rule listing both.
-  Only `http` and `env` rules can be stored; SSH signing keeps its own section ("SSH host rules"), and an
+  Only `http`, `env`, `http_session` and `ws_session` rules can be stored; SSH signing keeps its own section ("SSH host rules"), and an
   `auto_rules` field on an SSH key makes the credential invalid.
 - **They are validated and matched by the same code as configuration rules** (`autorules.py`), so the form and the
   matcher cannot disagree. A stored rule that is malformed makes that one credential invalid and the message names
@@ -1814,10 +1816,16 @@ restart and no redeploy. They differ from configuration rules in four ways:
   (an empty `clients`). The form offers enrolled clients only. A rule pinned to a client that is later revoked
   simply stops matching; the table shows the client as "(revoked)" until the rule is revoked or expires.
 
-**The form** (`POST /policies/auto_rules/add`, fields `secret`, `name`, `mode` (`http` or `env`), `host`, `scheme`,
-`methods` (repeated), `path_prefix`, `argv` (one word per line), `client` (`*` or a client id), `expires`
-(`never`, `30` or `90`), `confirm`) needs the confirmation tick: matching requests are then released with no
-approval, at any risk level and whatever the credential's `approval` says. A blank scheme means `https` and a blank
+**The form** (`POST /policies/auto_rules/add`, fields `secret`, `name`, `mode` (`http`, `env`, `http_session` or
+`ws_session`), `host`, `scheme`, `methods` (repeated), `path_prefix`, `argv` (one word per line), for an HTTP session
+`shosts` (one `host[:port]` per line) and `smethods` (repeated), for a WebSocket session `whost`, `wscheme`, `wport`,
+`wpath`, `wquery` and `max_frames`, for both sessions `ttl_min` (minutes) and, for HTTP, `max_calls`, then `client`
+(`*` or a client id), `expires` (`never`, `30` or `90`), `confirm`) needs the confirmation tick: matching requests are
+then released with no approval, at any risk level and whatever the credential's `approval` says (for a session kind the
+tick says that a matching session opens with no approval and keeps running, unattended, until its time or call limit).
+The offered values are narrow: GET and HEAD, 15 minutes, 100 calls or 500 frames, `wss`, no query string, and no host
+(a blank host, cap or path is refused, never defaulted). A session rule must name hosts the credential allows
+(otherwise it could never match, and the form refuses it as `invalid`). A blank scheme means `https` and a blank
 path prefix means `/`. `POST /policies/auto_rules/revoke` takes `secret` and `rule`. Both are guarded like the SSH
 rule forms (SSO identity, trusted peer, CSRF token, same-origin check) and are not reachable with an agent key.
 Whoever can use the approval site or edit the vault collection can add one: the same trust level as `approval`.
@@ -1844,6 +1852,53 @@ The approval of a stored rule is an ordinary `approved` event with `via: policy`
 rule's `rule_name` (it carries no `rule_id`, which the history page reads as a standing SSH rule); the request
 history says `Policies rule "name" (auto-approved)`. Last-used time and use counts are kept in
 `auto_rules_state.json` beside the audit log, not in the vault, and are pruned of rules that no longer exist.
+
+
+### Auto-approving sessions: `http_session` and `ws_session`
+
+A session open request (`asb session open`, `asb ws`) can be approved by a rule too, config or stored on the credential
+(code: `secret_broker/sessionrules.py`). A session is a window of many calls, so the rule does not name one request, it
+**bounds the window**, and a request matches only when its whole manifest lies inside it. Nothing about a session
+changes once it is open: the same masking, header allowlists, scope checks, caps, revoke on the Clients tab.
+
+    {"name": "unifi reads", "mode": "http_session", "secret": "unifi", "hosts": ["unifi.example.com:443"],
+     "methods": ["GET", "HEAD"], "max_ttl_s": 600, "max_calls": 50, "clients": ["c-1a2b3c4d"]},
+    {"name": "ha stream", "mode": "ws_session", "secret": "ha", "host": "ha.example.com", "scheme": "wss",
+     "port": 443, "path_prefix": "/api/websocket", "max_ttl_s": 900, "max_frames": 500}
+
+| Field | Modes | Meaning |
+|---|---|---|
+| `hosts` | http_session | Required, 1 to 5 entries, each `host` or `host:port` exactly as a session manifest writes them: a bare host means ports 80 **and** 443 (plain http included), `host:443` means exactly port 443 on any scheme (the session's scope check compares host and port, never the scheme of each call, so an explicit port does not by itself keep calls on https; this is how human-approved sessions behave too). |
+| `methods` | http_session | Upper-case methods, default `["GET", "HEAD"]`. |
+| `host`, `scheme`, `port` | ws_session | The one server: `wss` (default) or `ws`, port 443 or 80 by scheme unless given. |
+| `path_prefix` | ws_session | Required (`/` for any path). The manifest's path must be plain (no `%` escape, `;`, backslash or dot segment) and at or below it. A http session manifest carries no path, so an `http_session` rule has no `path_prefix` (it could not be verified); path-bounded unattended work is what plans are for. |
+| `allow_query` | ws_session | Default `false`: a manifest whose url has a query string does not match. |
+| `max_ttl_s`, `max_calls` / `max_frames` | both | **Required**, never defaulted: 30 to 86400 seconds; 1 to 10000 calls (HTTP) or 1 to 100000 frames (WebSocket). |
+
+**Matching is a subset test, in one function** (`sessionrules.within`; the config parser, the stored-rule parser and the
+Policies form share the one parser). The request matches only if every host and port it asks for, every method, and for
+WebSocket the scheme, host, port, path and query are inside the rule; one thing outside means no match, and the request
+waits for a human exactly as before. A manifest the matcher cannot read, a rule for another credential or another
+mode, an unlisted client, the legacy shared key, an expired stored rule, a client set to never auto-approve: no match.
+The claim runs **after** the request-time refusals (the credential's allowed hosts and ports, the destination guard, the
+internal key, per-client session caps), so a rule never opens a host those would have refused.
+
+**The caps win.** The session gets the lower of what it asked for and what the rule allows (`ttl = min(request,
+max_ttl_s)`, the same for calls or frames), so a rule cannot yield an unbounded session. Like the other rules it
+ignores the risk ceiling and the credential's `approval`.
+
+**Audit.** The approval is a plain `approved` with `via: policy`, `decision_source: config_rule` or `ui_rule` and the
+rule's `rule_name`, preceded by `auto_rule_used` carrying the effective `ttl_s`, `max_calls` and whether the rule
+`shortened` the request; the usual `session_opened` / `ws_session_opened` follow with the final limits. No new event
+names: the agent audit API still hides `auto_rule_used` and shows no rule name. The history says "Policies rule "name"
+(auto-approved)" or "configuration rule". `auto_rule_created` for a session rule carries `rule_hosts`,
+`rule_max_ttl_s` and `rule_max_calls`.
+
+**What this does not cover.** The rule does not pin the credential's WebSocket sign-in or blocked message types: those
+are the operator's settings on the credential and apply to every session however it was approved. There is no rate
+limit beyond the existing per-client caps on open and pending sessions, so a rule lets an agent open a fresh session
+when the last one ends; revoke the rule (or give it an expiry) to stop that, and revoke open sessions on the Clients
+tab. `session_close` is not an approval: the owning client can always close its own session, which only shortens a window.
 
 ## The credential page: Settings and Policies
 
@@ -2698,10 +2753,11 @@ approve), the call cap and the client's name; the agent's purpose text is shown 
 with every non-ASCII character escaped. You may shorten the time and the cap on the card; you cannot
 lengthen them.
 
-**Opening always needs a human.** The open request is high by code (no model sees it), never
-auto-approved (`approval: allow`, Always, timed grants and SSH rules do not apply), has no Always or timed
+**Opening needs a human, unless a session rule covers it.** The open request is high by code (no model sees it), never
+auto-approved by `approval: allow`, Always, timed grants or SSH rules, has no Always or timed
 chips, and no notification button, token or Home Assistant hook can decide it: only the authenticated approval
-site can. It follows the other approval requests' rules for pending caps (3 requests, 2 session requests per
+site can. The one exception is an explicit `http_session` rule that bounds the whole manifest
+([Auto-approving sessions](#auto-approving-sessions-http_session-and-ws_session)). It follows the other approval requests' rules for pending caps (3 requests, 2 session requests per
 client), the deny cooldown per credential and the request TTL (`ttl_seconds`).
 
 **Time-bound, abandoned at the deadline.** The deadline is `approval time + ttl` and is never moved:
@@ -2841,8 +2897,10 @@ revoke and the Clients tab are one implementation) and is a separate kind. Code:
 config, handshake steps), `secret_broker/wsproto.py` (a minimal RFC 6455 client over `socket`/`ssl`, stdlib only).
 
 **Approval.** `asb ws NAME URL [--ttl N] [--max-frames N]` asks for a session. The card is **always HIGH**, decided
-by code with no model call, never auto-approved (policy `allow`, Always, timed grants, SSH rules and `auto_approve_max`
-cannot cover it), and the notification has no buttons: only the approval site decides. The card names the credential,
+by code with no model call, never auto-approved by policy `allow`, Always, timed grants, SSH rules or `auto_approve_max`
+(only an explicit `ws_session` rule bounding the whole manifest can, see
+[Auto-approving sessions](#auto-approving-sessions-http_session-and-ws_session)), and the notification has no buttons: only
+the approval site decides. The card names the credential,
 `scheme://host:port`, how the credential signs in, the time limit (fixed from approval, never extended) and the caps; the
 approver may shorten the time and frame cap, never lengthen them. The agent supplies no purpose text (it is refused); the
 path and query it chose are shown escaped and labelled unverified, and are not in the notification. Session-level approval
@@ -3416,7 +3474,8 @@ decision. Hidden on purpose:
   policy; the refusal itself is already returned to the client without the allowed list).
 - Policies-page auto-approve rules: `auto_rule_created`, `auto_rule_revoked`, `auto_rule_expired`,
   `auto_rule_refused`, `auto_rule_change_failed`, `auto_rules_state_corrupt`,
-  `auto_rules_state_write_failed`, and `auto_rule_used` (a rule-approved request shows as a plain `approved`).
+  `auto_rules_state_write_failed`, and `auto_rule_used` (a rule-approved request shows as a plain `approved`; for a
+  session it also carries the effective `ttl_s` and `max_calls`).
 - Standing SSH rules: `ssh_rule_created`, `ssh_rule_used`, `ssh_rule_revoked`,
   `ssh_rule_expired`, `ssh_rule_refused`, `ssh_rule_change_failed`,
   `ssh_rules_state_corrupt`, `ssh_rules_state_write_failed`, and the `rule_id` /
