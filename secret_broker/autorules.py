@@ -16,8 +16,10 @@ managed on its Policies page: see uirules.py), like a standing SSH rule or a pla
 an ordinary approval with `decision_source: config_rule` and the rule's name. Everything else prompts as before.
 
 What a rule can and cannot do:
-  * Modes: `ssh_sign`, `http`, `env`. Root commands (`sudo`), credential requests, guidance proposals, plans
-    and sessions are decided by a human by design and are refused at load, so a typo cannot open them.
+  * Modes: `ssh_sign`, `http`, `env`, and `http_session` / `ws_session` (a session open request whose whole
+    manifest lies inside the rule's bounds, opened with the rule's caps: see sessionrules.py). Root commands
+    (`sudo`), credential requests, guidance proposals, plans and stores are decided by a human by design and are
+    refused at load, so a typo cannot open them.
   * Every rule names the secret(s) it covers and says exactly what it matches. There is no "any host" or "any
     command": ssh needs an account and a server, http a host, env the full argv.
   * `clients` (names or ids) limits which enrolled clients a rule applies to. Leave it out for any enrolled

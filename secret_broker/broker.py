@@ -7764,10 +7764,7 @@ def approval_handler(broker):
                 if name not in cfg["secrets"] or cfg["secrets"][name].get("ssh"):
                     return _page(self, 400, "<h1>Bad request</h1>")
                 one = lambda k: form.get(k, [""])[0]  # noqa: E731
-                fields = dict(name=one("name"), mode=one("mode"), host=one("host"), scheme=one("scheme"),
-                              methods=form.get("methods", []), path_prefix=one("path_prefix"),
-                              argv=[w.strip() for w in one("argv").splitlines() if w.strip()],
-                              client=one("client") or clients_mod.ANY)
+                fields = uirules_mod.fields_from_form(form)
                 res = broker.add_auto_rule(name, fields, one("expires"), one("confirm") == "1", user,
                                            self._ip, self._fwd())
                 if res["status"] == "created":
