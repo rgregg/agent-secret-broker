@@ -5808,7 +5808,7 @@ _CLIENT_NOTES = {"planrevoked": "Plan revoked: it stops matching before its next
                  "removed": "Removed from the list.",
                  "rulerevoked": "Rule revoked.", "rulegone": "That rule no longer exists.", "rulefail": "Could not revoke the rule.",
                  "disabled": "Client disabled: every request is refused until you enable it again.",
-                 "disabledmem": "Client disabled in memory, but the client list could not be saved; it is retried.",
+                 "disabledmem": "Client disabled in memory, but the client list could not be saved; it is retried, and a restart before then leaves it active.",
                  "enabled": "Client enabled.", "enabledmem": "Client enabled in memory, but the client list could not be saved; "
                  "it is retried, and a restart before then leaves it disabled.",
                  "notdisabled": "That client is not disabled.", "isrevoked": "That client is revoked, which is permanent.", "taken": "That name is taken or not allowed.",
