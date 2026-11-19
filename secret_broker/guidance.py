@@ -217,19 +217,68 @@ JS = r"""
     var c=document.getElementById(t.getAttribute('data-gcount'));if(!c)return;
     function u(){c.textContent=t.value.length+' / '+t.getAttribute('data-gmax');}
     t.addEventListener('input',u);u();});
+  document.querySelectorAll('button[data-gsuggest]').forEach(function(b){
+    b.addEventListener('click',function(e){
+      var f=b.form,box=document.getElementById(b.getAttribute('data-gnotes')),
+          t=f.querySelector('textarea[data-gmax]');
+      if(!window.fetch||!box||!t)return;                 /* no script support: the form posts and the page returns */
+      e.preventDefault();
+      function say(lines,bad){box.textContent='';lines.forEach(function(l){
+        var p=document.createElement('p');p.className=bad?'err':'gflag';p.textContent=l;box.appendChild(p);});}
+      b.disabled=true;say(['Asking the model for a draft...'],false);
+      fetch(b.getAttribute('formaction'),{method:'POST',credentials:'same-origin',cache:'no-store',redirect:'manual',
+        headers:{'Accept':'application/json'},body:new URLSearchParams(new FormData(f))})
+      .then(function(r){return r.json();}).then(function(d){
+        if(typeof d.draft!=='string'){say([d.error||'Could not suggest guidance'],true);return;}
+        t.value=d.draft;t.dispatchEvent(new Event('input'));
+        say(['Draft from '+d.model+'. Not saved: edit it, then press Save.'].concat(d.notes||[]),false);
+      }).catch(function(){say(['Could not suggest guidance'],true);})
+      .then(function(){b.disabled=false;});
+    });});
 })();
 """
 
+SUGGEST_NOTE = ("Suggest guidance asks the broker's configured model for a draft. The model sees this credential's "
+                "name, kind, allowed hosts, variable names, the guidance above and a count of its recent requests "
+                "(method, host, path with ids removed, outcome, risk). It never sees values, bodies, headers, query "
+                "strings or any text an agent wrote, except single plain words (letters only) of request paths. The draft is not saved until you press Save.")
 
-def card(name, sc, csrf, idx=0, open_=False):
+
+def _suggest_ui(name, idx, suggest):
+    """The Suggest button, its notes area and (when a draft came back without script) the review notes."""
+    esc = html.escape
+    if suggest is None:
+        return "", ""
+    if not suggest.get("available"):
+        btn = ("<button type=button disabled data-gsuggest data-gnotes='gn%d'>Suggest guidance</button>" % idx)
+        return btn, f"<p class=muted id='gn{idx}'><small>{esc(suggest.get('unavailable') or '')}</small></p>"
+    btn = (f"<button type=submit formaction='/policies/guidance/suggest' data-gsuggest data-gnotes='gn{idx}'>"
+           "Suggest guidance</button>")
+    res = suggest.get("draft")
+    lines = []
+    if res and res.get("status") == "ok":
+        lines = ([f"Draft from {res['model']}. Not saved: edit it, then press Save."] + list(res.get("notes") or []))
+    elif res:
+        lines = [res.get("message") or ""]
+    cls = "err" if res and res.get("status") != "ok" else "gflag"
+    notes = "".join(f"<p class={cls}>{esc(x)}</p>" for x in lines)
+    return btn, f"<div id='gn{idx}' aria-live=polite>{notes}</div><p><small class=muted>{esc(SUGGEST_NOTE)}</small></p>"
+
+
+def card(name, sc, csrf, idx=0, open_=False, suggest=None):
     """The risk-guidance editor for one credential (`idx` makes the element ids unique on a page that holds
-    several; `open_` renders it expanded)."""
+    several; `open_` renders it expanded). `suggest` is None (no Suggest button) or {"available": bool,
+    "unavailable": fixed text, "draft": a Broker.suggest_guidance result or None}: an ok draft is put in the
+    textarea, unsaved."""
     esc = html.escape
     cur = sc.get("guidance") or ""
+    res = (suggest or {}).get("draft")
+    shown = res["draft"] if res and res.get("status") == "ok" else cur
     ignored = ("<small class=muted>Stored guidance ignored: " + esc(sc["guidance_invalid"]) + "</small>"
                if sc.get("guidance_invalid") else "")
     badge = ignored + (f"<span class='pill ok'>Guidance set ({len(cur)} chars)</span>" if cur
              else "<span class='pill plain'>No guidance</span>")
+    sbtn, snotes = _suggest_ui(name, idx, suggest)
     return (
         f"<details class='card gbox'{' open' if open_ else ''}><summary><b>{esc(name)}</b> {badge}"
         "<small class=muted>Risk guidance</small></summary>"
@@ -238,7 +287,7 @@ def card(name, sc, csrf, idx=0, open_=False):
         f"<input type=hidden name=name value='{esc(name)}'>"
         f"<p><small class=muted>{esc(NOTE)}</small></p>"
         f"<textarea name=guidance maxlength={MAX_LEN} data-gmax={MAX_LEN} data-gcount='gc{idx}' "
-        f"rows=6 aria-label='Risk guidance for {esc(name)}'>{esc(cur)}</textarea>"
-        f"<div class=grow><button>Save</button><small class=muted>"
-        f"<span id='gc{idx}'>{len(cur)} / {MAX_LEN}</span> characters (max {MAX_LEN}). "
-        "Empty removes the guidance.</small></div></form></details>")
+        f"rows=6 aria-label='Risk guidance for {esc(name)}'>{esc(shown)}</textarea>"
+        f"<div class=grow><button>Save</button>{sbtn}<small class=muted>"
+        f"<span id='gc{idx}'>{len(shown)} / {MAX_LEN}</span> characters (max {MAX_LEN}). "
+        f"Empty removes the guidance.</small></div>{snotes}</form></details>")

@@ -11,7 +11,7 @@ import html
 import time
 
 from . import clients as clients_mod
-from . import credlinks, guidance, sshhosts, sshrules, uirules
+from . import credlinks, guidance, guidancesuggest, sshhosts, sshrules, uirules
 
 
 @dataclasses.dataclass
@@ -145,7 +145,9 @@ def body(name, sc, ctx):
                                   ctx.client_names, ctx.client_choices, open_=True))
     parts.append("<h3>Risk guidance</h3><p><small class=muted>" + html.escape(guidance.NOTE) +
                  " Guidance is never shown to agents.</small></p>")
-    parts.append(guidance.card(name, sc, ctx.csrf, open_=True))
+    gs_state = st.get("guidance")
+    parts.append(guidance.card(name, sc, ctx.csrf, open_=True, suggest=(
+        None if gs_state is None else {**gs_state, "unavailable": guidancesuggest.MESSAGES["unavailable"]})))
     if sc.get("ssh"):
         parts.append(f"<style>{sshhosts.CSS}{sshrules.CSS}</style><h3>SSH host policy</h3><p><small class=muted>"
                      "Restrict an SSH key to the servers it may log in to. This is never shown to agents."

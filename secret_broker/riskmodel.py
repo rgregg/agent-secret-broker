@@ -461,6 +461,16 @@ class JevAnalyzer:
                 "summary_model": (getattr(self._describer, "_model", None)
                                   if src == "model" else None)}
 
+    @property
+    def completion_model(self):
+        """The chat model that can draft guidance: the description writer's (None when summary_text is not chat)."""
+        return getattr(self._describer, "completion_model", None)
+
+    def complete(self, system, user, max_tokens):
+        if self._describer is None:
+            return None, "unavailable"
+        return self._describer.complete(system, user, max_tokens)
+
     def _describe(self, mode, names, spec, guidance=None):
         try:
             return guidance_mod.call(self._describer.describe, mode, names, spec, guidance)
@@ -555,6 +565,15 @@ class FloorAnalyzer:
         except Exception:  # noqa: BLE001
             pass
         return res
+
+    @property
+    def completion_model(self):
+        return getattr(self.inner, "completion_model", None)
+
+    def complete(self, system, user, max_tokens):
+        """The configured model's free-form reply (guidance drafting), or (None, "unavailable")."""
+        fn = getattr(self.inner, "complete", None)
+        return fn(system, user, max_tokens) if fn and self.completion_model else (None, "unavailable")
 
     def _shows_content(self):
         return getattr(self.inner, "_send", True) is not False

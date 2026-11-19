@@ -11,6 +11,7 @@ command. Placeholders such as {{VAR}} are sent unresolved; secret values are
 never part of the input.
 """
 import json
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -21,6 +22,7 @@ from . import keyprovider
 from . import scripts as scripts_mod
 from . import sshkey
 
+SUGGEST_TIMEOUT = 30.0   # floor for a guidance draft: the rating timeouts (4 to 6 s) are far too short for it
 MAX_SUMMARY = 320     # characters of a displayed summary (1 or 2 sentences)
 
 SYSTEM = (
@@ -74,6 +76,44 @@ def describe(mode, names, spec, max_content_chars=300, send_content=True):
     return "\n".join(lines)
 
 
+def chat_complete(key, base, model, system, user, max_tokens, timeout):
+    """One chat-completions call with a system and a user message -> (text, None) or (None, reason).
+    Reason is a fixed word: unavailable (no usable key), timeout, error, empty, truncated. Nothing from an
+    exception or from the provider's reply is ever carried in the reason."""
+    k = key.get()
+    if not k:
+        return None, "unavailable"
+    payload = {"model": model, "max_tokens": max_tokens, "temperature": 0, "stream": False,
+               "reasoning": {"effort": "minimal"},
+               "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
+    url = f"{base.rstrip('/')}/chat/completions"
+
+    def post():
+        req = urllib.request.Request(url, data=json.dumps(payload).encode(),
+                                     headers={"Authorization": f"Bearer {k}", "Content-Type": "application/json"})
+        with destguard.operator_urlopen(req, timeout=timeout) as r:
+            return json.load(r)
+    try:
+        try:
+            resp = post()
+        except urllib.error.HTTPError as e:
+            if e.code != 400:      # a provider that rejects the reasoning setting: ask once without it
+                raise
+            payload.pop("reasoning")
+            resp = post()
+        choice = resp["choices"][0]
+        text, finish = choice["message"]["content"], choice.get("finish_reason")
+    except TimeoutError:
+        return None, "timeout"
+    except Exception:  # noqa: BLE001  -- the reason is a closed word, never the exception
+        return None, "error"
+    if finish == "length":
+        return None, "truncated"
+    if not isinstance(text, str) or not text.strip():
+        return None, "empty"
+    return text, None
+
+
 class OpenRouterSummarizer:
     def __init__(self, api_key, model, timeout=4.0, max_content_chars=300, send_content=True,
                  base_url="https://openrouter.ai/api/v1"):
@@ -118,6 +158,15 @@ class OpenRouterSummarizer:
         summary = " ".join(summary.split())[:MAX_SUMMARY] or None
         return {"summary": summary, "risk": risk if risk in ("low", "medium", "high") else None,
                 "summary_model": self._model}
+
+    @property
+    def completion_model(self):
+        return self._model
+
+    def complete(self, system, user, max_tokens):
+        """A free-form chat reply for the human-only guidance drafter -> (text, None) | (None, reason)."""
+        return chat_complete(self._key, self._base, self._model, system, user, max_tokens,
+                             max(float(self._timeout), SUGGEST_TIMEOUT))
 
     def summarize(self, mode, names, spec):
         got = self.analyze(mode, names, spec)
