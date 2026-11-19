@@ -419,10 +419,12 @@ while enrolling and never an argument. No key is copied by hand.
   `SECRET_BROKER_KEY` in the environment overrides the file: unset it.
 - Exit codes: 0 enrolled, 4 denied, 5 expired (the card lives 10 minutes by default), 3 refused
   or unreachable (a name already waiting, too many pending, enrollment off), 2 usage.
-- The **Clients** tab lists every client (name, claimed host, enrolled, last seen, request count,
-  state, effective auto-approval ceiling, its own rules) and can rename, revoke and remove them.
-  Revoking takes effect on the next request (`asb` then says `this client has been revoked; run
-  asb enroll`), denies the client's waiting requests and deletes its own rules.
+- The **Clients** tab lists every client as one compact row (state icon, name, last seen, the `asb` version it
+  runs with an upgrade icon when it is out of date, rules count); a pop-over per client shows the rest and can
+  rename, **disable**, revoke and remove it. Revoking takes effect on the next request (`asb` then says `this
+  client has been revoked; run asb enroll`), denies the client's waiting requests and deletes its own rules, and
+  cannot be undone. Disabling is reversible: every request is refused (`this client is disabled`, HTTP 403)
+  without asking you, and its rules are kept for when you enable it again.
 - Every request now shows the **authenticated client** (verified) next to the `user@host` text
   the client typed (unverified), in cards, history, request details and the audit log.
 - The old shared key keeps working as the single client "shared key (legacy)" until the broker

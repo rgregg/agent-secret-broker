@@ -20,6 +20,7 @@ from cryptography.hazmat.primitives.asymmetric import ed25519
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import test_e2e as t  # noqa: E402
+from _pagetext import unshield  # noqa: E402
 import test_ssh as ts  # noqa: E402
 import test_ssh_host as th  # noqa: E402
 from secret_broker import destguard as _destguard  # noqa: E402
@@ -165,7 +166,7 @@ class CardChip(Base):
             self.assertEqual(page.count("approve_ssh_rule"), 1)
             self.assertIn("Automatically approve...", page)
             self.assertIn("Always: this host", page)
-            self.assertIn("Always approve deploy@web.example.com with this key?", page)
+            self.assertIn("Always approve deploy@web.example.com with this key?", unshield(page))
             self.assertIn("name=ssh_rule_expiry", page)
             self.assertIn("Never expires (default)", page)
             self.assertIn("<option value=30>30 days</option>", page)
@@ -175,7 +176,7 @@ class CardChip(Base):
 
     def test_unnamed_server_shows_short_fingerprint(self):
         rid = self.ask_ok(login(SID_A), [OTHER.bind(SID_A)])
-        self.assertIn(f"Always approve deploy@{OTHER.fp[:19]} with this key?", self.link_page(rid))
+        self.assertIn(f"Always approve deploy@{OTHER.fp[:19]} with this key?", unshield(self.link_page(rid)))
 
     def test_hostbound_login_data_is_eligible(self):
         rid = self.ask_ok(hostbound(SID_A, HOST))
@@ -468,7 +469,7 @@ class Match(Base):
         rid = self.expect("match", login(SID_A), [HOST.bind(SID_A)], True)
         rule = self.stored_rules()[0]
         body = t.req(self.abase + f"/request/{rid}", headers=self.H)[1]
-        self.assertIn(f"standing SSH rule (auto-approved): deploy@web.example.com, rule {rule['id']}", body)
+        self.assertIn(f"standing SSH rule (auto-approved): deploy@web.example.com, rule {rule['id']}", unshield(body))
         self.assertIn("ssh_rule_used", body)
         self.assertIn("auto-approved", body)
         self.assertNotIn("time-boxed grant", body)

@@ -167,6 +167,7 @@ HIDDEN = frozenset({
     # per-client credentials: enrolling, renaming and revoking clients is approver activity, and an
     # authentication failure can name a revoked client; none of it is the agent's business
     "enroll_requested", "enroll_decided", "enroll_refused", "enroll_notify_failed",
+    "client_disabled", "client_enabled", "client_disabled_denied",
     "client_revoked", "client_renamed", "client_rename_refused", "client_removed",
     "client_auth_failed", "clients_file_corrupt", "clients_file_write_failed", "clients_file_recovered",
     # an internal plan error is an operator matter (a class name only)

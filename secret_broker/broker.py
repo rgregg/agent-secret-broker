@@ -63,6 +63,8 @@ from . import credlinks as credlinks_mod
 from . import credpolicy as credpolicy_mod
 from . import uirules as uirules_mod
 from . import clients as clients_mod
+from . import clientspage as clientspage_mod
+from . import emailsafe as emailsafe_mod
 from . import clock as clock_mod
 from . import plans as plans_mod
 from . import planflow
@@ -1942,7 +1944,8 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
             # Revocation sets the client's state before it sweeps the pending requests under this
             # same lock, so a request is either refused here or already pending when swept.
             if not self.clients.is_active((client or clients_mod.ClientStore.LEGACY_VIEW)["id"]):
-                err = "this client has been revoked"
+                err = ("this client is disabled" if (self.clients.get((client or clients_mod.ClientStore.LEGACY_VIEW)["id"])
+                                                      or {}).get("state") == "disabled" else "this client has been revoked")
             elif mode == "guidance":
                 # proposals have their own small cap and never count against (or get
                 # blocked by) the cap and deny cooldown of real credential requests
@@ -3161,8 +3164,8 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
             if req.mode == "guidance" and req.result is None:
                 req.result = proposals_mod.outcome(req, status)
         if req.mode == "plan" and status != "approved" and req.plan_id:
-            self.plans.settle(req.plan_id, status, cooldown=extra.get("via") != "client_revoked")  # the plan follows its card
-        if status == "denied" and req.mode not in ("guidance", "plan") and extra.get("via") != "client_revoked":
+            self.plans.settle(req.plan_id, status, cooldown=extra.get("via") not in ("client_revoked", "client_disabled"))  # the plan follows its card
+        if status == "denied" and req.mode not in ("guidance", "plan") and extra.get("via") not in ("client_revoked", "client_disabled"):
             now = time.time()
             for n in req.names:
                 self._denied_at[n] = now
@@ -5628,7 +5631,7 @@ _TABS = (("requests", "/", "Requests"), ("policies", "/policies", "Policies"),
 
 
 def _chrome(tab, badge, user):
-    who = f"<span class=who>{html.escape(user)}</span>" if user else ""
+    who = f"<span class=who>{emailsafe_mod.text(user)}</span>" if user else ""
     head = ("<header class=top><div class=bar><span class=logo>A</span>"
             "<b class=brand>Agent Secret Broker</b><span class='pill ok'>&#9679; online</span>"
             f"{who}{_RELOAD_BTN}</div></header>")
@@ -5664,8 +5667,9 @@ def _page(h, code, body, wide=False, nav=True, script=None, tab=None, badge=0, u
            f"<link rel=icon href=\"{_ICON}\">"
            f"<link rel=apple-touch-icon sizes=180x180 href=\"{_ICON_PNG_URI}\">"
            "<link rel=manifest href=/manifest.webmanifest crossorigin=use-credentials>"
-           f"<style>{_CSS}{scripts_mod.CSS}{details_mod.CSS}{proposals_mod.CSS}{credreq_mod.CSS}{crededitor_mod.CSS}{peek_mod.CSS}{clients_mod.CSS}{sessions_mod.CSS}{plans_mod.CSS}</style><body>{_chrome(tab, badge, user) if nav else ''}"
-           f"<main class='{'wide' if wide else 'narrow'}'>{_SIGNED_OUT if nav else ''}{body}</main>{scr}</body></html>").encode()
+           f"<style>{_CSS}{scripts_mod.CSS}{details_mod.CSS}{proposals_mod.CSS}{credreq_mod.CSS}{crededitor_mod.CSS}{peek_mod.CSS}{clients_mod.CSS}{clientspage_mod.CSS}{sessions_mod.CSS}{plans_mod.CSS}</style><body>{_chrome(tab, badge, user) if nav else ''}"
+           f"<main class='{'wide' if wide else 'narrow'}'>{_SIGNED_OUT if nav else ''}{body}</main>{scr}</body></html>")
+    raw = emailsafe_mod.shield(raw).encode()        # user@host text must survive an address-rewriting edge proxy
     h.send_response(code)
     h.send_header("Content-Type", "text/html; charset=utf-8")
     h.send_header("Content-Length", str(len(raw)))
@@ -5801,7 +5805,13 @@ _CLIENT_NOTES = {"planrevoked": "Plan revoked: it stops matching before its next
                  "sesgone": "That session had already ended.", "renamed": "Client renamed.", "revoked": "Client revoked. Its next request fails.",
                  "revokedmem": "Client revoked in memory, but the client list could not be saved; it is "
                                "retried, and the revoke is lost on a restart until it is saved.",
-                 "removed": "Removed from the list.", "taken": "That name is taken or not allowed.",
+                 "removed": "Removed from the list.",
+                 "rulerevoked": "Rule revoked.", "rulegone": "That rule no longer exists.", "rulefail": "Could not revoke the rule.",
+                 "disabled": "Client disabled: every request is refused until you enable it again.",
+                 "disabledmem": "Client disabled in memory, but the client list could not be saved; it is retried, and a restart before then leaves it active.",
+                 "enabled": "Client enabled.", "enabledmem": "Client enabled in memory, but the client list could not be saved; "
+                 "it is retried, and a restart before then leaves it disabled.",
+                 "notdisabled": "That client is not disabled.", "isrevoked": "That client is revoked, which is permanent.", "taken": "That name is taken or not allowed.",
                  "nosave": "Could not save the client list.", "missing": "No such client.",
                  "active": "Only a revoked client can be removed."}
 _AUTO_LABEL = {"none": "off (every request asks a human)", "low": "up to low risk",
@@ -6129,9 +6139,9 @@ def _detail_html(r, evs, retained=""):
         + (f" {e(r['error'])}" if r["error"] else ""), True)
     if r["via"] == "policy" and r.get("rule_id"):
         used = first("ssh_rule_used") or {}
-        add("Decided by", "standing SSH rule (auto-approved): "
+        add("Decided by", "standing SSH rule (auto-approved): " + emailsafe_mod.text(
             f"{used.get('account') or '?'}@{used.get('rule_host') or sshrules_mod.short_fp(used.get('host_fp')) or '?'}"
-            f", rule {str(r['rule_id'])[:16]}")
+            f", rule {str(r['rule_id'])[:16]}"), True)
     elif r["via"] == "policy" and r.get("rule_name"):
         which = "Policies rule" if r.get("decision_source") == "ui_rule" else "configuration rule"
         add("Decided by", f"{which} \"{e(str(r['rule_name']))}\" (auto-approved)", True)
@@ -6242,14 +6252,16 @@ def client_handler(broker, client_key):
         _AUTH_MSG = {"revoked": "this client has been revoked; run `asb enroll` to enroll it again",
                      "legacy_denied": "the shared client key is no longer accepted; run `asb enroll`",
                      "bad_key": "bad client key",
+                     "disabled": "this client is disabled",
                      "clients_unavailable": "per-client credentials are unavailable: the broker's client "
                                             "list could not be read (ask the operator)"}
 
         def _authed(self):
             view, why = broker.client_auth(self.headers.get("X-Client-Key", ""), client_key,
-                                           self._ip, self.command, self.path.split("?")[0])
+                                           self._ip, self.command, self.path.split("?")[0],
+                                           self.headers.get("User-Agent", ""))
             if view is None:
-                _json(self, 401, {"error": self._AUTH_MSG.get(why, "bad client key")})
+                _json(self, 403 if why == "disabled" else 401, {"error": self._AUTH_MSG.get(why, "bad client key")})
                 return False
             self.client = view
             return True
@@ -6999,6 +7011,13 @@ def approval_handler(broker):
             elif path == "/clients/revoke":
                 res = broker.revoke_client(cid, user, peer, fwd)
                 tag = {"revoked": "revoked", "memory_only": "revokedmem", "already": "revoked"}.get(res, "missing")
+            elif path == "/clients/disable":
+                res = broker.disable_client(cid, user, peer, fwd)
+                tag = {"disabled": "disabled", "memory_only": "disabledmem", "already": "disabled",
+                       "revoked": "isrevoked"}.get(res, "missing")
+            elif path == "/clients/enable":
+                res = broker.enable_client(cid, user, peer, fwd)
+                tag = {"enabled": "enabled", "memory_only": "enabledmem", "not_disabled": "notdisabled"}.get(res, "missing")
             elif path == "/clients/remove":
                 res = broker.remove_client(cid, user, peer, fwd)
                 tag = {"removed": "removed", "active": "active", "not_saved": "nosave"}.get(res, "missing")
@@ -7007,7 +7026,7 @@ def approval_handler(broker):
             return self._redirect("/clients?note=" + tag)
 
         def _fragment(self, code, body):
-            raw = body.encode()
+            raw = emailsafe_mod.shield(body).encode()
             self.send_response(code)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(raw)))
@@ -7384,7 +7403,7 @@ def approval_handler(broker):
             _page(self, status, clients_mod.clients_section(broker, token, flash=note)
                   + plans_mod.active_table_html(broker.active_plans(), token)
                   + sessions_mod.sessions_section(broker, token),
-                  script=_GRANTS_JS, tab="clients", badge=broker.attention(), user=user)
+                  script=_GRANTS_JS + clientspage_mod.JS, tab="clients", badge=broker.attention(), user=user)
 
         def do_GET(self):
             user = self._user()
@@ -7631,7 +7650,8 @@ def approval_handler(broker):
                 self.rfile.read(min(int(self.headers.get("Content-Length", 0)), limit)).decode())
             link = path.startswith("/a/") and not broker.dest_guard.allow_loopback   # the notification link page
             if (link or cred_edit or path in ("/decide", "/credential", "/request/retry", "/policies", "/policies/guidance", "/policies/guidance/suggest", "/policies/ssh_hosts", "/grants/revoke",
-                        "/enroll/decide", "/clients/rename", "/clients/revoke", "/clients/remove", "/sessions/revoke",
+                        "/enroll/decide", "/clients/rename", "/clients/revoke", "/clients/remove", "/clients/disable",
+                        "/clients/enable", "/sessions/revoke",
                         "/policies/ssh_rules/add", "/policies/ssh_rules/revoke", "/policies/auto_rules/add",
                         "/policies/auto_rules/revoke", "/push/subscribe",
                         "/push/revoke", "/push/test", "/plans/decide", "/plans/revoke")) and not (
@@ -7686,6 +7706,8 @@ def approval_handler(broker):
             if path == "/grants/revoke":
                 gid = form.get("grant", [""])[0][:16]
                 done = broker.revoke_grant(gid, user, self._ip, self._fwd())
+                if form.get("back", [""])[0] == "clients":     # the Clients tab's rules dialog
+                    return self._redirect("/clients?note=" + {True: "rulerevoked", False: "rulegone"}.get(done, "rulefail"))
                 note = ("<p>" + ("Standing approval revoked" if done else
                                  "That standing approval is no longer active" if done is False else
                                  "Could not revoke the standing approval") + ".</p>")
@@ -7698,6 +7720,8 @@ def approval_handler(broker):
                 if name not in cfg["secrets"] or not cfg["secrets"][name].get("ssh"):
                     return _page(self, 400, "<h1>Bad request</h1>")
                 res = broker.revoke_ssh_rule(name, rid, user, self._ip, self._fwd())
+                if form.get("back", [""])[0] == "clients":
+                    return self._redirect("/clients?note=" + {"revoked": "rulerevoked", "missing": "rulegone"}.get(res, "rulefail"))
                 msg = {"revoked": "SSH rule revoked", "missing": "That SSH rule no longer exists",
                        "failed": "Could not revoke the SSH rule"}[res]
                 return self._credential_policies(user, name, f"<p>{msg}: {html.escape(name)}</p>",
@@ -7722,6 +7746,8 @@ def approval_handler(broker):
                 if name not in cfg["secrets"] or cfg["secrets"][name].get("ssh"):
                     return _page(self, 400, "<h1>Bad request</h1>")
                 res = broker.revoke_auto_rule(name, rid, user, self._ip, self._fwd())
+                if form.get("back", [""])[0] == "clients":
+                    return self._redirect("/clients?note=" + {"revoked": "rulerevoked", "missing": "rulegone"}.get(res, "rulefail"))
                 msg = {"revoked": "Auto-approve rule revoked", "missing": "That rule no longer exists",
                        "failed": "Could not revoke the rule"}[res]
                 return self._credential_policies(user, name, f"<p>{msg}: {html.escape(name)}</p>",

@@ -29,6 +29,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import test_e2e as t  # noqa: E402
 import test_grants as tg  # noqa: E402  (Base only)
+from _pagetext import unshield  # noqa: E402
 from secret_broker import destguard as _destguard  # noqa: E402
 _destguard.allow_loopback_for_tests()   # test stubs live on 127.0.0.1; no config key does this
 from secret_broker import audit_api  # noqa: E402
@@ -209,7 +210,7 @@ class Enrollment(CBase):
         self.assertEqual(status, 200)
         self.assertIn("Client enrollment: laptop", page)
         self.assertIn(body["code"], page)
-        self.assertIn("bob@laptop", page)
+        self.assertIn("bob@laptop", unshield(page))
         self.assertIn("unverified", page)
         self.assertIn("127.0.0.1", page)
         self.assertIn("name=decision value=approve", page)
@@ -708,10 +709,12 @@ class Administration(CBase):
     def test_clients_page(self):
         a = self.new_client("alpha", claim="bob@laptop")
         page = self.get("/clients")[1]
+        # the compact list moved the detail into per-client dialogs (see test_clients_page.py for the layout);
+        # everything this test asked for is still on the page
         for needle in ("Clients", "alpha", a["id"], "bob@laptop", "unverified", "shared key (legacy)",
-                       "Revoke...", "Rename", "data-label=Name", "data-label='Last seen'", "data-label=Requests",
-                       "data-label=State", "data-label=Ceiling", "Effective ceiling", "asb enroll"):
-            self.assertIn(needle, page, needle)
+                       "Revoke alpha", "Rename alpha", "Last seen", "Requests served", "Status",
+                       "Effective ceiling", "asb enroll"):
+            self.assertIn(needle, unshield(page), needle)
         self.assertIn(self.broker.csrf_token("alice"), page)
         self.assertNotIn(a["secret"], page)
         self.assertNotIn(a["hash"], page)
@@ -756,7 +759,8 @@ class Persistence(CBase):
         data = json.loads(text)
         self.assertEqual(set(data["clients"][0]), {"id", "name", "hash", "state", "created", "last_seen",
                                                    "requests", "last_source", "approved_by", "claim",
-                                                   "enrolled_from", "revoked_at", "revoked_by"})
+                                                   "enrolled_from", "revoked_at", "revoked_by",
+                                                   "client_version", "disabled_at", "disabled_by"})
 
     def test_pending_enrollments_do_not_survive_a_restart(self):
         self.enr("laptop")

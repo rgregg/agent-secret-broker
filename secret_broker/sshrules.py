@@ -34,6 +34,7 @@ import threading
 import time
 
 from . import clients as clients_mod
+from . import emailsafe
 from . import errclass
 from . import sshkey
 from .backends import BackendError
@@ -567,7 +568,7 @@ def chip_html(account, server, fp):
     return (f"<details class='alw sshrule'><summary class='chip always' data-tip='{e(tip, quote=True)}' "
             f"aria-label='Always approve {e(shown, quote=True)} with this key: {e(tip, quote=True)}'>"
             "Always: this host</summary>"
-            f"<div class=confirm><span>Always approve {e(shown)} with this key?</span>"
+            f"<div class=confirm><span>Always approve {emailsafe.text(shown)} with this key?</span>"
             "<label>Expires <select name=ssh_rule_expiry aria-label='Rule expiry'>"
             "<option value=never selected>Never expires (default)</option>"
             "<option value=30>30 days</option><option value=90>90 days</option></select></label>"

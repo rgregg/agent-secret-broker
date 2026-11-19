@@ -9,6 +9,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from secret_broker import riskmodel  # noqa: E402
+from _pagetext import unshield  # noqa: E402
 from test_grants import Base  # noqa: E402
 from test_ssh_host import SID_A, Host, login  # noqa: E402
 
@@ -53,7 +54,7 @@ class Combined(Base):
         self.assertEqual(r.summary, "auto: Log in to web.example.com as 'deploy'")   # the claim agrees: nothing to add
         _, page = self.get("/")
         self.assertIn(HOST.fp, page)
-        self.assertIn("Destination (claimed by the client): deploy@web.example.com:22", page)
+        self.assertIn("Destination (claimed by the client): deploy@web.example.com:22", unshield(page))
         self.assertNotIn("OWNER-NOTE-XYZ", page)
         self.assertNotIn("OWNER-NOTE-XYZ", self.notifier.sent[0]["message"])
         _, lp = self.get(f"/a/{r.nonce}")

@@ -7,7 +7,7 @@ use asb_client::{Client, Config, Error};
 use serde_json::Value;
 use std::time::Duration;
 
-pub const USER_AGENT: &str = "asb/1 (+https://github.com/rgregg/agent-secret-broker)";
+pub const USER_AGENT: &str = "asb/1.1 (+https://github.com/rgregg/agent-secret-broker)";
 
 /// `SECRET_BROKER_URL` and `SECRET_BROKER_KEY`, else `~/.config/secret-broker/client.json`.
 pub fn config() -> Result<Config, Die> {

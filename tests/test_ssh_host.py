@@ -18,6 +18,7 @@ from cryptography.hazmat.primitives.asymmetric import ec, ed25519, padding, rsa
 sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import test_ssh as ts  # noqa: E402
+from _pagetext import unshield  # noqa: E402
 from secret_broker import destguard as _destguard  # noqa: E402
 _destguard.allow_loopback_for_tests()   # test stubs live on 127.0.0.1; no config key does this
 from secret_broker import sshkey  # noqa: E402
@@ -313,7 +314,7 @@ class Verified(HostBase):
         want = f"Server: {self.host.fp} (ssh-ed25519) - known as web.example.com, 10.0.0.5"
         card = self.card(body)
         self.assertIn(want, card.replace("&#x27;", "'"))
-        self.assertIn("Destination (claimed by the client): deploy@web.example.com:22", card)
+        self.assertIn("Destination (claimed by the client): deploy@web.example.com:22", unshield(card))
         self.assertIn("log in over SSH as", card)
         # the first thing an approver reads is which machine, by name, then the account
         self.assertIn("Log in to web.example.com (10.0.0.5) as &#x27;deploy&#x27;", card)
@@ -344,7 +345,7 @@ class Verified(HostBase):
         _, body = self.sign(login(SID_A), claimed="a@b.example:22")
         card = self.card(body)
         self.assertIn("Server identity not verified", card)
-        self.assertIn("Destination (claimed by the client): a@b.example:22", card)
+        self.assertIn("Destination (claimed by the client): a@b.example:22", unshield(card))
         _, body = self.sign(login(SID_A))
         card = self.card(body)
         self.assertIn("Server identity not verified", card)

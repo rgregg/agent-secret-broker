@@ -45,7 +45,9 @@ import threading
 import time
 
 from . import risk as risk_mod
-from . import credlinks
+from . import emailsafe
+from . import clientver
+from .clientver import LATEST_CLIENT_VERSION  # noqa: F401  (re-exported: the newest client this build knows)
 
 ANY = "*"                       # a rule scope that applies to every client
 LEGACY_ID = "legacy"
@@ -55,7 +57,7 @@ SCOPE_RE = re.compile(r"\*|legacy|c-[0-9a-f]{8}")
 NAME_RE = re.compile(r"[a-z0-9][a-z0-9_.-]{0,31}")
 CLAIM_RE = re.compile(r"[A-Za-z0-9@._:+()\[\]-]{1,120}")
 HASH_RE = re.compile(r"[0-9a-f]{64}")
-STATES = ("active", "revoked")
+STATES = ("active", "disabled", "revoked")
 MAX_CLIENTS = 100               # rows kept (active and revoked); remove revoked rows to make room
 SECRET_PREFIX = "asbc1_"        # per-client secrets; the legacy shared key has no such prefix
 BODY_LIMIT = 1024               # bytes of an enrollment request
@@ -69,7 +71,7 @@ COOLDOWN_S = 300                # a source whose enrollment was denied or expire
 SUBMIT_MIN = (3, 10)
 SUBMIT_HOUR = (6, 20)
 POLL_MIN = (90, 600)
-STATS_FLUSH_S = 30
+STATS_FLUSH_S = 300             # buffered statistics (counts, last seen, version) reach the disk at most this often
 RETRY_S = 5                     # after a failed write, retry on the next operation this much later
 FAIL_LOG_S = 30                 # one auth-failure audit record per source per window
 RATE_MAP_CAP = 4096
@@ -150,7 +152,12 @@ def parse_config(cfg):
     block = {} if block is None else block
     if not isinstance(block, dict):
         raise ValueError("clients must be an object")
+    min_version = block.get("min_version")
+    if "min_version" in block and not (min_version == "none" or clientver.valid(min_version)):
+        raise ValueError('clients.min_version must be a version such as "1.1" (digits and dots), or "none"')
     for cid, spec in block.items():
+        if cid == "min_version":
+            continue
         at = f"clients.{cid}"
         if not (ID_RE.fullmatch(cid) or cid == LEGACY_ID):
             raise ValueError(f"{at}: the key must be a client id such as c-1a2b3c4d, or legacy")
@@ -177,7 +184,7 @@ def parse_config(cfg):
             from . import plans as plans_mod        # late: plans.py imports nothing from here
             ov["plans"] = plans_mod.parse_client_override(spec["plans"], f"{at}.plans")
         overrides[cid] = ov
-    return {"legacy": legacy, "enrollment": enr, "overrides": overrides}
+    return {"legacy": legacy, "enrollment": enr, "overrides": overrides, "min_version": min_version}
 
 
 # ---------------------------------------------------------------- the store
@@ -200,7 +207,10 @@ def _record(r):
             "requests": max(0, int(r.get("requests", 0))), "last_source": text(r.get("last_source"), 64),
             "approved_by": text(r.get("approved_by"), 120), "claim": text(r.get("claim"), 120),
             "enrolled_from": text(r.get("enrolled_from"), 64), "revoked_at": r.get("revoked_at"),
-            "revoked_by": text(r.get("revoked_by"), 120)}
+            "revoked_by": text(r.get("revoked_by"), 120),
+            "client_version": r.get("client_version") if clientver.valid(r.get("client_version")) else "",
+            "disabled_at": r.get("disabled_at") if num(r.get("disabled_at")) else None,
+            "disabled_by": text(r.get("disabled_by"), 120)}
 
 
 def src_key(addr):
@@ -229,7 +239,7 @@ class ClientStore:
         self.clock = clock
         self._lock = threading.RLock()
         self._clients = {}              # id -> record
-        self._legacy = {"last_seen": None, "last_source": "", "requests": 0}
+        self._legacy = {"last_seen": None, "last_source": "", "requests": 0, "client_version": ""}
         self._pending = {}              # enrollment id -> enrollment
         self._cooldown = {}             # source -> until
         self._rates = {}                # (kind, window) -> {key: {"t", "n"}}
@@ -270,7 +280,8 @@ class ClientStore:
                 seen, src = leg.get("last_seen"), str(leg.get("last_source") or "")
                 self._legacy = {"last_seen": seen if isinstance(seen, (int, float)) else None,
                                 "last_source": src[:64] if src.isascii() and src.isprintable() else "",
-                                "requests": max(0, leg.get("requests", 0))}
+                                "requests": max(0, leg.get("requests", 0)),
+                                "client_version": leg.get("client_version") if clientver.valid(leg.get("client_version")) else ""}
             self._clients = clients
         except (ValueError, TypeError, KeyError):
             self._fail_closed()
@@ -295,7 +306,7 @@ class ClientStore:
         for cid in self._revoked:       # an in-memory revocation always wins over what was loaded
             if cid in self._clients:
                 self._clients[cid]["state"] = "revoked"
-        data = {"version": 1, "clients": sorted(self._clients.values(), key=lambda c: c["created"]),
+        data = {"version": 2, "clients": sorted(self._clients.values(), key=lambda c: c["created"]),
                 "legacy": self._legacy}
         tmp = f"{self._path}.tmp"
         try:
@@ -349,9 +360,15 @@ class ClientStore:
     LEGACY_VIEW = {"id": LEGACY_ID, "name": LEGACY_NAME, "legacy": True}
 
     def authenticate(self, presented, legacy_key):
-        """(client view or None, reason). reason: ok | bad_key | revoked | legacy_denied.
+        """(client view or None, reason). reason: ok | bad_key | revoked | disabled | legacy_denied.
         Every stored hash and the legacy key are compared in constant time, with no early
         exit, so timing does not tell which (if any) matched."""
+        view, why, _who = self.identify(presented, legacy_key)
+        return view, why
+
+    def identify(self, presented, legacy_key):
+        """authenticate() plus a third value: the view of the client whose key matched even when it is
+        disabled (so the refusal can name it in the audit log), else None."""
         presented = presented if isinstance(presented, str) else ""
         h = hash_secret(presented) if 0 < len(presented) <= 256 and presented.isascii() else None
         found = None
@@ -362,33 +379,52 @@ class ClientStore:
                     found = rec
             view = self.view(found) if found is not None else None
             revoked = found is not None and (found["state"] == "revoked" or found["id"] in self._revoked)
+            disabled = found is not None and found["state"] == "disabled"
             unavailable = self.unreadable
         is_legacy = bool(legacy_key) and hmac.compare_digest(
             presented.encode("utf-8", "replace"), legacy_key.encode("utf-8", "replace"))
         if view is not None:
-            return (None, "revoked") if revoked else (view, "ok")
+            if revoked:
+                return None, "revoked", None
+            return (None, "disabled", view) if disabled else (view, "ok", view)
         if is_legacy:
             if self.cfg["legacy"] == "deny":
-                return None, "legacy_denied"
-            return dict(self.LEGACY_VIEW), "ok"
+                return None, "legacy_denied", None
+            return dict(self.LEGACY_VIEW), "ok", dict(self.LEGACY_VIEW)
         if unavailable:
-            return None, "clients_unavailable"      # could be a per-client key we cannot check
-        return None, "bad_key"
+            return None, "clients_unavailable", None    # could be a per-client key we cannot check
+        return None, "bad_key", None
 
-    def touch(self, view, source):
-        """Count one authenticated request and remember where it came from. Buffered: written
-        at most every STATS_FLUSH_S seconds."""
+    def touch(self, view, source, version=""):
+        """Count one authenticated request and remember where it came from and which `asb` version it
+        reported (kept only when well formed; an absent or odd one never erases a known one). A request
+        refused because the client is disabled is not counted but is still seen. Buffered: written at
+        most every STATS_FLUSH_S seconds."""
         now = self.clock()
         with self._lock:
             tgt = self._legacy if view["legacy"] else self._clients.get(view["id"])
             if tgt is None:
                 return
-            tgt["last_seen"], tgt["requests"] = now, tgt["requests"] + 1
+            tgt["last_seen"] = now
+            if tgt.get("state") != "disabled":
+                tgt["requests"] += 1
             tgt["last_source"] = str(source)[:64]
+            if clientver.valid(version):
+                tgt["client_version"] = version
             self._dirty = True
             self._retry_locked()
             if now - self._saved_at >= STATS_FLUSH_S:
                 self._save_locked()
+
+    def flush_due(self):
+        """What the periodic sweeper calls: retry a failed write, or write buffered statistics once
+        STATS_FLUSH_S has passed since the last write. (`flush()` writes whatever is waiting, now.)"""
+        with self._lock:
+            if self._failing:
+                return self.flush()
+            if self._dirty and self.clock() - self._saved_at >= STATS_FLUSH_S:
+                return self._save_locked()
+            return True
 
     def fail_should_log(self, source):
         """True for the first authentication failure from `source` in each FAIL_LOG_S window;
@@ -568,7 +604,7 @@ class ClientStore:
 
     def name_in_use(self, name, except_id=None):
         with self._lock:
-            return any(c["name"] == name and c["state"] == "active" and c["id"] != except_id
+            return any(c["name"] == name and c["state"] != "revoked" and c["id"] != except_id
                        for c in self._clients.values())
 
     def decide(self, eid, approve, name, actor):
@@ -599,7 +635,7 @@ class ClientStore:
             rec = {"id": cid, "name": final, "hash": e["hash"], "state": "active", "created": now,
                    "last_seen": None, "requests": 0, "last_source": "", "approved_by": actor[:120],
                    "claim": e["claim"], "enrolled_from": e["source"], "revoked_at": None,
-                   "revoked_by": ""}
+                   "revoked_by": "", "client_version": "", "disabled_at": None, "disabled_by": ""}
             self._clients[cid] = rec
             if not self._save_locked():
                 del self._clients[cid]
@@ -640,6 +676,35 @@ class ClientStore:
             rec.update(state="revoked", revoked_at=self.clock(), revoked_by=by[:120])
             saved = self._save_locked()
             return ("revoked" if saved else "memory_only"), dict(rec)
+
+    def disable(self, cid, by):
+        """Switch a client off, reversibly: its key still identifies it, but every request is refused. In
+        memory first, under the lock (the next request fails), then persisted. Returns (status, record
+        copy): disabled | already | revoked (a revoked client stays revoked) | missing | memory_only."""
+        with self._lock:
+            rec = self._clients.get(cid)
+            if rec is None:
+                return "missing", None
+            if rec["state"] == "revoked" or cid in self._revoked:
+                return "revoked", dict(rec)
+            if rec["state"] == "disabled":
+                return "already", dict(rec)
+            rec.update(state="disabled", disabled_at=self.clock(), disabled_by=by[:120])
+            saved = self._save_locked()
+            return ("disabled" if saved else "memory_only"), dict(rec)
+
+    def enable(self, cid):
+        """Switch a disabled client back on. (status, record copy): enabled | not_disabled | missing |
+        memory_only (enabled now, the write is retried; a restart before it lands leaves it disabled)."""
+        with self._lock:
+            rec = self._clients.get(cid)
+            if rec is None:
+                return "missing", None
+            if rec["state"] != "disabled" or cid in self._revoked:
+                return "not_disabled", dict(rec)
+            rec.update(state="active", disabled_at=None, disabled_by="")
+            saved = self._save_locked()
+            return ("enabled" if saved else "memory_only"), dict(rec)
 
     def remove(self, cid):
         """Forget a REVOKED client's row. 'removed' | 'missing' | 'active' | 'not_saved'."""
@@ -683,7 +748,7 @@ class ClientsMixin:
             time.sleep(10)
             try:
                 self.sweep_enrollments()
-                self.clients.flush()
+                self.clients.flush_due()
             except Exception:  # noqa: BLE001 -- never let the sweeper die
                 pass
 
@@ -714,10 +779,23 @@ class ClientsMixin:
         return f"up to {mx} risk; modes {modes} - {src}"
 
     # -- authentication ------------------------------------------------------
-    def client_auth(self, presented, legacy_key, peer, method, path):
+    def client_auth(self, presented, legacy_key, peer, method, path, user_agent=""):
         """(client view or None, reason). Failures are audited at most once per source per
-        window (client_auth_failed), never with key material."""
-        view, why = self.clients.authenticate(presented, legacy_key)
+        window (client_auth_failed), never with key material. A DISABLED client is identified but
+        refused before anything else is looked at: no rule, grant, plan or session is consulted, nobody
+        is notified, and the refusal is audited at most once per client per window (client_disabled_denied)."""
+        version = clientver.parse_user_agent(user_agent)
+        view, why, who = self.clients.identify(presented, legacy_key)
+        if why == "disabled":
+            self.clients.touch(who, peer, version)
+            ok, skipped = self.clients.fail_should_log("disabled:" + who["id"])
+            if ok:
+                fields = {"client_id": who["id"], "client_name": who["name"], "peer": peer, "method": method,
+                          "path": path[:60]}
+                if skipped:
+                    fields["suppressed"] = skipped
+                self.log("client_disabled_denied", **fields)
+            return None, why
         if view is None:
             ok, skipped = self.clients.fail_should_log(peer)
             if ok:
@@ -726,7 +804,7 @@ class ClientsMixin:
                     fields["suppressed"] = skipped
                 self.log("client_auth_failed", **fields)
             return None, why
-        self.clients.touch(view, peer)
+        self.clients.touch(view, peer, version)
         return view, why
 
     # -- enrollment ------------------------------------------------------------
@@ -801,6 +879,25 @@ class ClientsMixin:
                      client_ip=client_ip)
         return status
 
+    def disable_client(self, cid, actor, peer=None, client_ip=None):
+        """Switch a client off (reversible): its next request is refused, its waiting requests are denied
+        and its open sessions end. Its rules and plans stay but cannot be used. Returns the ClientStore status."""
+        status, rec = self.clients.disable(cid, actor)
+        if status not in ("disabled", "memory_only"):
+            return status
+        denied = self._deny_client_pending(cid, "this client is disabled", "client_disabled")
+        ended = self.revoke_client_sessions(cid, actor)
+        self.log("client_disabled", client_id=cid, client_name=rec["name"], user=actor, peer=peer, client_ip=client_ip,
+                 denied_pending=denied, sessions_ended=ended, saved=status == "disabled")
+        return status
+
+    def enable_client(self, cid, actor, peer=None, client_ip=None):
+        status, rec = self.clients.enable(cid)
+        if status in ("enabled", "memory_only"):
+            self.log("client_enabled", client_id=cid, client_name=rec["name"], user=actor, peer=peer,
+                     client_ip=client_ip, saved=status == "enabled")
+        return status
+
     def revoke_client(self, cid, actor, peer=None, client_ip=None):
         """Revoke a client: its next request fails, its pending requests are denied and its
         client-scoped rules are removed. Returns the ClientStore status."""
@@ -824,7 +921,7 @@ class ClientsMixin:
                      user=actor, peer=peer, client_ip=client_ip)
         return status
 
-    def _deny_client_pending(self, cid):
+    def _deny_client_pending(self, cid, error="this client was revoked", via="client_revoked"):
         """Deny every open request of this client (not counting against the deny cooldown)."""
         mine = []
         with self._lock:
@@ -833,7 +930,7 @@ class ClientsMixin:
                     r.status = "deciding"
                     mine.append(r)
         for r in mine:
-            self._finish(r, "denied", error="this client was revoked", via="client_revoked")
+            self._finish(r, "denied", error=error, via=via)
         return len(mine)
 
     def _purge_client_rules(self, cid):
@@ -862,22 +959,6 @@ class ClientsMixin:
                         failed += len(rules) - len(keep)
         return {"removed": removed, "failed": failed}
 
-    def client_rule_rows(self, cid):
-        """The rules scoped to one client, for its Clients row: [(kind, secret(s), covers)]."""
-        rows = []
-        for r in self.standing_rows():
-            if r.get("client") == cid:
-                rows.append((r["kind"], ", ".join(r["secrets"]), r["covers"]))
-        for name, sc in sorted(self.cfg["secrets"].items()):
-            for r in sc.get("ssh_rules") or []:
-                if r.get("client", ANY) == cid:
-                    rows.append(("ssh host rule", name, f"{r['user']} on {r['host'] or r['fp'][:19]}"))
-        for v in self.active_plans():
-            if v["client_id"] == cid:
-                rows.append(("plan", ", ".join(v["names"]),
-                             f"{v['uses']}/{v['uses_max']} calls used, {max(0, v['left_s']) // 60} min left"))
-        return rows
-
 
 # ---------------------------------------------------------------- page fragments
 CSS = """
@@ -897,6 +978,11 @@ border:1px solid var(--line);background:var(--card);color:var(--fg);width:100%;m
 """
 
 
+def _pending_icon():
+    from . import clientspage
+    return clientspage.state_icon("pending", "Enrollment pending")
+
+
 def enroll_card_html(e, csrf, now, clash):
     """The dashboard card for one pending enrollment. `clash` says the proposed name is
     already used by an active client (the approver edits it). Everything shown is either
@@ -907,7 +993,7 @@ def enroll_card_html(e, csrf, now, clash):
             "pick a different one before approving.</p>") if clash else ""
     return (
         f"<article class='req enr' data-id='{esc(e['id'][:8])}'>"
-        f"<div class=reqhead><h2>Client enrollment: {esc(e['name'])}</h2>"
+        f"<div class=reqhead><h2>{_pending_icon()} Client enrollment: {esc(e['name'])}</h2>"
         f"<time data-exp='{int(e['expires'])}'>expires in {left}s</time></div>"
         "<div class='risk high'><b>NEW CLIENT</b><small>If you did not just run <code>asb enroll</code> "
         "on a machine you control, press Deny.</small></div>"
@@ -915,7 +1001,7 @@ def enroll_card_html(e, csrf, now, clash):
         f"Confirmation code: <span class=code>{esc(e['code'])}</span><br>"
         "Match it with the code printed in your terminal. If it differs, press Deny.<br>"
         f"Source address: {esc(e['source'])}<br>"
-        f"Claims to be (unverified, typed by the client): {esc(e['claim'])}</div>"
+        f"Claims to be (unverified, typed by the client): {emailsafe.text(e['claim'])}</div>"
         f"{warn}"
         "<form method=post action='/enroll/decide' class=decide>"
         f"<input type=hidden name=id value='{esc(e['id'])}'>"
@@ -936,7 +1022,7 @@ def from_html(req):
     esc = html.escape
     c = getattr(req, "client", None) or ClientStore.LEGACY_VIEW
     return (f"Client: <b>{esc(c['name'])}</b> <span class=muted>({esc(c['id'])})</span><br>"
-            f"Claimed source (unverified): {esc(req.source)}")
+            f"Claimed source (unverified): {emailsafe.text(req.source)}")
 
 
 def _ago(t, now):
@@ -950,87 +1036,6 @@ def _ago(t, now):
 
 
 def clients_section(broker, csrf, now=None, flash=""):
-    """The Clients tab body."""
-    esc = html.escape
-    now = time.time() if now is None else now
-    legacy_on = broker.clients.cfg["legacy"] == "allow"
-
-    def rules_cell(cid):
-        rr = broker.client_rule_rows(cid)
-        if not rr:
-            return "no rules of its own"
-        return (f"<details><summary>{len(rr)} rule{'' if len(rr) == 1 else 's'}</summary><ul class=rules>"
-                + "".join(f"<li>{esc(k)}: {credlinks.links(s.split(', '), tab='policies')} - {esc(c)}</li>"
-                          for k, s, c in rr) + "</ul></details>")
-
-    rows = []
-    leg = broker.clients.legacy_row()
-    rows.append(
-        f"<tr><td data-label=Name><b>{esc(LEGACY_NAME)}</b><br><span class=idn>id legacy</span></td>"
-        "<td data-label=Host>every machine using the shared key</td>"
-        "<td data-label=Enrolled>-</td>"
-        f"<td data-label='Last seen'>{esc(_ago(leg['last_seen'], now))}"
-        f"{'<br><small class=muted>' + esc(leg['last_source']) + '</small>' if leg['last_source'] else ''}</td>"
-        f"<td data-label=Requests>{leg['requests']}</td>"
-        f"<td data-label=State><span class='{'st-active' if legacy_on else 'st-revoked'}'>"
-        f"{'allowed' if legacy_on else 'denied'}</span></td>"
-        f"<td data-label=Ceiling>{esc(broker.client_ceiling_text(LEGACY_ID))}</td>"
-        f"<td data-label=Rules>{rules_cell(LEGACY_ID)}</td>"
-        "<td data-label=Actions><small class=muted>Set <code>legacy_client_key</code> to "
-        "<code>deny</code> in the broker config once every machine is enrolled.</small></td></tr>")
-    for c in broker.clients.rows():
-        active = c["state"] == "active"
-        if active:
-            acts = (
-                "<form method=post action='/clients/rename' class=inline>"
-                f"<input type=hidden name=csrf value='{esc(csrf)}'><input type=hidden name=id value='{esc(c['id'])}'>"
-                f"<input type=text name=name value='{esc(c['name'])}' maxlength=32 required "
-                f"aria-label='New name for {esc(c['name'], quote=True)}' spellcheck=false autocomplete=off>"
-                "<button>Rename</button></form>"
-                "<details class=rv><summary>Revoke...</summary><form method=post action='/clients/revoke' "
-                f"class=inline><input type=hidden name=csrf value='{esc(csrf)}'>"
-                f"<input type=hidden name=id value='{esc(c['id'])}'>"
-                "<p><small>This client stops working on its next request, its waiting requests are denied "
-                "and its own rules are removed. It can enroll again as a new client.</small></p>"
-                f"<button class='btn deny'>Confirm revoke</button></form></details>")
-        else:
-            acts = (f"<small class=muted>revoked {esc(iso(c['revoked_at'])) if c['revoked_at'] else ''}"
-                    f" by {esc(c['revoked_by'] or 'unknown')}</small>"
-                    "<form method=post action='/clients/remove' class=inline>"
-                    f"<input type=hidden name=csrf value='{esc(csrf)}'><input type=hidden name=id value='{esc(c['id'])}'>"
-                    "<button>Remove from list</button></form>")
-        rows.append(
-            f"<tr><td data-label=Name><b>{esc(c['name'])}</b><br><span class=idn>id {esc(c['id'])}</span></td>"
-            f"<td data-label=Host>{esc(c['claim'] or '-')}<br><small class=muted>unverified; enrolled from "
-            f"{esc(c['enrolled_from'] or '?')}</small></td>"
-            f"<td data-label=Enrolled>{esc(iso(c['created']))}<br><small class=muted>approved by "
-            f"{esc(c['approved_by'] or '?')}</small></td>"
-            f"<td data-label='Last seen'>{esc(_ago(c['last_seen'], now))}"
-            f"{'<br><small class=muted>' + esc(c['last_source']) + '</small>' if c['last_source'] else ''}</td>"
-            f"<td data-label=Requests>{c['requests']}</td>"
-            f"<td data-label=State><span class='st-{c['state']}'>{esc(c['state'])}</span></td>"
-            f"<td data-label=Ceiling>{esc(broker.client_ceiling_text(c['id']))}</td>"
-            f"<td data-label=Rules>{rules_cell(c['id'])}</td>"
-            f"<td data-label=Actions>{acts}</td></tr>")
-    table = ("<table class=tbl><thead><tr><th>Name</th><th>Host</th><th>Enrolled</th><th>Last seen</th>"
-             "<th>Requests</th><th>State</th><th>Effective ceiling</th><th>Own rules</th><th></th></tr></thead>"
-             "<tbody>" + "".join(rows) + "</tbody></table>")
-    cfg = broker.clients.cfg["enrollment"]
-    hint = ("<p><small class=muted>Add a machine by running <code>asb enroll --name NAME</code> on it; "
-            "a card appears on the Requests tab and you approve exactly that card after matching its "
-            "confirmation code. Refuse any enrollment you did not start. "
-            + ("Enrollment is turned off in the broker config." if not cfg["enabled"] else "")
-            + "</small></p>")
-    note = f"<div class=flash>{esc(flash)}</div>" if flash else ""
-    if broker.clients.unreadable:
-        note += ("<div class=crerr role=alert><b>The client list could not be read.</b> Every per-client "
-                 "credential is being refused (fail closed) until the file is fixed or removed.</div>")
-    elif broker.clients.unsaved():
-        note += ("<div class=crerr role=alert><b>The client list could not be saved.</b> A revoke, rename or "
-                 "enrollment is in effect now but is only in memory; if the broker restarts before the "
-                 "write succeeds, a revoked client would work again. The write is retried every few "
-                 "seconds. Check the disk.</div>")
-    return (f"<h1>Clients</h1>{note}{hint}<div class=cl>{table}</div>"
-            "<p><small class=muted>A rule made for one client never applies to another; rules for "
-            "<i>any client</i> apply to all. Rules are listed per client above and in full on each credential's "
-            "Policies page.</small></p>")
+    """The Clients tab body (see clientspage.py)."""
+    from . import clientspage
+    return clientspage.section(broker, csrf, now, flash)

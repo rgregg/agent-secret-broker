@@ -10,6 +10,7 @@ import _fast  # noqa: F401  (test-only: prompt server shutdown, fake-clock helpe
 import base64
 import json
 import os
+import re
 import sys
 import time
 import unittest
@@ -308,10 +309,11 @@ class StandingScope(ClientMixin, tg.Base):
         a = self.mk("alpha")
         self.broker._add_always("svc", "http", "any", "alice", a.id)
         self.broker.grants.add(["svc"], 15, "any", "alice", "dashboard", "r", mode="http", client=a.id)
-        page = _fast.unlink_names(self.get("/clients")[1])
-        self.assertIn("2 rules", page)
-        self.assertIn("always: svc", page)
-        self.assertIn("timed: svc", page)
+        page = self.get("/clients")[1]
+        self.assertIn("aria-label='2 rules for alpha: view'", page)
+        dlg = re.search(r"<dialog id='cr-%s'.*?</dialog>" % a.id, page, re.S).group(0)
+        self.assertEqual(sorted(re.findall(r"class=rkind>([^<]*)<", dlg)), ["Always approval", "Timed approval"])
+        self.assertEqual(dlg.count("<a class=clink href='/credentials/svc?tab=policies'>svc</a>"), 2)
 
     def get(self, path, user="alice"):
         return t.req(self.abase + path, headers={"X-authentik-username": user})
