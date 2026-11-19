@@ -601,15 +601,28 @@ Policies tab, and no route on the agent-facing port. Agents cannot reach it, and
   field, the variable `NAME_TOKEN`, `approval: prompt`, a `created: {by, at}` stamp. The token is never
   shown, logged or put in an audit event or error page; the box is never filled back in. `new` is reserved
   (it is a route).
-- **Rename** (on the edit page): changes only the `name` key; the vault item and its value stay. Refused
-  while anything is bound to the old name, because a grant, plan, session or standing entry names the
-  credential and must not silently follow or outlive it: timed grants, Always entries, active plans, open
-  sessions and pending requests (the page says how many). Also refused while the name is in
-  `plans.deny_secrets` (a renamed credential would silently stop matching that deny list), for the broker's
-  own summary key, for an item adopted with defaults (save it once on the edit page first), and when the
-  new name is taken. Same concurrency check as an edit.
-- **Delete** (on the edit page): deletes the vault item and its value. The human types the credential's name.
-  Same refusals as rename except `deny_secrets`. It cannot be undone from here.
+- **Rename** and **Delete** (the **Name** card on the edit page): two buttons, each opening a pop-over dialog (a
+  native `<dialog>` opened as a modal by the page's nonce'd script: focus moves into it, Escape or Cancel closes
+  it, focus returns to the button; they need JavaScript). A refused action answers with the page and that dialog
+  open again, the refusal's fixed message inside it (status 400, 409 for a stale form, 500 for a failed write).
+  - **Rename** (`POST /credentials/<name>/rename`, `new_name`, `old_sha`, optional `keep_alias=1`): changes only
+    the `name` key; the vault item and its value stay. With the box "Keep the old name as an alias" ticked
+    (off by default) the old name is added to the credential's `aliases` in the same vault write (see
+    "Aliases"). Refused while anything is bound to the old name, because a grant, plan, session or standing
+    entry names the credential and must not silently follow or outlive it: timed grants, Always entries, active
+    plans, open sessions and pending requests (the page says how many; both buttons are disabled with that
+    note). Also refused while the name or one of its aliases is in `plans.deny_secrets` (a renamed credential
+    would silently stop matching that deny list), for the broker's own summary key, for an item adopted with
+    defaults (save it once on the edit page first), and when the new name is taken by a credential or by
+    anyone's alias (renaming back to one of its own aliases takes that alias over). Same concurrency check as
+    an edit.
+  - **Delete** (`POST /credentials/<name>/delete`, `typed`): deletes the vault item and its value. The dialog
+    asks for the credential's name (its Delete button stays disabled until it is typed) and the server checks
+    the typed name again. Same refusals as rename except `deny_secrets`. It cannot be undone from here.
+- **Aliases** (a line on the Name card, shown when there are any): another name for the same credential, kept
+  when a credential is renamed (see "Aliases" below). **Remove** (`POST /credentials/<name>/alias/remove`,
+  `alias`, `old_sha`) stops answering to one name, audited as `credential_alias_removed` (`secret`, `alias`,
+  `user`); no confirmation, because nothing widens.
 - **Fetch fingerprint** (on the edit form): type a `host` or `host:port` (443 by default) that is in the form's
   allowed hosts and press **Fetch fingerprint**. The broker connects through the destination guard like any
   call (one resolution, every address checked, the port checked against the entries), completes a TLS
@@ -621,27 +634,56 @@ Policies tab, and no route on the agent-facing port. Agents cannot reach it, and
   device, not a Let's Encrypt name). At most 10 fetches a minute. A failure is a closed label (`connection`,
   `tls`, `timeout`, `dns`, `destination not allowed`, `other`).
 - **Values** (a card at the top of the edit page): one row per variable with where its value lives (the item's own
-  value, a field, or a field and key). Values are not in the page; they appear only when the human asks:
+  value, a field, or a field and key). A value is edited in place: ONE password input per variable showing the
+  placeholder `••••••` (never the value; the page source holds no value). Typing replaces the placeholder;
+  **Save** writes the vault immediately (it is not part of the Settings review flow). Values appear only when
+  the human asks:
   - **Show** (`POST /credentials/<name>/reveal`, `var`): the page script asks for JSON (`Accept:
-    application/json`, reply `{"value": ...}`, `Cache-Control: no-store`) and puts it in a read-only text area (newlines kept) with
-    **Copy** and **Hide**; without the script the edit page re-renders with that one value in its box. A POST,
+    application/json`, reply `{"value": ...}`, `Cache-Control: no-store`) and puts it in the same input (a
+    value with line breaks switches that value to the multi-line textarea) with **Copy** and **Hide** (Hide puts
+    the placeholder back); without the script the edit page re-renders with that one value in the box. A POST,
     never a GET, so it is not prefetched or kept in browser history. At most 30 a minute per user. This is the
     one place the broker puts a credential value on a page, on purpose, for the signed-in human (as the
     Vaultwarden web UI does); agents still never receive one (no route on the agent port).
-  - **Replace the value** (`POST /credentials/<name>/value`, `var`, `value`): written with `keep_previous`, so
+  - **Save a value** (`POST /credentials/<name>/value`, `var`, `value`): written with `keep_previous`, so
     the old value is in the item's `previous_value` (one slot per item, as with `asb store --replace`). A
-    variable with a `key` changes only that key of its structured field. The value box is never filled back in.
-    A **Multi-line value** box (PEM, JSON; shown as you type) is used instead when it is not empty; its CRLF line
-    ends, as browsers send them, are stored as LF. Add has the same box. Every value box on the tab (Replace, Add, New credential) has the same **Show** toggle as the credential entry page.
+    variable with a `key` changes only that key of its structured field. A submitted value equal to the
+    placeholder, or equal to what is stored already, is "No change": nothing is written, no `previous_value` is
+    made and no event is recorded. The box is never filled back in.
+  - **Multi-line** is a per-value toggle button (script only; off by default) that swaps the one-line input for a
+    textarea holding the same text (PEM, JSON); it is posted as `value_ml`, which wins when not empty, and its
+    CRLF line ends, as browsers send them, are stored as LF. Add has the same toggle. The Add box and the New
+    credential box keep the **Show** toggle of the credential entry page (they take typed text); the in-place
+    box does not (its Show button is the reveal above).
   - **Add a value** (`POST /credentials/<name>/value/add`, `var`, `value`, `confirm`, `old_sha`): a new hidden
     custom field named like the variable and `vars[VAR] = {"field": VAR}` in the metadata, in one vault write
     (`put(add_field=True)`). Needs the tick, because agents can then place that value on the credential's hosts.
-  - **Remove** (`POST /credentials/<name>/value/remove`, `var`, `old_sha`): drops the variable from the metadata
-    only; the vault field and its value stay. Not the last variable.
+    The placeholder is refused as a value (`placeholder`).
+  - **Remove** (`POST /credentials/<name>/value/remove`, `var`, `old_sha`, `confirm=1`): removes the variable
+    AND deletes its value from the vault. It cannot be undone, so the button opens a dialog that says so and
+    posts `confirm=1`; without it the server refuses (`confirm_delete`). Not the last variable. What is deleted:
+    - a variable with a `key` (a structured field): only that key leaves the field's text (`key_dropped`); the
+      field and its other keys stay (the field goes if no key is left);
+    - a variable whose field another variable still uses (`field_kept`): only the metadata changes. "Still
+      used" is conservative: `auto`, `password`, `notes` and `private_key` count as one slot (the item kind
+      decides which `auto` is);
+    - otherwise the field is removed (`field_deleted`; a built-in `password`/`notes`/`username` is cleared
+      instead, since the item kind needs the slot).
+
+    The item's `previous_value` / `previous_replaced_at` are deleted in the same operation whenever the vault is
+    changed destructively, because `previous_value` is one slot per item and may hold the removed value (a
+    remaining variable's rollback copy can be lost with it); they are kept in the `field_kept` case. The field
+    removal and the new metadata are one vault write (the previous slot goes first, so a failure in between
+    leaves the variable listed and the removal can be repeated). It needs the backend capability
+    `delete_field`: a backend without it refuses (`no_delete`) and changes nothing; it never falls back to
+    leaving the value in the vault. Another variable that reads the same key (or the whole field) keeps it
+    (`field_kept`). A vault product's own history of a login password (Bitwarden's password history) is out of
+    the broker's reach and is not cleared. The audit event carries `outcome` and `previous_dropped`, never a value.
   - Refusals are fixed messages: `unknown_var`, `ssh`, `internal`, `invalid` (the field is not structured),
-    `empty`, `too_large`, `bad_value` (control characters other than tab and newlines), `exists`,
+    `empty`, `too_large`, `bad_value` (control characters other than tab and newlines), `placeholder`, `exists`,
     `field_exists`, `invalid_name` (the loader's rule about the name), `adopted` (add/remove need the item's own
-    metadata: save it once), `needs_confirmation`, `conflict`, `last`, `unsupported`, `rate_limited`,
+    metadata: save it once), `needs_confirmation`, `confirm_delete`, `no_delete`, `conflict`, `last`,
+    `private_key` (a variable on a `private_key` field is not deleted), `unsupported`, `rate_limited`,
     `vault_read`, `vault_write`.
   - An SSH key's private key is never shown, replaced or added here (the public key is shown); use
     `asb store --replace`. The broker's own summary key is not offered.
@@ -650,14 +692,43 @@ Policies tab, and no route on the agent-facing port. Agents cannot reach it, and
 - **Audit** (all hidden from the agent audit API; counts, closed labels and 64-character hashes only, never host
   names or values): `credentials_viewed`, `credential_changed` (`secret`, `user`, `peer`, `client_ip`,
   `changed_keys` count, `widened` labels, `old_sha256`, `new_sha256`), `credential_created` (`hosts` count,
-  `value_bytes`), `credential_renamed` (`new_secret`), `credential_deleted`, `credential_change_refused`
+  `value_bytes`), `credential_renamed` (`new_secret`, `alias_kept`), `credential_alias_removed`, `credential_deleted`, `credential_change_refused`
   (`reason`: `invalid`, `needs_confirmation`, `conflict`, `rename`, `unsupported`, `exists`, `internal`,
-  `adopted`, `bound`, `denied_by_name`, `confirm`) and `credential_change_failed` (`reason`: `vault_read`,
+  `adopted`, `bound`, `denied_by_name`, `confirm`, `alias_taken`, `unknown_alias`) and `credential_change_failed` (`reason`: `vault_read`,
   `vault_write`), and `credential_fingerprint_fetched` (`result`: `ok`, `invalid`, `not_listed`, `destination`,
   `rate_limited` or a failure label; `host_sha256`, the first 12 hex of the entry's sha256, never the host),
   `credential_value_revealed` (`secret`, `var`), `credential_value_changed` and `credential_value_added`
-  (`secret`, `var`, `value_bytes`), `credential_value_removed` (`secret`, `var`) and
+  (`secret`, `var`, `value_bytes`), `credential_value_removed` (`secret`, `var`, `outcome`, `previous_dropped`) and
   `credential_value_refused` (`action`: `reveal`, `replace`, `add`, `remove`; `reason`). Never a value.
+
+## Aliases
+
+A credential can keep its former names. An **alias** is another name for the same credential, stored in its
+`broker` metadata as `aliases: ["old-name", ...]` and set by **Rename with "Keep the old name as an alias"**
+(or by hand in the Advanced box). `Broker._entry` (the catalog validator, also run by the editor) accepts up to 10
+names that follow the credential-name rule, are not reserved and do not repeat the credential's own name; the
+editor also refuses (`alias_taken`) an alias that is another credential's name or alias. Names are unique across
+credentials and aliases: a name that is also a credential always wins, and an alias two credentials claim belongs
+to neither (`alias_ignored`, hidden audit event). Creating a credential (the editor, `asb store`, `request-
+credential`) or renaming to an alias is refused as "already exists".
+
+- **Resolved first.** `Broker.resolve_names` is the one place a requested name becomes a canonical name, and
+  it runs before anything else looks at the name: in `create()` for `http`, `env`, `ssh_sign` and `session` requests
+  (and so plan calls and WebSocket sessions) and on the rules of a submitted plan manifest. Deny lists,
+  `plans.deny_secrets` (which is also matched against a credential's aliases), the destination guard,
+  policies, auto-approve rules, grants, standing approvals, risk and the internal-key check therefore only ever
+  see the canonical name; an alias cannot bypass anything that names the credential, and grants, plans and
+  rules stay keyed by the canonical name. Guidance proposals, `store` and `credential` requests do not resolve
+  aliases (an alias there is an unknown name, or an existing one when creating).
+- **Flagged.** A request that used an alias still works, but the card, the approval link page and the history
+  details say "Requested as `old-name` (now `new-name`)", the `requested` audit event carries `aliases_used`
+  (both names), and an `alias_used` event (`alias`, `secret`, `mode`) is written, including for plan calls and
+  sessions that show no card. These events are hidden from the agent audit API.
+- **Not discoverable.** Aliases are not in `asb list`/`which`, `/v1/secrets`, `/v1/status` or any other
+  agent-facing output: they exist only as an input to name resolution, so they give an agent nothing it could
+  not already ask for by name.
+- **Until removed.** An alias never expires. The Name card lists them with a **Remove** button
+  (`credential_alias_removed`).
 
 ## Policy, risk, discovery
 
@@ -1906,7 +1977,13 @@ Every credential has a page at `/credentials/NAME` with two tabs, linked from ev
 shown (request cards, history details, the Clients tab, the Policies tab, plans):
 
 - **Settings** (`/credentials/NAME`) is the editor: allowed hosts, TLS, approval, WebSocket, values, the advanced
-  JSON box, rename and delete. A strip at the top says how many standing approvals and auto-approve rules the
+  JSON box, rename and delete. TLS, Approval and WebSocket are collapsed to a one-line summary ("verify the
+  certificate", "pinned: 2 fingerprints", "not verified"; "ask on my phone for each use", "allowed without
+  asking", ", plans allowed"; "off", "Home Assistant", "custom") that opens to change them. Collapsing is
+  presentation only: the controls stay in the form (a closed section still submits), so saving, the review
+  step, the widening confirmation and the "Unsaved changes" flag are unchanged, the summary follows what you
+  edit, and a section whose settings differ from the stored ones (a refused save, a fetched fingerprint) is
+  shown open. A strip at the top says how many standing approvals and auto-approve rules the
   credential has and whether risk guidance is set, with a link to the Policies tab. The Credentials list shows
   the same count per credential.
 - **Policies** (`/credentials/NAME?tab=policies`) holds everything that belongs to this credential alone, one
@@ -3125,6 +3202,7 @@ asks `"name" in backend.capabilities` (it never probes attributes).
 | `set_meta` | `set_meta` works | Always-allow, standing approvals, SSH rules and hosts, guidance edits. |
 | `create_login` | `create_login(item, username, password, uri=None, notes=None, meta=None)` | `restructure` (real username/password/URL fields). |
 | `edit_item` | `edit_item(item, new_name=None, meta=None, drop_meta=False)` | `restructure`; rename or replace/remove metadata. |
+| `delete_field` | `delete_field(item, field, meta=None)` | Really remove one field's value (the editor's Remove). A custom field is removed, a built-in `password`/`username`/`notes` is cleared, `None`/`""`/`"auto"` mean the item's natural field, `previous_value`/`previous_replaced_at` (either) remove both; a missing field is not an error, `broker` and `private_key` and a missing item are refused (`BackendInvalid`, `BackendNotFound`). `meta`, when given, is written in the same write. Implemented by `memory`, `file`, `local` and `bw`. |
 | `warm` | `warm()` | Unlock ahead of the first read, in the background, while a human reaches to approve. A backend whose `prewarm` setting is off omits it. |
 | `on_event` | `backend.on_event = fn` | Audit hook `fn(name, **fields)`; fields are names, counts and reasons only. A raising callback is ignored. |
 | `adopts` | `catalog()` returns adopted rows | Items without metadata become credentials with safe defaults. |
@@ -3201,7 +3279,7 @@ the case-insensitive then unique lookup rule, reserved and aliased field names,
 unicode, multiline and 64 KiB values, "no secret value in any exception",
 concurrent creates, updates and reads, persistence across a re-opened backend,
 visibility of another instance's writes, idle lock and reopen, `close()`
-idempotence, and every optional capability (create_login, edit_item, warm,
+idempotence, and every optional capability (create_login, edit_item, delete_field, warm,
 on_event, export/import, and `NotSupported` for what is not declared). Tests for
 a capability a backend does not declare are skipped, and tests for an
 undeclared optional method check that it raises `NotSupported`.

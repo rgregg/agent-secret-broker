@@ -73,6 +73,8 @@ from . import sessions as sessions_mod
 from . import wssessions as ws_mod
 from . import sshhosts as sshhosts_mod
 from . import crededitor as crededitor_mod
+from . import valueremoval as valueremoval_mod
+from . import aliases as aliases_mod
 from . import sshrules as sshrules_mod
 from . import risk as risk_mod
 from . import request_details as details_mod
@@ -202,6 +204,7 @@ class Request:
         self.mode = mode          # "env" | "http" | "store" | "ssh_sign" | "guidance" | "credential" | "plan" | "session" | "sudo"
         self.plan_id = None       # mode "plan": the plan this card would start
         self.names = names
+        self.aliases_used = {}    # {alias: canonical} when the agent asked by a former name
         self.spec = spec
         self.source = source      # client-claimed
         self.peer = peer          # actual socket peer
@@ -247,6 +250,7 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
         self.push = push                # PushStore when the webpush transport is configured
         self.cfg = config
         self.cfg["secrets"] = {}        # the catalog lives in the vault; see refresh_catalog()
+        self.cfg["aliases"] = {}        # {former name: credential name}; see aliases.py and resolve_names()
         self._catalog_at = 0.0
         self._catalog_sig = None
         self._started_at = time.time()
@@ -489,6 +493,7 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
             vars_[var] = {"item": item, "field": field}
             if ref.get("key"):
                 vars_[var]["key"] = str(ref["key"])
+        aliases = aliases_mod.parse(meta.get("aliases"), name, _NAME_RE, Broker.RESERVED_NAMES)
         standing = None
         if meta.get("standing") is not None:
             standing = standing_mod.parse(meta["standing"], name)
@@ -507,6 +512,9 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
                  "_tls": {"fingerprint": fp, "verify": verify}}
         entry.pop("guidance", None)
         entry.pop("ws", None)
+        entry.pop("aliases", None)
+        if aliases:
+            entry["aliases"] = aliases      # parsed; an input to resolve_names only, never in discovery/status output
         entry["_ws"] = ws_cfg           # operator config (handshake template, origin); never agent input, never listed
         if ginvalid:
             entry["guidance_invalid"] = ginvalid
@@ -668,10 +676,12 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
                 adopted.pop(name, None)
                 bad.extend({"item": i, "reason": f"duplicate secret name {name!r}"} for i in items)
         out.update(adopted)
+        amap, alias_dropped = aliases_mod.build_map(out)
         with self._cfg_lock:
             moved = self._cfg_gen != gen
             if not moved:
                 self.cfg["secrets"] = out
+                self.cfg["aliases"] = amap
                 self._catalog_at = time.time()
                 self._backend_ok = True
                 self._catalog_stats = {"count": len(out), "invalid": len(bad), "adopted": len(adopted),
@@ -687,13 +697,30 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
         self.prune_auto_rule_usage()
         self._sync_summary_key(out)
         ginv = {n: e["guidance_invalid"] for n, e in sorted(out.items()) if e.get("guidance_invalid")}
-        sig = json.dumps([sorted(out), bad, ginv], sort_keys=True)
+        sig = json.dumps([sorted(out), bad, ginv, alias_dropped], sort_keys=True)
         if sig != self._catalog_sig:
             self._catalog_sig = sig
+            for a in alias_dropped:
+                self.log("alias_ignored", alias=a, reason="taken")
             self.log("catalog_loaded", count=len(out), names=sorted(out), invalid=bad,
                      adopted=sorted(adopted))
             for n, why in ginv.items():
                 self.log("guidance_ignored", secret=n, reason=why)
+
+    def resolve_names(self, names):
+        """THE place a requested name becomes a canonical name: (names with every alias replaced by its
+        credential, {alias: canonical} for those that were). Run before any check, so a deny list, the
+        destination guard, a policy, rule, grant or risk rating only ever sees the canonical name."""
+        return aliases_mod.resolve(self.cfg.get("aliases") or {}, names)
+
+    def _alias_taken(self, name):
+        """True when `name` is some credential's alias (a name no new credential may take)."""
+        return name in (self.cfg.get("aliases") or {})
+
+    def _plan_denied(self, name):
+        """True when `plans.deny_secrets` names this credential or any of its aliases."""
+        deny = self.plans_cfg.get("deny_secrets") or ()
+        return name in deny or any(a in deny for a in (self.cfg["secrets"].get(name) or {}).get("aliases") or ())
 
     def _internal_secrets(self):
         """(names, vault items lowercased) of the credentials the broker uses for its own
@@ -955,6 +982,8 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
     def audit(self, event, req, **extra):
         rec = {"id": req.id, "mode": req.mode, "names": req.names, "client_id": req.client["id"],
                "client_name": req.client["name"], "source": req.source, "peer": req.peer, **extra}
+        if event == "requested" and req.aliases_used:
+            rec["aliases_used"] = dict(req.aliases_used)
         if req.summary:
             rec["summary"] = req.summary
             if req.summary_model:
@@ -1429,6 +1458,9 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
             return refused("invalid", str(e)[:200])
         if new_name != name:
             return refused("rename", "Renaming is not supported here: the name must stay the same")
+        if any(a in self.cfg["secrets"] or (a in self.cfg["aliases"] and self.cfg["aliases"][a] != name)
+               for a in _entry.get("aliases") or ()):
+            return refused("alias_taken", "An alias is already another credential's name or alias")
         with self._cfg_lock:
             try:
                 current = self.credential_stored_meta(name)
@@ -1477,6 +1509,10 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
         "last": "A credential needs at least one variable",
         "unsupported": "This vault backend cannot store metadata",
         "internal": "This is the broker's own key and cannot be shown or changed here",
+        "no_delete": "This vault backend cannot delete a single value, so nothing was removed",
+        "placeholder": "That is the placeholder shown in the box, not a value: type the value",
+        "confirm_delete": "Confirm that the value is deleted from the vault for good",
+        "private_key": "A private key cannot be deleted here; replace it with asb store --replace",
     }
 
     def _value_result(self, action, name, user, peer, client_ip, reason="", status=None, **extra):
@@ -1540,13 +1576,18 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
         """Replace one variable's value (the old one is kept as previous_value, as `asb store --replace` does)."""
         res = functools.partial(self._value_result, "replace", name, user, peer, client_ip)
         sc, ref, bad = self._value_ref(name, var)
+        if not bad and value == crededitor_mod.SENTINEL:
+            return res(unchanged=True)          # the box still shows its placeholder: the human typed nothing
         if bad or self._value_problem(value):
             return res(bad or self._value_problem(value))
         field = ref.get("field") or "auto"
         try:
+            old = self.backend.get(ref["item"], field)
+            if value == (structured.get(old, ref["key"]) if ref.get("key") else old):
+                return res(unchanged=True)      # saved as it already is: no write, no previous_value churn
             new = value
             if ref.get("key"):
-                new = structured.set_key(self.backend.get(ref["item"], field), ref["key"], value)
+                new = structured.set_key(old, ref["key"], value)
             self.backend.put(ref["item"], field, new, create=False, keep_previous=True)
         except structured.StructuredError:
             return res("invalid")
@@ -1596,6 +1637,8 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
                 return refusal
             if var in (stored.get("vars") or {}):
                 return res("exists")
+            if value == crededitor_mod.SENTINEL:
+                return res("placeholder")
             if self._value_problem(value):
                 return res(self._value_problem(value))
             new_meta = copy.deepcopy(stored)
@@ -1622,8 +1665,11 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
                  peer=peer, client_ip=client_ip)
         return res()
 
-    def remove_value(self, name, var, old_sha, user, peer=None, client_ip=None):
-        """Drop a variable from the metadata. The vault field stays (nothing is destroyed; reversible in the vault)."""
+    def remove_value(self, name, var, old_sha, user, confirm=False, peer=None, client_ip=None):
+        """Remove a variable AND its value from the vault (see valueremoval for exactly what goes). It cannot be
+        undone, so it needs `confirm` and a backend that can delete a field: without that capability it is
+        refused (never done the old, metadata-only way). The vault write carries the new metadata too (one
+        write); the result's `outcome` is key_dropped, field_kept or field_deleted."""
         res = functools.partial(self._value_result, "remove", name, user, peer, client_ip)
         if name not in self.cfg["secrets"]:
             raise ValueError("bad credential")
@@ -1639,21 +1685,46 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
                 return res("unknown_var")
             if len(vars_) == 1:
                 return res("last")
+            if backend_base.CAP_DELETE_FIELD not in self.backend.capabilities:
+                return res("no_delete")
+            if not confirm:
+                return res("confirm_delete")
+            item = self.cfg["secrets"][name]["_item"]
             new_meta = copy.deepcopy(stored)
             del new_meta["vars"][var]
             try:
-                Broker._entry(self.cfg["secrets"][name]["_item"], new_meta)
+                Broker._entry(item, new_meta)
             except ValueError as e:
                 self.log("credential_value_refused", action="remove", reason="invalid", secret=name, user=user,
                          peer=peer, client_ip=client_ip)
                 return {"status": "refused", "reason": "invalid", "message": str(e)[:200]}
+            outcome, field = valueremoval_mod.plan(vars_, var)
+            if outcome != valueremoval_mod.FIELD_KEPT and field == "private_key":
+                return res("private_key")      # delete_field never deletes a private key: refuse before touching anything
+            ref = self.cfg["secrets"][name]["vars"][var]
             try:
-                self.backend.set_meta(self.cfg["secrets"][name]["_item"], new_meta)
+                if outcome == valueremoval_mod.FIELD_KEPT:
+                    self.backend.set_meta(item, new_meta)
+                elif outcome == valueremoval_mod.KEY_DROPPED:
+                    left = structured.drop_key(self.backend.get(item, field), ref["key"])
+                    # the previous copy may hold the whole old field, key included: it goes first, so a failure
+                    # between the two writes leaves the variable listed and the removal can simply be repeated
+                    self.backend.delete_field(item, "previous_value")
+                    if left is None:
+                        self.backend.delete_field(item, field, meta=new_meta)
+                    else:
+                        self.backend.put(item, field, left, create=False, keep_previous=False, meta=new_meta)
+                else:
+                    self.backend.delete_field(item, "previous_value")
+                    self.backend.delete_field(item, field, meta=new_meta)
+            except structured.StructuredError:
+                return res("invalid")
             except (OSError, ValueError, KeyError, BackendError):
                 return res("vault_write")
         self._refresh_if(0)
-        self.log("credential_value_removed", secret=name, var=var, user=user, peer=peer, client_ip=client_ip)
-        return res()
+        self.log("credential_value_removed", secret=name, var=var, outcome=outcome,
+                 previous_dropped=outcome != valueremoval_mod.FIELD_KEPT, user=user, peer=peer, client_ip=client_ip)
+        return res(outcome=outcome)
 
     RESERVED_NAMES = frozenset({"new"})      # routes under /credentials/
 
@@ -1769,7 +1840,7 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
             return refused("bound", f"Still in use by {what}. Revoke or finish those first.")
         return None
 
-    def rename_credential(self, name, new_name, old_sha, user, peer=None, client_ip=None):
+    def rename_credential(self, name, new_name, old_sha, user, keep_alias=False, peer=None, client_ip=None):
         """Change a credential's name (the `name` key of its metadata; the vault item is untouched).
         Refused while anything is bound to the old name, or the old name is in `plans.deny_secrets`
         (a renamed credential would silently stop matching that deny list). Returns
@@ -1785,9 +1856,11 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
             return refused("invalid", "secret name must be 1-41 chars of a-z 0-9 _ - ")
         if new_name == name:
             return refused("invalid", "That is already its name")
-        if new_name in self.cfg["secrets"] or self._internal_hit([new_name]):
+        own = (self.cfg["secrets"][name].get("aliases") or ())
+        if (new_name in self.cfg["secrets"] or self._internal_hit([new_name])
+                or (self._alias_taken(new_name) and new_name not in own)):
             return refused("exists", "A credential with that name already exists")
-        if name in (self.plans_cfg.get("deny_secrets") or ()):
+        if self._plan_denied(name):
             return refused("denied_by_name", "plans.deny_secrets names this credential; "
                                              "change the config first, or the deny rule would stop matching")
         with self._cfg_lock:
@@ -1802,6 +1875,13 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
             if crededitor_mod.digest(current) != old_sha:
                 return refused("conflict", "Changed in the vault since you opened it", status="conflict")
             meta = {**current, "name": new_name}
+            aliases = [a for a in current.get("aliases") or [] if a != new_name]
+            if keep_alias:
+                aliases.append(name)
+            if aliases:
+                meta["aliases"] = aliases
+            else:
+                meta.pop("aliases", None)
             try:
                 got, _e = Broker._entry(sc["_item"], meta)
             except ValueError as e:
@@ -1814,8 +1894,44 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
                 self.log("credential_change_failed", reason="vault_write", **who)
                 return {"status": "failed", "reason": "vault_write", "message": "Could not save the credential"}
         self._refresh_if(0)
-        self.log("credential_renamed", new_secret=new_name, **who)
+        self.log("credential_renamed", new_secret=new_name, alias_kept=bool(keep_alias), **who)
         return {"status": "renamed", "reason": "", "message": ""}
+
+    def remove_alias(self, name, alias, old_sha, user, peer=None, client_ip=None):
+        """Stop answering to one former name. Nothing widens, so no confirmation; audited by name.
+        Returns {"status": ok|refused|conflict|failed, "reason", "message"}."""
+        if name not in self.cfg["secrets"]:
+            raise ValueError("bad credential change")
+        who = dict(secret=name, user=user, peer=peer, client_ip=client_ip)
+
+        def refused(reason, msg, status="refused"):
+            self.log("credential_change_refused", reason=reason, **who)
+            return {"status": status, "reason": reason, "message": msg}
+        if backend_base.CAP_SET_META not in self.backend.capabilities:
+            return refused("unsupported", "This vault backend cannot store metadata")
+        with self._cfg_lock:
+            if self.cfg["secrets"][name].get("auto"):
+                return refused("adopted", "This item has no broker metadata yet: save it once on this page first")
+            try:
+                current = self.credential_stored_meta(name)
+            except (OSError, ValueError, KeyError, BackendError):
+                return {"status": "failed", "reason": "vault_read", "message": "Could not read the vault"}
+            if crededitor_mod.digest(current) != old_sha:
+                return refused("conflict", "Changed in the vault since you opened it", status="conflict")
+            have = current.get("aliases") or []
+            if not isinstance(alias, str) or alias not in have:
+                return refused("unknown_alias", "That is not an alias of this credential")
+            meta = {**current, "aliases": [a for a in have if a != alias]}
+            if not meta["aliases"]:
+                del meta["aliases"]
+            try:
+                self.backend.set_meta(self.cfg["secrets"][name]["_item"], meta)
+            except (OSError, ValueError, KeyError, BackendError):
+                self.log("credential_change_failed", reason="vault_write", **who)
+                return {"status": "failed", "reason": "vault_write", "message": "Could not save the credential"}
+        self._refresh_if(0)
+        self.log("credential_alias_removed", alias=alias, **who)
+        return {"status": "ok", "reason": "", "message": ""}
 
     def delete_credential(self, name, typed, user, peer=None, client_ip=None):
         """Delete a credential's vault item (its value goes with it). The human must type the name.
@@ -1870,7 +1986,22 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
         return out
 
     # -- request lifecycle ------------------------------------------------
+    # modes whose names are existing credentials: a former name (alias) is accepted there. store and credential
+    # requests name a credential to create or replace and see an alias as an existing name (see _validate_store)
+    _ALIAS_MODES = ("http", "env", "ssh_sign", "session")
+
+    def _resolve_request_names(self, mode, names, source, peer, client):
+        """(canonical names, {alias: canonical}); each alias used is audited (both names)."""
+        if mode not in self._ALIAS_MODES:
+            return names, {}
+        names, used = self.resolve_names(names)
+        for alias, canon in used.items():
+            self.log("alias_used", alias=alias, secret=canon, mode=mode, source=source, peer=peer,
+                     **self._client_fields(client))
+        return names, used
+
     def create(self, mode, names, spec, source, peer=None, client=None):
+        names, aliased = self._resolve_request_names(mode, names, source, peer, client)
         if mode == "http" and "plan" in spec:       # a plan call: matched, released or refused; never a prompt
             return self._plan_call(names, spec, source, peer, client)
         if mode == "http" and isinstance(spec, dict) and spec.get("session") is not None:
@@ -1882,6 +2013,8 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
             self._refresh_if(0 if (mode not in ("store", "credential")
                                    and any(n not in self.cfg["secrets"] or n in pre for n in names))
                              else self.CATALOG_TTL)
+            if not aliased and mode in self._ALIAS_MODES and names and not all(n in self.cfg["secrets"] for n in names):
+                names, aliased = self._resolve_request_names(mode, names, source, peer, client)   # the refresh may add one
             secrets_cfg = self.cfg["secrets"]
             internal = self.internal_snapshot()     # ONE snapshot, taken after the refresh, for every check below
             if mode == "env":
@@ -1990,6 +2123,7 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
                        self.sudo_cfg["ttl_s"] if mode == "sudo" else self.cfg.get("ttl_seconds", 120))
             if err is None:
                 req = Request(mode, names, spec, source, ttl, peer, client)
+                req.aliases_used = aliased
                 self._by_id[req.id] = req
                 self._by_nonce[req.nonce] = req
         if err:
@@ -2203,7 +2337,7 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
         if replace:
             return self._validate_replacement(name, spec)
         spec.pop("replace", None)
-        if name in self.cfg["secrets"]:
+        if name in self.cfg["secrets"] or self._alias_taken(name):
             raise ValueError(f"{name} already exists; to replace its value use `asb update {name}`, or ask "
                              f"the human for a new one with `asb request-credential {name} --replace`")
         kind = spec.get("kind")
@@ -2534,7 +2668,7 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
             if not same:
                 raise ValueError("the new key has a different public key; store it as a new credential")
         if op == "create":
-            if name in secrets_cfg:
+            if name in secrets_cfg or self._alias_taken(name):
                 raise ValueError(f"{name} already exists; use update")
             hosts = spec.get("allowed_hosts")
             if (not isinstance(hosts, list) or not (0 if spec.get("ssh") else 1) <= len(hosts) <= 10
@@ -6016,6 +6150,9 @@ def _detail_html(r, evs, retained=""):
             rows.append(f"<dt>{e(k)}</dt><dd>{v if raw else e(str(v))}</dd>")
     add("Request id", f"<code>{e(r['id'])}</code>", True)
     add("Secrets", credlinks_mod.links(r["names"]), True)
+    used = r.get("aliases_used")
+    if used:
+        add("Requested as", ", ".join(f"{a} (a former name of {c})" for a, c in sorted(used.items())))
     add("Mode", r["mode"])
     if r["mode"] == "http":
         add("Request", f"{r['method'] or ''} {r['url'] or ''}".strip())
@@ -6699,7 +6836,8 @@ def approval_handler(broker):
                     f"<div class=reqhead><h2>"
                     f"{'Guidance proposal' if r.mode == 'guidance' else 'Plan: ' + credlinks_mod.links(r.names, tab='policies') if r.mode == 'plan' else credlinks_mod.links(r.names)}</h2>"
                     f"<time data-exp='{int(r.expires)}'>expires in "
-                    f"{max(0, int(r.expires - time.time()))}s</time></div>{_risk_html(r)}"
+                    f"{max(0, int(r.expires - time.time()))}s</time></div>{aliases_mod.note_html(r.aliases_used)}"
+                    f"{_risk_html(r)}"
                     f"<div class=box>{clients_mod.from_html(r)}<br>{what}</div>"
                     f"{details_mod.html(broker.details_view(r))}"
                     f"<p><small>{rnote}</small></p>"
@@ -7236,13 +7374,15 @@ def approval_handler(broker):
             blocked = ("This is the broker's own key and cannot be changed here" if broker.is_internal_secret(name)
                        else "This item has no broker metadata yet (adopted with defaults): save it once above "
                             "to give it its own, then it can be renamed or deleted" if sc.get("auto") else "")
+            dialog = kw.pop("dialog", None)     # (which, message): a refused rename/delete/remove, re-opened
             extra = "" if kw.get("preview") is not None else crededitor_mod.manage_section(
                 name, self._tok(user), crededitor_mod.digest(stored), broker.credential_bindings(name),
-                can_write=can_write, blocked=blocked)
+                can_write=can_write, blocked=blocked, aliases=stored.get("aliases") or [], dialog=dialog,
+                new_name=kw.pop("new_name", ""))
             revealed = kw.pop("revealed", None)
             values = "" if kw.get("preview") is not None or broker.is_internal_secret(name) else \
                 crededitor_mod.values_section(name, sc, self._tok(user), crededitor_mod.digest(stored),
-                                              can_write=can_write, revealed=revealed)
+                                              can_write=can_write, revealed=revealed, dialog=dialog)
             if kw.get("preview") is None:
                 per, _ = broker.standing_by_credential()
                 c = credpolicy_mod.counts(name, sc, per.get(name, []), broker.config_rules_for(name))
@@ -7297,17 +7437,21 @@ def approval_handler(broker):
                     return self._credential_edit(user, name, revealed=(var, res["value"]))
             elif action == "value":
                 res = broker.replace_value(name, var, value, user, **who)
-                flash = f"Value replaced: {var}"
+                flash = f"No change: {var}" if res.get("unchanged") else f"Value replaced: {var}"
             elif action == "value/add":
                 res = broker.add_value(name, var, value, one("old_sha"), user,
                                        confirm=one("confirm") == "1", **who)
                 flash = f"Value added: {var}"
             else:
-                res = broker.remove_value(name, var, one("old_sha"), user, **who)
-                flash = f"Variable removed: {var}"
+                res = broker.remove_value(name, var, one("old_sha"), user, confirm=one("confirm") == "1", **who)
+                flash = f"Removed from the vault: {var}" + (
+                    " (its vault field is still used by another variable, so the field stays)"
+                    if res.get("outcome") == "field_kept" else "")
             if res["status"] == "ok":
                 return self._credential_edit(user, name, flash=flash)
             code = {"conflict": 409, "failed": 500}.get(res["status"], 429 if res["reason"] == "rate_limited" else 400)
+            if action == "value/remove" and res["status"] != "conflict":
+                return self._credential_edit(user, name, status=code, dialog=(f"remove:{var}", res["message"]))
             return self._credential_edit(user, name, status=code, error=res["message"])
 
         def _credential_new(self, user, status=200, **kw):
@@ -7328,13 +7472,23 @@ def approval_handler(broker):
             name = parts[2] if len(parts) >= 4 else ""
             action = "/".join(parts[3:])
             if name not in cfg["secrets"] or action not in ("preview", "save", "rename", "delete", "fingerprint",
-                                                            "reveal", "value", "value/add", "value/remove"):
+                                                            "reveal", "value", "value/add", "value/remove",
+                                                            "alias/remove"):
                 return _page(self, 404, "<h1>Not found</h1>")
             if action in ("reveal", "value", "value/add", "value/remove"):
                 return self._credential_value_post(name, action, one, user)
+            if action == "alias/remove":
+                res = broker.remove_alias(name, one("alias"), one("old_sha"), user, peer=self._ip,
+                                          client_ip=self._fwd())
+                if res["status"] == "ok":
+                    return self._credential_edit(user, name, flash=f"Alias removed: {one('alias')[:64]}")
+                code = 409 if res["status"] == "conflict" else 500 if res["status"] == "failed" else 400
+                return self._credential_edit(user, name, status=code, error=res["message"],
+                                             conflict=res["status"] == "conflict")
             if action in ("rename", "delete"):
                 if action == "rename":
                     res = broker.rename_credential(name, one("new_name"), one("old_sha"), user,
+                                                   keep_alias=one("keep_alias") == "1",
                                                    peer=self._ip, client_ip=self._fwd())
                     done, flash = res["status"] == "renamed", f"Renamed {html.escape(name)} to {html.escape(one('new_name'))}"
                 else:
@@ -7343,8 +7497,11 @@ def approval_handler(broker):
                 if done:
                     return self._credentials_page(user, flash)
                 code = 409 if res["status"] == "conflict" else 500 if res["status"] == "failed" else 400
-                return self._credential_edit(user, name, status=code, error=res["message"],
-                                             conflict=res["status"] == "conflict")
+                if res["status"] == "conflict":
+                    return self._credential_edit(user, name, status=code, error=res["message"], conflict=True)
+                # the refusal's fixed message goes inside the dialog it came from, which is shown open again
+                return self._credential_edit(user, name, status=code, dialog=(action, res["message"]),
+                                             new_name=one("new_name")[:41] if action == "rename" else "")
             try:
                 stored = broker.credential_stored_meta(name)
             except (OSError, ValueError, KeyError, BackendError):
@@ -7478,6 +7635,7 @@ def approval_handler(broker):
             _page(self, 200, f"""
 <h1>{'Guidance proposal' if req.mode == 'guidance' else 'Secret request'}</h1>
 <p><b>{credlinks_mod.links(req.names)}</b></p>
+{aliases_mod.note_html(req.aliases_used)}
 {summary_html}
 <div class=box>{clients_mod.from_html(req)}<br>{what}</div>
 {details_mod.html(broker.details_view(req))}

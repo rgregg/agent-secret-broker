@@ -91,6 +91,13 @@ def _scripts(rec):
             for i, p in enumerate(paths[:5])]
 
 
+def _aliases(v):
+    """{former name: credential name} from a `requested` record, cleaned; {} when there is none."""
+    if not isinstance(v, dict):
+        return {}
+    return {_clean(k): _clean(c) for k, c in list(v.items())[:10] if isinstance(k, str) and isinstance(c, str)}
+
+
 def _short_url(url):
     if not url:
         return None
@@ -155,6 +162,7 @@ class History:
                 "ssh_what": rec.get("ssh_what"), "ssh_headline": rec.get("ssh_headline"), "peer": rec.get("peer"),
                 "client_id": rec.get("client_id"), "client_name": rec.get("client_name"),
                 "argv": _clean_argv(rec.get("argv")), "scripts": _scripts(rec), "risk_reasons": None, "risk_model": None,
+                "aliases_used": _aliases(rec.get("aliases_used")),
             }
             self._events[rid] = []
             while len(self._rows) > self._max:

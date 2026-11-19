@@ -18,6 +18,9 @@ from .wssessions import PRESET_DENY
 MAX_JSON = 100_000          # the advanced box, in characters
 FORM_LIMIT = 400_000        # percent-encoding of the above, plus the form fields
 MAX_PINS = 20
+# What an unchanged value box shows. Never the value: nothing but the human's own Show reply may put a value on a page.
+# The server treats a submitted value equal to this (or to the stored value) as "no change".
+SENTINEL = "\u2022" * 6
 _CTRL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f  ]")
 
 # the keys the form manages; every other key in the metadata is carried through untouched
@@ -68,6 +71,36 @@ def tls_summary(meta):
         fp = meta["tls_fingerprint"]
         return f"pinned ({len(fp) if isinstance(fp, list) else 1})"
     return "verified" if mode == "verify" else "NOT verified"
+
+
+def tls_line(meta):
+    """The one-line summary of the TLS section (the page script keeps it current while the human edits)."""
+    mode = tls_mode(meta)
+    if mode == "pin":
+        fp = meta["tls_fingerprint"]
+        n = len(fp) if isinstance(fp, list) else 1
+        return f"pinned: {n} fingerprint{'' if n == 1 else 's'}"
+    return "verify the certificate" if mode == "verify" else "not verified"
+
+
+def approval_line(meta):
+    return ("allowed without asking" if meta.get("approval", "prompt") == "allow"
+            else "ask on my phone for each use") + (", plans allowed" if meta.get("plans") else "")
+
+
+def ws_line(meta):
+    return {"off": "off", "home-assistant": "Home Assistant", "custom": "custom"}[ws_mode(meta)]
+
+
+def fold(sid, title, summary, body, opened):
+    """A card whose body is collapsed to one line: the title and the current setting. The controls stay in the
+    form (a closed <details> still submits them), so saving, the review step and the unsaved-changes flag are
+    exactly what they were; collapsing is presentation only. A section whose settings differ from the stored
+    ones is rendered open so a refused save does not hide what the human changed."""
+    e = html.escape
+    return (f"<div class=card><details class=cfold id='{sid}'{' open' if opened else ''}>"
+            f"<summary><span class=ft>{e(title)}</span> <span class=fs data-sum='{sid}'>{e(summary)}</span></summary>"
+            f"{body}</details></div>")
 
 
 def ws_mode(meta):
@@ -340,6 +373,16 @@ border-radius:.5rem;background:var(--bg);color:var(--fg)}
 border-radius:.5rem;background:var(--bg);color:var(--fg);resize:vertical}
 details.ml{flex:1 1 100%}details.ml textarea{width:100%;font:.85rem ui-monospace,Menlo,monospace;padding:.4rem .6rem;
 border:1px solid var(--line);border-radius:.5rem;background:var(--bg);color:var(--fg)}
+.cfold>summary{display:flex;gap:.6rem;align-items:baseline;flex-wrap:wrap;list-style:none}
+.cfold>summary::-webkit-details-marker{display:none}
+.cfold>summary::before{content:"\\25B8";color:var(--muted)}.cfold[open]>summary::before{content:"\\25BE"}
+.cfold .ft{font-size:1.05rem;font-weight:600}.cfold .fs{color:var(--muted);font-size:.9rem}
+.cfold[open]>summary{margin-bottom:.5rem}
+.vbox{display:flex;flex:1 1 14rem;min-width:0}.vbox>input,.vbox>textarea{flex:1 1 auto;min-width:0}
+.abar2{display:flex;gap:.6rem;flex-wrap:wrap;margin-top:.8rem}
+.aliases ul{list-style:none;padding:0;margin:.3rem 0}.aliases li{display:flex;gap:.6rem;align-items:center;margin:.25rem 0}
+.aliases form{display:contents}
+.cdlg .dbody{padding-top:.8rem}.cdlg .err{margin:.2rem 0 .6rem}
 @media (max-width:42rem){.ctbl th.ic,.ctbl td.ic{text-align:left;width:100%}
  .ctbl td .vh{position:static;width:auto;height:auto;clip:auto;align-self:center;font-size:.85rem}
  .abar .btn,.abar button{flex:1 1 auto}}
@@ -466,7 +509,7 @@ def list_section(secrets, flash="", q="", counts=None):
     return head + flash + body
 
 
-JS = r"""
+JS_SRC = r"""
 (function(){
   var q=document.getElementById('cq');
   if(q){
@@ -497,29 +540,89 @@ JS = r"""
     var cl=document.getElementById('cclose');
     if(cl)cl.addEventListener('click',function(e){if(dirty&&!confirm('Discard your unsaved changes?'))e.preventDefault();});
   }
+  var SENT='__SENT__',el=function(id){return document.getElementById(id);};
   var btn=function(kind,v){return document.querySelector('[data-'+kind+'="'+v+'"]');};
+  var inp=function(v){return el('val-'+v);},area=function(v){return el('ml-'+v);};
+  var box=function(v){var a=area(v);return a&&!a.disabled?a:inp(v);};
+  // one-line summaries of the collapsed sections follow what the human is editing
+  var fs=function(id){return document.querySelector('[data-sum="'+id+'"]');};
+  var sums=function(){
+    if(!fm)return;var v,n,t;
+    if(fs('tls')){v=(fm.querySelector('input[name=tls]:checked')||{}).value;
+      n=(fm.elements.tls_fingerprint.value.match(/\S+/g)||[]).length;
+      fs('tls').textContent=v==='skip'?'not verified':v==='pin'?'pinned: '+n+' fingerprint'+(n===1?'':'s'):'verify the certificate';}
+    if(fs('approval')){fs('approval').textContent=(fm.elements.approval.value==='allow'?'allowed without asking':
+      'ask on my phone for each use')+(fm.elements.plans&&fm.elements.plans.checked?', plans allowed':'');}
+    if(fs('ws')){t=(fm.querySelector('input[name=ws]:checked')||{}).value;
+      fs('ws').textContent=t==='home-assistant'?'Home Assistant':t==='custom'?'custom':'off';}
+  };
+  if(fm){fm.addEventListener('input',sums);fm.addEventListener('change',sums);}
+  // multi-line is a per-value toggle: it swaps the one-line input for a textarea holding the same text
+  var setML=function(v,on){
+    var i=inp(v),a=area(v),t=btn('ml',v);if(!i||!a)return;
+    if(on){a.value=i.value;a.rows=Math.max(5,Math.min(12,a.value.split('\n').length));}
+    else if(/[\r\n]/.test(a.value)&&a.value!==SENT){return;}      // a value with line breaks cannot be one line
+    else{i.value=a.value;}
+    a.hidden=!on;a.disabled=!on;(i.closest('.peek')||i).hidden=on;i.disabled=on;
+    if(t)t.setAttribute('aria-pressed',on?'true':'false');
+    (on?a:i).focus();
+  };
+  [].forEach.call(document.querySelectorAll('[data-ml]'),function(b){b.hidden=false;
+    b.addEventListener('click',function(){var v=b.getAttribute('data-ml'),a=area(v);setML(v,!!(a&&a.disabled));});});
+  // typing over the placeholder dots replaces them
+  [].forEach.call(document.querySelectorAll('input[data-sentinel],textarea[name=value_ml]'),function(x){
+    x.addEventListener('focus',function(){if(x.value===SENT)x.select();});});
+  var show=function(v,val){
+    var i=inp(v),a=area(v);
+    if(/[\r\n]/.test(val)){if(a.disabled)setML(v,true);a.value=val;a.rows=Math.min(12,val.replace(/\n+$/,'').split('\n').length);}
+    else{if(!a.disabled){a.value='';setML(v,false);}i.type='text';i.value=val;}
+    btn('copy',v).hidden=false;btn('hide',v).hidden=false;var r=btn('reveal',v);if(r)r.hidden=true;
+  };
   [].forEach.call(document.querySelectorAll('[data-reveal]'),function(b){
     b.form.addEventListener('submit',function(e){
-      e.preventDefault();var v=b.getAttribute('data-reveal'),box=document.getElementById('val-'+v);
+      e.preventDefault();var v=b.getAttribute('data-reveal');
       fetch(b.form.action,{method:'POST',credentials:'same-origin',cache:'no-store',redirect:'manual',
         headers:{'Accept':'application/json'},body:new URLSearchParams(new FormData(b.form))})
       .then(function(r){return r.json();}).then(function(d){
         if(d.value===undefined){alert(d.error||'Could not show the value');return;}
-        box.value=d.value;box.rows=Math.min(12,d.value.replace(/\n+$/,'').split('\n').length);btn('copy',v).hidden=false;btn('hide',v).hidden=false;b.hidden=true;
+        show(v,d.value);
       }).catch(function(){alert('Could not show the value');});
     });
   });
   [].forEach.call(document.querySelectorAll('[data-hide]'),function(b){b.addEventListener('click',function(){
-    var v=b.getAttribute('data-hide'),bx=document.getElementById('val-'+v);bx.value='';bx.rows=1;b.hidden=true;
-    btn('copy',v).hidden=true;var r=btn('reveal',v);if(r)r.hidden=false;});});
+    var v=b.getAttribute('data-hide'),i=inp(v),a=area(v);
+    a.value='';if(!a.disabled)setML(v,false);i.type='password';i.value=SENT;
+    b.hidden=true;btn('copy',v).hidden=true;var r=btn('reveal',v);if(r)r.hidden=false;});});
   [].forEach.call(document.querySelectorAll('[data-copy]'),function(b){b.addEventListener('click',function(){
-    var v=b.getAttribute('data-copy'),box=document.getElementById('val-'+v);
-    if(navigator.clipboard)navigator.clipboard.writeText(box.value).then(function(){b.textContent='Copied';
+    var v=b.getAttribute('data-copy');
+    if(navigator.clipboard)navigator.clipboard.writeText(box(v).value).then(function(){b.textContent='Copied';
       setTimeout(function(){b.textContent='Copy';},1500);});});});
-  [].forEach.call(document.querySelectorAll('form[data-confirm]'),function(f){f.addEventListener('submit',function(e){
-    if(!confirm(f.getAttribute('data-confirm')))e.preventDefault();});});
+  // pop-over dialogs: opened as modals (focus moves in, Escape closes), focus returns to the button that opened them
+  var openDlg=function(d,op){
+    if(!d)return;d._op=op||document.activeElement;
+    if(d.hasAttribute('open'))d.removeAttribute('open');
+    if(d.showModal)d.showModal();else d.setAttribute('open','');
+    var f=d.querySelector('[data-dlg-focus]')||d.querySelector('input:not([type=hidden]),textarea,select,button');
+    if(f)f.focus();
+  };
+  [].forEach.call(document.querySelectorAll('dialog.cdlg'),function(d){
+    d.addEventListener('close',function(){var o=d._op;if(o&&o.isConnected&&!o.disabled)o.focus();});
+    d.addEventListener('click',function(e){if(e.target===d)d.close();});
+    [].forEach.call(d.querySelectorAll('[data-dlg-close]'),function(b){b.addEventListener('click',function(){d.close();});});
+    var ex=d.querySelector('[data-expect]'),go=d.querySelector('[data-needs-expect]');
+    if(ex&&go){var sync=function(){go.disabled=ex.value!==ex.getAttribute('data-expect');};
+      ex.addEventListener('input',sync);sync();}
+  });
+  [].forEach.call(document.querySelectorAll('[data-dlg-open]'),function(b){b.hidden=false;
+    b.addEventListener('click',function(){openDlg(el(b.getAttribute('data-dlg-open')),b);});});
+  // a dialog a refused action re-rendered open (with its message inside) becomes a modal again
+  [].forEach.call(document.querySelectorAll('dialog.cdlg[open]'),function(d){
+    openDlg(d,document.querySelector('[data-dlg-open="'+d.id+'"]'));});
 })();
 """
+
+
+JS = JS_SRC.replace("__SENT__", SENTINEL)
 
 
 def new_section(token, name="", hosts="", error="", can_write=True):
@@ -544,9 +647,34 @@ def new_section(token, name="", hosts="", error="", can_write=True):
             f"<a class=btn href='/credentials'>Cancel</a></div></form></div></div>")
 
 
-def manage_section(name, token, sha, bindings, *, can_write, blocked=""):
-    """Rename and delete, under the edit form. `bindings`: {kind: count} of what is bound to the name;
-    `blocked`: why neither is possible (internal key, adopted item), or ''."""
+def dialog_html(dlg_id, title, body, *, opened=False):
+    """A pop-over dialog (a native <dialog>; the page script opens it as a modal, so focus moves in, Escape
+    closes it and focus returns to the button that opened it). `opened` renders it already open: a refused
+    action re-renders its dialog with the fixed message inside, and without script it is shown in place."""
+    i = html.escape(dlg_id, quote=True)
+    return (f"<dialog id='{i}' class='dlg cdlg' aria-labelledby='{i}-t'{' open' if opened else ''}>"
+            f"<div class=dhead><h2 id='{i}-t'>{html.escape(title)}</h2>"
+            f"<button type=button class='btn sm' data-dlg-close>Close</button></div>"
+            f"<div class=dbody>{body}</div></dialog>")
+
+
+def opener(dlg_id, label, cls="btn", disabled=False):
+    """The button that opens a dialog. Hidden until the script runs (no dead control without it)."""
+    return (f"<button type=button class='{cls}' data-dlg-open='{html.escape(dlg_id, quote=True)}' "
+            f"{'disabled ' if disabled else ''}hidden>{html.escape(label)}</button>")
+
+
+def _dialog_error(dialog, which):
+    """(opened, error paragraph) for a dialog: the refused action's fixed message, shown inside that dialog."""
+    if not dialog or dialog[0] != which:
+        return False, ""
+    return True, f"<p class=err role=alert>{html.escape(dialog[1])}</p>"
+
+
+def manage_section(name, token, sha, bindings, *, can_write, blocked="", aliases=(), dialog=None, new_name=""):
+    """The credential's name: its aliases, and the Rename and Delete buttons (each opens a dialog).
+    `bindings`: {kind: count} of what is bound to the name; `blocked`: why neither is possible (internal key,
+    adopted item), or ''. `dialog`: (which, message) of a refused rename/delete, re-opened with the message."""
     e = html.escape
     bound = {k: v for k, v in bindings.items() if v}
     note = ""
@@ -557,20 +685,47 @@ def manage_section(name, token, sha, bindings, *, can_write, blocked=""):
         here = credlinks.link(name, tab="policies", text="this credential's Policies page")
         note = (f"<p><small class=muted>Rename and delete are unavailable while this credential is in use "
                 f"({e(what)}). Revoke those on {here}, the Policies tab and the Clients tab first.</small></p>")
-    dis = "" if (can_write and not blocked and not bound) else " disabled"
-    return (f"<h2>Rename or delete</h2>{note}"
-            f"<form class=cred-form method=post action='/credentials/{e(name)}/rename'>"
-            f"<input type=hidden name=csrf value='{e(token)}'><input type=hidden name=old_sha value='{e(sha)}'>"
-            f"<label>New name</label><input type=text name=new_name maxlength=41{dis}>"
-            f"<p><small class=muted>Only the name changes; the vault item and its value stay. Anything that "
-            f"refers to the old name (a deny rule in the config, an agent's saved command) must be updated.</small></p>"
-            f"<p><button type=submit{dis}>Rename</button></p></form>"
-            f"<form class=cred-form method=post action='/credentials/{e(name)}/delete'>"
-            f"<input type=hidden name=csrf value='{e(token)}'>"
-            f"<label>Delete: type <code>{e(name)}</code> to confirm</label>"
-            f"<input type=text name=typed autocomplete=off{dis}>"
-            f"<p><small class=muted>This deletes the vault item and its value. It cannot be undone from here.</small></p>"
-            f"<p><button type=submit class='btn deny'{dis}>Delete this credential</button></p></form>")
+    off = not (can_write and not blocked and not bound)
+    n = e(name)
+    hid = f"<input type=hidden name=csrf value='{e(token)}'>"
+    alias_line = ""
+    if aliases and can_write and not blocked:
+        items = "".join(
+            f"<li><code>{e(a)}</code><form method=post action='/credentials/{n}/alias/remove'>{hid}"
+            f"<input type=hidden name=old_sha value='{e(sha)}'><input type=hidden name=alias value='{e(a)}'>"
+            f"<button type=submit class='btn sm'>Remove</button></form></li>" for a in aliases)
+        alias_line = (f"<div class=aliases><b>Aliases</b><ul>{items}</ul><p class=hint>Other names this "
+                      f"credential answers to. A request that uses one is flagged on its card and in history. "
+                      f"They stay until you remove them here.</p></div>")
+    r_open, r_err = _dialog_error(dialog, "rename")
+    d_open, d_err = _dialog_error(dialog, "delete")
+    rename = dialog_html(
+        "dlg-rename", "Rename this credential",
+        f"<form class=cred-form method=post action='/credentials/{n}/rename'>{r_err}{hid}"
+        f"<input type=hidden name=old_sha value='{e(sha)}'>"
+        f"<label for=rn-new>New name</label><input type=text id=rn-new name=new_name maxlength=41 "
+        f"value='{e(new_name)}' autocomplete=off spellcheck=false data-dlg-focus>"
+        f"<label style='font-weight:400'><input type=checkbox name=keep_alias value=1> "
+        f"Keep the old name as an alias</label>"
+        f"<p class=hint>Only the name changes; the vault item and its value stay. With the box ticked the old name "
+        f"still works for agents (flagged each time) until you remove it here; without it, anything that refers to "
+        f"the old name (a deny rule in the config, an agent's saved command) must be updated.</p>"
+        f"<div class=abar2><button type=submit class='btn approve'>Rename</button>"
+        f"<button type=button class=btn data-dlg-close>Cancel</button></div></form>", opened=r_open)
+    delete = dialog_html(
+        "dlg-delete", "Delete this credential",
+        f"<form class=cred-form method=post action='/credentials/{n}/delete'>{d_err}{hid}"
+        f"<label for=dl-typed>Type <code>{n}</code> to confirm</label>"
+        f"<input type=text id=dl-typed name=typed autocomplete=off spellcheck=false data-expect='{e(name, quote=True)}' "
+        f"data-dlg-focus>"
+        f"<p class=hint>This deletes the vault item and its value. It cannot be undone from here.</p>"
+        f"<div class=abar2><button type=submit class='btn deny' data-needs-expect>Delete this credential</button>"
+        f"<button type=button class=btn data-dlg-close>Cancel</button></div></form>", opened=d_open)
+    return (f"<h2>Name</h2>{alias_line}{note}"
+            f"<div class=vline>{opener('dlg-rename', 'Rename...', 'btn', off)}"
+            f"{opener('dlg-delete', 'Delete...', 'btn deny', off)}</div>"
+            f"<noscript><p class=hint>Renaming, deleting and removing a value need JavaScript.</p></noscript>"
+            f"{rename}{delete}")
 
 
 def _where(ref):
@@ -581,9 +736,30 @@ def _where(ref):
     return out + (f", key <code>{e(ref['key'])}</code>" if ref.get("key") else "")
 
 
-def values_section(name, sc, token, sha, *, can_write, revealed=None):
+def value_box(v, shown=None, *, form):
+    """The in-place editor of one value: ONE password input that holds the sentinel (never the value) until the
+    human types or presses Show, plus a hidden, disabled textarea the per-value Multi-line toggle swaps in.
+    `shown`: the one revealed value (the no-script Show), which goes into the same box."""
+    e = html.escape
+    f = f"form='{form}'"
+    if shown is not None and ("\n" in shown or "\r" in shown):
+        nrows = min(12, shown.rstrip("\n").count("\n") + 1)
+        # the newline right after <textarea> is the one the HTML parser discards, so a leading newline survives
+        return (f"<textarea name=value_ml id='ml-{v}' {f} rows={nrows} spellcheck=false autocomplete=off "
+                f"aria-label='Value of {v}'>\n{e(shown)}</textarea>"
+                f"<input type=password name=value id='val-{v}' {f} value='{SENTINEL}' hidden disabled>")
+    inp = (f"<input type=text name=value id='val-{v}' {f} value='{e(shown)}' autocomplete=off spellcheck=false "
+           f"aria-label='Value of {v}'>" if shown is not None else
+           f"<input type=password name=value id='val-{v}' {f} value='{SENTINEL}' autocomplete=new-password "
+           f"spellcheck=false aria-label='Value of {v}' data-sentinel>")
+    return (inp + f"<textarea name=value_ml id='ml-{v}' {f} rows=5 spellcheck=false autocomplete=off hidden disabled "
+                  f"aria-label='Value of {v} (multi-line)'></textarea>")
+
+
+def values_section(name, sc, token, sha, *, can_write, revealed=None, dialog=None):
     """The Values card. No value is ever in it, except `revealed` = (var, value): the one value the human just
-    asked to see through the no-script fallback (the script fills the box from a JSON reply instead)."""
+    asked to see through the no-script fallback (the script fills the box from a JSON reply instead).
+    `dialog`: (which, message) of a refused removal, whose dialog is re-opened with the message."""
     e = html.escape
     n = e(name)
     hid = f"<input type=hidden name=csrf value='{e(token)}'>"
@@ -592,39 +768,43 @@ def values_section(name, sc, token, sha, *, can_write, revealed=None):
                 f"changed here; replace it with <code>asb store --replace</code>.</p>"
                 f"<p><b>Public key</b></p><p class=pubkey>{e(str(sc.get('ssh_public_key') or ''))}</p></div>")
     vars_ = sc.get("vars") or {}
-    rows = []
+    rows, dialogs = [], []
     for var, ref in vars_.items():
         v = e(var)
         shown = revealed[1] if revealed and revealed[0] == var else None
-        # a textarea keeps a value's newlines (an <input> drops them); the newline right after <textarea> is
-        # the one the HTML parser discards, so a value that starts with a newline keeps it
-        nrows = min(12, (shown or "").rstrip("\n").count("\n") + 1)
-        box = (f"<textarea readonly id='val-{v}' aria-label='Value of {v}' rows={nrows} spellcheck=false "
-               f"placeholder='hidden'>\n{e(shown or '')}</textarea>")
-        remove = ""
+        multi = shown is not None and ("\n" in shown or "\r" in shown)
         if can_write and len(vars_) > 1 and not sc.get("auto"):
-            remove = (f"<form method=post action='/credentials/{n}/value/remove' data-confirm='Remove {v} from "
-                      f"this credential? The value stays in the vault item.'>{hid}"
-                      f"<input type=hidden name=old_sha value='{e(sha)}'><input type=hidden name=var value='{v}'>"
-                      f"<button type=submit class='btn sm'>Remove</button></form>")
+            did = f"dlg-rm-{v}"
+            opened, err = _dialog_error(dialog, f"remove:{var}")
+            remove = opener(did, "Remove...", "btn sm")
+            dialogs.append(dialog_html(
+                did, f"Remove {var} from the vault",
+                f"<form method=post action='/credentials/{n}/value/remove'>{err}{hid}"
+                f"<input type=hidden name=old_sha value='{e(sha)}'><input type=hidden name=var value='{v}'>"
+                f"<input type=hidden name=confirm value=1>"
+                f"<p>This removes <code>{v}</code> from this credential. Its value is <b>deleted from the vault</b> "
+                f"(<span class=muted>{_where(ref)}</span>), together with its saved previous value, "
+                f"unless another variable still uses that field. It cannot be undone.</p>"
+                f"<div class=abar2><button type=submit class='btn deny'>Delete the value</button>"
+                f"<button type=button class=btn data-dlg-close data-dlg-focus>Cancel</button></div></form>",
+                opened=opened))
+        else:
+            remove = ""
         rows.append(
             f"<div class=vrow><div class=vhead><code>{v}</code><small class=muted>{_where(ref)}</small></div>"
-            f"<div class=vline>{box}"
-            f"<form method=post action='/credentials/{n}/reveal'>{hid}<input type=hidden name=var value='{v}'>"
-            f"<button type=submit class='btn sm' data-reveal='{v}'>Show</button></form>"
+            f"<form id='sv-{v}' method=post action='/credentials/{n}/value' autocomplete=off>{hid}"
+            f"<input type=hidden name=var value='{v}'></form>"
+            f"<form id='rv-{v}' method=post action='/credentials/{n}/reveal'>{hid}"
+            f"<input type=hidden name=var value='{v}'></form>"
+            f"<div class=vline><span class=vbox>{value_box(v, shown, form=f'sv-{v}')}</span>"
+            f"<button type=button class='btn sm' data-ml='{v}' aria-pressed={'true' if multi else 'false'} hidden>"
+            f"Multi-line</button>"
+            f"<button type=submit form='sv-{v}' class='btn sm approve'{'' if can_write else ' disabled'}>Save</button>"
+            f"<button type=submit form='rv-{v}' class='btn sm' data-reveal='{v}'"
+            f"{' hidden' if shown is not None else ''}>Show</button>"
             f"<button type=button class='btn sm' data-copy='{v}'{'' if shown is not None else ' hidden'}>Copy</button>"
             f"<button type=button class='btn sm' data-hide='{v}'{'' if shown is not None else ' hidden'}>Hide</button>"
-            f"{remove}</div>"
-            f"<details><summary>Replace the value</summary>"
-            f"<form method=post action='/credentials/{n}/value' autocomplete=off class=vline>{hid}"
-            f"<input type=hidden name=var value='{v}'>"
-            + peek.wrap(f"<input type=password name=value autocomplete=new-password aria-label='New value of {v}'"
-                        f" placeholder='new value'>")
-            + f"<button type=submit class='btn sm'>Save value</button>"
-            + f"<details class=ml><summary>Multi-line value (PEM, JSON)</summary><textarea name=value_ml rows=5 "
-               f"spellcheck=false autocomplete=off aria-label='Multi-line value'></textarea><p class=hint>Shown as "
-               f"you type. Used instead of the box above when it is not empty.</p></details>" + "</form>"
-            f"<p class=hint>The old value is kept in the item's <code>previous_value</code>.</p></details></div>")
+            f"{remove}</div></div>")
     add = ""
     if can_write and not sc.get("auto"):
         add = (f"<details><summary>Add a value</summary>"
@@ -632,18 +812,20 @@ def values_section(name, sc, token, sha, *, can_write, revealed=None):
                f"<input type=hidden name=old_sha value='{e(sha)}'>"
                f"<label>Variable name (letters, digits and _, like <code>API_SECRET</code>)</label>"
                f"<input type=text name=var maxlength=64 spellcheck=false>"
-               f"<label>Value</label>" + peek.wrap("<input type=password name=value autocomplete=new-password>")
-               + f"<details class=ml><summary>Multi-line value (PEM, JSON)</summary><textarea name=value_ml rows=5 "
-               f"spellcheck=false autocomplete=off aria-label='Multi-line value'></textarea><p class=hint>Shown as "
-               f"you type. Used instead of the box above when it is not empty.</p></details>" +
-               f"<label style='font-weight:400'><input type=checkbox name=confirm value=1> I understand agents can "
-               f"use this value on this credential's hosts</label>"
-               f"<p class=hint>Stored in a new hidden field of the same vault item, named like the variable.</p>"
-               f"<p><button type=submit class='btn sm'>Add value</button></p></form></details>")
+               f"<label>Value</label><div class=vline><span class=vbox>"
+               + peek.wrap("<input type=password name=value id='val-ADD' autocomplete=new-password>")
+               + f"<textarea name=value_ml id='ml-ADD' rows=5 spellcheck=false autocomplete=off hidden disabled "
+                 f"aria-label='New value (multi-line)'></textarea></span>"
+                 f"<button type=button class='btn sm' data-ml='ADD' aria-pressed=false hidden>Multi-line</button></div>"
+                 f"<label style='font-weight:400'><input type=checkbox name=confirm value=1> I understand agents can "
+                 f"use this value on this credential's hosts</label>"
+                 f"<p class=hint>Stored in a new hidden field of the same vault item, named like the variable.</p>"
+                 f"<p><button type=submit class='btn sm'>Add value</button></p></form></details>")
     elif sc.get("auto"):
         add = "<p class=hint>Save this credential once below to give it its own metadata; then values can be added.</p>"
-    return (f"<div class=card><h2>Values</h2><p class=hint>Shown only when you press Show; each view is recorded "
-            f"in the audit log.</p>{''.join(rows)}{add}</div>")
+    return (f"<div class=card><h2>Values</h2><p class=hint>Type over the dots to replace a value and press Save "
+            f"(the old one is kept as <code>previous_value</code>); Show reads it from the vault and is recorded "
+            f"in the audit log. Remove deletes it from the vault.</p>{''.join(rows)}{add}{''.join(dialogs)}</div>")
 
 
 def edit_section(name, meta, token, stored, *, can_write, error="", preview=None, widen=(), conflict=False,
@@ -711,9 +893,11 @@ def edit_section(name, meta, token, stored, *, can_write, error="", preview=None
                  f"</summary><p>" + " ".join(f"<code>{e(b)}</code>" for b in blocked) + "</p></details>")
     else:
         wnote = "<p class=err>No message types are blocked: a session may send anything.</p>"
-    wcard = (f"<div class=card><h2>WebSocket</h2><p class=hint>Whether an agent may ask for a WebSocket session "
-             f"(<code>asb ws</code>), where the broker holds the connection.</p><div class=seg>{wseg}</div>"
-             f"{wnote}</div>")
+    differs = lambda *keys: any(meta.get(k) != stored.get(k) for k in keys)  # noqa: E731
+    wcard = fold("ws", "WebSocket", ws_line(meta),
+                 f"<p class=hint>Whether an agent may ask for a WebSocket session "
+                 f"(<code>asb ws</code>), where the broker holds the connection.</p><div class=seg>{wseg}</div>"
+                 f"{wnote}", differs("ws"))
     dirty = " data-dirty" if meta != stored else ""
     form = (f"<form class=cred-form id=cedit method=post action='/credentials/{e(name)}/save'{dirty}>"
             f"<input type=hidden name=csrf value='{e(token)}'><input type=hidden name=old_sha value='{e(sha)}'>"
@@ -722,19 +906,22 @@ def edit_section(name, meta, token, stored, *, can_write, error="", preview=None
             f"per line, <code>host</code> or <code>host:port</code>.</p>"
             f"<textarea name=allowed_hosts rows=4{dis}>"
             f"{e(chr(10).join(meta.get('allowed_hosts') or []))}</textarea></div>"
-            f"<div class=card><h2>TLS</h2><p class=hint>How the broker checks the server's certificate.</p>"
-            f"<div class=seg>{seg}</div>"
-            f"<div id=cpins><label>Pinned fingerprints (one per line, <code>sha256:&lt;64 hex&gt;</code>)</label>"
-            f"<textarea name=tls_fingerprint rows=3{dis}>{e(pin_text)}</textarea>"
-            f"<div class=fprow><input type=text name=fp_host placeholder='host or host:port from the list above' "
-            f"aria-label='Host to fetch a certificate from' autocomplete=off{dis}>"
-            f"<button type=submit formaction='/credentials/{e(name)}/fingerprint'{dis}>Fetch fingerprint</button>"
-            f"</div></div></div>"
-            f"<div class=card><h2>Approval</h2><p class=hint>Whether each use waits for you.</p>"
-            f"<select name=approval aria-label=Approval{dis}>{sel}</select>"
-            f"<label style='font-weight:400'><input type=checkbox name=plans value=1"
-            f"{' checked' if meta.get('plans') else ''}{dis}> Allow plans (a batch of calls approved once)</label>"
-            f"</div>{wcard}"
+            + fold("tls", "TLS", tls_line(meta),
+                   f"<p class=hint>How the broker checks the server's certificate.</p>"
+                   f"<div class=seg>{seg}</div>"
+                   f"<div id=cpins><label>Pinned fingerprints (one per line, <code>sha256:&lt;64 hex&gt;</code>)</label>"
+                   f"<textarea name=tls_fingerprint rows=3{dis}>{e(pin_text)}</textarea>"
+                   f"<div class=fprow><input type=text name=fp_host placeholder='host or host:port from the list above' "
+                   f"aria-label='Host to fetch a certificate from' autocomplete=off{dis}>"
+                   f"<button type=submit formaction='/credentials/{e(name)}/fingerprint'{dis}>Fetch fingerprint</button>"
+                   f"</div></div>", differs("tls_fingerprint", "tls_verify") or bool(fetched))
+            + fold("approval", "Approval", approval_line(meta),
+                   f"<p class=hint>Whether each use waits for you.</p>"
+                   f"<select name=approval aria-label=Approval{dis}>{sel}</select>"
+                   f"<label style='font-weight:400'><input type=checkbox name=plans value=1"
+                   f"{' checked' if meta.get('plans') else ''}{dis}> Allow plans (a batch of calls approved once)</label>",
+                   differs("approval", "plans"))
+            + f"{wcard}"
             f"<details><summary>Advanced: the whole metadata as JSON</summary>"
             f"<p class=hint>Edit this only for keys the form does not cover. If you change it, it "
             f"replaces the form's fields.</p>"

@@ -196,22 +196,176 @@ class Add(Base):
 
 
 class Remove(Base):
-    def test_removes_the_variable_and_keeps_the_field(self):
-        r = self.broker.remove_value("multi", "M_SEC", self.sha("multi"), "alice")
-        self.assertEqual(r["status"], "ok")
-        self.assertEqual(set(self.broker.credential_stored_meta("multi")["vars"]), {"M_ID"})
-        self.assertNotIn("M_SEC", self.broker.cfg["secrets"]["multi"]["vars"])
-        self.assertEqual(json.loads(self.vault("Multi", "notes"))["SECRET"], MULTI_SEC)   # nothing destroyed
-        self.assertEqual([e["var"] for e in self.events("credential_value_removed")], ["M_SEC"])
+    """Removing a variable deletes its value from the vault (it is irreversible, so it needs `confirm`)."""
+
+    def remove(self, name, var, **kw):
+        kw.setdefault("confirm", True)
+        return self.broker.remove_value(name, var, self.sha(name), "alice", **kw)
+
+    def add_extra(self):
+        self.assertEqual(self.broker.add_value("svc", "SVC_EXTRA", EXTRA, self.sha("svc"), "alice",
+                                               confirm=True)["status"], "ok")
+
+    def test_deletes_the_vault_field_and_its_previous_value(self):
+        self.add_extra()
+        self.assertEqual(self.broker.replace_value("svc", "SVC_EXTRA", NEW_VALUE, "alice")["status"], "ok")
+        self.assertEqual(self.vault("Svc", "previous_value"), EXTRA)          # premise: a previous copy exists
+        r = self.remove("svc", "SVC_EXTRA")
+        self.assertEqual((r["status"], r["outcome"]), ("ok", "field_deleted"))
+        for f in ("SVC_EXTRA", "previous_value", "previous_replaced_at"):
+            with self.subTest(f), self.assertRaises(BackendNotFound):
+                self.vault("Svc", f)
+        self.assertEqual(self.vault("Svc", "token"), t.SECRET)                # the other value is untouched
+        self.assertNotIn("SVC_EXTRA", self.stored()["vars"])
+        self.assertNotIn("SVC_EXTRA", self.broker.cfg["secrets"]["svc"]["vars"])
+        raw = json.dumps(self.broker.backend._data["Svc"])
+        self.assertNotIn(EXTRA, raw)
+        self.assertNotIn(NEW_VALUE, raw)
+
+    def test_the_audit_event_names_the_variable_and_never_a_value(self):
+        self.add_extra()
+        self.remove("svc", "SVC_EXTRA")
+        ev = self.events("credential_value_removed")
+        self.assertEqual([(e["secret"], e["var"], e["outcome"], e["previous_dropped"]) for e in ev],
+                         [("svc", "SVC_EXTRA", "field_deleted", True)])
+        self.assert_no_values_in_audit()
+
+    def test_a_keyed_variable_drops_only_its_key_and_the_previous_copy(self):
+        self.assertEqual(self.broker.replace_value("multi", "M_ID", NEW_VALUE, "alice")["status"], "ok")
+        self.assertIn(MULTI_SEC, self.vault("Multi", "previous_value"))        # premise: it holds the whole blob
+        r = self.remove("multi", "M_SEC")
+        self.assertEqual((r["status"], r["outcome"]), ("ok", "key_dropped"))
+        self.assertEqual(json.loads(self.vault("Multi", "notes")), {"ID": NEW_VALUE})
+        with self.assertRaises(BackendNotFound):
+            self.vault("Multi", "previous_value")
+        self.assertNotIn(MULTI_SEC, json.dumps(self.broker.backend._data["Multi"]))
+        self.assertEqual(set(self.stored_of("multi")["vars"]), {"M_ID"})
+
+    def stored_of(self, name):
+        return self.broker.credential_stored_meta(name)
+
+    def test_a_field_another_variable_still_uses_is_kept(self):
+        meta = self.broker.credential_stored_meta("svc")
+        meta["vars"]["SVC_ALIAS"] = {"field": "token"}
+        self.broker.backend.set_meta("Svc", meta)
+        self.broker._refresh_if(0)
+        self.assertEqual(self.broker.replace_value("svc", "SVC_TOKEN", NEW_VALUE, "alice")["status"], "ok")
+        r = self.remove("svc", "SVC_ALIAS")
+        self.assertEqual((r["status"], r["outcome"]), ("ok", "field_kept"))
+        self.assertEqual(self.vault("Svc", "token"), NEW_VALUE)               # still there: SVC_TOKEN uses it
+        self.assertEqual(self.vault("Svc", "previous_value"), t.SECRET)       # untouched: nothing destructive
+        self.assertEqual(set(self.stored()["vars"]), {"SVC_TOKEN"})
+        self.assertFalse(self.events("credential_value_removed")[0]["previous_dropped"])
+
+    def test_a_built_in_field_is_cleared(self):
+        self.broker.backend._data["Svc"]["notes"] = EXTRA
+        meta = self.broker.credential_stored_meta("svc")
+        meta["vars"]["SVC_NOTE"] = {"field": "notes"}
+        self.broker.backend.set_meta("Svc", meta)
+        self.broker._refresh_if(0)
+        self.assertEqual(self.vault("Svc", "notes"), EXTRA)                  # premise
+        r = self.remove("svc", "SVC_NOTE")
+        self.assertEqual((r["status"], r["outcome"]), ("ok", "field_deleted"))
+        self.assertEqual(self.vault("Svc", "notes"), "")
+        self.assertNotIn(EXTRA, json.dumps(self.broker.backend._data["Svc"]))
+
+    def test_without_the_capability_nothing_changes(self):
+        self.add_extra()
+        before_vault, before_meta = json.dumps(self.broker.backend._data["Svc"]), self.stored()
+        with mock.patch.object(type(self.broker.backend), "capabilities",
+                               self.broker.backend.capabilities - {"delete_field"}):
+            r = self.remove("svc", "SVC_EXTRA")
+        self.assertEqual((r["status"], r["reason"]), ("refused", "no_delete"))
+        self.assertEqual(r["message"], self.broker._VALUE_TEXT["no_delete"])
+        self.assertEqual(json.dumps(self.broker.backend._data["Svc"]), before_vault)   # no fallback: nothing written
+        self.assertEqual(self.stored(), before_meta)
+        self.assertEqual(self.events("credential_value_removed"), [])
+        self.assertEqual([e["reason"] for e in self.events("credential_value_refused")], ["no_delete"])
+
+    def test_it_needs_the_confirmation(self):
+        self.add_extra()
+        r = self.remove("svc", "SVC_EXTRA", confirm=False)
+        self.assertEqual((r["status"], r["reason"]), ("refused", "confirm_delete"))
+        self.assertEqual(self.vault("Svc", "SVC_EXTRA"), EXTRA)
+        self.assertIn("SVC_EXTRA", self.stored()["vars"])
+
+    def test_a_vault_failure_changes_nothing_and_leaks_nothing(self):
+        self.add_extra()
+        with mock.patch.object(self.broker.backend, "delete_field", side_effect=BackendError("boom " + EXTRA)):
+            r = self.remove("svc", "SVC_EXTRA")
+        self.assertEqual((r["status"], r["reason"], r["message"]),
+                         ("failed", "vault_write", "Could not save to the vault"))
+        self.assertEqual(self.vault("Svc", "SVC_EXTRA"), EXTRA)
+        self.assertIn("SVC_EXTRA", self.stored()["vars"])
+        self.assertNotIn(EXTRA, self.audit_text())
+
+    def test_a_key_that_another_variable_reads_stays_in_the_vault(self):
+        meta = self.broker.credential_stored_meta("multi")
+        meta["vars"]["M_COPY"] = {"item": "Multi", "field": "notes", "key": "SECRET"}
+        self.broker.backend.set_meta("Multi", meta)
+        self.broker._refresh_if(0)
+        r = self.remove("multi", "M_SEC")
+        self.assertEqual((r["status"], r["outcome"]), ("ok", "field_kept"))
+        self.assertEqual(json.loads(self.vault("Multi", "notes")), {"ID": MULTI_ID, "SECRET": MULTI_SEC})
+        self.assertEqual(self.broker.reveal_value("multi", "M_COPY", "alice")["value"], MULTI_SEC)
+
+    def test_a_private_key_field_is_refused_before_anything_is_deleted(self):
+        self.add_extra()
+        self.assertEqual(self.broker.replace_value("svc", "SVC_EXTRA", NEW_VALUE, "alice")["status"], "ok")
+        meta = self.broker.credential_stored_meta("svc")
+        meta["vars"]["SVC_EXTRA"] = {"field": "private_key"}
+        self.broker.backend.set_meta("Svc", meta)
+        self.broker._refresh_if(0)
+        self.assertEqual(self.vault("Svc", "previous_value"), EXTRA)           # premise: a previous copy exists
+        r = self.remove("svc", "SVC_EXTRA")
+        self.assertEqual((r["status"], r["reason"]), ("refused", "private_key"))
+        self.assertEqual(self.vault("Svc", "previous_value"), EXTRA)           # nothing was touched, not even this
+        self.assertIn("SVC_EXTRA", self.stored()["vars"])
 
     def test_refusals(self):
-        self.assertEqual(self.broker.remove_value("svc", "SVC_TOKEN", self.sha("svc"), "alice")["reason"], "last")
-        self.assertEqual(self.broker.remove_value("multi", "NOPE", self.sha("multi"), "alice")["reason"],
-                         "unknown_var")
-        self.assertEqual(self.broker.remove_value("multi", "M_ID", "0" * 64, "alice")["reason"], "conflict")
-        self.assertEqual(self.broker.remove_value("sshk", "SSHK_KEY", self.sha("sshk"), "alice")["reason"], "ssh")
+        self.assertEqual(self.remove("svc", "SVC_TOKEN")["reason"], "last")
+        self.assertEqual(self.remove("multi", "NOPE")["reason"], "unknown_var")
+        self.assertEqual(self.broker.remove_value("multi", "M_ID", "0" * 64, "alice", confirm=True)["reason"],
+                         "conflict")
+        self.assertEqual(self.remove("sshk", "SSHK_KEY")["reason"], "ssh")
         self.assertEqual(set(self.broker.credential_stored_meta("multi")["vars"]), {"M_ID", "M_SEC"})
+        self.assertEqual(json.loads(self.vault("Multi", "notes")), {"ID": MULTI_ID, "SECRET": MULTI_SEC})
         self.assertEqual(self.events("credential_value_removed"), [])
+
+
+class RemovalPlan(unittest.TestCase):
+    """The pure rule behind Remove: what may leave the vault."""
+
+    def plan(self, vars_, var):
+        from secret_broker import valueremoval
+        return valueremoval.plan(vars_, var)
+
+    def test_the_four_outcomes(self):
+        self.assertEqual(self.plan({"A": {"field": "x"}, "B": {"field": "y"}}, "A"), ("field_deleted", "x"))
+        self.assertEqual(self.plan({"A": {"field": "x"}, "B": {"field": "x"}}, "A"), ("field_kept", "x"))
+        self.assertEqual(self.plan({"A": {"field": "n", "key": "K"}, "B": {"field": "n", "key": "J"}}, "A"),
+                         ("key_dropped", "n"))
+        self.assertEqual(self.plan({"A": {"field": "n", "key": "K"}, "B": {"field": "y"}}, "A"),
+                         ("key_dropped", "n"))
+
+    def test_a_key_another_variable_also_reads_is_never_dropped(self):
+        shared_key = {"A": {"field": "cfg", "key": "x"}, "B": {"field": "cfg", "key": "x"}}
+        self.assertEqual(self.plan(shared_key, "A"), ("field_kept", "cfg"))
+        whole = {"A": {"field": "cfg", "key": "x"}, "B": {"field": "cfg"}}      # B reads the whole field
+        self.assertEqual(self.plan(whole, "A"), ("field_kept", "cfg"))
+        self.assertEqual(self.plan({"A": {"field": "cfg", "key": "x"}, "B": {"field": "cfg", "key": "y"}}, "A"),
+                         ("key_dropped", "cfg"))                               # a different key: only A's goes
+
+    def test_the_items_natural_slot_has_several_names_and_counts_as_one(self):
+        for other in ("auto", "notes", "password", "private_key", None, {}):
+            with self.subTest(other=other):
+                ref = {} if other in (None, {}) else {"field": other}
+                self.assertEqual(self.plan({"A": {}, "B": ref}, "A")[0], "field_kept")
+        self.assertEqual(self.plan({"A": {}, "B": {"field": "custom"}}, "A")[0], "field_deleted")
+
+    def test_a_reference_that_is_not_an_object_is_read_like_the_loader_reads_it(self):
+        self.assertEqual(self.plan({"A": None, "B": {"field": "x"}}, "A"), ("field_deleted", "auto"))
+        self.assertEqual(self.plan({"A": "junk", "B": None}, "A")[0], "field_kept")
 
 
 class Hidden(unittest.TestCase):
@@ -253,7 +407,7 @@ class Pages(Base):
         self.assertEqual(hdr["Cache-Control"], "no-store")
         esc = "S3CR3T-&#x27;&lt;b&gt;x&lt;/b&gt;&lt;/script&gt;"
         self.assertEqual(body.count(esc), 1)                             # in one box: M_ID's
-        self.assertRegex(body, r"<textarea readonly id='val-M_ID' [^>]*>\n" + re.escape(esc) + "</textarea>")
+        self.assertRegex(body, r"<input type=text name=value id='val-M_ID' form='sv-M_ID' value='" + re.escape(esc) + "'")
         self.assertNotIn(tricky, body)
         self.assertNotIn(MULTI_SEC, body)                                # only the one asked for
 
@@ -295,9 +449,16 @@ class Pages(Base):
         self.assertNotIn(EXTRA, body)
         self.assertEqual(self.vault("Svc", "SVC_EXTRA"), EXTRA)
         code, _, body = self.raw_post("/credentials/svc/value/remove", var="SVC_EXTRA", old_sha=self.sha("svc"))
+        self.assertEqual(code, 400)                                      # no confirmation: nothing is deleted
+        self.assertIn(self.broker._VALUE_TEXT["confirm_delete"], body)
+        self.assertEqual(self.vault("Svc", "SVC_EXTRA"), EXTRA)
+        code, _, body = self.raw_post("/credentials/svc/value/remove", var="SVC_EXTRA", old_sha=self.sha("svc"),
+                                      confirm="1")
         self.assertEqual(code, 200)
-        self.assertIn("Variable removed: SVC_EXTRA", body)
+        self.assertIn("Removed from the vault: SVC_EXTRA", body)
         self.assertNotIn("SVC_EXTRA", self.stored()["vars"])
+        with self.assertRaises(BackendNotFound):
+            self.vault("Svc", "SVC_EXTRA")
         code, _, _ = self.raw_post("/credentials/svc/value/remove", var="SVC_TOKEN", old_sha="0" * 64)
         self.assertEqual(code, 409)
 
@@ -316,12 +477,14 @@ class Pages(Base):
 
 
 class Peek(Base):
-    def test_every_value_box_on_the_editor_has_the_toggle(self):
+    def test_every_box_that_takes_a_new_value_has_the_toggle(self):
+        # the in-place editor of an existing value holds only the placeholder dots (its Show button is the
+        # reveal flow, not this toggle); the Add box and the New credential box take typed text and keep it
         code, body = self.get("/credentials/svc")
         self.assertEqual(code, 200)
-        boxes = body.count("type=password name=value")
-        self.assertEqual(boxes, 2)                                       # Replace (one variable) and Add
-        self.assertEqual(body.count("<span class=peek><input type=password name=value"), boxes)
+        self.assertEqual(body.count("type=password name=value"), 2)       # the in-place box (one variable) and Add
+        self.assertEqual(body.count("<span class=peek><input type=password name=value"), 1)
+        self.assertIn("<span class=peek><input type=password name=value id='val-ADD'", body)
         self.assertIn("querySelectorAll('button[data-peek]')", body)
         code, body = self.get("/credentials/new")
         self.assertIn("<span class=peek><input type=password name=value", body)
@@ -359,7 +522,8 @@ class WithASummaryKey(Base):
                                                            confirm=True))
         self.assertEqual(r["status"], "ok")
         self.assertEqual(self.vault("Svc", "SVC_EXTRA"), EXTRA)
-        r = self.run_bounded(lambda: self.broker.remove_value("svc", "SVC_EXTRA", self.sha("svc"), "alice"))
+        r = self.run_bounded(lambda: self.broker.remove_value("svc", "SVC_EXTRA", self.sha("svc"), "alice",
+                                                                            confirm=True))
         self.assertEqual(r["status"], "ok")
         self.assertNotIn("SVC_EXTRA", self.stored()["vars"])
 
@@ -372,7 +536,7 @@ class WithASummaryKey(Base):
         self.assertEqual(self.run_bounded(lambda: self.broker.add_value("multi", "M_X", EXTRA, sha, "alice",
                                                                         confirm=True))["reason"], "internal")
         self.assertEqual(self.run_bounded(lambda: self.broker.remove_value("multi", "M_ID", sha,
-                                                                           "alice"))["reason"], "internal")
+                                                                           "alice", confirm=True))["reason"], "internal")
         self.assertEqual(json.loads(self.vault("Multi", "notes")), {"ID": MULTI_ID, "SECRET": MULTI_SEC})
 
 
@@ -386,7 +550,8 @@ class MultiLine(Base):
         code, _, body = self.raw_post("/credentials/svc/reveal", var="SVC_TOKEN")
         self.assertEqual(code, 200)
         # a textarea, with the leading newline the HTML parser drops, so the value's own first line survives
-        self.assertIn("rows=4 spellcheck=false placeholder='hidden'>\n-----BEGIN KEY-----\nS3CR3T-line-one\n", body)
+        self.assertIn("rows=4 spellcheck=false autocomplete=off aria-label='Value of SVC_TOKEN'>\n"
+                      "-----BEGIN KEY-----\nS3CR3T-line-one\n", body)
 
     def test_replace_and_add_take_a_multi_line_value_with_lf_line_ends(self):
         crlf = self.PEM.replace("\n", "\r\n")                           # what a browser submits from a textarea
@@ -404,9 +569,11 @@ class MultiLine(Base):
         self.assertEqual(code, 200)
         self.assertEqual(self.vault("Svc", "token"), NEW_VALUE)
 
-    def test_the_page_offers_the_multi_line_box(self):
+    def test_the_page_offers_the_multi_line_toggle_not_an_open_box(self):
         code, body = self.get("/credentials/svc")
-        self.assertEqual(body.count("<textarea name=value_ml"), 2)       # Replace and Add
+        self.assertEqual(body.count("<textarea name=value_ml"), 2)       # one per value box and Add, both off
+        self.assertEqual(body.count("data-ml="), 2)
+        self.assertEqual(len(re.findall(r"<textarea name=value_ml[^>]* hidden disabled", body)), 2)
 
 
 class Adopted(unittest.TestCase):

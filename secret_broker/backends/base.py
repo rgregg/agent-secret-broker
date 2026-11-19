@@ -147,12 +147,13 @@ def as_uris(uri):
     """create_login's `uri`: None, one URL, or a list of them -> a list of URLs."""
     return [u for u in ([uri] if isinstance(uri, str) else uri or []) if u]
 CAP_EDIT_ITEM = "edit_item"
+CAP_DELETE_FIELD = "delete_field"
 CAP_WARM = "warm"
 CAP_ON_EVENT = "on_event"
 CAP_ADOPTS = "adopts"
 CAP_EXPORT_ITEMS = "export_items"
 CAP_IMPORT_ITEMS = "import_items"
-KNOWN_CAPABILITIES = frozenset({CAP_SET_META, CAP_CREATE_LOGIN, CAP_EDIT_ITEM, CAP_WARM,
+KNOWN_CAPABILITIES = frozenset({CAP_SET_META, CAP_CREATE_LOGIN, CAP_EDIT_ITEM, CAP_DELETE_FIELD, CAP_WARM,
                                 CAP_ON_EVENT, CAP_ADOPTS, CAP_EXPORT_ITEMS, CAP_IMPORT_ITEMS})
 
 
@@ -428,6 +429,16 @@ class VaultBackend(abc.ABC):
         BackendNotFound if `item` does not."""
         raise NotSupported("this backend cannot edit items")
 
+    def delete_field(self, item, field, meta=None):
+        """["delete_field"] Really remove one field's value from the item, optionally replacing the broker
+        metadata (`meta`) in the SAME write. A custom field is removed; a built-in `password`, `username` or
+        `notes` is cleared (the item kind needs the slot); `previous_value` / `previous_replaced_at` (either
+        name) remove both rotation-history fields. `None`, `""` and `"auto"` mean the item's natural secret field
+        (as for `get`). A field that is not there is not an error (the call can be
+        repeated); the `broker` field and `private_key` are BackendInvalid; a missing item is BackendNotFound.
+        Never falls back to anything weaker: a backend that cannot do this omits the capability."""
+        raise NotSupported("this backend cannot delete fields")
+
     def warm(self):
         """["warm"] Open the store ahead of a likely read (unlock, sync, decrypt) so
         the first real read is fast. Called from a background thread; may raise
@@ -484,6 +495,21 @@ def check_item_args(item, value=_UNSET):
         raise BackendInvalid("item name must be a non-empty string")
     if value is not _UNSET and not isinstance(value, str):
         raise BackendInvalid("value must be a string")
+
+
+def check_delete_field_args(item, field):
+    """Shared argument checks for `delete_field`: a non-empty item and field name, never `broker` or `private_key`."""
+    check_item_args(item)
+    if not isinstance(field, str) and field is not None:
+        raise BackendInvalid("field name must be a string")
+    if field in (META_FIELD, "private_key"):
+        raise BackendInvalid(f"field {field!r} cannot be deleted")
+
+
+def check_resolved_delete_field(field):
+    """BackendInvalid when the field an alias (`auto`) resolved to is one that cannot be deleted."""
+    if field in (META_FIELD, "private_key"):
+        raise BackendInvalid(f"field {field!r} cannot be deleted")
 
 
 def lookup_name(names, wanted):

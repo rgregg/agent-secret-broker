@@ -94,7 +94,8 @@ class PlansMixin:
         sc = self.cfg["secrets"].get(name)
         if sc is None or sc.get("ssh") or name in self._internal_secrets()[0]:
             return None
-        return {"hosts": frozenset(sc.get("allowed_hosts") or ()), "plans": sc.get("plans"),
+        return {"hosts": frozenset(sc.get("allowed_hosts") or ()),
+                "plans": False if self._plan_denied(name) else sc.get("plans"),
                 "sig": source_sig(sc), "vars": frozenset(sc["vars"])}
 
     def _plan_check(self, rules, forbid_msg=True):
@@ -120,7 +121,7 @@ class PlansMixin:
                 raise plans_mod.ManifestError(f"{f}.secret: this credential cannot be used in http mode")
             if sc.get("plans") is False:
                 raise plans_mod.ManifestError(f"{f}.secret: this credential does not allow plans", 403)
-            if r["secret"] in deny:
+            if self._plan_denied(r["secret"]):
                 raise plans_mod.ManifestError(f"{f}.secret: this credential does not allow plans", 403)
             if (r["host"] not in destguard.host_parts(hosts) or self.dest_guard.host_refused(r["host"])
                     or not self.dest_guard.port_ok(self.allowed_entries(r["secret"]), r["host"], r["port"])):
@@ -154,6 +155,7 @@ class PlansMixin:
         pre = self.internal_snapshot()      # pre-refresh: only decides how to refresh, never a decision
         self._refresh_if(0 if any(n not in self.cfg["secrets"] or n in pre for n in _named(raw))
                          else self.CATALOG_TTL)
+        raw, aliased = _resolve_manifest(self, raw)
         try:
             man = plans_mod.validate_manifest(raw, cfg, self.plan_max_minutes(cid))
             sigs = self._plan_check(man["rules"])
@@ -182,6 +184,7 @@ class PlansMixin:
                                  "cooldown": "a plan from this client was denied recently; try again later"}[perr])
             if err is None:
                 req = Request("plan", names, spec, source, cfg["pending_ttl_s"], peer, client)
+                req.aliases_used = aliased
                 req.plan_id = plan.id
                 self.plans.set_request(plan.id, req.id, req.expires)
                 self._by_id[req.id] = req
@@ -394,6 +397,24 @@ class PlansMixin:
                            "url": f"{r['scheme']}://{r['host']}:{r['port']}{r['path_prefix']}",
                            "query": r["query"], "body": body_kind(r), "uses": r["uses"],
                            "max_uses": r["max_uses"]} for r in v["rules"]]}
+
+
+def _resolve_manifest(broker, raw):
+    """(a copy of the raw manifest with every rule's `secret` alias replaced by its credential, {alias:
+    canonical}). The plan, its hash and every later match use the canonical names only."""
+    rules = raw.get("rules") if isinstance(raw, dict) else None
+    if not isinstance(rules, list):
+        return raw, {}
+    used, out = {}, []
+    for r in rules:
+        if isinstance(r, dict) and isinstance(r.get("secret"), str):
+            (name,), one = broker.resolve_names([r["secret"]])
+            used.update(one)
+            r = {**r, "secret": name}
+        out.append(r)
+    for alias, canon in used.items():
+        broker.log("alias_used", alias=alias, secret=canon, mode="plan")
+    return {**raw, "rules": out}, used
 
 
 def _named(raw):

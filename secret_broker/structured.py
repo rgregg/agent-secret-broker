@@ -109,3 +109,29 @@ def set_key(text, key, value):
     if not hit:
         raise StructuredError(f"key {key!r} not found in the field")
     return "\n".join(lines) + ("\n" if text.endswith("\n") else "")
+
+
+def drop_key(text, key):
+    """The field text without `key`, everything else as it was. Returns None when no key is left (the caller
+    then removes the whole field). StructuredError if the key is not there."""
+    if is_json(text):
+        try:
+            obj = json.loads(text)
+        except ValueError:
+            raise StructuredError("field is not valid JSON") from None
+        if not isinstance(obj, dict) or key not in obj:
+            raise StructuredError(f"key {key!r} not found in the field")
+        del obj[key]
+        return json.dumps(obj, indent=2) if obj else None
+    lines, kept, hit = text.splitlines(), [], False
+    for line in lines:
+        m = _LINE.match(line)
+        if m and m.group(1) == key:
+            hit = True
+            continue
+        kept.append(line)
+    if not hit:
+        raise StructuredError(f"key {key!r} not found in the field")
+    if not any(_LINE.match(x) for x in kept if x.strip() and not x.lstrip().startswith("#")):
+        return None
+    return "\n".join(kept) + ("\n" if text.endswith("\n") else "")

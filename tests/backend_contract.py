@@ -104,6 +104,7 @@ class BackendContract:
     def test_undeclared_optional_methods_raise_not_supported(self):
         calls = {"create_login": lambda: self.b.create_login("x", "u", "p"),
                  "edit_item": lambda: self.b.edit_item("x", new_name="y"),
+                 "delete_field": lambda: self.b.delete_field("x", "EXTRA"),
                  "warm": lambda: self.b.warm(),
                  "export_items": lambda: self.b.export_items(),
                  "import_items": lambda: self.b.import_items([Item("x", "note", notes="n")])}
@@ -398,6 +399,87 @@ class BackendContract:
     def test_add_field_on_a_missing_item_is_not_found(self):
         with self.assertRaises(BackendNotFound):
             self.b.put("Nope", "EXTRA", "v", add_field=True)
+
+    # == delete_field (optional capability) =============================================
+    def test_delete_field_removes_only_that_custom_field(self):
+        self.need("delete_field")
+        self.b.put("DF", "notes", "first", create=True)
+        self.b.put("DF", "EXTRA", OTHER, add_field=True)
+        self.b.put("DF", "KEEP", "kept-val", add_field=True)
+        self.assertEqual(self.b.get("DF", "EXTRA"), OTHER)            # premise: the field is there
+        self.b.delete_field("DF", "EXTRA")
+        with self.assertRaises(BackendNotFound):
+            self.b.get("DF", "EXTRA")
+        self.assertEqual(self.b.get("DF", "KEEP"), "kept-val")
+        self.assertEqual(self.b.get("DF", "notes"), "first")
+
+    def test_delete_field_is_idempotent_and_needs_the_item(self):
+        self.need("delete_field")
+        self.b.put("DF", "notes", "first", create=True)
+        self.b.delete_field("DF", "NEVER_THERE")                      # a missing field is not an error
+        self.assertEqual(self.b.get("DF", "notes"), "first")
+        with self.assertRaises(BackendNotFound):
+            self.b.delete_field("Nope", "EXTRA")
+
+    def test_delete_field_writes_the_metadata_in_the_same_call(self):
+        self.need("delete_field")
+        self.b.put("DF", "notes", "first", create=True, meta={"vars": {"A": {"field": "notes"}}})
+        self.b.put("DF", "EXTRA", OTHER, add_field=True, meta={"vars": {"A": {"field": "notes"}, "E": {"field": "EXTRA"}}})
+        self.b.delete_field("DF", "EXTRA", meta={"vars": {"A": {"field": "notes"}}})
+        self.assertEqual(self.row("DF")["meta"], {"vars": {"A": {"field": "notes"}}})
+        with self.assertRaises(BackendNotFound):
+            self.b.get("DF", "EXTRA")
+
+    def test_delete_field_on_the_previous_slot_removes_both_names(self):
+        self.need("delete_field")
+        self.b.put("DF", "notes", "first", create=True)
+        self.b.put("DF", "notes", "second", keep_previous=True)
+        self.assertEqual(self.b.get("DF", "previous_value"), "first")  # premise: a previous value exists
+        self.b.delete_field("DF", "previous_value")
+        for f in ("previous_value", "previous_replaced_at"):
+            with self.subTest(f), self.assertRaises(BackendNotFound):
+                self.b.get("DF", f)
+        self.assertEqual(self.b.get("DF", "notes"), "second")
+        self.b.delete_field("DF", "previous_replaced_at")              # nothing there: still fine
+
+    def test_delete_field_clears_a_builtin_value(self):
+        self.need("delete_field")
+        self.b.put("DFL", "password", "pw-val", create=True)
+        self.b.delete_field("DFL", "password")
+        self.assertEqual(self.b.get("DFL", "password"), "")
+        self.b.put("DFN", "notes", "note-val", create=True)
+        self.b.delete_field("DFN", "notes")
+        self.assertEqual(self.b.get("DFN", "notes"), "")
+
+    def test_delete_field_through_the_auto_alias_clears_the_natural_field(self):
+        self.need("delete_field")
+        self.b.put("DFA", "notes", "note-val", create=True)
+        self.b.put("DFA", "KEEP", "kept-val", add_field=True)
+        self.b.delete_field("DFA", "auto")
+        self.assertEqual(self.b.get("DFA", "notes"), "")
+        self.assertEqual(self.b.get("DFA", "KEEP"), "kept-val")
+        self.b.put("DFB", "password", "pw-val", create=True)
+        self.b.delete_field("DFB", None)
+        self.assertEqual(self.b.get("DFB", "password"), "")
+
+    def test_delete_field_refuses_the_metadata_field(self):
+        self.need("delete_field")
+        self.b.put("DF", "notes", "first", create=True, meta={"a": 1})
+        with self.assertRaises(BackendInvalid):
+            self.b.delete_field("DF", "broker")
+        self.assertEqual(self.row("DF")["meta"], {"a": 1})
+
+    def test_delete_field_removes_the_value_from_a_re_opened_backend(self):
+        self.need("delete_field")
+        if not self.persistent:
+            self.skipTest("not persistent")
+        self.b.put("DF", "notes", "first", create=True)
+        self.b.put("DF", "EXTRA", OTHER, add_field=True)
+        self.b.delete_field("DF", "EXTRA")
+        again = self.reopen(self.b)
+        self.addCleanup(again.close)
+        with self.assertRaises(BackendNotFound):
+            again.get("DF", "EXTRA")
 
     def test_replace_login_username(self):
         self.need("create_login")
