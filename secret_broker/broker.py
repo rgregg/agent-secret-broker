@@ -43,6 +43,7 @@ from .backends import BackendError
 from .backends.base import BackendConflict, BackendInvalid, BackendNotFound
 from .backends import base as backend_base
 from . import audit_api
+from . import clientver
 from . import destguard
 from . import errclass
 from . import httpcheck
@@ -909,6 +910,16 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
                                    (self._desc_rules, req.summary_rule)):
                     if key:
                         table[key] = table.get(key, 0) + 1
+
+    def expected_client_version(self):
+        """What clients are told is the newest `asb` they should run: one version string or None (clientver.expected)."""
+        cfg = self.clients.cfg
+        return clientver.expected(cfg.get("min_version"), cfg.get("update_notice", True))
+
+    def with_client_version(self, answer):
+        """`answer` (a client-API reply) plus `latest_client_version` when there is one to tell. The only place it is added."""
+        v = self.expected_client_version()
+        return dict(answer, latest_client_version=v) if v else answer
 
     def status(self):
         """Deploy-verification summary for GET /v1/status. Counts and type names
@@ -6592,8 +6603,8 @@ def client_handler(broker, client_key):
             # a request policy approved is "approved" at once (its release runs on its own thread; see
             # Broker._release_by_policy): the client then collects the result with its poll
             st = "approved" if req.auto and req.status == "deciding" else req.status
-            _json(self, 202, {"id": req.id, "status": st, "error": req.error,
-                              "expires_in": int(req.expires - time.time())})
+            _json(self, 202, broker.with_client_version({"id": req.id, "status": st, "error": req.error,
+                                                         "expires_in": int(req.expires - time.time())}))
 
         def _ws_api(self, path):
             """WebSocket session relay: /v1/ws/send {session, text}, /v1/ws/recv {session, wait, max}. The
@@ -6644,7 +6655,7 @@ def client_handler(broker, client_key):
             if not self._authed():
                 return
             if u.path == "/v1/status":
-                return _json(self, 200, broker.status())
+                return _json(self, 200, broker.with_client_version(broker.status()))
             if planflow.client_request(self, broker, "GET", u.path):
                 return
             if u.path in ("/v1/audit", "/v1/audit/verify"):

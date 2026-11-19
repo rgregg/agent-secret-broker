@@ -155,8 +155,11 @@ def parse_config(cfg):
     min_version = block.get("min_version")
     if "min_version" in block and not (min_version == "none" or clientver.valid(min_version)):
         raise ValueError('clients.min_version must be a version such as "1.1" (digits and dots), or "none"')
+    update_notice = block.get("update_notice", True)
+    if not isinstance(update_notice, bool):
+        raise ValueError("clients.update_notice must be true or false")
     for cid, spec in block.items():
-        if cid == "min_version":
+        if cid in ("min_version", "update_notice"):
             continue
         at = f"clients.{cid}"
         if not (ID_RE.fullmatch(cid) or cid == LEGACY_ID):
@@ -184,7 +187,8 @@ def parse_config(cfg):
             from . import plans as plans_mod        # late: plans.py imports nothing from here
             ov["plans"] = plans_mod.parse_client_override(spec["plans"], f"{at}.plans")
         overrides[cid] = ov
-    return {"legacy": legacy, "enrollment": enr, "overrides": overrides, "min_version": min_version}
+    return {"legacy": legacy, "enrollment": enr, "overrides": overrides, "min_version": min_version,
+            "update_notice": update_notice}
 
 
 # ---------------------------------------------------------------- the store
