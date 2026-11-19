@@ -239,9 +239,25 @@ def check_reply(text):
         raise Refused("too_long") from None
     if not draft:
         raise Refused("empty")
-    return draft, {"length": len(draft), "non_ascii": guidance.non_ascii_count(draft),
-                   "flags": proposals.lint(draft),
-                   "default_high": draft.rstrip().lower().endswith(DEFAULT_LINE)}
+    rev = {"length": len(draft), "non_ascii": guidance.non_ascii_count(draft), "flags": proposals.lint(draft),
+           "default_high": draft.rstrip().lower().endswith(DEFAULT_LINE)}
+    rev["notes"] = review_notes(draft, rev)
+    return draft, rev
+
+
+def review_notes(draft, rev):
+    """The review aids as plain sentences (the proposals review's flagged-phrase and non-ASCII notes, and one
+    for a missing closing default). Fixed wording around code points and phrase labels; never the draft."""
+    notes = []
+    if rev["flags"]:
+        notes.append(f"Flagged: {', '.join(rev['flags'])}. These phrases look like they lower a rating or steer "
+                     "the classifier. Read the whole text.")
+    if rev["non_ascii"]:
+        points = sorted({f"U+{ord(c):04X}" for c in draft if ord(c) > 127})[:8]
+        notes.append(f"Non-ASCII characters: {rev['non_ascii']} ({', '.join(points)})")
+    if not rev["default_high"]:
+        notes.append(f"The draft does not end with \"{DEFAULT_LINE}\". Add it unless you mean otherwise.")
+    return notes
 
 
 # ------------------------------------------------------------ the action (called by Broker.suggest_guidance)

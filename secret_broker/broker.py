@@ -7773,7 +7773,7 @@ def approval_handler(broker):
                 code = {"ok": 200, "failed": 500, "rate_limited": 429}.get(res["status"], 400)
                 if "application/json" in (self.headers.get("Accept") or ""):
                     return self._json(code, {k: res[k] for k in ("draft", "length", "non_ascii", "flags",
-                                                                  "default_high", "model") if k in res}
+                                                                  "default_high", "model", "notes") if k in res}
                                       | ({} if res["status"] == "ok" else {"error": res["message"],
                                                                              "reason": res["reason"]}))
                 note = ("<p>Draft below: not saved. Edit it, then press Save.</p>" if code == 200 else

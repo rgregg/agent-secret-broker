@@ -1,8 +1,10 @@
 """Suggest guidance: the model call, the prompt (structural facts only), the reply checks, the broker action, the
 Policies page and its audit trail."""
 import _fast  # noqa: F401  (test-only: fast server shutdown)
+import html
 import json
 import os
+import re
 import sys
 import unittest
 import unittest.mock
@@ -486,6 +488,85 @@ class Suggest(t.Harness):
             self.assertIn(ev, audit_api.HIDDEN)
             self.assertIsNone(audit_api.redact({"seq": 1, "ts": 1.0, "event": ev, "secret": "svc", "model": "m",
                                                 "reason": "x", "reason_class": "x", "request": "r"}))
+
+
+class SuggestPage(Suggest):
+    """The Risk guidance card, with and without JavaScript."""
+
+    def page(self):
+        return t.req(self.abase + "/credentials/svc?tab=policies", headers={"X-authentik-username": "alice"})
+
+    def card(self, body):
+        m = re.search(r"<details class='card gbox'.*?</details>", body, re.S)
+        self.assertIsNotNone(m)                                  # the premise: the editor's card was found
+        return m.group(0)
+
+    def textarea(self, card):
+        m = re.search(r"<textarea[^>]*>(.*?)</textarea>", card, re.S)
+        self.assertIsNotNone(m)
+        return m.group(1)
+
+    def test_button_is_offered_when_a_model_is_configured(self):
+        status, body = self.page()
+        card = self.card(body)
+        self.assertEqual(status, 200)
+        self.assertRegex(card, r"<button[^>]*formaction='/policies/guidance/suggest'[^>]*data-gsuggest[^>]*>"
+                               r"Suggest guidance</button>")
+        self.assertNotIn("disabled", re.search(r"<button[^>]*data-gsuggest[^>]*>", card).group(0))
+        self.assertEqual(self.textarea(card), "Existing owner text")        # no draft until asked
+        self.assertIn("The model sees", card)                              # the privacy line is on the card
+
+    def test_save_stays_the_first_button_so_enter_never_asks_the_model(self):
+        card = self.card(self.page()[1])
+        buttons = re.findall(r"<button[^>]*>.*?</button>", card)
+        self.assertTrue(buttons[0].endswith("Save</button>"), buttons)
+        self.assertNotIn("formaction", buttons[0])
+
+    def test_button_is_disabled_with_a_fixed_message_without_a_model(self):
+        class NoChat:
+            def analyze(self, *a, **k):
+                return None
+        self.broker.summarizer = NoChat()
+        card = self.card(self.page()[1])
+        self.assertRegex(card, r"<button[^>]*disabled[^>]*data-gsuggest[^>]*>Suggest guidance</button>")
+        self.assertIn(gs.MESSAGES["unavailable"], card)
+
+    def test_page_script_wires_the_button(self):
+        self.assertIn("data-gsuggest", guidance.JS)
+        self.assertIn("application/json", guidance.JS)
+        self.assertNotIn("innerHTML", guidance.JS)             # a reply is only ever set as text
+
+    def test_without_javascript_the_page_comes_back_with_an_unsaved_escaped_draft(self):
+        self.model.text = "<script>alert(1)</script> Reads are always low\nunknown operations: high"
+        code, body = self.post(json_reply=False)
+        self.assertEqual(code, 200)
+        card = self.card(body)
+        self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt; Reads are always low", self.textarea(card))
+        self.assertNotIn("<script>alert(1)", body)
+        self.assertIn("not saved", body.lower())
+        self.assertIn("Flagged: always low", card)
+        self.assertIn("%d / 2000" % (len(self.model.text)), card)
+        self.assertEqual(self.stored()["guidance"], "Existing owner text")
+        self.assertEqual(self.events("guidance_changed"), [])
+
+    def test_without_javascript_a_failure_shows_the_fixed_message_and_keeps_the_text(self):
+        self.model.text = "bad​ " + CANARY
+        code, body = self.post(json_reply=False)
+        self.assertEqual(code, 500)
+        self.assertIn(html.escape(gs.MESSAGES["invalid"]), body)
+        self.assertNotIn(CANARY, body)
+        self.assertEqual(self.textarea(self.card(body)), "Existing owner text")
+
+    def test_review_notes_name_non_ascii_and_a_missing_default_line(self):
+        self.model.text = "Reads: low café"
+        code, got = self.post()
+        self.assertEqual(code, 200)
+        self.assertIn("Non-ASCII characters: 1 (U+00E9)", got["notes"])
+        self.assertTrue(any("unknown operations: high" in n for n in got["notes"]))
+        self.assertFalse(got["default_high"])
+        self.model.text = REPLY
+        self.broker._suggest_times = {}
+        self.assertEqual(self.post()[1]["notes"], [])
 
 
 if __name__ == "__main__":
