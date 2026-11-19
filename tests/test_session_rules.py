@@ -170,6 +170,14 @@ class HttpWithin(unittest.TestCase):
         self.assertIsNotNone(find(raw, "http_session", hmanifest(methods=["GET", "HEAD"])))
         self.assertIsNone(find(raw, "http_session", hmanifest(methods=["GET", "POST"])))
 
+    def test_within_itself_refuses_a_rule_of_the_other_kind(self):
+        h, w = autorules.parse([hs()])[0], autorules.parse([ws()])[0]
+        self.assertIsNotNone(sessionrules.within(h, "http_session", hmanifest()))          # controls
+        self.assertIsNotNone(sessionrules.within(w, "ws_session", wmanifest()))
+        self.assertIsNone(sessionrules.within(h, "ws_session", wmanifest()))
+        self.assertIsNone(sessionrules.within(w, "http_session", hmanifest()))
+        self.assertIsNone(sessionrules.within(h, "http", hmanifest()))
+
     def test_mode_must_match_the_kind(self):
         self.assertIsNone(find(hs(), "ws_session", wmanifest()))
         self.assertIsNone(find(ws(), "http_session", hmanifest()))
@@ -189,6 +197,7 @@ class WsWithin(unittest.TestCase):
             "other host": wmanifest(host="evil.example.com", hosts=["evil.example.com:443"]),
             "other port": wmanifest(port=8443, hosts=["ha.example.com:8443"]),
             "plain ws for a wss rule": wmanifest(scheme="ws", port=80, hosts=["ha.example.com:80"]),
+            "plain ws on the same port number": wmanifest(scheme="ws"),
             "other path": wmanifest(target="/api/other"),
             "sibling prefix": wmanifest(target="/api/websocketx"),
             "parent path": wmanifest(target="/api"),
