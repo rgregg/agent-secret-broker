@@ -241,7 +241,7 @@ JS = r"""
 SUGGEST_NOTE = ("Suggest guidance asks the broker's configured model for a draft. The model sees this credential's "
                 "name, kind, allowed hosts, variable names, the guidance above and a count of its recent requests "
                 "(method, host, path with ids removed, outcome, risk). It never sees values, bodies, headers, query "
-                "strings or anything an agent wrote. The draft is not saved until you press Save.")
+                "strings or any text an agent wrote, except single plain words (letters only) of request paths. The draft is not saved until you press Save.")
 
 
 def _suggest_ui(name, idx, suggest):

@@ -2230,11 +2230,11 @@ The model: `complete(system, user, max_tokens)` on the `openrouter` classifier, 
 No new key or provider.
 
 What is sent: credential name, kind, allowed hosts, variable names, the existing guidance (delimited, defanged), the
-generic rubric and a digest of the newest 200 HTTP rows of that credential: method, host (an allowed host, else
-`other`), path with every segment that is not a short plain word replaced by `{id}` or `{other}` (6 segments at most),
+generic rubric and a digest of the newest 200 requests of that credential (HTTP ones listed): method, host (an allowed host, else
+`other`), path with every segment that is not a plain word (letters only, up to 16) replaced by `{id}` or `{other}` (6 segments at most),
 outcome, risk level and a count, 25 lines at most, in a block marked untrusted. Never sent: values, the vault item or
 field, bodies, headers, query strings, client ids or names, other credentials, summaries, purposes, task text or any
-other text an agent wrote (tests plant canaries in all of them). The reply is checked with `guidance.validate_text`;
+other free text an agent wrote (tests plant canaries in all of them; the path words are the one agent-chosen string sent). The reply is checked with `guidance.validate_text`;
 flagged phrases and non-ASCII characters are reported with the draft.
 
 Audit events (all hidden from the agent API): `guidance_suggested` (`secret`, `user`, `peer`, `client_ip`, `model`,

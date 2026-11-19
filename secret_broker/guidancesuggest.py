@@ -59,7 +59,7 @@ class Refused(Exception):
 
 
 # ------------------------------------------------------------ the digest
-_WORD = re.compile(r"[A-Za-z][A-Za-z_-]{0,19}(?:\.[A-Za-z]{1,5})?\Z")
+_WORD = re.compile(r"[A-Za-z]{1,16}(?:\.[A-Za-z]{1,5})?\Z")
 _VERSION = re.compile(r"v[0-9]{1,2}(?:\.[0-9]{1,2})?\Z")
 _ID_LIKE = re.compile(r"[0-9]")
 
@@ -70,7 +70,7 @@ def _case_changes(seg):
 
 def collapse_path(path):
     """The path of a request with everything an agent or a service could have put in it removed. A segment is
-    kept only when it is a short plain word (letters, `_` and `-`, at most 20, an optional short extension, at
+    kept only when it is a short plain word (letters only, at most 16, an optional short extension, at
     most three lower-to-upper case changes) or a version such as `v1`; a segment with a digit becomes `{id}`
     and any other becomes `{other}`. At most MAX_SEGMENTS segments are kept (then `...`)."""
     segs = [s for s in (path or "").split("/") if s]

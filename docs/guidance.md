@@ -89,19 +89,21 @@ Requirements and limits:
 
 - A chat model must be configured: `summary.type: openrouter` (any prompt), or `jev` with `summary_text: chat`
   (the description model, `summary_model`, writes the draft). Otherwise the button is disabled and says why.
-- The call may take up to 30 seconds (never less than the configured `summary.timeout`).
+- The call may take up to 30 seconds (never less than the configured `summary.timeout`); a provider that rejects
+  the reasoning setting is asked once more, so up to twice that.
 - At most 3 suggestions per credential and 10 in all per 5 minutes (HTTP 429 after that).
 - An SSH key can be asked too, but guidance never affects SSH signing (always high), so the draft says so.
 - The broker's own summary key credential is refused.
 
 **What leaves the broker (exactly).** The model is sent: the credential's name and kind (token, login or SSH key),
 its allowed hosts (`host[:port]`), its variable names, the guidance it already has (yours), the risk rubric from
-[risk.md](risk.md), and a digest of up to the 200 newest HTTP requests made with this credential, at most 25 lines of
-`count x METHOD host path -> outcome, rated level`. In the path every segment that is not a short plain word is
+[risk.md](risk.md), and a digest of up to the 200 newest requests made with this credential (only the HTTP ones are listed), at most 25 lines of
+`count x METHOD host path -> outcome, rated level`. In the path every segment that is not a plain word (letters only, up to 16, or a `v1`-style version) is
 replaced (`{id}` for anything with a digit, `{other}` for the rest) and only 6 segments are kept; a host that is not
 one of the credential's allowed hosts shows as `other`. It is never sent: a credential value (or the vault item and
 field that hold it), request or response bodies, headers, query strings, client ids or names, anything about another
-credential, or any text an agent wrote (summaries, purposes, task text, commands). Agent text could be crafted to bias
+credential, or any free text an agent wrote (summaries, purposes, task text, commands). The one agent-chosen string that
+reaches the model is the request path, reduced to those plain words. Agent text could be crafted to bias
 the draft, so none of it is included. The digest is in its own block marked untrusted, and the reply is treated as
 untrusted too: it goes through the same check as the editor (hidden characters are refused, at most 2000
 characters), and a refused reply is described by a fixed message, never shown or logged.
