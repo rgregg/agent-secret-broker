@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "agent_secret_broker",
+  "project_id": "241cd742-3625-405a-9164-072c0b7186dd"
+}
