@@ -310,6 +310,33 @@ class Remove(Base):
         self.assertEqual(self.events("credential_value_removed"), [])
 
 
+class RemovalPlan(unittest.TestCase):
+    """The pure rule behind Remove: what may leave the vault."""
+
+    def plan(self, vars_, var):
+        from secret_broker import valueremoval
+        return valueremoval.plan(vars_, var)
+
+    def test_the_four_outcomes(self):
+        self.assertEqual(self.plan({"A": {"field": "x"}, "B": {"field": "y"}}, "A"), ("field_deleted", "x"))
+        self.assertEqual(self.plan({"A": {"field": "x"}, "B": {"field": "x"}}, "A"), ("field_kept", "x"))
+        self.assertEqual(self.plan({"A": {"field": "n", "key": "K"}, "B": {"field": "n", "key": "J"}}, "A"),
+                         ("key_dropped", "n"))
+        self.assertEqual(self.plan({"A": {"field": "n", "key": "K"}, "B": {"field": "y"}}, "A"),
+                         ("key_dropped", "n"))
+
+    def test_the_items_natural_slot_has_several_names_and_counts_as_one(self):
+        for other in ("auto", "notes", "password", "private_key", None, {}):
+            with self.subTest(other=other):
+                ref = {} if other in (None, {}) else {"field": other}
+                self.assertEqual(self.plan({"A": {}, "B": ref}, "A")[0], "field_kept")
+        self.assertEqual(self.plan({"A": {}, "B": {"field": "custom"}}, "A")[0], "field_deleted")
+
+    def test_a_reference_that_is_not_an_object_is_read_like_the_loader_reads_it(self):
+        self.assertEqual(self.plan({"A": None, "B": {"field": "x"}}, "A"), ("field_deleted", "auto"))
+        self.assertEqual(self.plan({"A": "junk", "B": None}, "A")[0], "field_kept")
+
+
 class Hidden(unittest.TestCase):
     def test_value_events_are_hidden_from_the_agent_audit_api(self):
         from secret_broker import audit_api

@@ -21,16 +21,16 @@ _NATURAL = frozenset({"auto", "password", "notes", "private_key", ""})
 
 
 def _slot(ref):
-    f = (ref or {}).get("field") or "auto"
+    f = (ref if isinstance(ref, dict) else {}).get("field") or "auto"
     return "<natural>" if f in _NATURAL else f
 
 
 def plan(vars_, var):
     """(outcome, field) for removing `var` from the metadata's `vars` map. `field` is the vault field to act on
     (as written in the variable's reference; `auto` when it names none)."""
-    ref = vars_[var]
-    field = (ref or {}).get("field") or "auto"
-    if (ref or {}).get("key"):
+    ref = vars_[var] if isinstance(vars_[var], dict) else {}      # the loader reads a non-object reference as {}
+    field = ref.get("field") or "auto"
+    if ref.get("key"):
         return KEY_DROPPED, field
     mine = _slot(ref)
     if any(_slot(r) == mine for v, r in vars_.items() if v != var):
