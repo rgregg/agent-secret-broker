@@ -73,6 +73,7 @@ from . import sessions as sessions_mod
 from . import wssessions as ws_mod
 from . import sshhosts as sshhosts_mod
 from . import crededitor as crededitor_mod
+from . import valueremoval as valueremoval_mod
 from . import sshrules as sshrules_mod
 from . import risk as risk_mod
 from . import request_details as details_mod
@@ -1477,6 +1478,8 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
         "last": "A credential needs at least one variable",
         "unsupported": "This vault backend cannot store metadata",
         "internal": "This is the broker's own key and cannot be shown or changed here",
+        "no_delete": "This vault backend cannot delete a single value, so nothing was removed",
+        "confirm_delete": "Confirm that the value is deleted from the vault for good",
     }
 
     def _value_result(self, action, name, user, peer, client_ip, reason="", status=None, **extra):
@@ -1622,8 +1625,11 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
                  peer=peer, client_ip=client_ip)
         return res()
 
-    def remove_value(self, name, var, old_sha, user, peer=None, client_ip=None):
-        """Drop a variable from the metadata. The vault field stays (nothing is destroyed; reversible in the vault)."""
+    def remove_value(self, name, var, old_sha, user, confirm=False, peer=None, client_ip=None):
+        """Remove a variable AND its value from the vault (see valueremoval for exactly what goes). It cannot be
+        undone, so it needs `confirm` and a backend that can delete a field: without that capability it is
+        refused (never done the old, metadata-only way). The vault write carries the new metadata too (one
+        write); the result's `outcome` is key_dropped, field_kept or field_deleted."""
         res = functools.partial(self._value_result, "remove", name, user, peer, client_ip)
         if name not in self.cfg["secrets"]:
             raise ValueError("bad credential")
@@ -1639,21 +1645,44 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
                 return res("unknown_var")
             if len(vars_) == 1:
                 return res("last")
+            if backend_base.CAP_DELETE_FIELD not in self.backend.capabilities:
+                return res("no_delete")
+            if not confirm:
+                return res("confirm_delete")
+            item = self.cfg["secrets"][name]["_item"]
             new_meta = copy.deepcopy(stored)
             del new_meta["vars"][var]
             try:
-                Broker._entry(self.cfg["secrets"][name]["_item"], new_meta)
+                Broker._entry(item, new_meta)
             except ValueError as e:
                 self.log("credential_value_refused", action="remove", reason="invalid", secret=name, user=user,
                          peer=peer, client_ip=client_ip)
                 return {"status": "refused", "reason": "invalid", "message": str(e)[:200]}
+            outcome, field = valueremoval_mod.plan(vars_, var)
+            ref = self.cfg["secrets"][name]["vars"][var]
             try:
-                self.backend.set_meta(self.cfg["secrets"][name]["_item"], new_meta)
+                if outcome == valueremoval_mod.FIELD_KEPT:
+                    self.backend.set_meta(item, new_meta)
+                elif outcome == valueremoval_mod.KEY_DROPPED:
+                    left = structured.drop_key(self.backend.get(item, field), ref["key"])
+                    # the previous copy may hold the whole old field, key included: it goes first, so a failure
+                    # between the two writes leaves the variable listed and the removal can simply be repeated
+                    self.backend.delete_field(item, "previous_value")
+                    if left is None:
+                        self.backend.delete_field(item, field, meta=new_meta)
+                    else:
+                        self.backend.put(item, field, left, create=False, keep_previous=False, meta=new_meta)
+                else:
+                    self.backend.delete_field(item, "previous_value")
+                    self.backend.delete_field(item, field, meta=new_meta)
+            except structured.StructuredError:
+                return res("invalid")
             except (OSError, ValueError, KeyError, BackendError):
                 return res("vault_write")
         self._refresh_if(0)
-        self.log("credential_value_removed", secret=name, var=var, user=user, peer=peer, client_ip=client_ip)
-        return res()
+        self.log("credential_value_removed", secret=name, var=var, outcome=outcome,
+                 previous_dropped=outcome != valueremoval_mod.FIELD_KEPT, user=user, peer=peer, client_ip=client_ip)
+        return res(outcome=outcome)
 
     RESERVED_NAMES = frozenset({"new"})      # routes under /credentials/
 
@@ -7303,8 +7332,10 @@ def approval_handler(broker):
                                        confirm=one("confirm") == "1", **who)
                 flash = f"Value added: {var}"
             else:
-                res = broker.remove_value(name, var, one("old_sha"), user, **who)
-                flash = f"Variable removed: {var}"
+                res = broker.remove_value(name, var, one("old_sha"), user, confirm=one("confirm") == "1", **who)
+                flash = f"Removed from the vault: {var}" + (
+                    " (its vault field is still used by another variable, so the field stays)"
+                    if res.get("outcome") == "field_kept" else "")
             if res["status"] == "ok":
                 return self._credential_edit(user, name, flash=flash)
             code = {"conflict": 409, "failed": 500}.get(res["status"], 429 if res["reason"] == "rate_limited" else 400)

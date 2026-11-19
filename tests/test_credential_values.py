@@ -196,21 +196,117 @@ class Add(Base):
 
 
 class Remove(Base):
-    def test_removes_the_variable_and_keeps_the_field(self):
-        r = self.broker.remove_value("multi", "M_SEC", self.sha("multi"), "alice")
-        self.assertEqual(r["status"], "ok")
-        self.assertEqual(set(self.broker.credential_stored_meta("multi")["vars"]), {"M_ID"})
-        self.assertNotIn("M_SEC", self.broker.cfg["secrets"]["multi"]["vars"])
-        self.assertEqual(json.loads(self.vault("Multi", "notes"))["SECRET"], MULTI_SEC)   # nothing destroyed
-        self.assertEqual([e["var"] for e in self.events("credential_value_removed")], ["M_SEC"])
+    """Removing a variable deletes its value from the vault (it is irreversible, so it needs `confirm`)."""
+
+    def remove(self, name, var, **kw):
+        kw.setdefault("confirm", True)
+        return self.broker.remove_value(name, var, self.sha(name), "alice", **kw)
+
+    def add_extra(self):
+        self.assertEqual(self.broker.add_value("svc", "SVC_EXTRA", EXTRA, self.sha("svc"), "alice",
+                                               confirm=True)["status"], "ok")
+
+    def test_deletes_the_vault_field_and_its_previous_value(self):
+        self.add_extra()
+        self.assertEqual(self.broker.replace_value("svc", "SVC_EXTRA", NEW_VALUE, "alice")["status"], "ok")
+        self.assertEqual(self.vault("Svc", "previous_value"), EXTRA)          # premise: a previous copy exists
+        r = self.remove("svc", "SVC_EXTRA")
+        self.assertEqual((r["status"], r["outcome"]), ("ok", "field_deleted"))
+        for f in ("SVC_EXTRA", "previous_value", "previous_replaced_at"):
+            with self.subTest(f), self.assertRaises(BackendNotFound):
+                self.vault("Svc", f)
+        self.assertEqual(self.vault("Svc", "token"), t.SECRET)                # the other value is untouched
+        self.assertNotIn("SVC_EXTRA", self.stored()["vars"])
+        self.assertNotIn("SVC_EXTRA", self.broker.cfg["secrets"]["svc"]["vars"])
+        raw = json.dumps(self.broker.backend._data["Svc"])
+        self.assertNotIn(EXTRA, raw)
+        self.assertNotIn(NEW_VALUE, raw)
+
+    def test_the_audit_event_names_the_variable_and_never_a_value(self):
+        self.add_extra()
+        self.remove("svc", "SVC_EXTRA")
+        ev = self.events("credential_value_removed")
+        self.assertEqual([(e["secret"], e["var"], e["outcome"], e["previous_dropped"]) for e in ev],
+                         [("svc", "SVC_EXTRA", "field_deleted", True)])
+        self.assert_no_values_in_audit()
+
+    def test_a_keyed_variable_drops_only_its_key_and_the_previous_copy(self):
+        self.assertEqual(self.broker.replace_value("multi", "M_ID", NEW_VALUE, "alice")["status"], "ok")
+        self.assertIn(MULTI_SEC, self.vault("Multi", "previous_value"))        # premise: it holds the whole blob
+        r = self.remove("multi", "M_SEC")
+        self.assertEqual((r["status"], r["outcome"]), ("ok", "key_dropped"))
+        self.assertEqual(json.loads(self.vault("Multi", "notes")), {"ID": NEW_VALUE})
+        with self.assertRaises(BackendNotFound):
+            self.vault("Multi", "previous_value")
+        self.assertNotIn(MULTI_SEC, json.dumps(self.broker.backend._data["Multi"]))
+        self.assertEqual(set(self.stored_of("multi")["vars"]), {"M_ID"})
+
+    def stored_of(self, name):
+        return self.broker.credential_stored_meta(name)
+
+    def test_a_field_another_variable_still_uses_is_kept(self):
+        meta = self.broker.credential_stored_meta("svc")
+        meta["vars"]["SVC_ALIAS"] = {"field": "token"}
+        self.broker.backend.set_meta("Svc", meta)
+        self.broker._refresh_if(0)
+        self.assertEqual(self.broker.replace_value("svc", "SVC_TOKEN", NEW_VALUE, "alice")["status"], "ok")
+        r = self.remove("svc", "SVC_ALIAS")
+        self.assertEqual((r["status"], r["outcome"]), ("ok", "field_kept"))
+        self.assertEqual(self.vault("Svc", "token"), NEW_VALUE)               # still there: SVC_TOKEN uses it
+        self.assertEqual(self.vault("Svc", "previous_value"), t.SECRET)       # untouched: nothing destructive
+        self.assertEqual(set(self.stored()["vars"]), {"SVC_TOKEN"})
+        self.assertFalse(self.events("credential_value_removed")[0]["previous_dropped"])
+
+    def test_a_built_in_field_is_cleared(self):
+        self.broker.backend._data["Svc"]["notes"] = EXTRA
+        meta = self.broker.credential_stored_meta("svc")
+        meta["vars"]["SVC_NOTE"] = {"field": "notes"}
+        self.broker.backend.set_meta("Svc", meta)
+        self.broker._refresh_if(0)
+        self.assertEqual(self.vault("Svc", "notes"), EXTRA)                  # premise
+        r = self.remove("svc", "SVC_NOTE")
+        self.assertEqual((r["status"], r["outcome"]), ("ok", "field_deleted"))
+        self.assertEqual(self.vault("Svc", "notes"), "")
+        self.assertNotIn(EXTRA, json.dumps(self.broker.backend._data["Svc"]))
+
+    def test_without_the_capability_nothing_changes(self):
+        self.add_extra()
+        before_vault, before_meta = json.dumps(self.broker.backend._data["Svc"]), self.stored()
+        with mock.patch.object(type(self.broker.backend), "capabilities",
+                               self.broker.backend.capabilities - {"delete_field"}):
+            r = self.remove("svc", "SVC_EXTRA")
+        self.assertEqual((r["status"], r["reason"]), ("refused", "no_delete"))
+        self.assertEqual(r["message"], self.broker._VALUE_TEXT["no_delete"])
+        self.assertEqual(json.dumps(self.broker.backend._data["Svc"]), before_vault)   # no fallback: nothing written
+        self.assertEqual(self.stored(), before_meta)
+        self.assertEqual(self.events("credential_value_removed"), [])
+        self.assertEqual([e["reason"] for e in self.events("credential_value_refused")], ["no_delete"])
+
+    def test_it_needs_the_confirmation(self):
+        self.add_extra()
+        r = self.remove("svc", "SVC_EXTRA", confirm=False)
+        self.assertEqual((r["status"], r["reason"]), ("refused", "confirm_delete"))
+        self.assertEqual(self.vault("Svc", "SVC_EXTRA"), EXTRA)
+        self.assertIn("SVC_EXTRA", self.stored()["vars"])
+
+    def test_a_vault_failure_changes_nothing_and_leaks_nothing(self):
+        self.add_extra()
+        with mock.patch.object(self.broker.backend, "delete_field", side_effect=BackendError("boom " + EXTRA)):
+            r = self.remove("svc", "SVC_EXTRA")
+        self.assertEqual((r["status"], r["reason"], r["message"]),
+                         ("failed", "vault_write", "Could not save to the vault"))
+        self.assertEqual(self.vault("Svc", "SVC_EXTRA"), EXTRA)
+        self.assertIn("SVC_EXTRA", self.stored()["vars"])
+        self.assertNotIn(EXTRA, self.audit_text())
 
     def test_refusals(self):
-        self.assertEqual(self.broker.remove_value("svc", "SVC_TOKEN", self.sha("svc"), "alice")["reason"], "last")
-        self.assertEqual(self.broker.remove_value("multi", "NOPE", self.sha("multi"), "alice")["reason"],
-                         "unknown_var")
-        self.assertEqual(self.broker.remove_value("multi", "M_ID", "0" * 64, "alice")["reason"], "conflict")
-        self.assertEqual(self.broker.remove_value("sshk", "SSHK_KEY", self.sha("sshk"), "alice")["reason"], "ssh")
+        self.assertEqual(self.remove("svc", "SVC_TOKEN")["reason"], "last")
+        self.assertEqual(self.remove("multi", "NOPE")["reason"], "unknown_var")
+        self.assertEqual(self.broker.remove_value("multi", "M_ID", "0" * 64, "alice", confirm=True)["reason"],
+                         "conflict")
+        self.assertEqual(self.remove("sshk", "SSHK_KEY")["reason"], "ssh")
         self.assertEqual(set(self.broker.credential_stored_meta("multi")["vars"]), {"M_ID", "M_SEC"})
+        self.assertEqual(json.loads(self.vault("Multi", "notes")), {"ID": MULTI_ID, "SECRET": MULTI_SEC})
         self.assertEqual(self.events("credential_value_removed"), [])
 
 
@@ -295,9 +391,16 @@ class Pages(Base):
         self.assertNotIn(EXTRA, body)
         self.assertEqual(self.vault("Svc", "SVC_EXTRA"), EXTRA)
         code, _, body = self.raw_post("/credentials/svc/value/remove", var="SVC_EXTRA", old_sha=self.sha("svc"))
+        self.assertEqual(code, 400)                                      # no confirmation: nothing is deleted
+        self.assertIn(self.broker._VALUE_TEXT["confirm_delete"], body)
+        self.assertEqual(self.vault("Svc", "SVC_EXTRA"), EXTRA)
+        code, _, body = self.raw_post("/credentials/svc/value/remove", var="SVC_EXTRA", old_sha=self.sha("svc"),
+                                      confirm="1")
         self.assertEqual(code, 200)
-        self.assertIn("Variable removed: SVC_EXTRA", body)
+        self.assertIn("Removed from the vault: SVC_EXTRA", body)
         self.assertNotIn("SVC_EXTRA", self.stored()["vars"])
+        with self.assertRaises(BackendNotFound):
+            self.vault("Svc", "SVC_EXTRA")
         code, _, _ = self.raw_post("/credentials/svc/value/remove", var="SVC_TOKEN", old_sha="0" * 64)
         self.assertEqual(code, 409)
 
@@ -359,7 +462,8 @@ class WithASummaryKey(Base):
                                                            confirm=True))
         self.assertEqual(r["status"], "ok")
         self.assertEqual(self.vault("Svc", "SVC_EXTRA"), EXTRA)
-        r = self.run_bounded(lambda: self.broker.remove_value("svc", "SVC_EXTRA", self.sha("svc"), "alice"))
+        r = self.run_bounded(lambda: self.broker.remove_value("svc", "SVC_EXTRA", self.sha("svc"), "alice",
+                                                                            confirm=True))
         self.assertEqual(r["status"], "ok")
         self.assertNotIn("SVC_EXTRA", self.stored()["vars"])
 
@@ -372,7 +476,7 @@ class WithASummaryKey(Base):
         self.assertEqual(self.run_bounded(lambda: self.broker.add_value("multi", "M_X", EXTRA, sha, "alice",
                                                                         confirm=True))["reason"], "internal")
         self.assertEqual(self.run_bounded(lambda: self.broker.remove_value("multi", "M_ID", sha,
-                                                                           "alice"))["reason"], "internal")
+                                                                           "alice", confirm=True))["reason"], "internal")
         self.assertEqual(json.loads(self.vault("Multi", "notes")), {"ID": MULTI_ID, "SECRET": MULTI_SEC})
 
 

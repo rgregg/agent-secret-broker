@@ -433,7 +433,8 @@ class VaultBackend(abc.ABC):
         """["delete_field"] Really remove one field's value from the item, optionally replacing the broker
         metadata (`meta`) in the SAME write. A custom field is removed; a built-in `password`, `username` or
         `notes` is cleared (the item kind needs the slot); `previous_value` / `previous_replaced_at` (either
-        name) remove both rotation-history fields. A field that is not there is not an error (the call can be
+        name) remove both rotation-history fields. `None`, `""` and `"auto"` mean the item's natural secret field
+        (as for `get`). A field that is not there is not an error (the call can be
         repeated); the `broker` field and `private_key` are BackendInvalid; a missing item is BackendNotFound.
         Never falls back to anything weaker: a backend that cannot do this omits the capability."""
         raise NotSupported("this backend cannot delete fields")
@@ -499,8 +500,14 @@ def check_item_args(item, value=_UNSET):
 def check_delete_field_args(item, field):
     """Shared argument checks for `delete_field`: a non-empty item and field name, never `broker` or `private_key`."""
     check_item_args(item)
-    if not isinstance(field, str) or not field:
-        raise BackendInvalid("field name must be a non-empty string")
+    if not isinstance(field, str) and field is not None:
+        raise BackendInvalid("field name must be a string")
+    if field in (META_FIELD, "private_key"):
+        raise BackendInvalid(f"field {field!r} cannot be deleted")
+
+
+def check_resolved_delete_field(field):
+    """BackendInvalid when the field an alias (`auto`) resolved to is one that cannot be deleted."""
     if field in (META_FIELD, "private_key"):
         raise BackendInvalid(f"field {field!r} cannot be deleted")
 

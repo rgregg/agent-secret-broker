@@ -16,7 +16,7 @@ import urllib.request
 from .. import destguard
 
 from .. import sshkey
-from .base import (as_uris, check_delete_field_args, check_new_field, merge_uri_hosts, CAP_ADOPTS, CAP_CREATE_LOGIN, CAP_DELETE_FIELD, CAP_EDIT_ITEM, CAP_EXPORT_ITEMS, CAP_ON_EVENT,
+from .base import (as_uris, check_delete_field_args, check_resolved_delete_field, check_new_field, merge_uri_hosts, CAP_ADOPTS, CAP_CREATE_LOGIN, CAP_DELETE_FIELD, CAP_EDIT_ITEM, CAP_EXPORT_ITEMS, CAP_ON_EVENT,
                    CAP_SET_META, CAP_WARM, LOGIN, META_FIELD, NOTE, RESERVED_FIELDS, SSH_KEY,
                    BackendConfigError, BackendConflict, BackendError, BackendInvalid,
                    BackendNotFound, BackendRateLimited, BackendSpec, BackendUnavailable, Item,
@@ -429,6 +429,9 @@ class BwBackend(VaultBackend):
             if existing is None:
                 raise BackendNotFound(f"item {item!r} not found")
             fields = existing.get("fields") or []
+            if field in (None, "", "auto"):
+                field = self._auto_field(existing)
+            check_resolved_delete_field(field)
             if field in _PREVIOUS:
                 fields = [f for f in fields if f.get("name") not in _PREVIOUS]
             elif field in ("password", "username") and existing.get("login") is not None:

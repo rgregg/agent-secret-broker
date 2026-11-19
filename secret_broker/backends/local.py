@@ -9,7 +9,7 @@ from .base import (AUTO_ALIASES, check_new_field, as_uris, merge_uri_hosts, CAP_
                    CAP_IMPORT_ITEMS, CAP_ON_EVENT, CAP_SET_META, CAP_WARM, LOGIN, META_FIELD, NOTE,
                    PREVIOUS_FIELDS, RESERVED_FIELDS, SSH_KEY, BackendConfigError, BackendConflict,
                    BackendInvalid, BackendNotFound, BackendSpec, Item, VaultBackend, auto_field_for,
-                   auto_shape, check_delete_field_args, check_item_args, clean_meta, lookup_name, now_iso)
+                   auto_shape, check_delete_field_args, check_resolved_delete_field, check_item_args, clean_meta, lookup_name, now_iso)
 from .localstore import LocalStore, key_source_from_config
 
 
@@ -181,15 +181,17 @@ class LocalBackend(VaultBackend):
 
         def apply(items):
             it = items[self._require(items, item)]
-            if field in PREVIOUS_FIELDS:
-                for f in PREVIOUS_FIELDS:
-                    it.pop(f, None)
-            elif field in ("password", "username") and _kind(it) == LOGIN:
-                it[field] = None
-            elif field == "notes":
+            f = auto_field_for(_kind(it)) if field in AUTO_ALIASES else field
+            check_resolved_delete_field(f)
+            if f in PREVIOUS_FIELDS:
+                for pf in PREVIOUS_FIELDS:
+                    it.pop(pf, None)
+            elif f in ("password", "username") and _kind(it) == LOGIN:
+                it[f] = None
+            elif f == "notes":
                 it["notes"] = None
             else:
-                (it.get("fields") or {}).pop(field, None)
+                (it.get("fields") or {}).pop(f, None)
             if meta is not None:
                 it[META_FIELD] = meta
         self._store.mutate(apply)

@@ -6,7 +6,7 @@ import threading
 from .base import (AUTO_ALIASES, check_new_field, as_uris, merge_uri_hosts, CAP_ADOPTS, CAP_CREATE_LOGIN, CAP_DELETE_FIELD, CAP_EDIT_ITEM, CAP_EXPORT_ITEMS,
                    CAP_IMPORT_ITEMS, CAP_SET_META, LOGIN, META_FIELD, NOTE, PREVIOUS_FIELDS,
                    RESERVED_FIELDS, SSH_KEY, BackendConflict, BackendInvalid, BackendNotFound,
-                   Item, VaultBackend, BackendSpec, auto_shape, check_delete_field_args, check_item_args, clean_meta,
+                   Item, VaultBackend, BackendSpec, auto_shape, check_delete_field_args, check_resolved_delete_field, check_item_args, clean_meta,
                    lookup_name, now_iso)
 
 
@@ -136,6 +136,8 @@ class MemoryBackend(VaultBackend):
         with self._lock:
             name = self._find(item)
             it = self._items[name]
+            field = it.auto_field() if field in AUTO_ALIASES else field
+            check_resolved_delete_field(field)
             if field in PREVIOUS_FIELDS:
                 self._prev.pop(name, None)
             elif field in ("password", "username") and it.kind == LOGIN:

@@ -451,6 +451,17 @@ class BackendContract:
         self.b.delete_field("DFN", "notes")
         self.assertEqual(self.b.get("DFN", "notes"), "")
 
+    def test_delete_field_through_the_auto_alias_clears_the_natural_field(self):
+        self.need("delete_field")
+        self.b.put("DFA", "notes", "note-val", create=True)
+        self.b.put("DFA", "KEEP", "kept-val", add_field=True)
+        self.b.delete_field("DFA", "auto")
+        self.assertEqual(self.b.get("DFA", "notes"), "")
+        self.assertEqual(self.b.get("DFA", "KEEP"), "kept-val")
+        self.b.put("DFB", "password", "pw-val", create=True)
+        self.b.delete_field("DFB", None)
+        self.assertEqual(self.b.get("DFB", "password"), "")
+
     def test_delete_field_refuses_the_metadata_field(self):
         self.need("delete_field")
         self.b.put("DF", "notes", "first", create=True, meta={"a": 1})
