@@ -78,8 +78,11 @@ fn due_after(record: &str, now: i64) -> bool {
 /// True, and recorded, when no notice was shown in the last day. False when one was, or when the record cannot be
 /// written (a read-only home would otherwise print it on every call). Never fails.
 fn due(path: &std::path::Path, now: i64) -> bool {
-    if let Ok(text) = std::fs::read_to_string(path) {
-        let head: String = text.chars().take(40).collect();
+    if let Ok(f) = std::fs::File::open(path) {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        let _ = f.take(40).read_to_end(&mut buf);
+        let head = String::from_utf8_lossy(&buf).into_owned();
         if !due_after(&head, now) {
             return false;
         }
@@ -124,7 +127,11 @@ pub fn maybe_notice(answer: &Value) {
     DONE.store(true, Ordering::SeqCst);
     if let Some(path) = state_path() {
         if due(&path, now_s()) {
-            eprintln!("{}", notice_text(expected));
+            {
+                use std::io::Write;
+                let _ = writeln!(std::io::stderr(), "{}", notice_text(expected));
+                // a closed stderr is not an error
+            }
         }
     }
 }

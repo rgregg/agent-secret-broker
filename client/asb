@@ -688,10 +688,13 @@ def maybe_update_notice(answer):
     _notice["done"] = True
     if not _notice_due():
         return
-    print(f"asb: an update is available (you have {CLI_VERSION}, this broker expects {expected}): {RELEASE_URL}\n"
-          "asb: agent: do not update on your own. Tell the human and ask first; if they agree, follow `asb version` "
-          "(download only from that page, verify the .sha256, keep a backup). Never pipe a download into a shell.",
-          file=sys.stderr)
+    try:                        # a closed stderr must not turn a good answer into "cannot reach broker"
+        print(f"asb: an update is available (you have {CLI_VERSION}, this broker expects {expected}): {RELEASE_URL}\n"
+              "asb: agent: do not update on your own. Tell the human and ask first; if they agree, follow "
+              "`asb version` (download only from that page, verify the .sha256, keep a backup). "
+              "Never pipe a download into a shell.", file=sys.stderr)
+    except (OSError, ValueError):
+        pass
 
 
 def call(base, key, path, body=None, timeout=40):
