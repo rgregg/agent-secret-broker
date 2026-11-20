@@ -30,7 +30,8 @@ from . import sudomode
 
 MODE = "exec"
 DEFAULTS = {"enabled": False, "clients": [], "max_concurrent": 4, "max_output_bytes": 262144,
-            "max_seconds": 600, "max_pending_per_client": 3, "readonly": [], "ssh_path": None}
+            "max_seconds": 600, "max_pending_per_client": 3, "readonly": [], "ssh_path": None,
+            "probe_per_client": 30, "probe_overall": 120}
 MAX_COMMAND_CHARS = 4096
 MAX_SCRIPT_BYTES = 32 * 1024
 DEFAULT_TIMEOUT_S = 60
@@ -70,7 +71,8 @@ def parse_config(raw, field="exec"):
         raise ValueError(f"{field}.clients must be a list of client ids such as c-1a2b3c4d")
     out["clients"] = sorted(set(out["clients"]))
     for key, lo, hi in (("max_concurrent", 1, 32), ("max_output_bytes", 1024, 16 * 1024 * 1024),
-                        ("max_seconds", 1, 600), ("max_pending_per_client", 1, 20)):
+                        ("max_seconds", 1, 600), ("max_pending_per_client", 1, 20),
+                        ("probe_per_client", 1, 1000), ("probe_overall", 1, 5000)):
         if not _int(out[key]) or not lo <= out[key] <= hi:
             raise ValueError(f"{field}.{key} must be a whole number from {lo} to {hi}")
     ro = out["readonly"]
@@ -80,7 +82,7 @@ def parse_config(raw, field="exec"):
     out["readonly"] = sorted(set(ro))
     sp = out["ssh_path"]
     if sp is not None and not (isinstance(sp, str) and os.path.isabs(sp) and "\x00" not in sp):
-        raise ValueError(f"{field}.ssh_path must be an absolute directory holding ssh, ssh-agent and ssh-add")
+        raise ValueError(f"{field}.ssh_path must be an absolute directory holding ssh, ssh-agent, ssh-add and ssh-keyscan")
     return out
 
 

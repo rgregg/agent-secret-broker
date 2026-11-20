@@ -376,7 +376,8 @@ class Config(unittest.TestCase):
     def test_defaults(self):
         c = execmode.parse_config(None)
         self.assertEqual(c, {"enabled": False, "clients": [], "max_concurrent": 4, "max_output_bytes": 262144,
-                             "max_seconds": 600, "max_pending_per_client": 3, "readonly": [], "ssh_path": None})
+                             "max_seconds": 600, "max_pending_per_client": 3, "readonly": [], "ssh_path": None,
+                             "probe_per_client": 30, "probe_overall": 120})
         self.assertEqual(execmode.parse_config({}), c)
 
     def test_values(self):
@@ -390,7 +391,8 @@ class Config(unittest.TestCase):
                     {"max_concurrent": 0}, {"max_concurrent": 33}, {"max_concurrent": True},
                     {"max_output_bytes": 10}, {"max_output_bytes": 10 ** 9}, {"max_seconds": 0},
                     {"max_seconds": 601}, {"max_pending_per_client": 0}, {"readonly": "ls"},
-                    {"ssh_path": "relative/dir"}, {"ssh_path": 5}, "x", [], 5):
+                    {"ssh_path": "relative/dir"}, {"ssh_path": 5}, {"probe_per_client": 0}, {"probe_per_client": 1001},
+                    {"probe_overall": 0}, {"probe_overall": True}, "x", [], 5):
             with self.subTest(raw=raw), self.assertRaises(ValueError) as cm:
                 execmode.parse_config(raw)
             self.assertIn("exec", str(cm.exception))
