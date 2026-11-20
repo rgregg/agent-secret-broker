@@ -468,10 +468,8 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
             if (ref0 if isinstance(ref0, dict) else {}).get("field", "auto") not in ("private_key", "auto"):
                 raise ValueError("an ssh key secret's variable must use the private_key field")
         auto_rules = None
-        if meta.get("auto_rules") is not None:
-            if ssh:
-                raise ValueError("auto_rules only applies to a credential that is not an ssh key")
-            auto_rules = autorules_mod.parse_stored(meta["auto_rules"], name)
+        if meta.get("auto_rules") is not None:      # an ssh key holds only `exec` rules, any other credential none of them
+            auto_rules = autorules_mod.parse_stored(meta["auto_rules"], name, ssh=ssh)
         ssh_hosts = None
         if meta.get("ssh_hosts") is not None:
             if not ssh:
@@ -8020,7 +8018,7 @@ def approval_handler(broker):
                     status=400 if res["status"] == "refused" else 500, ssh_rules={"error": res["message"]})
             if path == "/policies/auto_rules/revoke":
                 name, rid = form.get("secret", [""])[0], form.get("rule", [""])[0][:16]
-                if name not in cfg["secrets"] or cfg["secrets"][name].get("ssh"):
+                if name not in cfg["secrets"]:
                     return _page(self, 400, "<h1>Bad request</h1>")
                 res = broker.revoke_auto_rule(name, rid, user, self._ip, self._fwd())
                 if form.get("back", [""])[0] == "clients":
@@ -8031,12 +8029,15 @@ def approval_handler(broker):
                                                  status=500 if res == "failed" else 200)
             if path == "/policies/auto_rules/add":
                 name = form.get("secret", [""])[0]
-                if name not in cfg["secrets"] or cfg["secrets"][name].get("ssh"):
+                if name not in cfg["secrets"]:
                     return _page(self, 400, "<h1>Bad request</h1>")
                 one = lambda k: form.get(k, [""])[0]  # noqa: E731
                 fields = uirules_mod.fields_from_form(form)
-                res = broker.add_auto_rule(name, fields, one("expires"), one("confirm") == "1", user,
-                                           self._ip, self._fwd())
+                try:
+                    res = broker.add_auto_rule(name, fields, one("expires"), one("confirm") == "1", user,
+                                               self._ip, self._fwd())
+                except ValueError:          # an exec rule for a non-ssh credential, or any other kind for an ssh key
+                    return _page(self, 400, "<h1>Bad request</h1>")
                 if res["status"] == "created":
                     return self._credential_policies(user, name,
                                                      f"<p>Auto-approve rule added: {html.escape(name)}</p>")

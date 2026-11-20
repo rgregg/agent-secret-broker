@@ -333,7 +333,7 @@ class Loading(unittest.TestCase):
         meta = tsr.Validation.meta(tsr.Validation(), auto_rules=[http_rule()])
         with self.assertRaises(ValueError) as cm:
             Broker._entry("Item", meta)
-        self.assertIn("auto_rules only applies to a credential that is not an ssh key", str(cm.exception))
+        self.assertIn("auto_rules[0].mode must be one of exec", str(cm.exception))   # an ssh key holds exec rules only
         _, ok = Broker._entry("Item", {**self.META, "auto_rules": [http_rule()]})      # control
         self.assertIn("auto_rules", ok)
 
@@ -774,7 +774,11 @@ class PoliciesTab(ManageBase):
     def test_unknown_and_ssh_credentials_are_400(self):
         for cred in ("nope", "deploy"):
             self.assertEqual(self.post(self.ADD, secret=cred, **self.form())[0], 400, cred)
-            self.assertEqual(self.post(self.REVOKE, secret=cred, rule="abcd1234")[0], 400, cred)
+        self.assertEqual(self.post(self.REVOKE, secret="nope", rule="abcd1234")[0], 400)
+        # an ssh key may now hold exec rules, so revoking an id it does not have is the ordinary "no longer exists"
+        code, body = self.post(self.REVOKE, secret="deploy", rule="abcd1234")
+        self.assertEqual(code, 200)
+        self.assertIn("That rule no longer exists", body)
         self.assertEqual(self.stored(), [])
 
     def test_a_revoke_failure_is_500_and_the_rule_stays_active(self):

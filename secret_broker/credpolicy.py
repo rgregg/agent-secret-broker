@@ -149,6 +149,13 @@ def body(name, sc, ctx):
     parts.append(guidance.card(name, sc, ctx.csrf, open_=True, suggest=(
         None if gs_state is None else {**gs_state, "unavailable": guidancesuggest.MESSAGES["unavailable"]})))
     if sc.get("ssh"):
+        parts.append(f"<style>{uirules.CSS}</style><h3>Remote command rules ({len(sc.get('auto_rules') or [])})</h3>"
+                     "<p><small class=muted>Plain remote commands this key may run through <code>asb exec</code> "
+                     "without asking. Each rule names one server, one account and the first words of the command. "
+                     "Scripts and commands with shell syntax always go through the normal approval. Never shown "
+                     "to agents.</small></p>")
+        parts.append(uirules.card(name, sc, [], ctx.csrf, ctx.usage_auto, None, st.get("auto_rules"),
+                                  ctx.client_names, ctx.client_choices, open_=True))
         parts.append(f"<style>{sshhosts.CSS}{sshrules.CSS}</style><h3>SSH host policy</h3><p><small class=muted>"
                      "Restrict an SSH key to the servers it may log in to. This is never shown to agents."
                      "</small></p>")
