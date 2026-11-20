@@ -476,7 +476,7 @@ tab and newline, and hidden characters, are refused before anything is sent.
 Prints the command's stdout and stderr to the same streams and exits with its exit code. If the broker could
 not run it, prints `asb: exec failed: LABEL` and exits 3; LABEL is one of host_key_mismatch, host_not_pinned,
 connect_failed, auth_failed, timeout, output_cap, ssh_unavailable, internal (any output captured before the
-failure is still printed). Output cut at the broker's cap prints `asb: output was truncated` on stderr.
+failure is still printed). Output cut at the broker's cap prints `asb: output was truncated at the broker's cap` on stderr.
 Other exits: 2 usage, 3 refused (exec not enabled for this client, host not allowed) or broker error, 4 denied,
 5 expired unanswered. A remote exit code can equal one of these; stderr tells them apart. A denial or timeout is
 final: stop and tell the human what you needed.
@@ -3233,10 +3233,10 @@ def exec_wait(payload, timeout_s):
     payload["source"] = f"{os.environ.get('USER', '?')}@{socket.gethostname()}"
     code, r = call(base, key, "/v1/requests", payload)
     if code != 202:
-        die(_srv(r.get("error", f"broker returned {code}")), EXIT_BROKER)
+        die(_srv(r.get("error") or f"broker returned {code}"), EXIT_BROKER)
     rid, first, running = r.get("id"), True, False
     expires = r.get("expires_in")
-    deadline = time.time() + (expires if isinstance(expires, (int, float)) and expires > 0 else 300) + 15
+    deadline = time.monotonic() + (min(expires, 86400) if isinstance(expires, (int, float)) and expires > 0 else 300) + 15
     while True:
         status = r.get("status")
         if status == "released":
@@ -3247,13 +3247,13 @@ def exec_wait(payload, timeout_s):
             die(f"request {status}" + (f": {_srv(r['error'])}" if r.get("error") else ""), status_exit(status))
         if first and status not in ("approved", "running"):     # approved by policy: nobody is being waited for
             print("asb: waiting for approval...", file=sys.stderr)
-        if status == "running" and not running:                 # the human has answered: now the command's own time
-            running, deadline = True, max(deadline, time.time() + timeout_s + 60)
-        if time.time() >= deadline or not isinstance(rid, str):
+        if status in ("approved", "running") and not running:                 # the human has answered: now the command's own time
+            running, deadline = True, max(deadline, time.monotonic() + timeout_s + 60)
+        if time.monotonic() >= deadline or not isinstance(rid, str):
             die("timed out waiting for the command", EXIT_EXPIRED)
         code, r = call(base, key, f"/v1/requests/{rid}?wait=25")
         if code != 200:
-            die(_srv(r.get("error", f"broker returned {code}")), EXIT_BROKER)
+            die(_srv(r.get("error") or f"broker returned {code}"), EXIT_BROKER)
         first = False
 
 

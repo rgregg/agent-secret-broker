@@ -111,6 +111,7 @@ fn wait(mut payload: Map<String, Value>, timeout_s: u64) -> Result<Value, Die> {
         .get("expires_in")
         .and_then(Value::as_f64)
         .filter(|e| *e > 0.0)
+        .map(|e| e.min(86400.0))
         .unwrap_or(300.0);
     let mut deadline = Instant::now() + Duration::from_secs_f64(expires + 15.0);
     let (mut first, mut running) = (true, false);
@@ -134,7 +135,7 @@ fn wait(mut payload: Map<String, Value>, timeout_s: u64) -> Result<Value, Die> {
             // a request the broker approved by policy is not waiting for anyone
             eprintln!("asb: waiting for approval...");
         }
-        if status == "running" && !running {
+        if (status == "running" || status == "approved") && !running {
             // the human has answered: now the command's own time
             running = true;
             deadline = deadline.max(Instant::now() + Duration::from_secs(timeout_s + 60));

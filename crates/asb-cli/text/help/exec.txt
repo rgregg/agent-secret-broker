@@ -18,7 +18,7 @@ tab and newline, and hidden characters, are refused before anything is sent.
 Prints the command's stdout and stderr to the same streams and exits with its exit code. If the broker could
 not run it, prints `asb: exec failed: LABEL` and exits 3; LABEL is one of host_key_mismatch, host_not_pinned,
 connect_failed, auth_failed, timeout, output_cap, ssh_unavailable, internal (any output captured before the
-failure is still printed). Output cut at the broker's cap prints `asb: output was truncated` on stderr.
+failure is still printed). Output cut at the broker's cap prints `asb: output was truncated at the broker's cap` on stderr.
 Other exits: 2 usage, 3 refused (exec not enabled for this client, host not allowed) or broker error, 4 denied,
 5 expired unanswered. A remote exit code can equal one of these; stderr tells them apart. A denial or timeout is
 final: stop and tell the human what you needed.
