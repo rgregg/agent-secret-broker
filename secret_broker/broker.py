@@ -60,6 +60,7 @@ from . import proposals as proposals_mod
 from . import credreq as credreq_mod
 from . import sudomode as sudo_mod
 from . import execmode as exec_mod
+from . import execrun as execrun_mod
 from . import riskmodel as riskmodel_mod
 from . import autorules as autorules_mod
 from . import credlinks as credlinks_mod
@@ -334,7 +335,7 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
         self.proposals_cfg = proposals_mod.parse_config(config.get("guidance_proposals"))
         self.credreq_cfg = credreq_mod.parse_config(config.get("credential_requests"))
         self.sudo_cfg = sudo_mod.parse_config(config.get("sudo"))
-        self.exec_cfg = exec_mod.parse_config(config.get("exec"))
+        self.exec_cfg = exec_mod.parse_config(config.get("exec"))        # (a property: sizes the run slots)
         self.auto_rules = autorules_mod.parse(config.get("auto_approve"))
         # guidance applies: vault writes are serialized and spaced; transient errors are retried.
         # The clock, sleep and jitter are attributes so tests can drive them.
@@ -2268,8 +2269,22 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
             elif req.mode == "env" and req.spec.get("scripts"):
                 rec = {"scripts": details_mod.scripts_view(req.spec["scripts"],
                                                            self.details_cfg["max_script_bytes"])}
+            elif req.mode == "exec":
+                rec = {"exec": exec_mod.details_record(req.spec)}
             else:
                 return
+            self.details.put(req.id, rec)
+        except Exception as e:  # noqa: BLE001 -- retention must never break a request
+            self.log("request_details_store_error", op="retain", error=type(e).__name__)
+
+    def _retain_exec_result(self, req, result):
+        """Add the (masked, clipped) output of a remote command to what the history pop-over keeps for it."""
+        if self.details is None:
+            return
+        try:
+            rec, _ = self.details.get(req.id)
+            rec = rec if isinstance(rec, dict) and "exec" in rec else {"exec": exec_mod.details_record(req.spec)}
+            rec["exec"]["result"] = exec_mod.result_record(result, self.details_cfg["max_script_bytes"] * 2)
             self.details.put(req.id, rec)
         except Exception as e:  # noqa: BLE001 -- retention must never break a request
             self.log("request_details_store_error", op="retain", error=type(e).__name__)
@@ -2857,8 +2872,54 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
         if not sshkey.known_host_lines(raw, spec["host"], spec["port"]):
             raise PermissionError("this key has no pinned host key (known_hosts line) for that host and port")
 
+    @property
+    def exec_cfg(self):
+        return self._exec_cfg
+
+    @exec_cfg.setter
+    def exec_cfg(self, cfg):
+        self._exec_cfg = cfg
+        self._exec_slots = threading.BoundedSemaphore(cfg["max_concurrent"])     # at most this many ssh runs at once
+
+    def _exec_state_dir(self):
+        """Where a run's private directory goes: beside the audit log (the broker's own state directory)."""
+        apath = self._audit._path
+        return os.path.join(os.path.dirname(os.path.abspath(apath)), "exec") if apath else None
+
     def _exec_run(self, req):
-        raise BackendError("remote commands cannot run yet")
+        """Run the approved remote command and return the wire result {"exit_code", "stdout", "stderr",
+        "truncated", "label"}. Runs on the release thread (a human's approval or a policy release, never the
+        thread answering the agent). The key is read from the vault only here, held in memory and handed to
+        ssh-add on a pipe (execrun.py); the pinned host is checked again against the live catalog, since the
+        policy may have changed since the request was made."""
+        name, sp, cfg = req.names[0], req.spec, self.exec_cfg
+        sc = self.cfg["secrets"].get(name)
+        if sc is None or not sc.get("ssh"):
+            raise BackendError(f"{name} is no longer an ssh key in the vault catalog")
+        raw = ((sc.get("_meta") or {}).get("ssh_hosts") or {}).get("known_hosts") or []
+        pinned = (sshkey.known_host_lines(raw, sp["host"], sp["port"])
+                  if sp["host"] in ((sc.get("ssh_hosts") or {}).get("allowed") or []) else [])
+        with self._exec_slots:
+            (var, ref), = sc["vars"].items()
+            pem = self.backend.get(ref["item"], ref.get("field") or "auto")
+            self.audit("secret_read", req, secret=name, vars=[var])
+            try:
+                text = structured.get(pem, ref["key"]) if ref.get("key") else pem
+                if sshkey.public_line(sshkey.load_private(text)) != sc["ssh_public_key"]:
+                    raise BackendError(f"{name}: the vault key no longer matches ssh_public_key")
+            except (sshkey.SshKeyError, structured.StructuredError) as e:
+                raise BackendError(f"{name}: {e}") from None
+            masker = masking.Masker((text,))
+            self.audit("exec_started", req)
+            res = execrun_mod.run(sp, (text if text.endswith("\n") else text + "\n").encode(), pinned, cfg,
+                                  masker.mask, workdir_base=self._exec_state_dir())
+        del text, pem
+        out = {k: res[k] for k in ("exit_code", "stdout", "stderr", "truncated", "label")}
+        self.audit("exec_finished", req, exit_code=res["exit_code"], stdout_bytes=len(res["stdout"].encode()),
+                   stderr_bytes=len(res["stderr"].encode()), truncated=res["truncated"], label=res["label"],
+                   duration_ms=res["duration_ms"])
+        self._retain_exec_result(req, out)
+        return out
 
     def _exec_assess(self, req, notes):
         """The risk of a remote command: LOW with no model call for a plain command on the read-only table
@@ -7120,7 +7181,7 @@ def approval_handler(broker):
         def _retained_html(self, row):
             """Request details kept for a finished request (headers/body for http, script
             text for env), or a short note when they are gone. Read by the approver pages only."""
-            if broker.details is None or not (row["mode"] == "http" or (row["mode"] == "env" and row["scripts"])):
+            if broker.details is None or not (row["mode"] in ("http", "exec") or (row["mode"] == "env" and row["scripts"])):
                 return ""
             days = broker.details_cfg["retention_days"]
             rec, state = broker.details.get(row["id"])
@@ -7128,7 +7189,8 @@ def approval_handler(broker):
                 state = "expired"
             if state == "ok":
                 try:
-                    return (details_mod.html(rec) if row["mode"] == "http"
+                    return (details_mod.html(rec) if row["mode"] == "http" else
+                            exec_mod.retained_html(rec.get("exec")) if row["mode"] == "exec"
                             else scripts_mod.card_html(rec.get("scripts")))
                 except Exception:  # noqa: BLE001 -- a malformed record is just "not available"
                     state = "error"

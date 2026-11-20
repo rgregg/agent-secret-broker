@@ -463,6 +463,45 @@ def model_text(spec, limit=4000):
     return _shown(text)[:limit]
 
 
+def details_record(spec):
+    """What the history pop-over keeps of the request itself (the request-details store, never the audit
+    log): the text as shown, and for a script its full text."""
+    out = {"shown": display_text(spec), "host": spec["host"], "account": spec["user"]}
+    if "script" in spec:
+        out.update(script=spec["script"]["text"], interpreter=spec["script"]["interpreter"])
+    return out
+
+
+def result_record(result, limit):
+    """The outcome for the pop-over: exit status, label, and each stream clipped to `limit` characters."""
+    return {"exit_code": result.get("exit_code"), "label": result.get("label"), "truncated": result.get("truncated"),
+            "stdout": (result.get("stdout") or "")[:limit], "stderr": (result.get("stderr") or "")[:limit]}
+
+
+def retained_html(rec):
+    """The pop-over block for a finished remote command (server-escaped, every non-ASCII character as U+XXXX)."""
+    if not isinstance(rec, dict):
+        return ""
+    e = sudomode._esc
+    parts = ["<details class=reqdetails open><summary>Remote command</summary>"]
+    if rec.get("script") is not None:
+        parts.append(f"<p class=note>{html.escape(str(rec.get('interpreter') or 'sh'))} script</p>"
+                     f"<pre class=reqtext tabindex=0>{e(rec['script'])}</pre>")
+    else:
+        parts.append(f"<pre class=reqtext tabindex=0>{e(str(rec.get('shown') or ''))}</pre>")
+    res = rec.get("result")
+    if isinstance(res, dict):
+        head = (f"Exit status {html.escape(str(res.get('exit_code')))}" if res.get("exit_code") is not None
+                else f"Failed: {html.escape(str(res.get('label')))}")
+        parts.append(f"<p class=note>{head}{' (output cut)' if res.get('truncated') else ''}</p>")
+        for k in ("stdout", "stderr"):
+            if res.get(k):
+                parts.append(f"<p class=note>{k}</p><pre class=reqtext tabindex=0>{e(str(res[k]))}</pre>")
+    parts.append("<p class=note><small>Output is shown as the broker returned it to the agent, with credential "
+                 "values masked.</small></p></details>")
+    return "".join(parts)
+
+
 def describe_html(req):
     """(what_html, note_html) for the card header: host, account, and the exact text that runs (a
     script in full with its hash)."""

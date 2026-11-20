@@ -72,6 +72,51 @@ class Grammar(unittest.TestCase):
             with self.subTest(argv=argv):
                 self.assertEqual(execmode.parse_simple(execmode.rebuild(argv)), argv)
 
+    def test_a_real_shell_reads_the_rebuilt_command_as_exactly_the_parsed_argv(self):
+        """The remote shell must see what the card showed. Every word over a hostile alphabet goes through a real
+        sh: `printf '%s\\0' <rebuilt>` must print back exactly the words that were parsed."""
+        import itertools
+        import shutil
+        import subprocess
+        sh = shutil.which("sh")
+        if sh is None:
+            self.skipTest("no sh on this machine")
+        alphabet = ["a", " ", "'", '"', "\\", "$", "`", ";", "\u00e9", "\n", "-", "~", "*", "#", "=", "!", "(", "&"]
+        words = ["".join(w) for n in (1, 2, 3) for w in itertools.product(alphabet, repeat=n)]
+        self.assertGreater(len(words), 5000)
+        lines, want = [], []
+        for w in words:
+            lines.append("printf '%s\\0' " + execmode.rebuild(["echo", w]))
+            want.append(w)
+        out = subprocess.run([sh], input="\n".join(lines).encode(), capture_output=True, check=True).stdout.decode()
+        got = out.split("\0")[:-1]
+        self.assertEqual(got[0::2], ["echo"] * len(words))      # positive control: every line ran and printed
+        self.assertEqual(got[1::2], want)
+
+    def test_a_real_shell_reads_anything_the_grammar_calls_simple_as_the_parsed_argv(self):
+        """The grammar must be a true subset of shell: for every short text over a hostile alphabet that
+        parse_simple accepts, `printf '%s\\0' <text>` in a real sh prints exactly the parsed words."""
+        import itertools
+        import shutil
+        import subprocess
+        sh = shutil.which("sh")
+        if sh is None:
+            self.skipTest("no sh on this machine")
+        alphabet = ["a", " ", "'", '"', "-", "=", "~", "{", "}", "%", "@", ":", "/", ".", ",", "+", "_", "\u00e9"]
+        texts = []
+        for n in range(1, 5):
+            for w in itertools.product(alphabet, repeat=n):
+                text = "".join(w)
+                argv = execmode.parse_simple(text)
+                if argv is not None:
+                    texts.append((text, argv))
+        self.assertGreater(len(texts), 20000)
+        script = "\n".join("printf '%s\\0' x " + text for text, _ in texts)
+        out = subprocess.run([sh], input=script.encode(), capture_output=True, check=True).stdout.decode()
+        got = out.split("\0")[:-1]
+        want = [w for _, argv in texts for w in ["x"] + argv]
+        self.assertEqual(got, want)
+
     def test_rebuild_quotes_the_dangerous_words(self):
         out = execmode.rebuild(["echo", "a b", "x;y", "$HOME", "plain"])
         self.assertEqual(out, "echo 'a b' 'x;y' '$HOME' plain")
