@@ -111,9 +111,10 @@ class Rig(unittest.TestCase):
         pids = [c["pid"] for c in self.calls("ssh-agent") if "pid" in c]
         deadline = time.monotonic() + 10
         for pid in pids:                                       # SIGTERM is delivered asynchronously: wait for it, bounded
-            while alive(pid) and time.monotonic() < deadline:
+            while os.path.exists(f"/proc/{pid}") and time.monotonic() < deadline:
                 pass
-            self.assertFalse(alive(pid), f"agent {pid} is still running")
+            # gone entirely, not merely dead: the agent is our child and must have been reaped (no zombie)
+            self.assertFalse(os.path.exists(f"/proc/{pid}"), f"agent {pid} is still running or was not reaped")
         return pids
 
 

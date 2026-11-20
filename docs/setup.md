@@ -369,6 +369,25 @@ still ask. You can list, add and revoke these rules on the key's **Policies** pa
 visible to agents, and a rule cannot override `allowed_hosts`. See
 [reference.md](reference.md#standing-per-host-rules-ssh_rules).
 
+## Optional: remote commands over SSH (`asb exec`)
+
+If agents should run commands on your hosts through the broker (instead of `asb ssh-agent`, where every login is a tap),
+turn on the `exec` block and pin each host on the key. The broker image includes the OpenSSH client; it still runs as `nobody`
+and needs a network route to each host.
+
+1. Store the key (`asb store deploy --ssh < ~/.ssh/id_ed25519`) and, in its **Policies** page, set the SSH host policy: the
+   host's name under allowed hosts **and** its `known_hosts` line (`ssh-keyscan -t ed25519 nas.example.com`).
+2. Enable it for the clients that may use it (ids from the Clients tab):
+
+       "exec": {"enabled": true, "clients": ["c-1a2b3c4d"]}
+
+3. Add rules for the commands you want without a tap (the key's Policies page, or `auto_approve` in the configuration), for
+   example host `nas.example.com`, account `ryan`, words `systemctl status`. Everything else asks you on your phone, with the
+   exact command on the card.
+4. Once a host works this way, set the key's **Agent signing** to `ask` or `off` so the path that cannot be vetted is closed.
+
+Details, limits and the audit trail: [reference.md](reference.md#remote-commands-request-mode-exec).
+
 ## Alternative: no vault, the encrypted local store
 
 Skip steps 1 and the vault parts of 2 and 3. The credentials live in one

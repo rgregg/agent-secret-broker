@@ -9,8 +9,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl unzip ca-c
  && echo "${BW_SHA256}  /tmp/bw.zip" | sha256sum -c - \
  && unzip -q /tmp/bw.zip -d /out && chmod 0755 /out/bw
 
-# Stage 2: runtime (Python + the pinned web-push dependencies + the bw binary)
+# Stage 2: runtime (Python + the pinned web-push dependencies + the bw binary + the OpenSSH client programs
+# the broker drives for remote commands: `ssh`, `ssh-agent`, `ssh-add`; it still runs as `nobody`)
 FROM python:3.12-slim
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends openssh-client \
+ && rm -rf /var/lib/apt/lists/*
 COPY --from=bw /out/bw /usr/local/bin/bw
 WORKDIR /app
 COPY requirements.txt .

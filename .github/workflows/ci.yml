@@ -83,6 +83,27 @@ jobs:
           sudo env "PATH=$PATH" ASB_E2E_DISPOSABLE=1 ASB_E2E_HELPER="$PWD/target/release/asb-root-exec"
           "$(which python)" tests/e2e_root_exec/driver.py
 
+  # Remote exec against REAL OpenSSH: the broker, a real unprivileged sshd on loopback and the real ssh, ssh-agent and
+  # ssh-add the broker drives. Needs no root; ASB_E2E_REQUIRE makes a missing OpenSSH program a failure, not a skip.
+  # Locally: tests/e2e_remote_exec/run.sh (a throwaway container) or `python tests/e2e_remote_exec/driver.py`.
+  remote-exec-e2e:
+    name: remote-exec-e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - run: pip install -r requirements.txt
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends openssh-server openssh-client
+      - name: stop the system sshd (the driver starts its own, on a loopback port)
+        run: sudo systemctl stop ssh || true
+      - name: run remote exec end to end
+        run: ASB_E2E_REQUIRE=1 python tests/e2e_remote_exec/driver.py
+
   # Release builds of the `asb` binary, one native build per platform (no cross-compiling: each runner builds and
   # smoke-runs its own binary). Each artifact is a tar.gz with a .sha256 beside it. Windows is not here: the CLI uses
   # Unix sockets, termios and file modes, so it does not build there yet.
@@ -142,7 +163,7 @@ jobs:
   # The single check to require in branch protection: it keeps the name "test" and is green only when
   # every shard and the Rust job are.
   test:
-    needs: [shard, rust, root-e2e, rust-cli-parity]
+    needs: [shard, rust, root-e2e, remote-exec-e2e, rust-cli-parity]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -150,6 +171,7 @@ jobs:
           test "${{ needs.shard.result }}" = "success" || { echo "tests: ${{ needs.shard.result }}"; exit 1; }
           test "${{ needs.rust.result }}" = "success" || { echo "rust: ${{ needs.rust.result }}"; exit 1; }
           test "${{ needs.root-e2e.result }}" = "success" || { echo "root-e2e: ${{ needs.root-e2e.result }}"; exit 1; }
+          test "${{ needs.remote-exec-e2e.result }}" = "success" || { echo "remote-exec-e2e: ${{ needs.remote-exec-e2e.result }}"; exit 1; }
           test "${{ needs.rust-cli-parity.result }}" = "success" || { echo "rust-cli-parity: ${{ needs.rust-cli-parity.result }}"; exit 1; }
 
   # A pushed v* tag publishes the binaries as a GitHub release (archives + checksums + the rendered Homebrew formula).

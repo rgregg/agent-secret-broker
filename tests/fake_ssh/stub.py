@@ -9,7 +9,6 @@ so a test can prove the key travelled only on stdin.
 """
 import json
 import os
-import signal
 import sys
 import time
 
@@ -32,24 +31,11 @@ def log(**kw):
 
 
 def agent(cfg):
+    """`ssh-agent -D -a SOCK`: stay in the foreground, create the socket, print the first line, run until killed."""
     sock = sys.argv[sys.argv.index("-a") + 1]
-    r, w = os.pipe()
-    if os.fork():                                   # parent: report the pid and exit, like the real agent
-        os.close(w)
-        pid = int(os.read(r, 32))
-        log(pid=pid, sock=sock)
-        print(f"SSH_AUTH_SOCK={sock}; export SSH_AUTH_SOCK;\nSSH_AGENT_PID={pid}; export SSH_AGENT_PID;")
-        return 0
-    os.setsid()
-    if os.fork():
-        os._exit(0)
-    null = os.open(os.devnull, os.O_RDWR)           # like the real agent: let go of the caller's pipes
-    for fd in (0, 1, 2):
-        os.dup2(null, fd)
     open(sock, "w").close()                         # "listening"
-    os.write(w, str(os.getpid()).encode())
-    os.close(w)
-    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    log(pid=os.getpid(), sock=sock)
+    print(f"SSH_AUTH_SOCK={sock}; export SSH_AUTH_SOCK;", flush=True)
     while True:
         time.sleep(0.05)
 

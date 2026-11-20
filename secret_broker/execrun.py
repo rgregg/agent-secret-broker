@@ -6,7 +6,7 @@ memory and in a private ssh-agent for the length of the call:
 
   1. a private directory (0700) holds a known_hosts file generated from the key's pinned lines for this host
      only, and the agent's socket;
-  2. `ssh-agent -a SOCK` starts an agent that exists for this call alone; the key goes in with `ssh-add -`
+  2. `ssh-agent -D -a SOCK` starts an agent, as our own child, that exists for this call alone; the key goes in with `ssh-add -`
      on a PIPE (never argv, an environment variable or a file);
   3. `ssh` runs with a FIXED option list. The request supplies exactly three values, each in a slot that can
      only be a value: the login name after `-l`, the port after `-p`, and, after `--`, the host and the
@@ -24,7 +24,6 @@ it with stub binaries and a clock that fires at once.
 import os
 import re
 import shutil
-import signal
 import subprocess
 import tempfile
 import threading
@@ -126,20 +125,38 @@ class _Capped:
 
 
 def _start_agent(agent_bin, sock, env):
-    """Start a private agent that serves only `sock`; returns its pid. `ssh-agent -a SOCK` forks after the
-    socket is ready and the parent exits, printing the pid, so there is nothing to wait for."""
-    out = subprocess.run([agent_bin, "-a", sock, "-s"], env=env, stdin=subprocess.DEVNULL, capture_output=True,
-                         timeout=10, check=True).stdout.decode("ascii", "replace")
-    m = re.search(r"SSH_AGENT_PID=(\d+)", out)
-    if not m:
-        raise RuntimeError("no agent pid")
-    return int(m.group(1))
-
-
-def _stop(pid):
+    """Start a private agent that serves only `sock` and return its Popen. It runs in the foreground (`-D`) as OUR
+    child, so it can be waited for: a daemonized agent would be re-parented to the broker's process (PID 1 in a
+    container) and linger as a zombie after every call. With -D it prints its first line only once the socket
+    is listening, so reading that line is the readiness signal and there is nothing to poll."""
+    proc = subprocess.Popen([agent_bin, "-D", "-a", sock], env=env, stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    watchdog = threading.Timer(10, proc.kill)
+    watchdog.daemon = True
+    watchdog.start()
     try:
-        os.kill(pid, signal.SIGTERM)
-    except (ProcessLookupError, PermissionError):
+        line = proc.stdout.readline()
+    finally:
+        watchdog.cancel()
+    if not line.startswith(b"SSH_AUTH_SOCK="):
+        _stop(proc)
+        raise RuntimeError("the agent did not start")
+    return proc
+
+
+def _stop(proc):
+    """End and reap a child; SIGTERM first, SIGKILL if it does not go."""
+    try:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(5)
+        if proc.stdout is not None:
+            proc.stdout.close()
+    except (OSError, subprocess.SubprocessError):
         pass
 
 
@@ -163,7 +180,7 @@ def run(spec, key_pem, known_hosts_lines, cfg, mask, *, workdir_base=None, popen
     ssh, agent_bin, add_bin = (_binary(cfg, n) for n in ("ssh", "ssh-agent", "ssh-add"))
     if not (ssh and agent_bin and add_bin):
         return done("ssh_unavailable")
-    workdir, agent_pid, proc = None, None, None
+    workdir, agent, proc = None, None, None
     try:
         try:
             base = workdir_base
@@ -179,7 +196,7 @@ def run(spec, key_pem, known_hosts_lines, cfg, mask, *, workdir_base=None, popen
             with os.fdopen(fd, "w") as f:
                 f.write("\n".join(known_hosts_lines) + "\n")
             env = _minimal_env(workdir)
-            agent_pid = _start_agent(agent_bin, sock, env)
+            agent = _start_agent(agent_bin, sock, env)
             add = subprocess.run([add_bin, "-"], input=key_pem, env={**env, "SSH_AUTH_SOCK": sock},
                                  capture_output=True, timeout=10)
             if add.returncode != 0:
@@ -257,7 +274,7 @@ def run(spec, key_pem, known_hosts_lines, cfg, mask, *, workdir_base=None, popen
                         pipe.close()
                 except OSError:
                     pass
-        if agent_pid is not None:
-            _stop(agent_pid)
+        if agent is not None:
+            _stop(agent)
         if workdir:
             shutil.rmtree(workdir, ignore_errors=True)
