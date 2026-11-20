@@ -140,15 +140,41 @@ class Intake(Unpinned):
         self.assertNotIn("S3CR3T", open(self.audit).read() + b)
         self.assertEqual(self.events("exec_probe")[-1]["outcome"], "unreachable")
 
-    def test_a_failing_probe_does_not_block_a_host_the_key_already_pins(self):
-        self.servers.table[("nas.example.com", 22)] = {"label": "timeout"}
-        rid = self.pending()
-        self.assertNotIn("host_state", self.req(rid).spec)           # the ordinary flow, as before the probe existed
-        self.assertEqual(self.events("exec_probe")[-1]["outcome"], "timeout")
-        # but a host that is not pinned and allowed fails
-        self.assertEqual(self.ask(host=NEW)[0], 202)                 # control: the stub serves it
-        self.servers.table[("nas.example.com", 2222)] = {"label": "timeout"}
-        self.assertEqual(self.ask(host="nas.example.com", port=2222)[0], 403)
+    def test_a_probe_failure_looks_the_same_for_a_pinned_and_an_unpinned_host(self):
+        # the agent must not learn from a refusal which hosts the key pins: same status, same body, same code path
+        self.enable(max_pending_per_client=20)
+        for label in ("unreachable", "not_ssh", "timeout", "refused_destination", "rate_limited", "ssh_unavailable"):
+            got = {}
+            for what, host, port in (("pinned", "nas.example.com", 22), ("pinned other port", "port.example.com", 2222),
+                                     ("unpinned", NEW, 22), ("not allowed", "unlisted.example.com", 22),
+                                     ("changed port", "nas.example.com", 2222)):
+                self.servers.table[(host, port)] = {"label": label}
+                code, b = self.ask(host=host, port=port)
+                got[what] = (code, b)
+            self.assertEqual(len(set(got.values())), 1, (label, got))
+            self.assertEqual(next(iter(got.values()))[0], 403)
+        self.assertEqual(self.events("requested"), [])
+        self.assertEqual({e["pinned"] for e in self.events("exec_probe")}, {True, False})   # the audit alone knows
+        self.assertEqual(self.ran, [])
+        self.servers.table[("nas.example.com", 22)] = NAS                                    # control: it works when the probe does
+        self.assertEqual(self.ask()[0], 202)
+
+    def test_the_other_refusals_do_not_depend_on_whether_the_host_is_pinned(self):
+        pair = lambda **kw: {h: self.ask(host=h, **kw) for h in ("nas.example.com", NEW)}   # noqa: E731
+        self.broker.exec_cfg = execmode.parse_config({"enabled": True, "clients": []})
+        refused = pair()
+        self.assertEqual(len(set(refused.values())), 1)
+        self.assertEqual(next(iter(refused.values()))[0], 403)
+        self.enable()
+        bad_key = pair(names=["svc"])
+        self.assertEqual(len(set(bad_key.values())), 1)
+        self.assertEqual(next(iter(bad_key.values()))[0], 400)
+        self.enable(max_pending_per_client=1)
+        self.pending()
+        capped = pair()
+        self.assertEqual(len(set(capped.values())), 1)
+        self.assertEqual(next(iter(capped.values()))[0], 403)
+        self.assertIn("too many pending", next(iter(capped.values()))[1])
 
     def test_the_pending_cap_is_checked_before_any_probe(self):
         self.enable(max_pending_per_client=1)

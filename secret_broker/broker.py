@@ -2924,9 +2924,9 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
     def _exec_host_state(self, names, spec, client):
         """Look at the server (execprobe) and classify the request: pinned (nothing is added to `spec`: the
         ordinary exec flow), or new / same_key_elsewhere / changed (the request carries `host_state` and the
-        presented key and goes only to a human). A probe failure for a host the key already pins and allows is
-        ignored (the run then behaves as it always did and fails closed on its own); for any other host it
-        refuses the request with ONE text whatever the cause, so the agent learns nothing about the network:
+        presented key and goes only to a human). A probe failure refuses the request with ONE text, status and code
+        path whatever the cause AND whether or not the key pins the host (a different answer would tell the agent
+        which hosts are pinned): it learns nothing about the network or the policy:
         the label (unreachable, not_ssh, timeout, refused_destination, rate_limited, ssh_unavailable) goes to the
         audit log only. Runs before the request exists, never under a lock."""
         cid = (client or clients_mod.ClientStore.LEGACY_VIEW)["id"]
@@ -2946,9 +2946,7 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
         if "label" in res:
             self.log("exec_probe", host=host, port=port, outcome=res["label"], pinned=was_pinned, names=names,
                      **self._client_fields(client))
-            if was_pinned:
-                return
-            raise PermissionError(self.PROBE_REFUSED)
+            raise PermissionError(self.PROBE_REFUSED)       # pinned or not: the agent's view must not tell them apart
         cls = execprobe_mod.classify(host, port, [k["fingerprint"] for k in res["keys"]], raw, allowed)
         self.log("exec_probe", host=host, port=port, outcome="ok", state=cls["state"], names=names,
                  **self._client_fields(client))
