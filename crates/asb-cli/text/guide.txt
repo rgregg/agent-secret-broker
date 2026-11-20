@@ -38,8 +38,19 @@ Which command? (decision rule)
   A service that speaks WebSocket (e.g. Home Assistant's /api/websocket)   asb ws NAME URL (see below)
   A program that needs the secret itself (an official CLI, a library)   env mode: asb NAME -- command
   A command that needs root (the helper only runs what its admin allowed)  asb sudo -- command
+  Use for any command you would otherwise ssh for: asb exec NAME HOST -- command (see "Remote commands" below).
+  The broker runs it over SSH and returns the output; plain read-only commands can be approved without a human.
+  Not for an interactive session, scp/rsync/git over ssh or port forwarding (those stay on asb ssh-agent).
   Do not write a script around curl or requests to do an HTTP flow: use a session. The broker keeps
   the cookies and tokens, so the secret and the session never reach you.
+
+Remote commands (asb exec: instead of ssh)
+  asb exec NAME HOST [--user U] -- systemctl status nginx
+  asb exec NAME HOST --script check.sh [--interpreter bash]
+  NAME is an SSH key credential (asb list), HOST a name it is pinned for. The broker connects, runs exactly
+  that text and returns stdout and stderr; the exit code is the remote command's. The human and the risk check
+  see the command first and a plain read-only command can be auto-approved. After -- each word is one quoted
+  argument; for a pipe or redirect use `sh -c '...'` or --script. See `asb help exec` for limits and exit codes.
 
 HTTP sessions (multi-step flows; one human approval for a bounded unit of work)
   asb session open unifi --for "list clients and rename one" --host unifi.local:443 --methods GET,HEAD,POST,PUT

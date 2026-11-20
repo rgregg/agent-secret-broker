@@ -36,12 +36,16 @@ import time
 import urllib.parse
 
 from . import clients as clients_mod
+from . import execmode
+from . import guidance as guidance_mod
 from . import sessionrules
 from . import sshrules
 from . import scripts as scripts_mod
 
-MODES = ("ssh_sign", "http", "env") + sessionrules.MODES
-STORED_MODES = ("http", "env") + sessionrules.MODES          # what a rule kept in a credential's vault metadata may be
+MODES = ("ssh_sign", "http", "env", "exec") + sessionrules.MODES
+STORED_MODES = ("http", "env", "exec") + sessionrules.MODES   # what a rule kept in a credential's vault metadata may be
+# `exec` is the one mode an SSH key's own metadata may hold; every other stored mode belongs to a non-ssh credential
+SSH_STORED_MODES = ("exec",)
 STORED_KEYS = frozenset({"id", "by", "at", "expires_at"})
 MAX_STORED = 50
 HUMAN_ONLY = ("sudo", "credential", "guidance", "plan", "session_close", "store")
@@ -51,6 +55,7 @@ KEYS = {
     "ssh_sign": {"name", "mode", "secret", "secrets", "clients", "host", "host_fp", "account"},
     "http": {"name", "mode", "secret", "secrets", "clients", "scheme", "host", "methods", "path_prefix"},
     "env": {"name", "mode", "secret", "secrets", "clients", "argv"},
+    "exec": {"name", "mode", "secret", "clients", "host", "account", "port", "argv"},
     **{m: sessionrules.COMMON | sessionrules.KEYS[m] for m in sessionrules.MODES},
 }
 _SECRET = re.compile(r"[A-Za-z0-9_.-]{1,64}")
@@ -71,7 +76,7 @@ def _strings(rule, field, where, *, max_n=50, max_len=255, required=False):
     return list(v)
 
 
-def _parse_rule(r, where, *, implicit_secret=None, extra_keys=()):
+def _parse_rule(r, where, *, implicit_secret=None, extra_keys=(), stored_modes=STORED_MODES):
     """Validate one rule object -> a normalized rule. `implicit_secret` is the credential a stored rule belongs
     to (the object then must not name one); without it the rule names its secret(s), as a config rule does."""
     if not isinstance(r, dict):
@@ -82,8 +87,8 @@ def _parse_rule(r, where, *, implicit_secret=None, extra_keys=()):
                          "(a session open request is matched against the rule's limits, never released as it is)")
     if mode in HUMAN_ONLY:
         raise ValueError(f"{where}.mode {mode!r} always needs a human and cannot be auto-approved by a rule")
-    if mode not in MODES or (implicit_secret is not None and mode not in STORED_MODES):
-        allowed = MODES if implicit_secret is None else STORED_MODES
+    if mode not in MODES or (implicit_secret is not None and mode not in stored_modes):
+        allowed = MODES if implicit_secret is None else stored_modes
         raise ValueError(f"{where}.mode must be one of {', '.join(allowed)}")
     allowed_keys = KEYS[mode] | set(extra_keys)
     if implicit_secret is not None:
@@ -139,6 +144,24 @@ def _parse_rule(r, where, *, implicit_secret=None, extra_keys=()):
         rule.update(host=host.lower(), scheme=scheme, methods=frozenset(methods), path_prefix=prefix)
     elif mode in sessionrules.MODES:
         rule.update(sessionrules.parse(mode, r, where))
+    elif mode == "exec":
+        host = r.get("host")
+        if not isinstance(host, str) or not _HOST.fullmatch(host.lower()):
+            raise ValueError(f"{where}.host is required (the server's name, as named in the key's allowed hosts)")
+        acct = r.get("account")
+        if not isinstance(acct, str) or not re.fullmatch(r"[\x21-\x7e]{1,64}", acct) or acct.startswith("-"):
+            raise ValueError(f"{where}.account is required (the login name, e.g. \"ryan\")")
+        argv = r.get("argv")
+        if (not isinstance(argv, list) or not argv or len(argv) > 64 or not argv[0]
+                or not all(isinstance(a, str) and len(a) <= 4096 for a in argv)):
+            raise ValueError(f"{where}.argv is required: the words every matching command starts with")
+        for w in argv:      # the rules table is where "run with no approval" is consented to: no look-alikes or hidden text
+            if not w.isascii() or guidance_mod.hidden_problem(w):
+                raise ValueError(f"{where}.argv words must be plain ASCII text (no hidden or look-alike characters)")
+        port = r.get("port", 22)
+        if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+            raise ValueError(f"{where}.port must be a whole number from 1 to 65535 (default 22)")
+        rule.update(host=host.lower(), account=acct, port=port, argv=tuple(argv))
     else:
         argv = r.get("argv")
         if (not isinstance(argv, list) or not argv or len(argv) > 64
@@ -171,10 +194,10 @@ def parse(raw, field="auto_approve"):
 _STORED_ID = re.compile(r"[A-Za-z0-9_-]{4,16}")
 
 
-def parse_stored(raw, credential, field="auto_rules"):
+def parse_stored(raw, credential, field="auto_rules", ssh=False):
     """Validate the `auto_rules` list kept in a credential's vault metadata -> normalized rules (source "ui").
     The rules belong to `credential`; only http and env rules can be stored. Raises ValueError naming the
-    field (`auto_rules[1].host`)."""
+    field (`auto_rules[1].host`). An ssh key's metadata holds only `exec` rules, and only an ssh key's does."""
     if raw is None:
         return []
     if not isinstance(raw, list):
@@ -182,9 +205,10 @@ def parse_stored(raw, credential, field="auto_rules"):
     if len(raw) > MAX_STORED:
         raise ValueError(f"{field} has more than {MAX_STORED} rules")
     out, names, ids = [], set(), set()
+    modes = SSH_STORED_MODES if ssh else tuple(m for m in STORED_MODES if m not in SSH_STORED_MODES)
     for i, r in enumerate(raw):
         where = f"{field}[{i}]"
-        rule = _parse_rule(r, where, implicit_secret=credential, extra_keys=STORED_KEYS)
+        rule = _parse_rule(r, where, implicit_secret=credential, extra_keys=STORED_KEYS, stored_modes=modes)
         rid = r.get("id")
         if not isinstance(rid, str) or not _STORED_ID.fullmatch(rid):
             raise ValueError(f"{where}.id is required (4-16 letters, digits, '-' or '_')")
@@ -221,6 +245,8 @@ def serialize_stored(rules):
                 d["scheme"] = r["scheme"]
         elif r["mode"] in sessionrules.MODES:
             d.update(sessionrules.serialize(r))
+        elif r["mode"] == "exec":
+            d.update(host=r["host"], account=r["account"], port=r["port"], argv=list(r["argv"]))
         else:
             d["argv"] = list(r["argv"])
         if r["clients"]:
@@ -331,6 +357,17 @@ def _env_ok(rule, spec):
     return not scripts_mod.script_not_visible(argv, spec.get("scripts"), spec.get("cwd"))
 
 
+def _exec_ok(rule, spec):
+    """A remote command matches only when it is a plain command (execmode.parse_simple) on the rule's host and
+    port as the rule's account whose words begin with the rule's words. Never a script and never a command that
+    uses shell syntax: those are compared on nothing a rule can read."""
+    if ("command" not in spec or spec.get("host") != rule["host"] or spec.get("user") != rule["account"]
+            or spec.get("port") != rule["port"]):
+        return False
+    argv = execmode.parse_simple(spec["command"])
+    return argv is not None and tuple(argv[:len(rule["argv"])]) == rule["argv"]
+
+
 def find(rules, mode, names, spec, client, now=None):
     """The first rule that approves this request, or None. `names` are the secrets the request names. A stored
     rule past its expiry never matches, whether or not it has been dropped yet."""
@@ -345,7 +382,7 @@ def find(rules, mode, names, spec, client, now=None):
         if mode in sessionrules.MODES:
             ok = sessionrules.within(rule, mode, spec or {})
         else:
-            ok = {"ssh_sign": _ssh_ok, "http": _http_ok, "env": _env_ok}[mode](rule, spec or {})
+            ok = {"ssh_sign": _ssh_ok, "http": _http_ok, "env": _env_ok, "exec": _exec_ok}[mode](rule, spec or {})
         if ok:
             return rule
     return None

@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import test_clients as tc  # noqa: E402
 import test_client_rules as tcr  # noqa: E402
-from secret_broker import autorules, clients as clients_mod  # noqa: E402
+from secret_broker import autorules, clientver, clients as clients_mod  # noqa: E402
 import test_ssh_rules as sr  # noqa: E402
 from _pagetext import raw_email_shapes, visible  # noqa: E402
 
@@ -254,7 +254,7 @@ class Layout(tc.CBase):
         self.assertNotIn("Upgrade recommended", rows["shared key (legacy)"])               # unknown is never flagged
 
     def test_min_version_config_moves_the_threshold(self):
-        self.raw("GET", "/v1/status", headers={"X-Client-Key": self.ca["secret"], "User-Agent": "asb/1.1"})
+        self.raw("GET", "/v1/status", headers={"X-Client-Key": self.ca["secret"], "User-Agent": f"asb/{clientver.LATEST_CLIENT_VERSION}"})
         self.assertNotIn("Upgrade recommended", rows_of(self.page())["alpha"])
         self.broker.clients.cfg["min_version"] = "1.5"
         self.assertIn("Upgrade recommended", rows_of(self.page())["alpha"])

@@ -18,6 +18,7 @@ import urllib.request
 from . import destguard
 
 from . import guidance as guidance_mod
+from . import execmode as exec_mod
 from . import keyprovider
 from . import scripts as scripts_mod
 from . import sshkey
@@ -65,6 +66,10 @@ def describe(mode, names, spec, max_content_chars=300, send_content=True):
         lines.append(f"operation: sign with an SSH key ({spec['ssh']['text']})")
         for line in sshkey.host_lines(spec.get("host")):
             lines.append(line[0].lower() + line[1:])
+    elif mode == "exec":
+        lines.append(f"operation: run on remote host {spec.get('host')} as {spec.get('user')}")
+        body = exec_mod.model_text(spec, max_content_chars) if send_content else "<not shown>"
+        lines.append(("script (untrusted text): " if "script" in spec else "command: ") + json.dumps(body))
     else:
         cmd = " ".join(spec.get("argv") or [])
         lines.append("command: " + (cmd[:max_content_chars] if send_content else "<not shown>"))

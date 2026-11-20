@@ -267,3 +267,13 @@ Read all of it, and check it against operations you actually use. The model may 
     Anything that changes Wi-Fi names or passwords, DNS, port forwarding, firewall,
     remote administration, router or admin passwords, firmware, factory reset, or
     that uses the login to read the stored Wi-Fi password: high.
+
+## SSH keys used for remote commands (`asb exec`)
+
+    Reading status (systemctl status, docker ps, df, uptime, free, listing a log or config
+    directory, zfs or zpool state): low.
+    Restarting or reloading one named service or container, a script that only reads: medium.
+    Stopping, disabling or removing anything, installing or upgrading packages, changing
+    firewall, user, key, sudo or ssh settings, deleting or overwriting files, disks, reboots,
+    reading secrets (env files, keys, tokens, docker inspect), piping to a shell, downloading
+    and running anything, or a script judged by everything it does: high.

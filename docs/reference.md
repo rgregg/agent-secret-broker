@@ -11,6 +11,7 @@ How the broker works, in detail. For installing and configuring it see
     asb http NAME METHOD URL [-H 'K: V']... [-d BODY | -d @file | -d @-]
     asb http NAME METHOD URL ... --session ID     inside an approved http session (see "HTTP sessions")
     asb NAME[,NAME] -- command args...
+    asb exec NAME HOST [--user U] [--port P] [--timeout S] -- command args...   the broker runs it over SSH (see `docs/cli.md`)
     asb guidance propose FILE|- | --from-dir DIR   propose risk guidance for a human to review
     asb help COMMAND              usage + example for one command
     asb guide                     manual for agents: workflow, {{VAR}}, approvals, exit codes
@@ -1833,7 +1834,7 @@ guess, and the message names the field, such as `auto_approve[2].host`):
 | Field | Modes | Meaning |
 |---|---|---|
 | `name` | all | Required, unique. What the audit log and the history show. |
-| `mode` | all | `ssh_sign`, `http`, `env`, `http_session` or `ws_session` (the last two: [Auto-approving sessions](#auto-approving-sessions-http_session-and-ws_session)). |
+| `mode` | all | `ssh_sign`, `http`, `env`, `exec` ([Remote commands](#remote-commands-request-mode-exec)), `http_session` or `ws_session` (the last two: [Auto-approving sessions](#auto-approving-sessions-http_session-and-ws_session)). |
 | `secret` or `secrets` | all | The credential name(s) the rule covers. A request that names several credentials (`asb a,b -- cmd`, or two placeholders in one call) is matched only by a rule that lists **all** of them; a rule for one of them does not cover the pair. A rule listing `[a, b]` also covers a request for just `a`. |
 | `clients` | all | Optional list of client **ids** (`c-1a2b3c4d`, shown in the Clients tab). Ids only: a name can be reused by another client, an id cannot. Leave it out for any enrolled client. The legacy shared key never matches. |
 | `host` / `host_fp` | ssh_sign | Exactly one. The server: a name the key's `ssh_hosts.known_hosts` gives the server's **verified** host key, or the `SHA256:` fingerprint itself. |
@@ -1843,6 +1844,7 @@ guess, and the message names the field, such as `auto_approve[2].host`):
 | `methods` | http | Upper-case methods, default `["GET", "HEAD"]`. |
 | `path_prefix` | http | Default `/`. Matches that path and what is below it (`/v1` matches `/v1/x`, not `/v10`). Compared on the raw path: a path with any `%` escape, `;`, backslash or `.`/`..` segment never matches. A request with a method-override header (`X-HTTP-Method-Override` and friends) or a `_method=` parameter, or a GET/HEAD with a body, never matches either; the same goes for the path-rewrite headers (`X-Original-URL`, `X-Rewrite-URL`, ...) and a query or body parameter (or JSON key) named `method`, `_method`, `x.method`, `x[method]`, `http_method`, `method_override` or `http_verb` (frameworks read these as the HTTP method; only the name counts, so `payment_method=card` or a value containing the word is fine), and a multipart body. A query or body that needs more than one decoding pass, uses JSON or unicode escapes, or is not plain ASCII, and any `Content-Encoding`/`Transfer-Encoding` header, also never match (the broker cannot show it is free of an override). These are best-effort: no list of tricks is complete, so keep an http rule to the narrowest host, methods and path the job needs (reads where you can). |
 | `argv` | env | The exact command as a list of words. A script whose text the broker could not read never matches. |
+| `host`, `port`, `account`, `argv` | exec | The server (a name from the key's `ssh_hosts.allowed_hosts`), its port (default 22), the login name, and the words every matching command starts with. `secret` only (not `secrets`). Only a plain command matches (never a script or shell syntax). See [Remote commands](#remote-commands-request-mode-exec). |
 
 What a rule will not do:
 
@@ -2554,6 +2556,137 @@ the whole result.
   `{"status": "released"}`; denial and expiry are final, as for every mode.
 - Audit: `requested` carries `argv` (first 50 words, each clipped to 300), `argc`, `cwd`, `target_user`
   and `invoker`; no environment is ever sent or logged. History shows the mode as "root command".
+
+## Remote commands (request mode `exec`)
+
+`asb ssh-agent` signs a login without knowing what the session will do, so every login is a tap and none can be
+auto-approved safely. Remote exec turns that into text the broker can read: the agent asks the broker to run **one
+command or one script** on a host, the broker (which already holds the key) connects, runs exactly that and returns the
+output. The human, the risk model and the auto-approve rules all see the command before anything runs, the same way they
+see an HTTP request, so low-risk commands can be approved by rule. Design: `docs/superpowers/specs/2026-11-19-remote-exec-design.md`.
+
+Not covered (these stay on `asb ssh-agent`, always asking a human): interactive sessions or a TTY, `scp`/`rsync`/`sftp`,
+git over ssh, port or agent forwarding, jump hosts. Output is returned when the command finishes (no streaming).
+
+- Request: `POST /v1/requests`
+
+      {"mode": "exec", "names": ["agent-ssh"], "host": "nas.example.com", "user": "ryan", "port": 22,
+       "command": "systemctl status nginx", "timeout_s": 60, "source": "..."}
+
+  or `"script": {"text": "...", "interpreter": "sh"}` instead of `command` (exactly one; `interpreter` is `sh` or `bash`).
+  `names` is exactly one SSH key credential. Nothing else is accepted (an unknown field is 400): the request cannot choose
+  SSH options, a proxy, a forward, an environment or a key. `command` is at most 4096 characters, `script` at most 32 KiB;
+  control characters other than tab and newline and hidden characters (bidi, zero-width, ...) are refused (400); a command
+  may not start with `-`. `user` is a plain account name (not starting with `-`), `port` defaults to 22, `timeout_s`
+  to 60 (at most `exec.max_seconds`).
+- The host must be **named** in the key's `ssh_hosts.allowed_hosts` (a `SHA256:` fingerprint entry is not enough: the broker
+  needs a name to connect to) **and** have a `known_hosts` line for that name and port (`[host]:2222` for a non-default
+  port). It is lower-cased and compared exactly: a trailing dot, an IP spelled another way (`127.1`) or any other spelling
+  is a different, unpinned host. A refused host is 403 before anything is shown or run (one text for every host refusal; the audit log's
+  `exec_host_refused` has the reason, `not_allowed` or `not_pinned`), and is checked again when the command runs. The connection uses `StrictHostKeyChecking=yes` against only those pinned lines: no trust on first use.
+- Off by default. `"exec": {"enabled": true, "clients": ["c-1a2b3c4d"], "max_concurrent": 4, "max_output_bytes": 262144,
+  "max_seconds": 600, "max_pending_per_client": 3, "readonly": [...], "ssh_path": null}` (validated at startup). Only the
+  listed client ids may ask (others, and the legacy shared key, get 403). `GET /v1/status` shows `features.exec`.
+  `max_concurrent` bounds how many ssh runs go at once (the rest wait for a slot). `ssh_path` is a directory holding
+  `ssh`, `ssh-agent` and `ssh-add` (default: the `PATH`; the container image installs `openssh-client`); tests point it at stubs.
+
+### How a command is rated
+
+1. **Simple command.** The text parses under a deliberately small grammar: words separated by spaces, single quotes
+   literal, double quotes with no `$`, backtick or backslash inside, and none of `; & | < > ( ) $ ` backtick `\` newline
+   `* ? [ ] { } ~ ! #` (or a tab) outside quotes; a leading `NAME=value` is not simple. A backslash, a newline or a `!` in
+   **any** word (even quoted) makes the command not simple too: the login shell on the target is not ours to know, and fish
+   reads a backslash inside single quotes, and csh/tcsh a newline or `!`, differently from POSIX sh. Such a command is never
+   low, never matched by a rule, and is sent byte for byte for the model and the human to judge. The result is an argv.
+2. **Deterministic low.** A simple command whose program (a bare name, or an absolute path in `/bin`, `/usr/bin`, `/sbin`,
+   `/usr/sbin`, `/usr/local/bin`) is on the built-in read-only table, with its subcommand and flags inside that entry's
+   allowed set, is **low** with no model call. Built in: `systemctl status|is-active|is-enabled|is-failed|list-units|
+   list-unit-files|list-timers` (flags: `--no-pager`, `--all`, `--failed`, `--no-legend`, `--type=`, `--state=`, `--lines=N` with N at most 50; never `--full`, `-l` or `-n`, which print untruncated command lines or many journal lines), `docker ps|images|version` (`docker ps` without `--no-trunc`), `df`, `uptime`, `free`, `uname`, `hostname` (no new name),
+   `date` (a `+FORMAT` only, never a time to set), `ls`, `ps` (only `ps`, or `-o`/`-eo` with the columns `pid`, `ppid`, `comm`, `etime`, `stat`, `%cpu`, `%mem`, `user`; never `aux`, `-ef` or a column that prints arguments, which often hold passwords), `ip addr|address|route|link` (show
+   only), `ss`, `zpool list|status`, `zfs list`. Left **off** on purpose, so the model rates them: file readers (`cat`,
+   `head`, `tail`, `grep`), and anything that prints environment, configuration or application output that often holds
+   secrets (`docker inspect`, `docker info`, `docker logs`, `systemctl show`, `journalctl`, `ps` with `e`, `aux`, `-ef` or an arguments column).
+   The owner extends the table with `exec.readonly`: each entry is a program, up to two subcommand words, then **the flags
+   the owner allows** (`"smartctl -a --health"`); any other argument starting with `-` is not low.
+3. **Everything else** (not simple, not on the table, or a script) goes to the risk model with the credential's guidance,
+   exactly as an env or http request does; the model sees the text as untrusted data with obvious secrets
+   (`password=...`, `Bearer ...`, long opaque strings) replaced and non-ASCII shown as `<U+XXXX>`. No verdict means high. A
+   script or a non-simple command is never rated low by the table; only the model can lower it.
+4. **The text that runs is the text that was classified.** A simple command is rebuilt from its parsed argv with shell quoting
+   and that string is what the remote shell receives; a non-simple command is sent byte for byte; a script is sent on stdin
+   to `<interpreter> -s`, byte for byte, with its SHA-256 on the card and in the audit event.
+
+### Approval
+
+The normal policy chain: the client may use the credential, `approval: allow` plus the risk ceiling (for an SSH key this also
+needs `"auto_modes": ["ssh_sign", "exec"]` in the key's metadata, since a key defaults to `["ssh_sign"]`), auto-approve rules,
+otherwise a human. **There are no timed grants and no Always for `exec`** (a grant on the key would allow any command, the
+agent-signing problem again): standing permission is a rule, which is specific. A form post asking for one is refused (400)
+and claims nothing. The card shows host, account, the command shell-quoted with every non-ASCII character as `<U+XXXX>` (or
+the script in full with its hash) and why it was rated as it was; notification buttons follow the usual action policy, and the
+notification carries host, account, a clipped command and a link, never a script body or output.
+
+### Auto-approve rules for `exec`
+
+`{"name", "mode": "exec", "secret", "host", "account", "port": 22, "argv": [...], "clients": [...]}`: it approves a request when the
+command is **simple**, the host, port (default 22) and account are exactly the rule's, the client matches (the legacy key never does), and the rule's `argv`
+is a prefix of the parsed argv (`["systemctl", "status"]` allows `systemctl status nginx`, and also flags that follow: list as
+many words as the command needs to be specific). A script, or a command with shell syntax, never matches; a rule on one key never
+approves another; a rule for port 22 never approves port 2222. They live in the same two places as http rules:
+in the configuration (`auto_approve`, `secret` names one key, `secrets` is not allowed) and, for one key, on its **Policies** page
+(stored in the key's `auto_rules`, with the confirmation tick and an optional expiry; an SSH key holds only `exec` rules).
+A malformed stored rule makes the credential invalid, naming the field. Rule words must be plain ASCII (no hidden or
+look-alike characters). Requests that were approved by a rule count against `max_pending_per_client` until they finish running.
+At start-up the broker ends any ssh-agent a crashed run left behind and removes its directory (`exec/x-*`).
+
+### Running it
+
+On its own thread after approval: the agent polls `GET /v1/requests/<id>?wait=S` and sees `{"status": "running"}`, then once
+`{"status": "released", "exit_code": 0, "stdout": "...", "stderr": "...", "truncated": false, "label": null}` (then
+`{"status": "released"}`). On a broker-side failure `exit_code` is `null` and `label` is one of `host_key_mismatch`,
+`host_not_pinned`, `connect_failed`, `auth_failed`, `timeout`, `output_cap`, `ssh_unavailable`, `internal` (a closed set, never
+exception or `ssh` text). Denial and expiry are final as for every mode.
+
+Per call the broker makes a private directory (0700, `exec/` beside the audit log), writes a `known_hosts` file generated from
+the key's pinned lines for that host only, starts a private `ssh-agent` serving one socket, loads the key with `ssh-add -` from a
+**pipe** (never argv, an environment variable or a file) and runs `ssh` with a fixed option list: `-F /dev/null`,
+`BatchMode=yes`, `StrictHostKeyChecking=yes`, `UserKnownHostsFile=<generated>`, `GlobalKnownHostsFile=/dev/null`,
+`VerifyHostKeyDNS=no`, `CheckHostIP=no`, `UpdateHostKeys=no`, `PreferredAuthentications=publickey`, `ForwardAgent=no`,
+`ForwardX11=no`, `ClearAllForwardings=yes`, `RequestTTY=no`, `ControlMaster=no`, `ControlPath=none`, `ProxyCommand=none`,
+`ProxyJump=none`, `PermitLocalCommand=no`, `ConnectTimeout=10`, `ServerAliveInterval=15`, `IdentityFile=/dev/null` (OpenSSH
+takes `~` from the passwd entry, so without it the broker user's own `~/.ssh` keys would also be offered) and a minimal
+environment (a `PATH` and an empty `HOME`). A command's first word that starts with `-`, and any word starting with `=` or
+`%`, is sent single-quoted. The request supplies only the login name after `-l`, the port after `-p`, and, after `--`, the host
+and the command, so none of them can be read as an option. (`IdentitiesOnly=yes` is deliberately not set: with the private agent
+as the only identity source it stops OpenSSH offering the agent's key.) The agent and the directory are removed in a `finally`.
+Each stream is read with a byte cap (`max_output_bytes`); a stream over the cap kills the run: `output_cap`, `truncated: true`,
+the first `max_output_bytes` kept. The process is killed at `timeout_s` (`timeout`). Output is decoded as UTF-8 with
+replacement and masked with the credential-value masker (the private key, raw and in its encoded and per-line forms).
+When ssh itself fails (exit 255 with its own error text) the run is reported by label and ssh's words are dropped; a remote
+command that exits 255 on its own is returned as exit status 255.
+
+### Closing the agent-signing path: `ssh_agent`
+
+Key metadata `ssh_agent`: `"allow"` (the default: today's behavior), `"ask"` (every `ssh_sign` for the key goes to a human;
+no timed grant, Always, SSH host rule, configuration rule or `approval: allow` is used or offered, and a form post for one is
+refused) or `"off"` (`ssh_sign` for the key is refused, 403, `ssh signing is turned off for this key`, audited as
+`ssh_sign_refused` with `reason: ssh_agent_off`, before any host policy). Set it per key in the credential editor (the Approval
+section of an SSH key) once a host works through `asb exec`; making it more open than before needs the editor's confirmation
+tick. It exists so the exec vetting cannot be walked around; `exec` on the same key is unaffected by either value.
+
+### Audit and history
+
+`requested` carries `host`, `account`, `port`, `timeout_s` and, for a command, `argv` (its first 50 words, each clipped to 300,
+with obvious secrets such as `--password X`, `Authorization: Bearer X` and long opaque strings replaced by `<redacted>`, and
+newlines shown as `<U+000A>`; the same scrub applies to the notification text, while the approval card shows the whole command), or
+for a script only `script_len`, `script_digest` (SHA-256) and `interpreter`. `exec_started` and `exec_finished` (exit code,
+`stdout_bytes`, `stderr_bytes`, `duration_ms`, `truncated`, `label`) are hidden from the agent audit API. Command output is never
+in the audit log and never in a notification. History shows the mode as "remote command"; its pop-over shows the command or the
+full script and the result (clipped, masked) from the short-lived request-details store, as for env scripts.
+
+Tests: `tests/test_execmode.py` (grammar, table, config), `tests/test_exec_intake.py`, `tests/test_exec_rules.py`,
+`tests/test_execrun.py` (against stub `ssh`/`ssh-agent`/`ssh-add` in `tests/fake_ssh/`), `tests/test_ssh_agent_switch.py`, and
+`tests/e2e_remote_exec/` (real OpenSSH and sshd: `run.sh` in a throwaway container, or `driver.py` where OpenSSH is installed).
 
 ## Plans (task-scoped grants for unattended jobs)
 

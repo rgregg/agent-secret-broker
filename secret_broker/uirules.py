@@ -27,7 +27,7 @@ from .backends import BackendError
 from .backends import base as backend_base
 
 REASONS = ("invalid", "not_confirmed", "cap", "backend", "duplicate_name")
-FIELDS = ("name", "mode", "host", "scheme", "methods", "path_prefix", "argv", "clients", "expires_at",
+FIELDS = ("name", "mode", "host", "account", "scheme", "methods", "path_prefix", "argv", "port", "clients", "expires_at",
           "hosts", "port", "allow_query", "max_ttl_s", "max_calls", "max_frames")
 _CATCH = (OSError, ValueError, KeyError, BackendError)
 _FIELD_IN_ERROR = re.compile(r"auto_rules\[0\]\.([a-z_]+)")
@@ -65,7 +65,8 @@ def fields_from_form(form):
     """The `fields` dict `add_auto_rule` takes, from a parsed POST body (`form`: name -> list of str). The one
     place that knows the form's input names; the stored-rule names are used inside."""
     one = lambda k: form.get(k, [""])[0]  # noqa: E731
-    f = dict(name=one("name"), mode=one("mode"), host=one("host"), scheme=one("scheme"),
+    f = dict(name=one("name"), mode=one("mode"), host=one("host"), scheme=one("scheme"), account=one("account"),
+             exec_port=one("xport").strip(),
              methods=form.get("methods", []), path_prefix=one("path_prefix"),
              argv=[w.strip() for w in one("argv").splitlines() if w.strip()],
              client=one("client") or clients_mod.ANY)
@@ -90,6 +91,11 @@ def _raw_rule(fields, rid, by, now, days, client):
                    methods=list(fields.get("methods") or []), path_prefix=fields.get("path_prefix") or "/")
     elif mode == "env":
         raw["argv"] = list(fields.get("argv") or [])
+    elif mode == "exec":
+        raw.update(host=fields.get("host"), account=fields.get("account"), argv=list(fields.get("argv") or []))
+        port = fields.get("exec_port")
+        if port not in (None, ""):             # blank means the default, 22; anything else is validated by the parser
+            raw["port"] = int(port) if isinstance(port, str) and port.isascii() and port.isdigit() and len(port) <= 6 else port
     if client != clients_mod.ANY:
         raw["clients"] = [client]
     raw.update(by=by, at=sshrules.iso(now), expires_at=sshrules.iso(now + days * 86400) if days else None)
@@ -141,7 +147,8 @@ class UiRulesMixin:
         path_prefix, argv (list), client ("*" = any enrolled client, or a client id). Returns {"status":
         created|refused|failed, "message", "rule_id"?}; raises ValueError for an unknown or ssh credential."""
         sc = self.cfg["secrets"].get(name)
-        if not sc or sc.get("ssh"):
+        # an ssh key holds `exec` rules and nothing else; every other credential holds anything but `exec`
+        if not sc or bool(sc.get("ssh")) != (fields.get("mode") == "exec"):
             raise ValueError("bad auto-approve rule change")
         who = dict(credential=name, user=user, peer=peer, client_ip=client_ip, channel="policies")
 
@@ -168,7 +175,8 @@ class UiRulesMixin:
                 rid = secrets.token_hex(4)
             try:
                 [rule] = autorules.parse_stored(
-                    [_raw_rule(fields, rid, str(user)[:120] or "unknown", now, days, client)], name)
+                    [_raw_rule(fields, rid, str(user)[:120] or "unknown", now, days, client)], name,
+                    ssh=bool(sc.get("ssh")))
             except ValueError as e:
                 m = _FIELD_IN_ERROR.match(str(e))
                 return refused("invalid", _invalid(m.group(1) if m else None))
@@ -189,7 +197,9 @@ class UiRulesMixin:
             except _CATCH as e:
                 self.log("auto_rule_change_failed", op="create", error_class=backend_base.error_class(e), **who)
                 return {"status": "failed", "message": "Could not save the rule."}
-        extra = {"rule_host": rule["host"]} if rule["mode"] == "http" else {}
+        extra = {"rule_host": rule["host"]} if rule["mode"] in ("http", "exec") else {}
+        if rule["mode"] == "exec":
+            extra.update(account=rule["account"], rule_port=rule["port"])
         if rule["mode"] in sessionrules.MODES:
             extra = {"rule_hosts": list(rule["hosts"]) if rule["mode"] == "http_session"
                      else [f"{rule['host']}:{rule['port']}"],
@@ -202,7 +212,7 @@ class UiRulesMixin:
     def revoke_auto_rule(self, name, rule_id, user, peer=None, client_ip=None):
         """Remove a rule. Returns "revoked", "missing" or "failed"."""
         sc = self.cfg["secrets"].get(name)
-        if not sc or sc.get("ssh"):
+        if not sc:
             return "missing"
         with self._cfg_lock:
             rules = list(self.cfg["secrets"][name].get("auto_rules") or [])
@@ -277,6 +287,8 @@ def _matches(rule):
         return f"sign in as {rule['account']} on {rule['host'] or rule['host_fp']}"
     if rule["mode"] == "env":
         return "run: " + " ".join(rule["argv"])
+    if rule["mode"] == "exec":
+        return f"run on {rule['host']}:{rule['port']} as {rule['account']}: " + " ".join(rule["argv"]) + " ..."
     return f"{rule['scheme']}://{rule['host']}{rule['path_prefix']} ({', '.join(sorted(rule['methods']))})"
 
 
@@ -318,8 +330,7 @@ def card(name, sc, config_rules, csrf, usage, now=None, state=None, client_names
     """The auto-approve rules table and 'Add rule' form for one credential ("" for an SSH key). `config_rules`
     are the config rules that name this credential; `state` is {"error", "open"} for a re-render; `idx` keeps
     the element ids unique; `open_` renders it expanded."""
-    if sc.get("ssh"):
-        return ""
+    ssh = bool(sc.get("ssh"))
     e = html.escape
     now = time.time() if now is None else now
     st = dict(state or {})
@@ -330,7 +341,7 @@ def card(name, sc, config_rules, csrf, usage, now=None, state=None, client_names
     choices = [(cid, nm) for cid, nm in client_choices if cid != clients_mod.LEGACY_ID]
     i = idx
     stored = sc.get("auto_rules") or []     # every credential gets a card: an env-only one has no hosts
-    cfg_rules = config_rules
+    cfg_rules = [] if ssh else config_rules      # an ssh key's page shows its config rules in their own table
     rows = [_config_row(r, names, active) for r in cfg_rules]
     for r in stored:
         u = usage.get(name, r["id"])
@@ -354,6 +365,35 @@ def card(name, sc, config_rules, csrf, usage, now=None, state=None, client_names
              "<th>Source</th><th>Created</th><th>Expires</th><th>Last used</th><th></th></tr></thead><tbody>"
              + "".join(rows) + "</tbody></table>") if rows else "<div class='card empty'>No rules</div>"
     err = f"<div class=err role=alert>{e(st['error'])}</div>" if st.get("error") else ""
+    opts = "<option value='*' selected>Any enrolled client</option>" + "".join(
+        f"<option value='{e(cid, quote=True)}'>Only {e(cn)}</option>" for cid, cn in choices)
+    if ssh:
+        return (
+            f"<details class='card gbox arules'{' open' if st.get('open') else ''}><summary><b>{e(name)}</b> "
+            f"<small class=muted>{len(stored)} of {autorules.MAX_STORED} stored</small></summary>{err}{table}"
+            "<form method=post action='/policies/auto_rules/add' class=add>"
+            f"<input type=hidden name=csrf value='{e(csrf, quote=True)}'>"
+            f"<input type=hidden name=secret value='{e(name, quote=True)}'>"
+            "<input type=hidden name=mode value=exec>"
+            f"<b>Add rule for remote commands</b><label for='arn{i}'>Name (shown in the audit log)</label>"
+            f"<input id='arn{i}' name=name maxlength={autorules.MAX_NAME} autocomplete=off>"
+            f"<label for='arh{i}'>Server (a name from this key's allowed hosts)</label>"
+            f"<input id='arh{i}' name=host autocomplete=off placeholder='nas.example.com'>"
+            f"<label for='arxp{i}'>Port (blank: 22)</label><input id='arxp{i}' name=xport inputmode=numeric "
+            "autocomplete=off placeholder='22'>"
+            f"<label for='arac{i}'>Account</label><input id='arac{i}' name=account autocomplete=off placeholder='ryan'>"
+            f"<label for='ara{i}'>The command starts with these words, one per line</label>"
+            f"<textarea id='ara{i}' name=argv rows=3 autocomplete=off placeholder='systemctl&#10;status'></textarea>"
+            "<small class=muted>A plain command (no shell syntax, never a script) whose first words are these, "
+            "on that server as that account, is run without asking, whatever comes after the words (flags and "
+            "arguments included): list as many words as the command needs to be specific.</small>"
+            f"<label for='arc{i}'>Applies to</label><select id='arc{i}' name=client>{opts}</select>"
+            f"<label for='are{i}'>Expires</label><select id='are{i}' name=expires>"
+            "<option value=never selected>Never expires (default)</option><option value=30>30 days</option>"
+            "<option value=90>90 days</option></select>"
+            "<label class=chk><input type=checkbox name=confirm value=1> <span>I understand matching commands "
+            "will run with no approval, at any risk level</span></label>"
+            "<div class=grow><button>Add rule</button></div></form></details>")
     meth = "".join(f"<label><input type=checkbox name=methods value='{m}'"
                    f"{' checked' if m in ('GET', 'HEAD') else ''}> {m}</label>" for m in METHODS)
     smeth = "".join(f"<label><input type=checkbox name=smethods value='{m}'"

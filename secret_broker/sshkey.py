@@ -298,6 +298,34 @@ def parse_known_hosts(lines):
     return out
 
 
+def known_host_lines(lines, host, port=22):
+    """The plain known_hosts lines that pin `host` (lower case, exactly as spelled) on `port`, rewritten
+    to the one name OpenSSH will look up (`host`, or `[host]:port`): [`name keytype base64`, ...].
+    Same reading as parse_known_hosts (hashed names, wildcards, negations, @markers and bad lines are
+    ignored), so the lines an exec connection trusts are the lines the pin check counted."""
+    want = host if port == 22 else f"{host}:{port}"
+    out = []
+    for line in lines:
+        f = str(line).split()
+        if len(f) < 3 or f[0].startswith(("#", "@", "|")) or f[1] not in _HOSTKEY_TYPES:
+            continue
+        try:
+            blob = base64.b64decode(f[2], validate=True)
+        except ValueError:
+            continue
+        if _blob_type(blob) != f[1]:
+            continue
+        for n in f[0].split(","):
+            n = n.strip().lower()
+            if n.startswith("[") and "]:" in n:
+                h, _, p = n[1:].partition("]:")
+                n = h if p == "22" else f"{h}:{p}"
+            if n == want:
+                out.append(f"{want if port == 22 else f'[{host}]:{port}'} {f[1]} {f[2]}")
+                break
+    return list(dict.fromkeys(out))[:20]
+
+
 def _hop(h):
     out = f"{h['fp']} ({h['type']})"
     if h.get("names"):

@@ -358,7 +358,7 @@ class SshRulesMixin:
         if req.mode != "ssh_sign" or len(req.names) != 1:
             return False, "not_eligible"
         sc = self.cfg["secrets"].get(req.names[0])
-        if not sc or not sc.get("ssh"):
+        if not sc or not sc.get("ssh") or sc.get("ssh_agent") == "ask":
             return False, "not_eligible"
         fp, _account, why = identity(req.spec)
         if why:
