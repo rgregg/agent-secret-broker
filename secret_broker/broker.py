@@ -60,6 +60,7 @@ from . import proposals as proposals_mod
 from . import credreq as credreq_mod
 from . import sudomode as sudo_mod
 from . import execmode as exec_mod
+from . import execprobe as execprobe_mod
 from . import execrun as execrun_mod
 from . import riskmodel as riskmodel_mod
 from . import autorules as autorules_mod
@@ -2882,7 +2883,7 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
         if not sc.get("ssh"):
             raise ValueError("a remote command needs an ssh key credential")
         raw = ((sc.get("_meta") or {}).get("ssh_hosts") or {}).get("known_hosts") or []
-        why = ("not_allowed" if spec["host"] not in ((sc.get("ssh_hosts") or {}).get("allowed") or []) else
+        why = ("not_allowed" if not execprobe_mod.host_allowed((sc.get("ssh_hosts") or {}).get("allowed"), spec["host"]) else
                "not_pinned" if not sshkey.known_host_lines(raw, spec["host"], spec["port"]) else None)
         if why:      # one text for both: the key's host policy is never shown to an agent; the audit log has the reason
             self.log("exec_host_refused", reason=why, names=names, port=spec["port"])
@@ -2914,7 +2915,7 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
             raise BackendError(f"{name} is no longer an ssh key in the vault catalog")
         raw = ((sc.get("_meta") or {}).get("ssh_hosts") or {}).get("known_hosts") or []
         pinned = (sshkey.known_host_lines(raw, sp["host"], sp["port"])
-                  if sp["host"] in ((sc.get("ssh_hosts") or {}).get("allowed") or []) else [])
+                  if execprobe_mod.host_allowed((sc.get("ssh_hosts") or {}).get("allowed"), sp["host"]) else [])
         with self._exec_slots:
             (var, ref), = sc["vars"].items()
             pem = self.backend.get(ref["item"], ref.get("field") or "auto")

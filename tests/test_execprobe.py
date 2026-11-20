@@ -378,6 +378,83 @@ class Cache(Rig):
         self.assertEqual(len(self.connected), 3)                        # the limited call connected to nothing
 
 
+class Flights(Cache):
+    def test_rate_limited_and_failing_probes_leave_no_flight_behind(self):
+        cfg = execmode.parse_config({"enabled": True, "ssh_path": self.dir, "probe_per_client": 1})
+        p = execprobe.Prober(self.guard, lambda: cfg, clock=lambda: self.now[0])
+        self.assertNotIn("label", p.probe("nas.example.com", 22, "c-1"))
+        for i in range(300):                                         # an agent asking about many distinct pairs
+            self.resolved[f"h{i}.example.com"] = [PUBLIC]
+            self.assertEqual(p.probe(f"h{i}.example.com", 22, "c-1"), {"label": "rate_limited"})
+        self.assertEqual(len(self.connected), 1)                     # premise: the limiter, not the cache, answered
+        self.assertEqual(p._flights, {})
+        # failures (the server is not SSH) and an exception inside the probe leave nothing either
+        self.sock_kw = {"banner": b"nope\n"}
+        cfg2 = execmode.parse_config({"enabled": True, "ssh_path": self.dir})
+        q = execprobe.Prober(self.guard, lambda: cfg2, clock=lambda: self.now[0])
+        self.assertEqual(q.probe("nas.example.com", 22, "c-9"), {"label": "not_ssh"})
+        self.assertEqual(q._flights, {})
+        q.limiter.allow = lambda cid: 1 / 0
+        with self.assertRaises(ZeroDivisionError):
+            q.probe("h1.example.com", 22, "c-9")
+        self.assertEqual(q._flights, {})
+
+    def test_the_flight_map_is_bounded_while_probes_are_in_progress(self):
+        gate, results = threading.Event(), []
+        base = self.connector
+        self.guard._connector = lambda addr, timeout=None, **kw: (gate.wait(10), base(addr, timeout))[1]
+        n = execprobe.MAX_FLIGHTS + 20
+        cfg = execmode.parse_config({"enabled": True, "ssh_path": self.dir, "probe_per_client": 1000,
+                                     "probe_overall": 5000})
+        p = execprobe.Prober(self.guard, lambda: cfg, clock=lambda: self.now[0])
+        for i in range(n):
+            self.resolved[f"h{i}.example.com"] = [PUBLIC]
+        ts = [threading.Thread(target=lambda i=i: results.append(p.probe(f"h{i}.example.com", 22, "c-1"))) for i in range(n)]
+        for t in ts:
+            t.start()
+        for _ in range(500):
+            with p._lock:
+                if len(p._flights) >= execprobe.MAX_FLIGHTS:
+                    break
+            threading.Event().wait(0.01)
+        with p._lock:
+            self.assertEqual(len(p._flights), execprobe.MAX_FLIGHTS)
+        gate.set()
+        for t in ts:
+            t.join(20)
+        self.assertEqual(len(results), n)
+        self.assertEqual(sum(r == {"label": "rate_limited"} for r in results), 20)
+        self.assertEqual(p._flights, {})
+
+
+class AllowedGate(unittest.TestCase):
+    """classify, the intake check and the run all use execprobe.host_allowed: one rule."""
+    CASES = [("nas", ["nas"], True), ("nas", ["nas:2222"], False), ("nas", ["NAS"], False), ("nas", ["nas."], False),
+             ("127.0.0.1", ["127.0.0.1"], True), ("127.0.0.1", ["127.0.0.1:22"], False), ("nas", [], False),
+             ("nas", None, False), ("nas", ["SHA256:" + "A" * 43], False), ("nas", ["other", "nas"], True)]
+
+    def test_classify_agrees_with_the_gate_for_every_spelling(self):
+        k = key_of("ed")
+        for host, allowed, want in self.CASES:
+            with self.subTest(host=host, allowed=allowed):
+                self.assertEqual(execprobe.host_allowed(allowed, host), want)
+                got = execprobe.classify(host, 22, [k["fp"]], [line(host, k)], allowed)
+                self.assertEqual(got["state"], "pinned" if want else "new")
+
+    def test_the_catalog_loader_lowercases_entries_so_both_sides_see_the_same_names(self):
+        from secret_broker.broker import Broker
+        got = Broker._ssh_hosts({"allowed_hosts": ["NAS", "Nas.Example.com:2222"]})["allowed"]
+        self.assertEqual(got, ["nas", "nas.example.com:2222"])
+        self.assertTrue(execprobe.host_allowed(got, "nas"))
+        self.assertFalse(execprobe.host_allowed(got, "nas.example.com"))
+
+    def test_the_broker_has_no_second_copy_of_the_rule(self):
+        src = open(os.path.join(os.path.dirname(__file__), "..", "secret_broker", "broker.py")).read()
+        self.assertGreater(src.count("execprobe_mod.host_allowed("), 1)      # premise: the scan is looking at real uses
+        self.assertNotIn('host"] in ((sc.get("ssh_hosts")', src)
+        self.assertNotIn('host"] not in ((sc.get("ssh_hosts")', src)
+
+
 class Limits(unittest.TestCase):
     def test_per_client_and_overall_limits_with_a_sliding_window(self):
         now = [0.0]

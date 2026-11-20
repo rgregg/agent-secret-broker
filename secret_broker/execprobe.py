@@ -41,6 +41,7 @@ KEYSCAN_TIMEOUT_S = 4
 CACHE_TTL_S = 30.0
 FAIL_TTL_S = 5.0                    # a failure is remembered only long enough to absorb a burst
 MAX_KEYS = 8
+MAX_FLIGHTS = 64
 MAX_KEYSCAN_BYTES = 65536
 _BANNER_MAX = 1024
 _PREFERENCE = ("ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521",
@@ -218,24 +219,32 @@ class Prober:
                 return dict(got)
             flight = self._flights.get(key)
             if flight is None:
-                flight = self._flights[key] = threading.Lock()
-        with flight:
+                if len(self._flights) >= MAX_FLIGHTS:         # bounded: an agent cannot grow this map
+                    return _fail("rate_limited")
+                flight = self._flights[key] = [threading.Lock(), 0]
+            flight[1] += 1
+        try:
+            with flight[0]:
+                with self._lock:
+                    got = self._cached(key)
+                if got is not None:
+                    return dict(got)
+                if not self.limiter.allow(client_id):
+                    return _fail("rate_limited")
+                res = probe(host, key[1], self._cfg(), self.guard, self._clock, self._run)
+                ttl = FAIL_TTL_S if "label" in res else CACHE_TTL_S
+                with self._lock:
+                    self._cache[key] = (self._clock() + ttl, res)
+                    if len(self._cache) > 256:                # bounded: drop the expired, then the oldest
+                        now = self._clock()
+                        for k in [k for k, v in self._cache.items() if v[0] <= now] or list(self._cache)[:64]:
+                            self._cache.pop(k, None)
+                return dict(res)
+        finally:                                              # every exit path, an exception included
             with self._lock:
-                got = self._cached(key)
-            if got is not None:
-                return dict(got)
-            if not self.limiter.allow(client_id):
-                return _fail("rate_limited")
-            res = probe(host, key[1], self._cfg(), self.guard, self._clock, self._run)
-            ttl = FAIL_TTL_S if "label" in res else CACHE_TTL_S
-            with self._lock:
-                self._cache[key] = (self._clock() + ttl, res)
-                if len(self._cache) > 256:                    # bounded: drop the expired, then the oldest
-                    now = self._clock()
-                    for k in [k for k, v in self._cache.items() if v[0] <= now] or list(self._cache)[:64]:
-                        self._cache.pop(k, None)
-                self._flights.pop(key, None)
-            return dict(res)
+                flight[1] -= 1
+                if flight[1] == 0 and self._flights.get(key) is flight:
+                    del self._flights[key]
 
 
 # ---------------------------------------------------------------- classification (pure)
@@ -250,6 +259,13 @@ def _name_port(name, host):
         if rest.isascii() and rest.isdigit() and 1 <= int(rest) <= 65535:
             return int(rest)
     return None
+
+
+def host_allowed(allowed_hosts, host):
+    """THE rule for "this host name is on the key's allowed list": exact membership of the (lower-case) name, as
+    the exec gate has always applied it. Intake, classification and the run all call this one function, so they
+    cannot disagree. (`host:port` entries, fingerprint entries and other spellings do not allow a bare name.)"""
+    return host in (allowed_hosts or [])
 
 
 def classify(host, port, presented, known_lines, allowed_hosts):
@@ -271,7 +287,7 @@ def classify(host, port, presented, known_lines, allowed_hosts):
     pres = [p.rstrip("=") for p in pres]
     lines = sshkey.known_host_lines(list(known_lines or []), host, port)
     here = list(sshkey.parse_known_hosts(lines))                   # fingerprints pinned for this name and port
-    allowed = host in (allowed_hosts or [])
+    allowed = host_allowed(allowed_hosts, host)
     first = pres[0] if pres else None
     if here:
         hit = next((p for p in pres if p in here), None)
