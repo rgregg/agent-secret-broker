@@ -120,12 +120,14 @@ Check it:
   allow-list, and no password exists anywhere. Install, the allow-list and what it refuses:
   [root-exec.md](root-exec.md).
 - `asb exec NAME HOST -- command args...` is for any command you would otherwise `ssh` for. NAME is an SSH key
-  credential, HOST a name that key is pinned for; the broker (not your machine) connects, runs exactly that text and
+  credential, HOST a name (a host or port the key does not pin yet, or whose SSH key changed, asks the human, who sees the
+  server's key fingerprint and can approve once or remember it); the broker (not your machine) connects, runs exactly that text and
   returns the output, so a person, the risk check and an auto-approve rule see the command before it runs. stdout and
   stderr go to the same streams and the exit code is the remote command's. If the broker could not run it, `asb`
   prints `asb: exec failed: LABEL` (`host_key_mismatch`, `host_not_pinned`, `connect_failed`, `auth_failed`,
   `timeout`, `output_cap`, `ssh_unavailable` or `internal`) and exits 3; denial is 4 and expiry 5, as everywhere.
-  Options: `--user`, `--port`, `--timeout` (seconds, 1 to 600). Each word after `--` is one argument, joined with
+  Options: `--user` (default: your local `$USER`; with no usable `$USER` it is required), `--port` (default 22),
+  `--timeout` (seconds, 1 to 600). Each word after `--` is one argument, joined with
   shell quoting (`-- echo 'a b'` passes one argument): a pipe, redirect or variable needs `-- sh -c '...'` or
   `--script FILE` (at most 32 KiB of text, sent byte for byte to `sh -s` or `bash -s`). A command is at most 4096
   characters; control characters other than tab and newline, and hidden characters, are refused before anything is

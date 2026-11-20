@@ -75,6 +75,12 @@ _CONNECT = re.compile(r"Connection refused|Connection timed out|Operation timed 
                       r"Host is down|Temporary failure in name resolution", re.I)
 
 
+def _known_name(spec):
+    """The name a known_hosts line uses for this host and port: `host`, or `[host]:port`. HostKeyAlias replaces
+    ssh's own host-and-port name outright (it does NOT add the port), so the alias is spelled out in full."""
+    return spec["host"] if spec["port"] == 22 else f"[{spec['host']}]:{spec['port']}"
+
+
 def classify_ssh_failure(stderr):
     """The fixed label for an exit-255 run, from ssh's own stderr, or None when it does not look like ssh
     failing (a remote command can exit 255 too). A changed key is checked before 'not pinned' because ssh
@@ -193,7 +199,8 @@ def run(spec, key_pem, known_hosts_lines, cfg, mask, *, workdir_base=None, popen
     `mask(text)` hides credential values in the output; `known_hosts_lines` are the pinned lines for this host
     and port (sshkey.known_host_lines); nothing is connected to when there are none. `connect_ip` (an IP the
     destination guard has just validated) makes ssh connect to that address while the host NAME stays what the
-    known_hosts lookup uses."""
+    known_hosts lookup uses (HostName alone would make ssh look the ADDRESS up, so HostKeyAlias names the host;
+    found against a real sshd, the stub programs cannot show it)."""
     t0 = clock()
     res = {"exit_code": None, "stdout": "", "stderr": "", "truncated": False, "label": None, "duration_ms": 0}
 
@@ -243,7 +250,7 @@ def run(spec, key_pem, known_hosts_lines, cfg, mask, *, workdir_base=None, popen
 
         command, stdin = execmode.remote_payload(spec)
         argv = ([ssh] + [o.format(known_hosts=known) for o in FIXED_OPTIONS]
-                + (["-o", f"HostName={connect_ip}"] if connect_ip else [])
+                + (["-o", f"HostName={connect_ip}", "-o", f"HostKeyAlias={_known_name(spec)}"] if connect_ip else [])
                 + ["-l", spec["user"], "-p", str(spec["port"]), "--", spec["host"], command])
         try:
             proc = popen(argv, env={**env, "SSH_AUTH_SOCK": sock},

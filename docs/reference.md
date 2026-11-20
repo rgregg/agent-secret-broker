@@ -2579,16 +2579,70 @@ git over ssh, port or agent forwarding, jump hosts. Output is returned when the 
   control characters other than tab and newline and hidden characters (bidi, zero-width, ...) are refused (400); a command
   may not start with `-`. `user` is a plain account name (not starting with `-`), `port` defaults to 22, `timeout_s`
   to 60 (at most `exec.max_seconds`).
-- The host must be **named** in the key's `ssh_hosts.allowed_hosts` (a `SHA256:` fingerprint entry is not enough: the broker
-  needs a name to connect to) **and** have a `known_hosts` line for that name and port (`[host]:2222` for a non-default
+- **A host the key pins** is **named** in the key's `ssh_hosts.allowed_hosts` (a `SHA256:` fingerprint entry is not enough: the
+  broker needs a name to connect to) **and** has a `known_hosts` line for that name and port (`[host]:2222` for a non-default
   port). It is lower-cased and compared exactly: a trailing dot, an IP spelled another way (`127.1`) or any other spelling
-  is a different, unpinned host. A refused host is 403 before anything is shown or run (one text for every host refusal; the audit log's
-  `exec_host_refused` has the reason, `not_allowed` or `not_pinned`), and is checked again when the command runs. The connection uses `StrictHostKeyChecking=yes` against only those pinned lines: no trust on first use.
+  is a different host. One function (`execprobe.host_allowed`) decides "allowed" for intake, classification and the run.
+  The connection uses `StrictHostKeyChecking=yes` against only the pinned lines.
+- **A host or port the key does not pin, or whose key changed, is not refused: it goes to a human** (see "Unpinned and
+  changed hosts" below). `exec_host_refused` is no longer emitted.
+
+### Unpinned and changed hosts
+
+Before the request exists the broker reads the server's host key (an SSH handshake, no authentication, no command; the
+OpenSSH `ssh-keyscan` from `exec.ssh_path`) and compares it with what the key pins. Four states:
+
+- `pinned`: a line pins this name and port, the key is on it and the name is allowed. An ordinary request (the rest of this
+  section: rules, `approval: allow` and the risk rating work as before).
+- `new`: no pinned line for this name and port (or a line whose name is not on `allowed_hosts`), and the key matches nothing
+  pinned for this name on another port. A key pinned only under a **different** name counts for nothing.
+- `same_key_elsewhere`: no line for this port, but the presented key is pinned for the **same name** on another port; the card
+  says "same key as nas:22".
+- `changed`: a line pins this name and port and none of the keys the server presents is on it. This is also what a
+  man-in-the-middle looks like; it is what a rekeyed or reinstalled server looks like too.
+
+The three non-pinned states are **always a human decision**, rated high by code: no auto-approve rule (config or stored),
+`approval: allow`, grant, Always or SSH-rule chip is consulted, a decision carrying one is 400 and claims nothing, there is no
+notification button (host and port are in the notification, never a fingerprint), and every token channel (push, Home
+Assistant, Telegram) is refused. The card shows host, port, the SHA-256 fingerprint and the command, "First time seeing this
+key. Compare the fingerprint with the host before approving." (trust on first use), and for `changed` a large red banner with
+the presented and the pinned fingerprints and the man-in-the-middle caution above the command. Buttons:
+
+- **Approve once**: connect using exactly the key shown, save nothing.
+- **Approve and remember** (`new`, `same_key_elsewhere`): also write the pinned line (`name` or `[name]:port`) and, when it is
+  missing, the name to `allowed_hosts` in the key's `ssh_hosts` metadata (the same path as the Policies editor; vault first;
+  never duplicated; revocable there). Offered only when the key already restricts hosts (has an `allowed_hosts` list), the
+  vault can write metadata and the lists have room; otherwise the card says why, and Approve once still works.
+- **Approve and replace the pinned key** (`changed` only, instead of remember): needs an extra tick, replaces the old line
+  for that name and port in place (other names on a shared line stay) and audits both fingerprints.
+
+The connection that runs the command pins the key on the card: the runner is given one `known_hosts` line for that request
+and nothing from the catalog, connects to an address the destination guard validates **again** at run time
+(`-o HostName=IP` with `HostKeyAlias` spelled `name` or `[name]:port`, since ssh's alias does not add the port), and a server
+whose key changed since the card fails closed with `host_key_mismatch` (`connect_failed` when the guard now refuses the name).
+
+**Probe limits.** An enrolled client can now make the broker open a connection to a host and port it names, so: only clients in
+`exec.clients`, only for an SSH key it may use; the destination goes through the destination guard first (loopback, link-local,
+metadata names, the broker's own addresses, IPv4-mapped and similar forms, every address a name resolves to, and
+`destination_deny_cidrs`), the name is resolved once and the probe connects to the validated address; a short timeout; one
+result cached 30 s (5 s for a failure) per host and port with concurrent requests sharing one probe; a per-client and an overall
+rate limit (`exec.probe_per_client`, default 30 a minute, `exec.probe_overall`, default 120); and the pending cap
+(`exec.max_pending_per_client`, checked before any probe). The banner and everything but the public keys are dropped.
+**A probe failure for any host, pinned or not, is refused with one text, status and code path** ("could not read that host's
+key", 403) so the agent learns neither the network nor which hosts the key pins; the label (`unreachable`, `not_ssh`,
+`timeout`, `refused_destination`, `rate_limited`, `ssh_unavailable`) is in the hidden `exec_probe` event only. The agent never
+sees a fingerprint or any probe detail, only the request status. `ssh_path` must also hold `ssh-keyscan`.
+
+Rules: `host` may be a name or a list of up to 20 names and `port` a number or a list of up to 20 (every combination listed
+matches; one entry behaves exactly as the single value, and is stored as the bare value). The Policies form takes
+comma-separated lists. A listed host that the key does not pin still goes to a human, as above.
+
 - Off by default. `"exec": {"enabled": true, "clients": ["c-1a2b3c4d"], "max_concurrent": 4, "max_output_bytes": 262144,
-  "max_seconds": 600, "max_pending_per_client": 3, "readonly": [...], "ssh_path": null}` (validated at startup). Only the
+  "max_seconds": 600, "max_pending_per_client": 3, "readonly": [...], "ssh_path": null, "probe_per_client": 30,
+  "probe_overall": 120}` (validated at startup). Only the
   listed client ids may ask (others, and the legacy shared key, get 403). `GET /v1/status` shows `features.exec`.
   `max_concurrent` bounds how many ssh runs go at once (the rest wait for a slot). `ssh_path` is a directory holding
-  `ssh`, `ssh-agent` and `ssh-add` (default: the `PATH`; the container image installs `openssh-client`); tests point it at stubs.
+  `ssh`, `ssh-agent`, `ssh-add` and `ssh-keyscan` (default: the `PATH`; the container image installs `openssh-client`); tests point it at stubs.
 
 ### How a command is rated
 
@@ -2679,13 +2733,18 @@ tick. It exists so the exec vetting cannot be walked around; `exec` on the same 
 `requested` carries `host`, `account`, `port`, `timeout_s` and, for a command, `argv` (its first 50 words, each clipped to 300,
 with obvious secrets such as `--password X`, `Authorization: Bearer X` and long opaque strings replaced by `<redacted>`, and
 newlines shown as `<U+000A>`; the same scrub applies to the notification text, while the approval card shows the whole command), or
-for a script only `script_len`, `script_digest` (SHA-256) and `interpreter`. `exec_started` and `exec_finished` (exit code,
-`stdout_bytes`, `stderr_bytes`, `duration_ms`, `truncated`, `label`) are hidden from the agent audit API. Command output is never
+for a script only `script_len`, `script_digest` (SHA-256) and `interpreter`. For an unpinned or changed host it also carries `host_state`,
+`presented_fp`, `pinned_fp` and `same_as` (public values, hidden from the agent's view like the rest). `exec_started` and
+`exec_finished` (exit code, `stdout_bytes`, `stderr_bytes`, `duration_ms`, `truncated`, `label`), `exec_probe` (host, port,
+`outcome`: `ok` with the `state`, or a failure label; `pinned`; never the banner), `exec_host_remembered` and
+`exec_host_replaced` (host, port, `fingerprint`, `replaced_fingerprint`, approver, channel, whether anything changed) and
+`exec_host_remember_failed` (a vault write failed: the old metadata is untouched and the command did not run) are hidden from
+the agent audit API. Command output is never
 in the audit log and never in a notification. History shows the mode as "remote command"; its pop-over shows the command or the
 full script and the result (clipped, masked) from the short-lived request-details store, as for env scripts.
 
 Tests: `tests/test_execmode.py` (grammar, table, config), `tests/test_exec_intake.py`, `tests/test_exec_rules.py`,
-`tests/test_execrun.py` (against stub `ssh`/`ssh-agent`/`ssh-add` in `tests/fake_ssh/`), `tests/test_ssh_agent_switch.py`, and
+`tests/test_execprobe.py` and `tests/test_exec_unpinned.py` (unpinned hosts), `tests/test_execrun.py` (against stub `ssh`/`ssh-agent`/`ssh-add` in `tests/fake_ssh/`), `tests/test_ssh_agent_switch.py`, and
 `tests/e2e_remote_exec/` (real OpenSSH and sshd: `run.sh` in a throwaway container, or `driver.py` where OpenSSH is installed).
 
 ## Plans (task-scoped grants for unattended jobs)

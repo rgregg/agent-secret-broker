@@ -384,6 +384,9 @@ and needs a network route to each host.
 3. Add rules for the commands you want without a tap (the key's Policies page, or `auto_approve` in the configuration), for
    example host `nas.example.com`, account `ryan`, words `systemctl status`. Everything else asks you on your phone, with the
    exact command on the card.
+   You do not have to pin every host first: a host or port the key does not pin, or whose key changed, asks you with the
+   server's fingerprint on the card (compare it with the host) and a "remember" button that pins it (see
+   [reference.md](reference.md#unpinned-and-changed-hosts)). Remember needs the key to have an allowed hosts list already.
 4. Once a host works this way, set the key's **Agent signing** to `ask` or `off` so the path that cannot be vetted is closed.
 
 Details, limits and the audit trail: [reference.md](reference.md#remote-commands-request-mode-exec).
