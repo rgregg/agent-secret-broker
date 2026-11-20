@@ -2926,7 +2926,9 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
         ordinary exec flow), or new / same_key_elsewhere / changed (the request carries `host_state` and the
         presented key and goes only to a human). A probe failure refuses the request with ONE text, status and code
         path whatever the cause AND whether or not the key pins the host (a different answer would tell the agent
-        which hosts are pinned): it learns nothing about the network or the policy:
+        which hosts are pinned). What stays observable, and is documented as such: whether an SSH server answers
+        from the broker at a guard-allowed address (a request that reaches a human versus a refusal), and, by
+        timing, how a probe failed. The failure class itself goes only to the audit log:
         the label (unreachable, not_ssh, timeout, refused_destination, rate_limited, ssh_unavailable) goes to the
         audit log only. Runs before the request exists, never under a lock."""
         cid = (client or clients_mod.ClientStore.LEGACY_VIEW)["id"]
@@ -2954,6 +2956,7 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
             return
         key = next(k for k in res["keys"] if k["fingerprint"] == cls["fingerprint"])
         spec.update(host_state=cls["state"], presented_fp=key["fingerprint"], presented_key=key["key"],
+                    presented_type=key["key_type"],
                     pinned_fp=cls["pinned_fp"], same_as=cls["matches"], probe_address=res.get("address"))
 
     @property
@@ -3012,19 +3015,23 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
             return "replace needs a changed key, its confirmation and a writable policy"
         return None
 
-    def _remember_host(self, name, host, port, presented, user, replace=False):
+    def _remember_host(self, name, host, port, presented, user, replace=False, expect_fp=None):
         """Pin `presented` ({"key": "type base64", "fingerprint"}) for `host`:`port` on credential `name` and allow
         the host name, in the key's `ssh_hosts` metadata: read, change and write under the config lock, vault
         first (the same path as _persist_ssh_hosts), memory after. `replace` drops the existing line for this
-        host and port first. Never duplicates a line. Returns the new `ssh_hosts` metadata, or None when nothing
-        had to change; raises ValueError for a refusal, BackendError or OSError when the vault write fails (the
-        old metadata is then untouched)."""
+        host and port first, and only when the line being replaced is still the one the human saw (`expect_fp`).
+        Never duplicates a line. Returns (the new `ssh_hosts` metadata or None when nothing had to change, the
+        fingerprints that were pinned for this host and port before); raises ValueError for a refusal, BackendError
+        or OSError when the vault write fails (the old metadata is then untouched)."""
         with self._cfg_lock:
             sc = self.cfg["secrets"][name]
             raw = sshhosts_mod.normalize((sc.get("_meta") or {}).get("ssh_hosts"))
             known, allowed = list(raw.get("known_hosts", [])), list(raw.get("allowed_hosts", []))
             have = sshkey.known_host_lines(known, host, port)
+            old_fps = sorted(sshkey.parse_known_hosts(have))
             if replace:
+                if expect_fp not in old_fps:
+                    raise ValueError("the pinned key changed since the card was shown")
                 known = execprobe_mod.drop_pin(known, host, port)
                 have = []
             want = execprobe_mod.pin_line(host, port, presented["key"])
@@ -3040,11 +3047,11 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
             if raw.get("allow_forwarded"):
                 new["allow_forwarded"] = True
             if new == raw:
-                return None
+                return None, old_fps
             parsed = Broker._ssh_hosts(new)
             self._persist_ssh_hosts(name, new, user)
             sc["ssh_hosts"] = parsed
-        return new
+        return new, old_fps
 
     def _exec_run(self, req):
         """Run the approved remote command and return the wire result {"exit_code", "stdout", "stderr",
@@ -3065,25 +3072,26 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
             if req.exec_choice is None or not exec_mod.host_fields_ok(sp):
                 raise BackendError("an unpinned host needs a person's decision")
             presented = {"key": sp["presented_key"], "fingerprint": sp["presented_fp"]}
-            if req.exec_choice in ("remember", "replace"):
-                replace = req.exec_choice == "replace"
-                old_fp = sp.get("pinned_fp")
-                try:
-                    changed = self._remember_host(name, sp["host"], sp["port"], presented, req.approver, replace=replace)
-                except (ValueError, OSError, KeyError, BackendError):
-                    self.audit("exec_host_remember_failed", req, host=sp["host"], port=sp["port"], choice=req.exec_choice)
-                    raise BackendError("the host could not be saved to the key's policy") from None
-                self.audit("exec_host_replaced" if replace else "exec_host_remembered", req, host=sp["host"],
-                           port=sp["port"], fingerprint=sp["presented_fp"], replaced_fingerprint=old_fp,
-                           approver=req.approver, channel=req.exec_channel, changed=changed is not None)
             pinned = [execprobe_mod.pin_line(sp["host"], sp["port"], sp["presented_key"])]
             try:                        # connect to an address the guard allows NOW (DNS may have moved since the probe)
                 addrs = self.dest_guard.resolve(sp["host"], sp["port"])
             except OSError:
                 addrs = []
-            if not addrs:
+            if not addrs:               # before anything is saved: a host that cannot be reached is not remembered
                 return self._exec_failed(req, "connect_failed")
             connect_ip = sp.get("probe_address") if sp.get("probe_address") in addrs else addrs[0]
+            if req.exec_choice in ("remember", "replace"):
+                replace = req.exec_choice == "replace"
+                try:
+                    changed, removed = self._remember_host(name, sp["host"], sp["port"], presented, req.approver,
+                                                           replace=replace, expect_fp=sp.get("pinned_fp"))
+                except (ValueError, OSError, KeyError, BackendError):
+                    self.audit("exec_host_remember_failed", req, host=sp["host"], port=sp["port"], choice=req.exec_choice)
+                    raise BackendError("the host could not be saved to the key's policy") from None
+                self.audit("exec_host_replaced" if replace else "exec_host_remembered", req, host=sp["host"],
+                           port=sp["port"], fingerprint=sp["presented_fp"],
+                           replaced_fingerprint=",".join(removed) if replace else None,
+                           approver=req.approver, channel=req.exec_channel, changed=changed is not None)
         with self._exec_slots:
             (var, ref), = sc["vars"].items()
             pem = self.backend.get(ref["item"], ref.get("field") or "auto")

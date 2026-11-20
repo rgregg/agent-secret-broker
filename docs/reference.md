@@ -2627,9 +2627,17 @@ metadata names, the broker's own addresses, IPv4-mapped and similar forms, every
 `destination_deny_cidrs`), the name is resolved once and the probe connects to the validated address; a short timeout; one
 result cached 30 s (5 s for a failure) per host and port with concurrent requests sharing one probe; a per-client and an overall
 rate limit (`exec.probe_per_client`, default 30 a minute, `exec.probe_overall`, default 120); and the pending cap
-(`exec.max_pending_per_client`, checked before any probe). The banner and everything but the public keys are dropped.
+(`exec.max_pending_per_client`, checked before any probe); one 8 s deadline covers the connection and the banner however slowly
+a server drips, at most 3 addresses of a name are tried, one client may have at most 4 probes running or waiting, and a caller
+waiting on another's probe gives up after 25 s (all answered as `rate_limited`). The banner and everything but the public keys
+are dropped. **Cost for pinned hosts:** every exec request now probes first (cached 30 s): one banner connection plus
+`ssh-keyscan` (one connection per key type), so the target sees a few extra pre-auth connections, and a pinned host that is down,
+that resolves to a loopback, link-local, own or denied address, or a `ssh_path` without `ssh-keyscan` is refused at intake (the
+same text) instead of failing later as `connect_failed`.
 **A probe failure for any host, pinned or not, is refused with one text, status and code path** ("could not read that host's
-key", 403) so the agent learns neither the network nor which hosts the key pins; the label (`unreachable`, `not_ssh`,
+key", 403) so the agent learns nothing from the text about which hosts the key pins. What stays observable: whether an SSH
+server answers from the broker at an address the guard allows (a request that reaches a human versus a refusal), and, by
+timing, roughly how a probe failed (a refused destination is immediate, a timeout takes seconds). The label (`unreachable`, `not_ssh`,
 `timeout`, `refused_destination`, `rate_limited`, `ssh_unavailable`) is in the hidden `exec_probe` event only. The agent never
 sees a fingerprint or any probe detail, only the request status. `ssh_path` must also hold `ssh-keyscan`.
 

@@ -281,6 +281,19 @@ class Card(Unpinned):
         self.assertNotIn("approve_remember", card)
         self.assertIn("value=approve>Approve once", card)             # approving once still works
 
+    def test_the_card_names_the_key_type_of_the_fingerprint(self):
+        card = self.card(self.pending(**self.new()))
+        self.assertIn(f"{FP['fresh']}</code> (ssh-ed25519)", card)
+        self.assertNotIn("(<img", execmode.host_html({"host_state": "new", "host": "a.example", "port": 22,
+                                                      "presented_fp": FP["fresh"], "presented_type": "<img src=x>"}))
+
+    def test_the_fingerprint_shown_must_be_the_fingerprint_of_the_key_that_is_pinned(self):
+        sp = dict(self.req(self.pending(**self.new())).spec)
+        self.assertTrue(execmode.host_fields_ok(sp))                                # premise
+        self.assertFalse(execmode.host_fields_ok({**sp, "presented_fp": FP["nas"]}))   # a well-formed but other fingerprint
+        self.assertFalse(execmode.host_fields_ok({**sp, "presented_key": sshkey.public_line(UNLISTED)}))
+        self.assertFalse(execmode.host_fields_ok({**sp, "presented_key": "ssh-ed25519 AAAA!!!!AAAAAAAAAAAAAAAAAAAAAA"}))
+
     def test_the_fingerprint_on_the_card_comes_through_the_fixed_escaping(self):
         hostile = {"keys": [], "fingerprint": "SHA256:<script>x</script>", "key_type": "ssh-ed25519",
                    "key": "ssh-ed25519 AAAA", "address": "93.184.216.34"}
@@ -607,6 +620,28 @@ class Run(Unpinned):
         got = self.poll(req.id)
         self.assertEqual((got["status"], got["label"], got["exit_code"]), ("released", "connect_failed", None))
         self.assertEqual(self.ssh_calls(), [])
+
+    def test_a_replace_that_races_a_change_of_the_pin_refuses_and_keeps_what_is_there(self):
+        rid = self.pending(**self.changed())                                   # the card shows nas pinned as NAS
+        other = sshkey.public_line(UNLISTED)                                   # ...then someone re-pins it to another key
+        raw = {**self.meta(), "known_hosts": [ln for ln in self.meta()["known_hosts"] if not ln.startswith("nas.example.com ")]
+               + [f"nas.example.com {other}"]}
+        self.broker._persist_ssh_hosts("deploy", raw, "bob")
+        after = json.dumps(self.meta(), sort_keys=True)
+        self.assertEqual(self.decide_form(rid, "approve_replace", confirm_replace="1")[0], 303)
+        self.req(rid).done.wait(20)
+        self.assertEqual(self.req(rid).status, "failed")
+        self.assertEqual(json.dumps(self.meta(), sort_keys=True), after)       # the other pin was not clobbered
+        self.assertEqual(self.ssh_calls(), [])
+        self.assertEqual(len(self.events("exec_host_remember_failed")), 1)
+        self.assertEqual(self.events("exec_host_replaced"), [])
+
+    def test_nothing_is_saved_when_the_destination_is_refused_at_run_time(self):
+        self.broker.dest_guard._resolver = lambda h, p: ["169.254.169.254"]
+        req = self.go("approve_remember")
+        self.assertEqual(self.poll(req.id)["label"], "connect_failed")
+        self.assertEqual(json.dumps(self.meta(), sort_keys=True), self.meta0)
+        self.assertEqual(self.events("exec_host_remembered"), [])
 
     def test_a_forbidden_second_address_also_fails_closed(self):
         self.broker.dest_guard._resolver = lambda h, p: ["93.184.216.34", "::ffff:10.0.0.1"]

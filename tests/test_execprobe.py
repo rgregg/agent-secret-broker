@@ -409,7 +409,7 @@ class Flights(Cache):
         p = execprobe.Prober(self.guard, lambda: cfg, clock=lambda: self.now[0])
         for i in range(n):
             self.resolved[f"h{i}.example.com"] = [PUBLIC]
-        ts = [threading.Thread(target=lambda i=i: results.append(p.probe(f"h{i}.example.com", 22, "c-1"))) for i in range(n)]
+        ts = [threading.Thread(target=lambda i=i: results.append(p.probe(f"h{i}.example.com", 22, f"c-{i}"))) for i in range(n)]
         for t in ts:
             t.start()
         for _ in range(500):
@@ -425,6 +425,109 @@ class Flights(Cache):
         self.assertEqual(len(results), n)
         self.assertEqual(sum(r == {"label": "rate_limited"} for r in results), 20)
         self.assertEqual(p._flights, {})
+
+
+class Deadlines(Cache):
+    """One client or one hostile server cannot keep the probe, or every slot, busy."""
+
+    def test_a_server_that_drips_its_banner_is_cut_off_by_the_total_deadline(self):
+        now = [0.0]
+
+        class Drip(Sock):
+            def recv(inner, n):                                   # noqa: N805 -- one byte, three seconds later
+                inner.reads += 1
+                now[0] += 3.0
+                return b"x"
+        self.guard._connector = lambda addr, timeout=None, **kw: self.sockets.append(Drip(addr[0])) or self.sockets[-1]
+        self.assertEqual(self.probe(clock=lambda: now[0]), {"label": "timeout"})
+        self.assertLessEqual(self.sockets[-1].reads, 4)           # 8 s of deadline, 3 s a byte: not 1024 reads
+        self.assertGreaterEqual(self.sockets[-1].reads, 2)        # premise: it really was read for a while
+        self.assertTrue(self.sockets[-1].closed)
+        self.assertEqual(self.calls(), [])
+
+    def test_a_name_with_many_unreachable_addresses_is_tried_a_few_times_only(self):
+        self.resolved["many.example.com"] = [f"93.184.216.{i}" for i in range(20, 40)]
+
+        def refuse(addr, timeout=None, **kw):
+            self.connected.append(addr)
+            raise socket.timeout("S3CR3T-slow")
+        self.guard._connector = refuse
+        self.assertEqual(self.probe("many.example.com"), {"label": "timeout"})
+        self.assertEqual(len(self.connected), execprobe.MAX_ADDRESSES)
+
+    def test_the_guard_deadline_bounds_the_whole_connect(self):
+        import time as _t
+        calls = []
+
+        def slow(addr, timeout=None, **kw):
+            calls.append(timeout)
+            raise socket.timeout()
+        g = destguard.DestGuard(resolver=lambda h, p: [f"93.184.216.{i}" for i in range(20, 30)], local_addrs=lambda: [],
+                                connector=slow)
+        with self.assertRaises(socket.timeout):
+            g.connect("a.example.com", 22, timeout=4.0, deadline=_t.monotonic() - 1)       # already past: nothing is tried
+        self.assertEqual(calls, [])
+        with self.assertRaises(socket.timeout):
+            g.connect("a.example.com", 22, timeout=4.0, deadline=_t.monotonic() + 3, max_addresses=2)
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(all(t <= 3.0 for t in calls), calls)                              # never longer than what is left
+
+    def test_one_client_cannot_hold_every_probe_slot(self):
+        gate, results, inside = threading.Event(), {}, threading.Semaphore(0)
+        base = self.connector
+
+        def slow(addr, timeout=None, **kw):
+            inside.release()
+            gate.wait(10)
+            return base(addr, timeout)
+        self.guard._connector = slow
+        cfg = execmode.parse_config({"enabled": True, "ssh_path": self.dir, "probe_per_client": 1000, "probe_overall": 5000})
+        p = execprobe.Prober(self.guard, lambda: cfg, clock=lambda: self.now[0])
+        n = execprobe.MAX_INFLIGHT_PER_CLIENT + 3
+        for i in range(n):
+            self.resolved[f"h{i}.example.com"] = [PUBLIC]
+        ts = [threading.Thread(target=lambda i=i: results.__setitem__(i, p.probe(f"h{i}.example.com", 22, "c-1")))
+              for i in range(n)]
+        for t in ts[:execprobe.MAX_INFLIGHT_PER_CLIENT]:
+            t.start()
+        for _ in range(execprobe.MAX_INFLIGHT_PER_CLIENT):
+            self.assertTrue(inside.acquire(timeout=10))
+        for t in ts[execprobe.MAX_INFLIGHT_PER_CLIENT:]:
+            t.start()
+            t.join(10)                                                # these return at once: no slot for this client
+        self.assertEqual(sorted(i for i, r in results.items() if r == {"label": "rate_limited"}),
+                         list(range(execprobe.MAX_INFLIGHT_PER_CLIENT, n)))
+        other = {}
+        self.resolved["other.example.com"] = [PUBLIC]
+        t2 = threading.Thread(target=lambda: other.update(r=p.probe("other.example.com", 22, "c-2")))
+        t2.start()
+        self.assertTrue(inside.acquire(timeout=10))                   # another client still gets its probe
+        gate.set()
+        for t in ts[:execprobe.MAX_INFLIGHT_PER_CLIENT] + [t2]:
+            t.join(10)
+        self.assertNotIn("label", other["r"])
+        self.assertEqual(p._inflight, {})
+        self.assertEqual(p._flights, {})
+
+    def test_a_waiter_for_a_stuck_probe_gives_up(self):
+        from unittest import mock
+        gate, inside, out = threading.Event(), threading.Event(), {}
+        base = self.connector
+
+        def slow(addr, timeout=None, **kw):
+            inside.set()
+            gate.wait(10)
+            return base(addr, timeout)
+        self.guard._connector = slow
+        t = threading.Thread(target=lambda: self.prober.probe("nas.example.com", 22, "c-1"))
+        t.start()
+        self.assertTrue(inside.wait(10))
+        with mock.patch.object(execprobe, "PROBE_WAIT_S", 0.2):
+            out["r"] = self.prober.probe("nas.example.com", 22, "c-2")
+        self.assertEqual(out["r"], {"label": "rate_limited"})
+        gate.set()
+        t.join(10)
+        self.assertEqual((self.prober._flights, self.prober._inflight), ({}, {}))
 
 
 class AllowedGate(unittest.TestCase):

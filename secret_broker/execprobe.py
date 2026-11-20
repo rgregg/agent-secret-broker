@@ -38,6 +38,11 @@ LABELS = ("unreachable", "not_ssh", "timeout", "refused_destination", "rate_limi
 STATES = ("pinned", "new", "same_key_elsewhere", "changed")
 CONNECT_TIMEOUT_S = 4.0
 KEYSCAN_TIMEOUT_S = 4
+PROBE_DEADLINE_S = 8.0              # one deadline for the connection and the banner together, however slowly a server drips
+MAX_ADDRESSES = 3                   # addresses tried for one name
+KEYSCAN_RUN_S = 12                  # ssh-keyscan connects once per key type
+PROBE_WAIT_S = 25.0                 # the longest a second caller waits for the first one's probe
+MAX_INFLIGHT_PER_CLIENT = 4
 CACHE_TTL_S = 30.0
 FAIL_TTL_S = 5.0                    # a failure is remembered only long enough to absorb a burst
 MAX_KEYS = 8
@@ -59,11 +64,17 @@ def _fail(label):
 
 # ---------------------------------------------------------------- the probe
 
-def _read_banner(sock):
+def _read_banner(sock, deadline=None, clock=time.monotonic):
     """True when the server speaks SSH: one of its first lines (RFC 4253 lets a server send others first) begins
-    `SSH-`. The bytes are examined and dropped. Raises socket.timeout or OSError."""
+    `SSH-`. The bytes are examined and dropped. Raises socket.timeout or OSError. `deadline` bounds the whole read
+    (each recv gets what is left), so a server that sends a byte at a time cannot keep the probe waiting."""
     buf = b""
     while len(buf) < _BANNER_MAX:
+        if deadline is not None:
+            left = deadline - clock()
+            if left <= 0:
+                raise socket.timeout()
+            sock.settimeout(min(CONNECT_TIMEOUT_S, left))
         chunk = sock.recv(256)
         if not chunk:
             return False
@@ -113,8 +124,10 @@ def probe(host, port, cfg, guard, clock=time.monotonic, run=subprocess.run):
     keyscan = _binary(cfg, "ssh-keyscan")
     if keyscan is None:
         return _fail("ssh_unavailable")
+    deadline = clock() + PROBE_DEADLINE_S
     try:
-        sock = guard.connect(host, port, timeout=CONNECT_TIMEOUT_S)
+        sock = guard.connect(host, port, timeout=CONNECT_TIMEOUT_S, max_addresses=MAX_ADDRESSES,
+                             deadline=time.monotonic() + PROBE_DEADLINE_S)
     except destguard.DestinationRefused:
         return _fail("refused_destination")
     except socket.timeout:
@@ -133,7 +146,7 @@ def probe(host, port, cfg, guard, clock=time.monotonic, run=subprocess.run):
             return _fail("refused_destination")
         try:
             sock.settimeout(CONNECT_TIMEOUT_S)
-            if not _read_banner(sock):
+            if not _read_banner(sock, deadline, clock):
                 return _fail("not_ssh")
         except socket.timeout:
             return _fail("timeout")
@@ -148,7 +161,7 @@ def probe(host, port, cfg, guard, clock=time.monotonic, run=subprocess.run):
     env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": "/nonexistent", "LANG": "C", "LC_ALL": "C"}
     try:
         res = run(argv, stdin=subprocess.DEVNULL, capture_output=True, env=env,
-                  timeout=KEYSCAN_TIMEOUT_S + 4)
+                  timeout=KEYSCAN_RUN_S)
     except subprocess.TimeoutExpired:
         return _fail("timeout")
     except FileNotFoundError:
@@ -196,6 +209,7 @@ class Prober:
     def __init__(self, guard, cfg_fn, clock=time.monotonic, run=subprocess.run):
         self.guard, self._cfg, self._clock, self._run = guard, cfg_fn, clock, run
         self._cache, self._flights, self._lock = {}, {}, threading.Lock()
+        self._inflight = {}                                   # client id -> probes it has running or waiting
         cfg = cfg_fn()
         self.limiter = RateLimiter(cfg["probe_per_client"], cfg["probe_overall"], clock=clock)
 
@@ -222,9 +236,16 @@ class Prober:
                 if len(self._flights) >= MAX_FLIGHTS:         # bounded: an agent cannot grow this map
                     return _fail("rate_limited")
                 flight = self._flights[key] = [threading.Lock(), 0]
+            if self._inflight.get(client_id, 0) >= MAX_INFLIGHT_PER_CLIENT:
+                if flight[1] == 0:
+                    del self._flights[key]
+                return _fail("rate_limited")                  # one client cannot hold every slot
             flight[1] += 1
+            self._inflight[client_id] = self._inflight.get(client_id, 0) + 1
         try:
-            with flight[0]:
+            if not flight[0].acquire(timeout=PROBE_WAIT_S):
+                return _fail("rate_limited")
+            try:
                 with self._lock:
                     got = self._cached(key)
                 if got is not None:
@@ -240,8 +261,13 @@ class Prober:
                         for k in [k for k, v in self._cache.items() if v[0] <= now] or list(self._cache)[:64]:
                             self._cache.pop(k, None)
                 return dict(res)
+            finally:
+                flight[0].release()
         finally:                                              # every exit path, an exception included
             with self._lock:
+                self._inflight[client_id] -= 1
+                if self._inflight[client_id] <= 0:
+                    del self._inflight[client_id]
                 flight[1] -= 1
                 if flight[1] == 0 and self._flights.get(key) is flight:
                     del self._flights[key]

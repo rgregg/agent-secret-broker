@@ -262,18 +262,27 @@ class DestGuard:
         return parsed
 
     # -- connecting -------------------------------------------------------------------
-    def connect(self, host, port, timeout=None, source_address=None, entries=None):
+    def connect(self, host, port, timeout=None, source_address=None, entries=None, max_addresses=None,
+                deadline=None):
         """A socket connected to a validated address of `host`. `entries` (the credential's
-        allowed_hosts) enables the rule for IP literals on non-default ports."""
+        allowed_hosts) enables the rule for IP literals on non-default ports. `max_addresses` limits how many of the
+        validated addresses are tried and `deadline` (a time.monotonic() value) bounds the whole call, each
+        attempt included: a name with many unreachable addresses cannot hold the caller for long."""
         port = int(port)
         if entries is not None and not self.port_ok(entries, host, port):
             raise DestinationRefused()
         last = None
-        for ip in self.resolve(host, port):
+        for ip in self.resolve(host, port)[:max_addresses]:
+            t = timeout
+            if deadline is not None:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise last or socket.timeout()
+                t = left if t is None or t is socket._GLOBAL_DEFAULT_TIMEOUT else min(t, left)
             try:
                 kw = {"source_address": source_address} if source_address else {}
-                if timeout is not socket._GLOBAL_DEFAULT_TIMEOUT and timeout is not None:
-                    return self._connector((ip, port), timeout, **kw)
+                if t is not socket._GLOBAL_DEFAULT_TIMEOUT and t is not None:
+                    return self._connector((ip, port), t, **kw)
                 return self._connector((ip, port), **kw)
             except OSError as e:
                 last = e

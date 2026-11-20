@@ -18,6 +18,8 @@ audit text. Invariants (enforced in broker.py and execrun.py, tested in tests/te
   * the request chooses host, user, port, the command and a timeout; nothing else, and none of it
     can become an ssh option (validate refuses a host, user or command that begins with a dash).
 """
+import base64
+import binascii
 import hashlib
 import html
 import os
@@ -591,13 +593,29 @@ def fp_html(fp):
     return "<code>(unavailable)</code>"
 
 
+def _key_fingerprint(key):
+    """The SHA256 fingerprint of a `type base64` key, or None when it does not decode."""
+    try:
+        return sshkey.fingerprint(base64.b64decode(key.split(" ", 1)[1], validate=True))
+    except (IndexError, ValueError, binascii.Error):
+        return None
+
+
 def host_fields_ok(sp):
     """True when the host-key fields of a request spec are what the broker's probe produces: a known state, SHA256
     fingerprints, and a `type base64` key. Checked wherever they are used to connect or to persist."""
     st = sp.get("host_state")
     return (st in HOST_STATES and bool(_FP_RE.fullmatch(sp.get("presented_fp") or ""))
             and bool(_KEY_RE.fullmatch(sp.get("presented_key") or ""))
+            and _key_fingerprint(sp["presented_key"]) == sp["presented_fp"]     # what the card shows is what is pinned
             and (st != "changed" or bool(_FP_RE.fullmatch(sp.get("pinned_fp") or ""))))
+
+
+def _type_html(sp):
+    """` (ssh-ed25519)`: the key type the fingerprint is of (a server has several keys; `ssh-keygen -lf` lists them
+    by type), only when it is one of the known types."""
+    t = sp.get("presented_type")
+    return f" ({html.escape(t)})" if t in sshkey._HOSTKEY_TYPES else ""
 
 
 def host_html(sp):
@@ -611,7 +629,7 @@ def host_html(sp):
         return ("<div class=hostban role=alert style='border:3px solid var(--bad);background:var(--badbg);"
                 "color:var(--bad);border-radius:.5rem;padding:.7rem .9rem;margin:.4rem 0;font-size:1.05rem'>"
                 f"<b style='font-size:1.25rem'>HOST KEY CHANGED</b> for {where}<br>"
-                f"Presented now: {fp_html(sp.get('presented_fp'))}<br>"
+                f"Presented now: {fp_html(sp.get('presented_fp'))}{_type_html(sp)}<br>"
                 f"Pinned: {fp_html(sp.get('pinned_fp'))}<br>{html.escape(CHANGED_TEXT)}</div>")
     if st == "same_key_elsewhere":
         head = (f"A host and port this key has not pinned: {where}. Same key as "
@@ -619,7 +637,7 @@ def host_html(sp):
     else:
         head = f"A host this key has not pinned: {where}"
     return ("<div class=hostban style='border:2px solid var(--warn);border-radius:.5rem;padding:.5rem .8rem;"
-            f"margin:.4rem 0'><b>{head}.</b><br>Key presented: {fp_html(sp.get('presented_fp'))}<br>"
+            f"margin:.4rem 0'><b>{head}.</b><br>Key presented: {fp_html(sp.get('presented_fp'))}{_type_html(sp)}<br>"
             f"{html.escape(FIRST_USE)}</div>")
 
 
