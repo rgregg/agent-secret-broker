@@ -33,7 +33,7 @@ def cfg_rule(**kw):
 
 
 def stored_rule(**kw):
-    return {"id": "x0001", "name": "status", "mode": "exec", "host": H, "account": A,
+    return {"id": "x0001", "name": "status", "mode": "exec", "host": H, "account": A, "port": 22,
             "argv": ["systemctl", "status"], "by": "alice", "at": AT, "expires_at": None, **kw}
 
 
@@ -93,6 +93,41 @@ class Parse(unittest.TestCase):
         with self.assertRaises(ValueError):                                 # exec rules on a plain credential
             Broker._entry("p", {"name": "p", "vars": {"P": {"field": "token"}}, "allowed_hosts": ["a.example.com"],
                                 "auto_rules": [stored_rule()]})
+
+
+class RulePort(unittest.TestCase):
+    def rules(self, port=None):
+        kw = {} if port is None else {"port": port}
+        return {"config": autorules.parse([cfg_rule(**kw)]),
+                "stored": autorules.parse_stored([stored_rule(**({"port": 22} if port is None else kw))], "deploy", ssh=True)}
+
+    def test_the_default_is_22_and_a_rule_for_22_does_not_approve_2222(self):
+        for name, rules in self.rules().items():
+            self.assertEqual(rules[0]["port"], 22, name)
+            self.assertIsNotNone(find(rules, spec(port=22)), name)                    # positive control
+            self.assertIsNone(find(rules, spec(port=2222)), name)
+
+    def test_a_rule_for_another_port_approves_only_that_port(self):
+        for name, rules in self.rules(2222).items():
+            self.assertIsNotNone(find(rules, spec(port=2222)), name)
+            self.assertIsNone(find(rules, spec(port=22)), name)
+            self.assertIsNone(find(rules, spec(port=2223)), name)
+
+    def test_a_stored_rule_with_no_port_is_a_port_22_rule(self):
+        raw = stored_rule()
+        del raw["port"]
+        [r] = autorules.parse_stored([raw], "deploy", ssh=True)
+        self.assertEqual(r["port"], 22)
+        self.assertEqual(autorules.serialize_stored([r])[0]["port"], 22)
+
+    def test_a_bad_port_names_the_field(self):
+        for bad in (0, 65536, -1, "22", True, 22.0, None, []):
+            with self.assertRaises(ValueError) as cm:
+                autorules.parse([cfg_rule(port=bad)])
+            self.assertIn("auto_approve[0].port", str(cm.exception), repr(bad))
+            with self.assertRaises(ValueError) as cm:
+                autorules.parse_stored([stored_rule(port=bad)], "deploy", ssh=True)
+            self.assertIn("auto_rules[0].port", str(cm.exception), repr(bad))
 
 
 class RuleWords(unittest.TestCase):
@@ -272,6 +307,17 @@ class StoredRules(RulesBase):
         self.assertEqual(self.events("approved")[-1]["decision_source"], "ui_rule")
         self.assertEqual(self.broker.auto_rule_usage.get("deploy", rid)["uses"], 1)
 
+    def test_a_port_on_the_form_is_stored_and_only_that_port_is_approved(self):
+        self.add(exec_port="2222", name="alt", host="port.example.com")
+        [rule] = self.broker.auto_rules_of("deploy")
+        self.assertEqual(rule["port"], 2222)
+        self.assertEqual(self.events("auto_rule_created")[-1]["rule_port"], 2222)
+        self.assertEqual(self.ask_done(host="port.example.com", port=2222).status, "approved")
+        self.assertEqual(self.ask_done(wait=False, host="nas.example.com", port=22).status, "pending")   # a port-22 request is not covered
+        self.assertEqual(self.add(exec_port="70000", name="bad")["status"], "refused")
+        self.assertEqual(self.add(exec_port="", name="dflt", host="nas.example.com")["status"], "created")        # blank means 22
+        self.assertEqual([r["port"] for r in self.broker.auto_rules_of("deploy")], [2222, 22])
+
     def test_it_survives_a_reload_of_the_catalog(self):
         self.add()
         self.broker._refresh_if(0)
@@ -318,7 +364,8 @@ class StoredRules(RulesBase):
         self.assertIn("No rules", page)
         self.add()
         page = self.get("/credentials/deploy?tab=policies")[1]
-        self.assertIn("run on nas.example.com as ryan: systemctl status ...", page)
+        self.assertIn("run on nas.example.com:22 as ryan: systemctl status ...", page)
+        self.assertIn("name=xport", page)
         self.assertIn("/policies/auto_rules/revoke", page)
         self.assertNotIn("Add rule for remote commands", self.get("/credentials/svc?tab=policies")[1])
 
@@ -326,7 +373,7 @@ class StoredRules(RulesBase):
         hdr = {"X-authentik-username": "alice"}
         csrf = self.broker.csrf_token("alice")
         form = {"csrf": csrf, "secret": "deploy", "mode": "exec", "name": "status", "host": H, "account": A,
-                "argv": "systemctl\nstatus", "client": self.agent.id, "expires": "never", "confirm": "1"}
+                "argv": "systemctl\nstatus", "xport": "22", "client": self.agent.id, "expires": "never", "confirm": "1"}
         r = urllib.request.Request(self.abase + "/policies/auto_rules/add", data=urllib.parse.urlencode(form).encode(),
                                    headers=hdr, method="POST")
         self.assertEqual(urllib.request.urlopen(r, timeout=10).status, 200)

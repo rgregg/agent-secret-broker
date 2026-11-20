@@ -42,10 +42,22 @@ class Grammar(unittest.TestCase):
                 self.assertIsNone(execmode.parse_simple(f"ls a{ch}b"), ch)
                 self.assertIsNone(execmode.parse_simple(f"ls {ch}"), ch)
 
+    NON_POSIX = "\\\n!"       # read differently inside quotes by fish, csh or tcsh: such a word is not simple
+
     def test_metacharacters_inside_single_quotes_are_literal(self):
         for ch in META:
+            if ch in self.NON_POSIX:
+                continue
             with self.subTest(ch=repr(ch)):
                 self.assertEqual(execmode.parse_simple(f"echo 'a{ch}b'"), ["echo", f"a{ch}b"])
+
+    def test_a_backslash_newline_or_bang_in_any_word_is_not_simple_however_it_is_quoted(self):
+        for ch in self.NON_POSIX:
+            for text in (f"echo 'a{ch}b'", f'echo "a{ch}b"', f"echo a{ch}b", f"echo 'x' 'a{ch}'"):
+                with self.subTest(text=text):
+                    self.assertIsNone(execmode.parse_simple(text))
+            self.assertIsNone(execmode.classify(valid(command=f"uptime 'a{ch}b'"), CFG)["level"])
+        self.assertEqual(execmode.parse_simple("echo 'a b' \"c;d\""), ["echo", "a b", "c;d"])     # control
 
     def test_dollar_backtick_backslash_inside_double_quotes_are_not_simple(self):
         for ch in "$`\\":
@@ -67,7 +79,7 @@ class Grammar(unittest.TestCase):
         self.assertEqual(execmode.parse_simple("echo ''"), ["echo", ""])
 
     def test_rebuild_round_trips(self):
-        cases = [["ls"], ["echo", "a b", "c'd", 'e"f', "", "x;y", "$HOME", "~", "*", "é", "a\nb", "-n"],
+        cases = [["ls"], ["echo", "a b", "c'd", 'e"f', "", "x;y", "$HOME", "~", "*", "é", "-n"],
                  ["systemctl", "status", "nginx.service"], ["echo", "%+@:,./=-_"]]
         for argv in cases:
             with self.subTest(argv=argv):
@@ -170,7 +182,7 @@ class Table(unittest.TestCase):
         for text in ("systemctl status nginx", "systemctl is-active nginx.service", "docker ps -a", "docker version",
                      "df -h",
                      "uptime", "free -h", "uname -a", "hostname", "date +%s", "ls -la /var/log",
-                     "ps aux", "ps -ef", "ps", "ip addr show", "ip -4 addr", "ip route", "ss -tlnp",
+                     "ps", "ps -o pid,comm", "ps -eo pid,ppid,comm,etime,stat,%cpu,%mem,user", "ip addr show", "ip -4 addr", "ip route", "ss -tlnp",
                      "zpool status -v", "zfs list -t snapshot", "/usr/bin/systemctl status nginx"):
             with self.subTest(text=text):
                 c = execmode.classify(valid(command=text), CFG)
@@ -189,7 +201,11 @@ class Table(unittest.TestCase):
                      "systemctl", "docker", "systemctl status -x", "docker ps --format {{.ID}}", "ls -la; id",
                      "uptime | sh", "ls $(id)",
                      # entries that print environment or config (secrets): the model decides, not the table
-                     "docker inspect web", "systemctl show nginx", "systemctl show", "ps e", "ps aux e", "ps eww",
+                     "docker inspect web", "systemctl show nginx", "systemctl show", "ps e", "ps aux e", "ps eww", "ps aux", "ps -ef", "ps -e", "ps -A", "ps -eo pid,args", "ps -o pid,cmd", "ps -eo pid,command",
+                     "ps -o pid,comm,args", "ps aux pid", "ps -ef pid", "ps -e pid", "ps -eo", "ps -o", "ps -eo pid,comm e", "ps -ef -o pid",
+                     "docker ps --no-trunc", "docker ps -a --no-trunc", "systemctl status --full nginx",
+                     "systemctl status -l nginx", "systemctl status -n 500 nginx", "systemctl status --lines=51 nginx",
+                     "systemctl status --lines=1000 nginx", "systemctl status -n 5 nginx",
                      "ps -eo pid,args", "ps axe", "docker info", "docker logs web", "docker logs --tail=100 web",
                      "journalctl -u nginx -n 50 --no-pager", "journalctl --no-pager"):
             with self.subTest(text=text):
@@ -212,9 +228,17 @@ class Table(unittest.TestCase):
         self.assertEqual(self.low("uptime"), "low")
 
     def test_environment_dumpers_are_not_low_but_their_siblings_are(self):
-        for text in ("systemctl status nginx", "docker ps", "docker images", "ps aux"):         # positive control
+        for text in ("systemctl status nginx", "docker ps", "docker images", "ps"):         # positive control
             self.assertEqual(self.low(text), "low", text)
         for text in ("docker inspect web", "systemctl show nginx", "ps e", "ps aux e"):
+            self.assertIsNone(self.low(text), text)
+
+    def test_commands_that_print_other_processes_arguments_are_not_low_but_safe_forms_are(self):
+        for text in ("ps", "ps -o pid,comm", "ps -eo pid,ppid,comm,etime,stat,%cpu,%mem,user", "docker ps", "docker ps -a",
+                     "systemctl status nginx", "systemctl status --lines=50 nginx", "systemctl status --lines=5 nginx"):
+            self.assertEqual(self.low(text), "low", text)             # positive controls
+        for text in ("ps aux", "ps -ef", "ps -eo pid,args", "docker ps --no-trunc", "systemctl status --lines=51 nginx",
+                     "systemctl status -n 100 nginx", "systemctl status --full nginx"):
             self.assertIsNone(self.low(text), text)
 
     def test_readonly_extension(self):

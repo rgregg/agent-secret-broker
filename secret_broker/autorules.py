@@ -55,7 +55,7 @@ KEYS = {
     "ssh_sign": {"name", "mode", "secret", "secrets", "clients", "host", "host_fp", "account"},
     "http": {"name", "mode", "secret", "secrets", "clients", "scheme", "host", "methods", "path_prefix"},
     "env": {"name", "mode", "secret", "secrets", "clients", "argv"},
-    "exec": {"name", "mode", "secret", "clients", "host", "account", "argv"},
+    "exec": {"name", "mode", "secret", "clients", "host", "account", "port", "argv"},
     **{m: sessionrules.COMMON | sessionrules.KEYS[m] for m in sessionrules.MODES},
 }
 _SECRET = re.compile(r"[A-Za-z0-9_.-]{1,64}")
@@ -158,7 +158,10 @@ def _parse_rule(r, where, *, implicit_secret=None, extra_keys=(), stored_modes=S
         for w in argv:      # the rules table is where "run with no approval" is consented to: no look-alikes or hidden text
             if not w.isascii() or guidance_mod.hidden_problem(w):
                 raise ValueError(f"{where}.argv words must be plain ASCII text (no hidden or look-alike characters)")
-        rule.update(host=host.lower(), account=acct, argv=tuple(argv))
+        port = r.get("port", 22)
+        if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+            raise ValueError(f"{where}.port must be a whole number from 1 to 65535 (default 22)")
+        rule.update(host=host.lower(), account=acct, port=port, argv=tuple(argv))
     else:
         argv = r.get("argv")
         if (not isinstance(argv, list) or not argv or len(argv) > 64
@@ -243,7 +246,7 @@ def serialize_stored(rules):
         elif r["mode"] in sessionrules.MODES:
             d.update(sessionrules.serialize(r))
         elif r["mode"] == "exec":
-            d.update(host=r["host"], account=r["account"], argv=list(r["argv"]))
+            d.update(host=r["host"], account=r["account"], port=r["port"], argv=list(r["argv"]))
         else:
             d["argv"] = list(r["argv"])
         if r["clients"]:
@@ -355,10 +358,11 @@ def _env_ok(rule, spec):
 
 
 def _exec_ok(rule, spec):
-    """A remote command matches only when it is a plain command (execmode.parse_simple) on the rule's host
-    as the rule's account whose words begin with the rule's words. Never a script and never a command that
+    """A remote command matches only when it is a plain command (execmode.parse_simple) on the rule's host and
+    port as the rule's account whose words begin with the rule's words. Never a script and never a command that
     uses shell syntax: those are compared on nothing a rule can read."""
-    if "command" not in spec or spec.get("host") != rule["host"] or spec.get("user") != rule["account"]:
+    if ("command" not in spec or spec.get("host") != rule["host"] or spec.get("user") != rule["account"]
+            or spec.get("port") != rule["port"]):
         return False
     argv = execmode.parse_simple(spec["command"])
     return argv is not None and tuple(argv[:len(rule["argv"])]) == rule["argv"]

@@ -1843,7 +1843,7 @@ guess, and the message names the field, such as `auto_approve[2].host`):
 | `methods` | http | Upper-case methods, default `["GET", "HEAD"]`. |
 | `path_prefix` | http | Default `/`. Matches that path and what is below it (`/v1` matches `/v1/x`, not `/v10`). Compared on the raw path: a path with any `%` escape, `;`, backslash or `.`/`..` segment never matches. A request with a method-override header (`X-HTTP-Method-Override` and friends) or a `_method=` parameter, or a GET/HEAD with a body, never matches either; the same goes for the path-rewrite headers (`X-Original-URL`, `X-Rewrite-URL`, ...) and a query or body parameter (or JSON key) named `method`, `_method`, `x.method`, `x[method]`, `http_method`, `method_override` or `http_verb` (frameworks read these as the HTTP method; only the name counts, so `payment_method=card` or a value containing the word is fine), and a multipart body. A query or body that needs more than one decoding pass, uses JSON or unicode escapes, or is not plain ASCII, and any `Content-Encoding`/`Transfer-Encoding` header, also never match (the broker cannot show it is free of an override). These are best-effort: no list of tricks is complete, so keep an http rule to the narrowest host, methods and path the job needs (reads where you can). |
 | `argv` | env | The exact command as a list of words. A script whose text the broker could not read never matches. |
-| `host`, `account`, `argv` | exec | The server (a name from the key's `ssh_hosts.allowed_hosts`), the login name, and the words every matching command starts with. `secret` only (not `secrets`). Only a plain command matches (never a script or shell syntax). See [Remote commands](#remote-commands-request-mode-exec). |
+| `host`, `port`, `account`, `argv` | exec | The server (a name from the key's `ssh_hosts.allowed_hosts`), its port (default 22), the login name, and the words every matching command starts with. `secret` only (not `secrets`). Only a plain command matches (never a script or shell syntax). See [Remote commands](#remote-commands-request-mode-exec). |
 
 What a rule will not do:
 
@@ -2593,15 +2593,18 @@ git over ssh, port or agent forwarding, jump hosts. Output is returned when the 
 
 1. **Simple command.** The text parses under a deliberately small grammar: words separated by spaces, single quotes
    literal, double quotes with no `$`, backtick or backslash inside, and none of `; & | < > ( ) $ ` backtick `\` newline
-   `* ? [ ] { } ~ ! #` (or a tab) outside quotes; a leading `NAME=value` is not simple. The result is an argv.
+   `* ? [ ] { } ~ ! #` (or a tab) outside quotes; a leading `NAME=value` is not simple. A backslash, a newline or a `!` in
+   **any** word (even quoted) makes the command not simple too: the login shell on the target is not ours to know, and fish
+   reads a backslash inside single quotes, and csh/tcsh a newline or `!`, differently from POSIX sh. Such a command is never
+   low, never matched by a rule, and is sent byte for byte for the model and the human to judge. The result is an argv.
 2. **Deterministic low.** A simple command whose program (a bare name, or an absolute path in `/bin`, `/usr/bin`, `/sbin`,
    `/usr/sbin`, `/usr/local/bin`) is on the built-in read-only table, with its subcommand and flags inside that entry's
    allowed set, is **low** with no model call. Built in: `systemctl status|is-active|is-enabled|is-failed|list-units|
-   list-unit-files|list-timers`, `docker ps|images|version`, `df`, `uptime`, `free`, `uname`, `hostname` (no new name),
-   `date` (a `+FORMAT` only, never a time to set), `ls`, `ps` (`ps`, `ps aux`, `ps -ef`), `ip addr|address|route|link` (show
+   list-unit-files|list-timers` (flags: `--no-pager`, `--all`, `--failed`, `--no-legend`, `--type=`, `--state=`, `--lines=N` with N at most 50; never `--full`, `-l` or `-n`, which print untruncated command lines or many journal lines), `docker ps|images|version` (`docker ps` without `--no-trunc`), `df`, `uptime`, `free`, `uname`, `hostname` (no new name),
+   `date` (a `+FORMAT` only, never a time to set), `ls`, `ps` (only `ps`, or `-o`/`-eo` with the columns `pid`, `ppid`, `comm`, `etime`, `stat`, `%cpu`, `%mem`, `user`; never `aux`, `-ef` or a column that prints arguments, which often hold passwords), `ip addr|address|route|link` (show
    only), `ss`, `zpool list|status`, `zfs list`. Left **off** on purpose, so the model rates them: file readers (`cat`,
    `head`, `tail`, `grep`), and anything that prints environment, configuration or application output that often holds
-   secrets (`docker inspect`, `docker info`, `docker logs`, `systemctl show`, `journalctl`, `ps` with `e` or a custom format).
+   secrets (`docker inspect`, `docker info`, `docker logs`, `systemctl show`, `journalctl`, `ps` with `e`, `aux`, `-ef` or an arguments column).
    The owner extends the table with `exec.readonly`: each entry is a program, up to two subcommand words, then **the flags
    the owner allows** (`"smartctl -a --health"`); any other argument starting with `-` is not low.
 3. **Everything else** (not simple, not on the table, or a script) goes to the risk model with the credential's guidance,
@@ -2624,11 +2627,11 @@ notification carries host, account, a clipped command and a link, never a script
 
 ### Auto-approve rules for `exec`
 
-`{"name", "mode": "exec", "secret", "host", "account", "argv": [...], "clients": [...]}`: it approves a request when the command
-is **simple**, the host and account are exactly the rule's, the client matches (the legacy key never does), and the rule's `argv`
+`{"name", "mode": "exec", "secret", "host", "account", "port": 22, "argv": [...], "clients": [...]}`: it approves a request when the
+command is **simple**, the host, port (default 22) and account are exactly the rule's, the client matches (the legacy key never does), and the rule's `argv`
 is a prefix of the parsed argv (`["systemctl", "status"]` allows `systemctl status nginx`, and also flags that follow: list as
 many words as the command needs to be specific). A script, or a command with shell syntax, never matches; a rule on one key never
-approves another; the port is not part of the rule (any port pinned for that host). They live in the same two places as http rules:
+approves another; a rule for port 22 never approves port 2222. They live in the same two places as http rules:
 in the configuration (`auto_approve`, `secret` names one key, `secrets` is not allowed) and, for one key, on its **Policies** page
 (stored in the key's `auto_rules`, with the confirmation tick and an optional expiry; an SSH key holds only `exec` rules).
 A malformed stored rule makes the credential invalid, naming the field. Rule words must be plain ASCII (no hidden or

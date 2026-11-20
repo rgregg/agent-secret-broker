@@ -130,7 +130,7 @@ class E2E:
         from secret_broker import autorules
         self.broker.auto_rules = autorules.parse([
             {"name": f"{n} on the test host", "mode": "exec", "secret": "deploy", "host": "127.0.0.1",
-             "account": self.me, "argv": argv, "clients": [self.agent_id]}
+             "account": self.me, "port": self.port, "argv": argv, "clients": [self.agent_id]}
             for n, argv in (("echo", ["echo"]), ("sh", ["sh", "-c"]), ("sleep", ["sleep"]), ("touch", ["touch"]))])
 
     # -- the agent's side ------------------------------------------------------------------------

@@ -27,7 +27,7 @@ from .backends import BackendError
 from .backends import base as backend_base
 
 REASONS = ("invalid", "not_confirmed", "cap", "backend", "duplicate_name")
-FIELDS = ("name", "mode", "host", "account", "scheme", "methods", "path_prefix", "argv", "clients", "expires_at",
+FIELDS = ("name", "mode", "host", "account", "scheme", "methods", "path_prefix", "argv", "port", "clients", "expires_at",
           "hosts", "port", "allow_query", "max_ttl_s", "max_calls", "max_frames")
 _CATCH = (OSError, ValueError, KeyError, BackendError)
 _FIELD_IN_ERROR = re.compile(r"auto_rules\[0\]\.([a-z_]+)")
@@ -66,6 +66,7 @@ def fields_from_form(form):
     place that knows the form's input names; the stored-rule names are used inside."""
     one = lambda k: form.get(k, [""])[0]  # noqa: E731
     f = dict(name=one("name"), mode=one("mode"), host=one("host"), scheme=one("scheme"), account=one("account"),
+             exec_port=one("xport").strip(),
              methods=form.get("methods", []), path_prefix=one("path_prefix"),
              argv=[w.strip() for w in one("argv").splitlines() if w.strip()],
              client=one("client") or clients_mod.ANY)
@@ -92,6 +93,9 @@ def _raw_rule(fields, rid, by, now, days, client):
         raw["argv"] = list(fields.get("argv") or [])
     elif mode == "exec":
         raw.update(host=fields.get("host"), account=fields.get("account"), argv=list(fields.get("argv") or []))
+        port = fields.get("exec_port")
+        if port not in (None, ""):             # blank means the default, 22; anything else is validated by the parser
+            raw["port"] = int(port) if isinstance(port, str) and port.isascii() and port.isdigit() and len(port) <= 6 else port
     if client != clients_mod.ANY:
         raw["clients"] = [client]
     raw.update(by=by, at=sshrules.iso(now), expires_at=sshrules.iso(now + days * 86400) if days else None)
@@ -195,7 +199,7 @@ class UiRulesMixin:
                 return {"status": "failed", "message": "Could not save the rule."}
         extra = {"rule_host": rule["host"]} if rule["mode"] in ("http", "exec") else {}
         if rule["mode"] == "exec":
-            extra["account"] = rule["account"]
+            extra.update(account=rule["account"], rule_port=rule["port"])
         if rule["mode"] in sessionrules.MODES:
             extra = {"rule_hosts": list(rule["hosts"]) if rule["mode"] == "http_session"
                      else [f"{rule['host']}:{rule['port']}"],
@@ -284,7 +288,7 @@ def _matches(rule):
     if rule["mode"] == "env":
         return "run: " + " ".join(rule["argv"])
     if rule["mode"] == "exec":
-        return f"run on {rule['host']} as {rule['account']}: " + " ".join(rule["argv"]) + " ..."
+        return f"run on {rule['host']}:{rule['port']} as {rule['account']}: " + " ".join(rule["argv"]) + " ..."
     return f"{rule['scheme']}://{rule['host']}{rule['path_prefix']} ({', '.join(sorted(rule['methods']))})"
 
 
@@ -375,6 +379,8 @@ def card(name, sc, config_rules, csrf, usage, now=None, state=None, client_names
             f"<input id='arn{i}' name=name maxlength={autorules.MAX_NAME} autocomplete=off>"
             f"<label for='arh{i}'>Server (a name from this key's allowed hosts)</label>"
             f"<input id='arh{i}' name=host autocomplete=off placeholder='nas.example.com'>"
+            f"<label for='arxp{i}'>Port (blank: 22)</label><input id='arxp{i}' name=xport inputmode=numeric "
+            "autocomplete=off placeholder='22'>"
             f"<label for='arac{i}'>Account</label><input id='arac{i}' name=account autocomplete=off placeholder='ryan'>"
             f"<label for='ara{i}'>The command starts with these words, one per line</label>"
             f"<textarea id='ara{i}' name=argv rows=3 autocomplete=off placeholder='systemctl&#10;status'></textarea>"
