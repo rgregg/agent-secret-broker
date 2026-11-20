@@ -79,10 +79,13 @@ class Base(unittest.TestCase):
         self.addCleanup(s.close)
         return s
 
-    def asb(self, stub, *argv):
-        env = {k: v for k, v in os.environ.items() if not k.startswith(("SECRET_BROKER", "ASB_"))}
+    def asb(self, stub, *argv, env_extra=None, drop=()):
+        env = {k: v for k, v in os.environ.items() if not k.startswith(("SECRET_BROKER", "ASB_")) and k not in drop}
         env.update(HOME=self.tmp, XDG_STATE_HOME=os.path.join(self.tmp, "state"), SECRET_BROKER_URL=stub.url,
                    SECRET_BROKER_KEY="stub-key")
+        if "USER" not in drop:
+            env["USER"] = "localuser"
+        env.update(env_extra or {})
         return subprocess.run([sys.executable, "-I", CLI, *argv], env=env, capture_output=True, text=True, timeout=60)
 
     def run_ok(self, *argv, gets=(released("ok\n"),)):
@@ -115,9 +118,9 @@ class Request(Base):
              "command": "systemctl status nginx"})
 
     def test_what_you_did_not_give_is_not_sent(self):
-        # no guessed user (the local name is not the remote one), no port or timeout: the broker has the defaults
+        # the user is the local login name (see test_user_defaults...); no port or timeout: the broker has the defaults
         self.assertEqual(self.body("k", "nas", "--", "uptime"),
-                         {"mode": "exec", "names": ["k"], "host": "nas", "command": "uptime"})
+                         {"mode": "exec", "names": ["k"], "host": "nas", "user": "localuser", "command": "uptime"})
 
     def test_it_posts_once_and_polls_the_request_it_was_given(self):
         s, p = self.run_ok("k", "nas", "--", "uptime", gets=[RUNNING, released("up\n")])
@@ -249,7 +252,7 @@ class Script(Base):
     def test_a_script_file_is_sent_as_text_with_its_interpreter(self):
         path = self.write("s.sh", "echo hi\nuname -a\n")
         self.assertEqual(self.body("k", "nas", "--script", path),
-                         {"mode": "exec", "names": ["k"], "host": "nas",
+                         {"mode": "exec", "names": ["k"], "host": "nas", "user": "localuser",
                           "script": {"text": "echo hi\nuname -a\n", "interpreter": "sh"}})
 
     def test_bash_is_an_interpreter_and_travels_with_the_other_options(self):
@@ -343,6 +346,26 @@ class Usage(Base):
             for v in vals:
                 with self.subTest(flag=flag, value=v):
                     self.refused("k", "nas", flag, v, "--", "ls")
+
+    def test_user_defaults_to_the_local_login_name_and_the_flag_overrides_it(self):
+        self.assertEqual(self.body("k", "nas", "--", "ls")["user"], "localuser")
+        self.assertEqual(self.body("k", "nas", "--user", "ryan", "--", "ls")["user"], "ryan")
+        s = self.stub([released("ok\n")])
+        p = self.asb(s, "exec", "k", "nas", "--", "ls", env_extra={"USER": "a.b-c_d@x"})
+        self.assertEqual((p.returncode, s.bodies[0]["user"]), (0, "a.b-c_d@x"))
+
+    def test_without_a_usable_user_it_refuses_with_a_usage_message_and_sends_nothing(self):
+        for what, kw in (("unset", {"drop": ("USER",)}), ("empty", {"env_extra": {"USER": ""}}),
+                         ("space", {"env_extra": {"USER": "a b"}}), ("dash", {"env_extra": {"USER": "-oProxyCommand=x"}}),
+                         ("long", {"env_extra": {"USER": "u" * 65}}), ("non-ascii", {"env_extra": {"USER": "caf\u00e9"}})):
+            with self.subTest(what):
+                s = self.stub([released("ok\n")])
+                p = self.asb(s, "exec", "k", "nas", "--", "ls", **kw)
+                self.assertEqual(p.returncode, 2, p.stderr)
+                self.assertIn("pass --user NAME", p.stderr)
+                self.assertEqual((s.seen, s.bodies), ([], []))
+        s = self.stub([released("ok\n")])                      # control: --user needs no $USER at all
+        self.assertEqual(self.asb(s, "exec", "k", "nas", "--user", "ryan", "--", "ls", drop=("USER",)).returncode, 0)
 
     def test_the_limits_themselves_are_accepted(self):
         b = self.body("k", "nas", "--port", "65535", "--timeout", "600", "--user", "u" * 64, "--", "ls")

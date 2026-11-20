@@ -54,8 +54,8 @@ def find(rules, s, names=("deploy",), client=CLIENT):
 class Parse(unittest.TestCase):
     def test_config_rule(self):
         [r] = autorules.parse([cfg_rule(host="NAS.Example.com")])
-        self.assertEqual((r["mode"], r["host"], r["account"], r["argv"], r["secrets"]),
-                         ("exec", H, A, ("systemctl", "status"), frozenset({"deploy"})))
+        self.assertEqual((r["mode"], r["hosts"], r["account"], r["argv"], r["secrets"]),
+                         ("exec", (H,), A, ("systemctl", "status"), frozenset({"deploy"})))
 
     def test_bad_rules_name_the_field(self):
         for kw, field in (({"host": "a b"}, "host"), ({"host": None}, "host"), ({"account": "-x"}, "account"),
@@ -103,7 +103,7 @@ class RulePort(unittest.TestCase):
 
     def test_the_default_is_22_and_a_rule_for_22_does_not_approve_2222(self):
         for name, rules in self.rules().items():
-            self.assertEqual(rules[0]["port"], 22, name)
+            self.assertEqual(rules[0]["ports"], (22,), name)
             self.assertIsNotNone(find(rules, spec(port=22)), name)                    # positive control
             self.assertIsNone(find(rules, spec(port=2222)), name)
 
@@ -117,7 +117,7 @@ class RulePort(unittest.TestCase):
         raw = stored_rule()
         del raw["port"]
         [r] = autorules.parse_stored([raw], "deploy", ssh=True)
-        self.assertEqual(r["port"], 22)
+        self.assertEqual(r["ports"], (22,))
         self.assertEqual(autorules.serialize_stored([r])[0]["port"], 22)
 
     def test_a_bad_port_names_the_field(self):
@@ -310,13 +310,13 @@ class StoredRules(RulesBase):
     def test_a_port_on_the_form_is_stored_and_only_that_port_is_approved(self):
         self.add(exec_port="2222", name="alt", host="port.example.com")
         [rule] = self.broker.auto_rules_of("deploy")
-        self.assertEqual(rule["port"], 2222)
+        self.assertEqual(rule["ports"], (2222,))
         self.assertEqual(self.events("auto_rule_created")[-1]["rule_port"], 2222)
         self.assertEqual(self.ask_done(host="port.example.com", port=2222).status, "approved")
         self.assertEqual(self.ask_done(wait=False, host="nas.example.com", port=22).status, "pending")   # a port-22 request is not covered
         self.assertEqual(self.add(exec_port="70000", name="bad")["status"], "refused")
         self.assertEqual(self.add(exec_port="", name="dflt", host="nas.example.com")["status"], "created")        # blank means 22
-        self.assertEqual([r["port"] for r in self.broker.auto_rules_of("deploy")], [2222, 22])
+        self.assertEqual([r["ports"][0] for r in self.broker.auto_rules_of("deploy")], [2222, 22])
 
     def test_it_survives_a_reload_of_the_catalog(self):
         self.add()
@@ -388,6 +388,88 @@ class StoredRules(RulesBase):
         r = urllib.request.Request(self.abase + "/policies/auto_rules/revoke", data=form_r, headers=hdr, method="POST")
         self.assertEqual(urllib.request.urlopen(r, timeout=10).status, 200)
         self.assertEqual(self.broker.auto_rules_of("deploy"), [])
+
+
+class Lists(RulesBase):
+    """`host` and `port` of an exec rule may be lists; one entry is exactly the old single value."""
+    LISTED = cfg_rule(host=[H, "port.example.com", "NEW.example.com"], port=[22, 2222], clients=[AGENT])
+
+    def test_a_list_matches_exactly_the_listed_hosts_and_ports(self):
+        rules = autorules.parse([self.LISTED])
+        for host in (H, "port.example.com", "new.example.com"):
+            for port in (22, 2222):
+                self.assertIsNotNone(find(rules, spec(host=host, port=port)), (host, port))
+        for host, port in (("other.example.com", 22), (H, 2223), (H, 23), ("nas.example.com.", 22), ("nas2.example.com", 22),
+                           ("127.0.0.1", 22)):
+            self.assertIsNone(find(rules, spec(host=host, port=port)), (host, port))
+        self.assertEqual(rules[0]["hosts"], (H, "port.example.com", "new.example.com"))   # lower-cased, order kept
+
+    def test_a_one_element_list_is_the_old_single_value(self):
+        single = autorules.parse([cfg_rule()])[0]
+        one = autorules.parse([cfg_rule(host=[H], port=[22])])[0]
+        self.assertEqual((single["hosts"], single["ports"]), (one["hosts"], one["ports"]))
+        for s in (spec(), spec(host="x.example.com"), spec(port=2222)):
+            self.assertEqual(find([single], s) is not None, find([one], s) is not None)
+        stored = stored_rule(host=[H], port=[22])
+        [r] = autorules.parse_stored([stored], "deploy", ssh=True)
+        self.assertEqual(autorules.serialize_stored([r])[0]["host"], H)             # written back as the bare value
+        self.assertEqual(autorules.serialize_stored([r])[0]["port"], 22)
+        [m] = autorules.parse_stored([stored_rule(host=[H, "b.example.com"], port=[22, 23])], "deploy", ssh=True)
+        out = autorules.serialize_stored([m])[0]
+        self.assertEqual((out["host"], out["port"]), ([H, "b.example.com"], [22, 23]))
+        self.assertEqual(autorules.parse_stored([out], "deploy", ssh=True)[0]["hosts"], m["hosts"])   # round trip
+
+    def test_duplicates_collapse_and_bad_lists_are_refused_by_field(self):
+        [r] = autorules.parse([cfg_rule(host=[H, H.upper()], port=[22, 22])])
+        self.assertEqual((r["hosts"], r["ports"]), ((H,), (22,)))
+        too_many = [f"h{i}.example.com" for i in range(autorules.MAX_EXEC_LIST + 1)]
+        for kw, field in (({"host": []}, "host"), ({"host": too_many}, "host"), ({"host": [H, 3]}, "host"),
+                          ({"host": [H, "a b"]}, "host"), ({"host": [H, None]}, "host"), ({"host": {"a": 1}}, "host"),
+                          ({"port": []}, "port"), ({"port": [22, 0]}, "port"), ({"port": [22, 70000]}, "port"),
+                          ({"port": [22, True]}, "port"), ({"port": [22, "23"]}, "port"), ({"port": list(range(1, 22))}, "port")):
+            with self.assertRaises(ValueError) as cm:
+                autorules.parse([cfg_rule(**kw)])
+            self.assertIn(f"auto_approve[0].{field}", str(cm.exception), kw)
+        self.assertEqual(len(autorules.parse([cfg_rule(host=too_many[:-1])])), 1)      # control: exactly the cap is fine
+
+    def test_a_listed_rule_never_approves_a_host_the_key_does_not_pin(self):
+        self.broker.auto_rules = autorules.parse([cfg_rule(host=[H, "new.example.com"], port=[22, 2222],
+                                                           clients=[self.agent.id])])
+        self.enable(max_pending_per_client=20)
+        req = self.ask_done(command="systemctl status nginx")                  # control: listed and pinned
+        self.assertEqual((req.status, self.ran), ("approved", [req.id]))
+        before = len(self.ran)
+        for body in ({"host": "new.example.com"}, {"host": H, "port": 2222}):  # listed, but the key pins neither
+            for r in self.broker._by_id.values():
+                r.status = "expired"
+            req = self.ask_done(wait=False, **body)
+            self.assertEqual(req.status, "pending", body)
+            self.assertIn("host_state", req.spec)
+        self.assertEqual(len(self.ran), before)
+
+    def test_the_form_takes_comma_separated_lists(self):
+        add = lambda **kw: self.broker.add_auto_rule("deploy", {"name": "l", "mode": "exec", "account": A,   # noqa: E731
+                                                                "argv": ["uptime"], "client": self.agent.id, **kw},
+                                                     "never", True, "alice")
+        self.assertEqual(add(host="nas.example.com, port.example.com", exec_port="22, 2222")["status"], "created")
+        [rule] = self.broker.auto_rules_of("deploy")
+        self.assertEqual((rule["hosts"], rule["ports"]), ((H, "port.example.com"), (22, 2222)))
+        ev = self.events("auto_rule_created")[-1]
+        self.assertEqual((ev["rule_host"], ev["rule_port"]), ([H, "port.example.com"], [22, 2222]))
+        stored = self.broker.cfg["secrets"]["deploy"]["_meta"]["auto_rules"][0]
+        self.assertEqual((stored["host"], stored["port"]), ([H, "port.example.com"], [22, 2222]))
+        for name, kw in (("a", {"host": "nas.example.com,,x.example.com"}), ("b", {"host": "nas.example.com,"}),
+                         ("c", {"exec_port": "22,x"}), ("d", {"exec_port": "22,,23"}), ("e", {"exec_port": "22, 70000"})):
+            self.assertEqual(add(name=name, **kw)["status"], "refused", kw)
+        self.assertEqual(len(self.broker.auto_rules_of("deploy")), 1)
+        self.assertEqual(add(name="single", host="nas.example.com")["status"], "created")    # control
+        self.assertEqual(self.broker.cfg["secrets"]["deploy"]["_meta"]["auto_rules"][1]["host"], H)   # bare value for one
+        self.assertIn("nas.example.com,port.example.com:22,2222", autorules_text(self.broker))
+
+
+def autorules_text(broker):
+    from secret_broker import uirules
+    return uirules.describe(broker.auto_rules_of("deploy")[0])
 
 
 if __name__ == "__main__":

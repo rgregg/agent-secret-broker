@@ -80,6 +80,20 @@ def fields_from_form(form):
     return f
 
 
+def _comma_list(text, kind):
+    """A form's comma-separated list as the stored value: one entry is the bare value (the shape rules always had),
+    several are a list. A non-text value (a direct call) is passed through for the parser to refuse. Entries
+    that do not look like `kind` stay as text, so the parser refuses them by name."""
+    if not isinstance(text, str):
+        return text
+    parts = [x.strip() for x in text.split(",")]
+    if len(parts) > autorules.MAX_EXEC_LIST + 1 or "" in parts and len(parts) > 1:
+        return parts
+    if kind is int:
+        parts = [int(x) if x.isascii() and x.isdigit() and len(x) <= 6 else x for x in parts]
+    return parts[0] if len(parts) == 1 else parts
+
+
 def _raw_rule(fields, rid, by, now, days, client):
     """The stored form of a new rule from the form's fields (unvalidated: parse_stored does that)."""
     mode = fields.get("mode")
@@ -93,9 +107,10 @@ def _raw_rule(fields, rid, by, now, days, client):
         raw["argv"] = list(fields.get("argv") or [])
     elif mode == "exec":
         raw.update(host=fields.get("host"), account=fields.get("account"), argv=list(fields.get("argv") or []))
+        raw["host"] = _comma_list(fields.get("host"), str)
         port = fields.get("exec_port")
         if port not in (None, ""):             # blank means the default, 22; anything else is validated by the parser
-            raw["port"] = int(port) if isinstance(port, str) and port.isascii() and port.isdigit() and len(port) <= 6 else port
+            raw["port"] = _comma_list(port, int)
     if client != clients_mod.ANY:
         raw["clients"] = [client]
     raw.update(by=by, at=sshrules.iso(now), expires_at=sshrules.iso(now + days * 86400) if days else None)
@@ -197,9 +212,10 @@ class UiRulesMixin:
             except _CATCH as e:
                 self.log("auto_rule_change_failed", op="create", error_class=backend_base.error_class(e), **who)
                 return {"status": "failed", "message": "Could not save the rule."}
-        extra = {"rule_host": rule["host"]} if rule["mode"] in ("http", "exec") else {}
+        extra = {"rule_host": rule["host"]} if rule["mode"] == "http" else {}
         if rule["mode"] == "exec":
-            extra.update(account=rule["account"], rule_port=rule["port"])
+            one = lambda v: v[0] if len(v) == 1 else list(v)  # noqa: E731
+            extra.update(rule_host=one(rule["hosts"]), account=rule["account"], rule_port=one(rule["ports"]))
         if rule["mode"] in sessionrules.MODES:
             extra = {"rule_hosts": list(rule["hosts"]) if rule["mode"] == "http_session"
                      else [f"{rule['host']}:{rule['port']}"],
@@ -288,7 +304,8 @@ def _matches(rule):
     if rule["mode"] == "env":
         return "run: " + " ".join(rule["argv"])
     if rule["mode"] == "exec":
-        return f"run on {rule['host']}:{rule['port']} as {rule['account']}: " + " ".join(rule["argv"]) + " ..."
+        hosts, ports = ",".join(rule["hosts"]), ",".join(str(q) for q in rule["ports"])
+        return f"run on {hosts}:{ports} as {rule['account']}: " + " ".join(rule["argv"]) + " ..."
     return f"{rule['scheme']}://{rule['host']}{rule['path_prefix']} ({', '.join(sorted(rule['methods']))})"
 
 
@@ -377,9 +394,9 @@ def card(name, sc, config_rules, csrf, usage, now=None, state=None, client_names
             "<input type=hidden name=mode value=exec>"
             f"<b>Add rule for remote commands</b><label for='arn{i}'>Name (shown in the audit log)</label>"
             f"<input id='arn{i}' name=name maxlength={autorules.MAX_NAME} autocomplete=off>"
-            f"<label for='arh{i}'>Server (a name from this key's allowed hosts)</label>"
+            f"<label for='arh{i}'>Server (a name from this key's allowed hosts; several, comma-separated)</label>"
             f"<input id='arh{i}' name=host autocomplete=off placeholder='nas.example.com'>"
-            f"<label for='arxp{i}'>Port (blank: 22)</label><input id='arxp{i}' name=xport inputmode=numeric "
+            f"<label for='arxp{i}'>Port (blank: 22; several, comma-separated)</label><input id='arxp{i}' name=xport inputmode=numeric "
             "autocomplete=off placeholder='22'>"
             f"<label for='arac{i}'>Account</label><input id='arac{i}' name=account autocomplete=off placeholder='ryan'>"
             f"<label for='ara{i}'>The command starts with these words, one per line</label>"
