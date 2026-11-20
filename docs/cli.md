@@ -46,6 +46,8 @@ Check it:
 
     asb NAME[,NAME] -- command args...    # run a command with the value in its environment
     asb sudo -- command args...           # run a command as root through the root helper (you approve it)
+    asb exec NAME HOST [--user U] [--port P] [--timeout S] -- command args...   # the broker runs it on HOST over SSH
+    asb exec NAME HOST --script FILE [--interpreter sh|bash]                    # or a script, sent on stdin
 
     printf '%s' "$VALUE" | asb store NAME --hosts a.example.com   # add a credential
     printf 'A=...\nB=...\n' | asb store NAME --hosts a.example.com --keys   # one credential, variables A and B
@@ -117,6 +119,18 @@ Check it:
   broker itself. You approve the exact command, the helper runs only programs its admin put on its
   allow-list, and no password exists anywhere. Install, the allow-list and what it refuses:
   [root-exec.md](root-exec.md).
+- `asb exec NAME HOST -- command args...` is for any command you would otherwise `ssh` for. NAME is an SSH key
+  credential, HOST a name that key is pinned for; the broker (not your machine) connects, runs exactly that text and
+  returns the output, so a person, the risk check and an auto-approve rule see the command before it runs. stdout and
+  stderr go to the same streams and the exit code is the remote command's. If the broker could not run it, `asb`
+  prints `asb: exec failed: LABEL` (`host_key_mismatch`, `host_not_pinned`, `connect_failed`, `auth_failed`,
+  `timeout`, `output_cap`, `ssh_unavailable` or `internal`) and exits 3; denial is 4 and expiry 5, as everywhere.
+  Options: `--user`, `--port`, `--timeout` (seconds, 1 to 600). Each word after `--` is one argument, joined with
+  shell quoting (`-- echo 'a b'` passes one argument): a pipe, redirect or variable needs `-- sh -c '...'` or
+  `--script FILE` (at most 32 KiB of text, sent byte for byte to `sh -s` or `bash -s`). A command is at most 4096
+  characters; control characters other than tab and newline, and hidden characters, are refused before anything is
+  sent. Output arrives when the command ends. The broker side (enabling it, host pinning, rules) is in
+  [reference.md](reference.md). Added in `asb` 1.2.
 - **Scripts are shown to you.** For `NAME -- command`, `asb` looks for the script
   file the command runs and sends its text with the request, so the approval card
   and the risk check see what the script does, not just `bash deploy.sh`. It skips

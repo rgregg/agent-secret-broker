@@ -8,8 +8,8 @@ use serde_json::Value;
 use std::time::Duration;
 
 /// Keep in step with `CLI_VERSION` in client/asb, `USER_AGENT` below and secret_broker/clientver.py (a test pins all).
-pub const CLI_VERSION: &str = "1.1";
-pub const USER_AGENT: &str = "asb/1.1 (+https://github.com/rgregg/agent-secret-broker)";
+pub const CLI_VERSION: &str = "1.2";
+pub const USER_AGENT: &str = "asb/1.2 (+https://github.com/rgregg/agent-secret-broker)";
 
 /// `SECRET_BROKER_URL` and `SECRET_BROKER_KEY`, else `~/.config/secret-broker/client.json`.
 pub fn config() -> Result<Config, Die> {

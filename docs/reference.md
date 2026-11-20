@@ -11,6 +11,7 @@ How the broker works, in detail. For installing and configuring it see
     asb http NAME METHOD URL [-H 'K: V']... [-d BODY | -d @file | -d @-]
     asb http NAME METHOD URL ... --session ID     inside an approved http session (see "HTTP sessions")
     asb NAME[,NAME] -- command args...
+    asb exec NAME HOST [--user U] [--port P] [--timeout S] -- command args...   the broker runs it over SSH (see `docs/cli.md`)
     asb guidance propose FILE|- | --from-dir DIR   propose risk guidance for a human to review
     asb help COMMAND              usage + example for one command
     asb guide                     manual for agents: workflow, {{VAR}}, approvals, exit codes

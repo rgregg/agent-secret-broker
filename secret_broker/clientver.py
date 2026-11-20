@@ -11,7 +11,7 @@ make older ones show "upgrade recommended"; tests pin the three together.
 """
 import re
 
-LATEST_CLIENT_VERSION = "1.1"
+LATEST_CLIENT_VERSION = "1.2"
 MAX_LEN = 24
 _VER = re.compile(r"[0-9]{1,4}(?:\.[0-9]{1,4}){0,3}")
 _UA = re.compile(r"asb/([0-9]{1,4}(?:\.[0-9]{1,4}){0,3})(?:\s|\Z)")
