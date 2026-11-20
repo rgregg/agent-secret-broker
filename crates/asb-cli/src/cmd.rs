@@ -6,8 +6,8 @@ use crate::pyfmt::{json_dumps, py_str, quote, repr, truthy};
 use crate::text_gen::{self, DOC, GUIDE, HELP_TOPICS};
 use crate::util::{check_name, die_help};
 use crate::{
-    cmd_agent_setup, cmd_audit, cmd_enroll, cmd_env, cmd_fingerprint, cmd_guidance, cmd_http,
-    cmd_plan, cmd_session, cmd_ssh_agent, cmd_store, cmd_sudo, cmd_ws,
+    cmd_agent_setup, cmd_audit, cmd_enroll, cmd_env, cmd_exec, cmd_fingerprint, cmd_guidance,
+    cmd_http, cmd_plan, cmd_session, cmd_ssh_agent, cmd_store, cmd_sudo, cmd_ws,
 };
 use serde_json::Value;
 
@@ -37,7 +37,7 @@ fn dispatch(argv: &[String]) -> R {
         let rest = &argv[1..];
         let scan: &[String] = if cmd == "http" {
             &rest[..rest.len().min(3)]
-        } else if cmd == "sudo" {
+        } else if cmd == "sudo" || cmd == "exec" {
             &rest[..rest.iter().position(|a| a == "--").unwrap_or(rest.len())]
         } else if cmd == "plan" {
             &rest[..rest.len().min(2)] // a later --help belongs to the subcommand
@@ -64,13 +64,14 @@ fn dispatch(argv: &[String]) -> R {
         "audit" => cmd_audit::run(&argv[1..]),
         "guidance" => cmd_guidance::run(&argv[1..]),
         "sudo" => cmd_sudo::run(&argv[1..]),
+        "exec" => cmd_exec::run(&argv[1..]),
         "enroll" => cmd_enroll::run(&argv[1..]),
         "store" | "update" => cmd_store::store_or_update(argv),
         "request-credential" => cmd_store::request_credential(&argv[1..]),
         _ if argv.iter().any(|a| a == "--") => cmd_env::run(argv),
         _ => Err(die(
             format!(
-                "unknown command {}.\ncommands: list, which, status, version, audit, http, session, ws, plan, sudo, store, update, request-credential, guidance, enroll, ssh-agent, fingerprint, help, guide; or: asb NAME -- command\nstart with `asb guide`",
+                "unknown command {}.\ncommands: list, which, status, version, audit, http, session, ws, plan, sudo, exec, store, update, request-credential, guidance, enroll, ssh-agent, fingerprint, help, guide; or: asb NAME -- command\nstart with `asb guide`",
                 repr(cmd)
             ),
             USAGE,

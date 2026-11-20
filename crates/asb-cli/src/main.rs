@@ -12,6 +12,7 @@ mod cmd_agent_setup;
 mod cmd_audit;
 mod cmd_enroll;
 mod cmd_env;
+mod cmd_exec;
 mod cmd_fingerprint;
 mod cmd_guidance;
 mod cmd_http;

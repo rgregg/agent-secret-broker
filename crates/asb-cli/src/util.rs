@@ -157,7 +157,7 @@ pub fn os_error(e: &std::io::Error) -> String {
     }
 }
 
-fn strerror(n: i32) -> String {
+pub fn strerror(n: i32) -> String {
     // SAFETY: strerror returns a pointer to a static NUL-terminated message.
     unsafe {
         std::ffi::CStr::from_ptr(libc::strerror(n))
