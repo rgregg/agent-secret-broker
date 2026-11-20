@@ -34,6 +34,7 @@ import urllib.request
 from . import destguard
 
 from . import guidance as guidance_mod
+from . import execmode as exec_mod
 from . import keyprovider
 from . import scripts as scripts_mod
 from . import summarize
@@ -276,6 +277,14 @@ def request_fields(mode, names, spec, max_content_chars=400, send_content=True,
                 f["destination"] = str(host["claimed"])
             if host.get("forwarding"):
                 f["forwarding"] = True
+    elif mode == "exec":
+        f.update(operation="run a command or script on a remote host over SSH", host=spec.get("host"),
+                 account=spec.get("user"))
+        if "script" in spec:
+            f["command"] = f"<{spec['script']['interpreter']} script, {len(spec['script']['text'])} characters>"
+            f["script_text"] = (exec_mod.model_text(spec, max_script_chars) if send_content else "<not shown>")
+        else:
+            f["command"] = exec_mod.model_text(spec, max_content_chars) if send_content else "<not shown>"
     else:
         cmd = " ".join(spec.get("argv") or [])
         f["command"] = cmd[:max_content_chars] if send_content else "<not shown>"

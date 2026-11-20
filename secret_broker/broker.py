@@ -59,6 +59,8 @@ from . import guidancesuggest as guidancesuggest_mod
 from . import proposals as proposals_mod
 from . import credreq as credreq_mod
 from . import sudomode as sudo_mod
+from . import execmode as exec_mod
+from . import riskmodel as riskmodel_mod
 from . import autorules as autorules_mod
 from . import credlinks as credlinks_mod
 from . import credpolicy as credpolicy_mod
@@ -202,7 +204,7 @@ class Request:
         # credential presented), unlike `source`, which is the client's own user@host claim.
         self.client = client or dict(clients_mod.ClientStore.LEGACY_VIEW)
         self.nonce = secrets.token_urlsafe(24)
-        self.mode = mode          # "env" | "http" | "store" | "ssh_sign" | "guidance" | "credential" | "plan" | "session" | "sudo"
+        self.mode = mode          # "env" | "http" | "store" | "ssh_sign" | "guidance" | "credential" | "plan" | "session" | "sudo" | "exec"
         self.plan_id = None       # mode "plan": the plan this card would start
         self.names = names
         self.aliases_used = {}    # {alias: canonical} when the agent asked by a former name
@@ -332,6 +334,7 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
         self.proposals_cfg = proposals_mod.parse_config(config.get("guidance_proposals"))
         self.credreq_cfg = credreq_mod.parse_config(config.get("credential_requests"))
         self.sudo_cfg = sudo_mod.parse_config(config.get("sudo"))
+        self.exec_cfg = exec_mod.parse_config(config.get("exec"))
         self.auto_rules = autorules_mod.parse(config.get("auto_approve"))
         # guidance applies: vault writes are serialized and spaced; transient errors are retried.
         # The clock, sleep and jitter are attributes so tests can drive them.
@@ -949,6 +952,7 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
                          "guidance_proposals": bool(self.proposals_cfg["enabled"]),
                          "credential_requests": bool(self.credreq_cfg["enabled"]),
                          "sudo": bool(self.sudo_cfg["enabled"]),
+                         "exec": bool(self.exec_cfg["enabled"]),
                          "plans": bool(self.plans_cfg["enabled"]),
                          "client_enrollment": bool(self.clients_cfg["enrollment"]["enabled"]),
                          "legacy_client_key": self.clients_cfg["legacy"],
@@ -1046,6 +1050,8 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
                 rec.setdefault(k, v)
         elif req.mode == "sudo":
             rec.update(sudo_mod.audit_fields(req.spec))     # the command's first words; never an environment
+        elif req.mode == "exec":
+            rec.update(exec_mod.audit_fields(req.spec))     # the command's first words, or a script's size and hash
         elif req.mode == "ssh_sign":
             sp = req.spec
             rec.update(ssh_kind=sp["ssh"]["kind"], ssh_what=sp["ssh"]["text"], ssh_headline=sp["ssh"].get("headline"),
@@ -1999,7 +2005,7 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
     # -- request lifecycle ------------------------------------------------
     # modes whose names are existing credentials: a former name (alias) is accepted there. store and credential
     # requests name a credential to create or replace and see an alias as an existing name (see _validate_store)
-    _ALIAS_MODES = ("http", "env", "ssh_sign", "session")
+    _ALIAS_MODES = ("http", "env", "ssh_sign", "session", "exec")
 
     def _resolve_request_names(self, mode, names, source, peer, client):
         """(canonical names, {alias: canonical}); each alias used is audited (both names)."""
@@ -2050,6 +2056,10 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
                     raise ValueError("a sudo request names no credential")
                 sudo_mod.check_allowed(self.sudo_cfg, client)
                 sudo_mod.validate(spec)
+            elif mode == "exec":
+                exec_mod.check_allowed(self.exec_cfg, client)   # before anything about the names is revealed
+                exec_mod.validate(spec, self.exec_cfg)
+                self._validate_exec(names, spec, secrets_cfg, internal)
             else:
                 if not names or any(n not in secrets_cfg or n in internal for n in names):
                     if not self._backend_ok:
@@ -2120,6 +2130,11 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
                     if sum(r.status == "pending" and r.mode == "sudo" and r.client["id"] == cid_
                            for r in self._by_id.values()) >= self.sudo_cfg["max_pending_per_client"]:
                         err = "too many pending sudo requests"
+                if mode == "exec":
+                    cid_ = (client or clients_mod.ClientStore.LEGACY_VIEW)["id"]
+                    if sum(r.status == "pending" and r.mode == "exec" and r.client["id"] == cid_
+                           for r in self._by_id.values()) >= self.exec_cfg["max_pending_per_client"]:
+                        err = "too many pending remote command requests"
                 if mode == "credential":
                     open_cr = [r for r in self._by_id.values() if r.status == "pending" and r.mode == "credential"]
                     if len(open_cr) >= credreq_mod.MAX_PENDING:
@@ -2156,7 +2171,10 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
             return self._session_pending(req)
         # ssh_sign never reaches a model, so it carries no guidance either
         notes = {} if mode == "ssh_sign" else guidance_mod.for_names(self.cfg["secrets"], names)
-        a = risk_mod.assess(mode, names, spec, self.summarizer, guidance=notes or None)
+        if mode == "exec":
+            a = self._exec_assess(req, notes)
+        else:
+            a = risk_mod.assess(mode, names, spec, self.summarizer, guidance=notes or None)
         req.summary, req.risk = a["summary"], {k: a[k] for k in ("level", "model", "reasons")}
         req.summary_model = a.get("summary_model") if a.get("summary_source") != "deterministic" else None
         req.summary_source = a.get("summary_source")
@@ -2822,6 +2840,42 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
         spec.pop("binds", None)
         spec.pop("bind_overflow", None)
 
+    def _validate_exec(self, names, spec, secrets_cfg, internal):
+        """The key and host of a remote command (`spec` is already validated and normalized). The host
+        must be NAMED in the key's allowed_hosts (a fingerprint entry is not enough: the broker needs a
+        name to connect to) and have a pinned known_hosts line for that name and port. Refused here,
+        before anything is shown or run; the messages never echo the host."""
+        if len(names) != 1:
+            raise ValueError("a remote command names exactly one ssh key credential")
+        n = names[0]
+        if n not in secrets_cfg or n in internal:
+            raise ValueError("unknown secret name")
+        sc = secrets_cfg[n]
+        if not sc.get("ssh"):
+            raise ValueError("a remote command needs an ssh key credential")
+        if spec["host"] not in ((sc.get("ssh_hosts") or {}).get("allowed") or []):
+            raise PermissionError("that host is not named in this key's allowed hosts")
+        raw = ((sc.get("_meta") or {}).get("ssh_hosts") or {}).get("known_hosts") or []
+        if not sshkey.known_host_lines(raw, spec["host"], spec["port"]):
+            raise PermissionError("this key has no pinned host key (known_hosts line) for that host and port")
+
+    def _exec_run(self, req):
+        raise BackendError("remote commands cannot run yet")
+
+    def _exec_assess(self, req, notes):
+        """The risk of a remote command: LOW with no model call for a plain command on the read-only table
+        (execmode.classify); everything else is the risk model's call with the credential's guidance, and
+        no verdict means high. The classification reason leads the reasons shown to the approver."""
+        cls = exec_mod.classify(req.spec, self.exec_cfg)
+        if cls["level"] == "low":
+            return {"level": "low", "model": None, "reasons": [cls["reason"]],
+                    "summary": riskmodel_mod.deterministic_summary("exec", req.names, req.spec),
+                    "summary_model": None, "summary_source": "deterministic", "summary_reason": None,
+                    "summary_rule": None}
+        a = risk_mod.assess("exec", req.names, req.spec, self.summarizer, guidance=notes or None)
+        a["reasons"] = [cls["reason"]] + list(a["reasons"])
+        return a
+
     @staticmethod
     def _ssh_host(data, binds, claimed, sc, overflow=False):
         """Server identity for a login signature, and the key's allowed_hosts policy.
@@ -2980,6 +3034,8 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
                         f"({', '.join(sp['methods'])}), {sessions_mod._fmt_ttl(sp['ttl_s'])}, up to {sp['max_calls']} calls")
         elif req.mode == "sudo":
             what = sudo_mod.push_text(req.spec)
+        elif req.mode == "exec":
+            what = exec_mod.push_text(req.spec)
         elif req.mode == "ssh_sign":
             what = "\n".join([req.spec["ssh"].get("headline") or req.spec["ssh"]["text"],
                               f"SSH key {req.spec['fingerprint']}: {req.spec['ssh']['text']}"]
@@ -3836,6 +3892,10 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
                         always or grant_minutes is not None or ssh_rule is not None or credential is not None
                         or plan is not None or session_limits is not None):
                     req, code = None, 400   # a root command is approved once, as shown; nothing is claimed
+                if req is not None and req.mode == "exec" and (
+                        always or grant_minutes is not None or ssh_rule is not None or credential is not None
+                        or plan is not None or session_limits is not None):
+                    req, code = None, 400   # a remote command is approved once, as shown; standing permission is a rule
                 if req is not None and req.mode == "session":
                     # no Always, grant or SSH rule; the approver may only shorten the limits
                     fin = sessions_mod.check_limits(session_limits, req.spec) if approve else (0, 0)
@@ -4493,6 +4553,8 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
             raise BackendError("sessions are opened only by a human decision")
         if req.mode == "sudo":          # there is no value: the approval itself is the answer
             return {"approved": True}
+        if req.mode == "exec":          # runs the approved text over ssh; the result is the answer (see take_result)
+            return self._exec_run(req)
         if req.mode == "store":
             return self._store(req)
         if req.mode == "ssh_sign":
@@ -4612,8 +4674,12 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
         if delivered:
             self.audit("delivered", req, to_peer=peer, kind={"env": "env", "ssh_sign": "ssh_signature",
                                                              "credential": "stored", "session": "session",
-                                                             "sudo": "approval"}.get(req.mode, "http_response"))
-            return {"status": "approved", **(out or {})}
+                                                             "sudo": "approval",
+                                                             "exec": "exec_result"}.get(req.mode, "http_response"))
+            # a remote command's result is `released` (the wire contract): the one delivery carries it
+            return {"status": "released" if req.mode == "exec" else "approved", **(out or {})}
+        if req.mode == "exec" and req.status == "deciding":
+            return {"status": "running"}        # approved, and being run
         if req.status == "released":
             return {"status": "released"}
         return {"status": req.status, "error": req.error}
@@ -5867,6 +5933,8 @@ def _describe(req):
         return (ws_mod if req.spec.get("kind") == "ws" else sessions_mod).describe_html(req)
     if req.mode == "sudo":
         return sudo_mod.describe_html(req)
+    if req.mode == "exec":
+        return exec_mod.describe_html(req)
     if req.mode == "ssh_sign":
         host = "".join("<br>" + html.escape(x) for x in sshkey.host_lines(req.spec.get("host")))
         return (f"<strong>{html.escape(req.spec['ssh'].get('headline') or req.spec['ssh']['text'])}</strong>"
@@ -5948,7 +6016,7 @@ _CHANNEL_LABEL = {"dashboard": "web dashboard", "push": "browser push notificati
                   "ha": "Home Assistant", "link": "approval link", "telegram": "Telegram"}
 _MODE_LABEL = {"http": "web", "env": "run-with-secret", "ssh_sign": "ssh signing",
                "guidance": "guidance proposal", "credential": "credential request", "plan": "plan",
-               "session": "http session", "sudo": "root command"}
+               "session": "http session", "sudo": "root command", "exec": "remote command"}
 _CLIENT_NOTES = {"planrevoked": "Plan revoked: it stops matching before its next call.",
                  "plangone": "That plan is no longer active.", "sesrevoked": "Session revoked. Its next call fails.",
                  "sesgone": "That session had already ended.", "renamed": "Client renamed.", "revoked": "Client revoked. Its next request fails.",
@@ -5987,6 +6055,12 @@ def _approve_actions(broker, req):
     revoke_hint = "Revoke any time on " + (        # where a standing approval for these secrets is listed and revoked
         credlinks_mod.link(req.names[0], tab="policies", text="the credential's Policies page")
         if len(req.names) == 1 else "the Policies page") + "."
+    if req.mode == "exec":          # Approve or Deny only: standing permission for remote commands is a rule
+        return ("<div class=decide-row><button class='btn approve' name=decision value=approve>"
+                "Approve</button><button class='btn deny' name=decision value=deny>Deny</button></div>"
+                "<p class=scope><small class=muted>Approves this one command, as shown. There is no Always or "
+                "timed approval for remote commands: to allow a kind of command without asking, add an "
+                f"auto-approve rule on {revoke_hint[len('Revoke any time on '):]}</small></p>")
     if req.mode == "sudo":          # Approve or Deny only: no Always, no timed grant
         return ("<div class=decide-row><button class='btn approve' name=decision value=approve>"
                 "Approve</button><button class='btn deny' name=decision value=deny>Deny</button></div>"
@@ -6198,6 +6272,24 @@ def _detail_html(r, evs, retained=""):
         add("Command", cmd)
         add("Directory", req_ev.get("cwd"))
         add("Asked by local user", req_ev.get("invoker"))
+    elif r["mode"] == "exec":
+        # where, as whom, the command's words (or a script's size and hash) and the outcome as counts and a
+        # fixed label; the script text and the output are in the retained request-details store, never here
+        req_ev, fin = first("requested") or {}, last("exec_finished") or {}
+        add("Operation", "run a command or script on a remote host over SSH")
+        add("Host", r.get("exec_host"))
+        add("Account", req_ev.get("account"))
+        add("Port", req_ev.get("port"))
+        if r.get("script_digest"):
+            add("Script", f"{e(str(req_ev.get('interpreter') or 'sh'))} script, {e(str(req_ev.get('script_len')))} bytes, "
+                f"sha256 <code>{e(r['script_digest'])}</code>", True)
+        else:
+            words = " ".join(r.get("argv") or [])
+            add("Command", "<code>" + e(exec_mod._shown(words)) + "</code>", True)
+        add("Exit status", fin.get("exit_code"))
+        add("Failure", fin.get("label"))
+        add("Output", f"{fin['stdout_bytes']} bytes on stdout, {fin['stderr_bytes']} on stderr"
+            f"{', cut at the cap' if fin.get('truncated') else ''}" if fin.get("stdout_bytes") is not None else None)
     elif r["mode"] == "credential":
         # kind, hosts, variable names and sizes only: the purpose text and the value are not retained
         req_ev, prov, st = first("requested") or {}, last("credential_provided") or {}, last("stored") or {}
@@ -6577,6 +6669,11 @@ def client_handler(broker, client_key):
                         raise ValueError("a sudo request names no credential")
                     spec = {"argv": body.get("argv"), "cwd": body.get("cwd"), "user": body.get("user", "root"),
                             "invoker": body.get("invoker")}
+                elif mode == "exec":
+                    # only these fields: nothing else the agent sends can reach an ssh option or the broker's state
+                    if set(body) - {"mode", "names", "source", "host", "user", "port", "command", "script", "timeout_s"}:
+                        raise ValueError("unknown field in an exec request")
+                    spec = {k: body[k] for k in ("host", "user", "port", "command", "script", "timeout_s") if k in body}
                 elif mode == "ssh_sign":
                     spec = {"data_b64": body.get("data_b64"), "flags": body.get("flags", 0),
                             "binds": body.get("binds"), "claimed_dest": body.get("claimed_dest"),
@@ -6891,7 +6988,7 @@ def approval_handler(broker):
                 if arg("outcome") in OUTCOMES + ("unknown",) and arg("outcome") != "pending":
                     a["outcome"] = arg("outcome")
                 a["secret"] = arg("secret")
-                if arg("mode") in ("http", "env", "store", "ssh_sign", "guidance", "credential", "plan", "session", "sudo"):
+                if arg("mode") in ("http", "env", "store", "ssh_sign", "guidance", "credential", "plan", "session", "sudo", "exec"):
                     a["mode"] = arg("mode")
             try:
                 n = int(arg("limit") or HIST_PAGE)
@@ -6922,6 +7019,10 @@ def approval_handler(broker):
                     what = "credential request"
                 elif r["mode"] == "sudo":
                     what = "run as root: " + sudo_mod.display_text(r.get("argv") or [])[:100]
+                elif r["mode"] == "exec":
+                    what = (f"run on {r.get('exec_host') or '?'}: "
+                            + sudo_mod.display_text(r.get("argv") or [])[:100] if not r.get("script_digest") else
+                            f"run a script on {r.get('exec_host') or '?'}")
                 elif r["mode"] == "plan":
                     what = "plan"
                 elif r["mode"] == "session":

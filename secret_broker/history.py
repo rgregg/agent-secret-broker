@@ -41,7 +41,10 @@ _EV_KEYS = ("reason", "reasons", "model", "risk", "error", "via", "channel", "de
             "names", "rule", "uses_left_rule", "uses_left_plan", "left_s", "cause", "suppressed",
             # http sessions: public prefix, manifest and counters; never an id, cookie or value
             "session", "methods", "ttl_s", "max_calls", "calls", "left_s", "reason_class", "lifetime_s",
-            "unused", "shortened", "revoked_by", "suppressed")
+            "unused", "shortened", "revoked_by", "suppressed",
+            # remote commands: where, size and hash of a script, and the outcome as counts and a fixed label; never output
+            "host", "port", "interpreter", "script_len", "script_digest", "exit_code", "stdout_bytes",
+            "stderr_bytes", "truncated", "label")
 _WORD_RE = re.compile(r"^[a-z_]{1,32}$")
 
 
@@ -161,7 +164,9 @@ class History:
                 "hosts_removed": rec.get("hosts_removed"), "final_seq": -1,
                 "ssh_what": rec.get("ssh_what"), "ssh_headline": rec.get("ssh_headline"), "peer": rec.get("peer"),
                 "client_id": rec.get("client_id"), "client_name": rec.get("client_name"),
-                "argv": _clean_argv(rec.get("argv")), "scripts": _scripts(rec), "risk_reasons": None, "risk_model": None,
+                "argv": _clean_argv(rec.get("argv")), "scripts": _scripts(rec),
+                "exec_host": _clean(rec.get("host")) if rec.get("mode") == "exec" else None,
+                "script_digest": _clean(rec.get("script_digest")) if rec.get("mode") == "exec" else None, "risk_reasons": None, "risk_model": None,
                 "aliases_used": _aliases(rec.get("aliases_used")),
             }
             self._events[rid] = []

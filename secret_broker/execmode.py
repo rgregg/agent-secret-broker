@@ -42,7 +42,7 @@ LABELS = ("host_key_mismatch", "host_not_pinned", "connect_failed", "auth_failed
 _BAD_CHARS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")       # tab and newline are legal
 _HOST_RE = re.compile(r"[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?")
 _FIELDS = {"host", "user", "port", "command", "script", "timeout_s"}
-WARNING = ("An agent asked the broker to run this on a remote host over SSH. The text below is exactly what "
+WARNING = ("An agent asked the broker to run this on a remote host over SSH. The text shown is exactly what "
            "will run. Approve only a command you recognise and meant to allow.")
 
 

@@ -58,6 +58,9 @@ WHITELIST = {
                   "script_sizes": ("script_sizes", _IL), "script_markers": ("script_markers", _L),
                   "host_fp": ("host_fp", _S), "host_name": ("host_name", _S),
                   "claimed_dest": ("claimed_dest", _S),
+                  # remote commands (the agent's own request: where, as whom, a script's size and hash)
+                  "host": ("host", _S), "account": ("account", _S), "script_len": ("script_len", _I),
+                  "script_digest": ("script_digest", _S),
                   # the authenticated client's NAME (the agent's own; never ids, hashes or other clients' rules)
                   "client": ("client_name", _S)},
     "rejected": {"names": ("names", _L), "mode": ("mode", _S), "source": ("source", _S),
@@ -154,6 +157,8 @@ HIDDEN = frozenset({
     "push_test", "ha_decide_dropped", "telegram_decide_refused", "telegram_poll_error",
     # server-identity policy (a key's allowed_hosts) is approval context
     "ssh_sign_refused",
+    # remote commands: the run and its outcome (counts and a fixed label) are approval context, not for the agent's audit view
+    "exec_started", "exec_finished",
     # a credential request: the human's entry and any refused submission are approver activity;
     # the agent sees `requested` (name, mode, kind) and `stored` (the name) and the outcome
     "credential_provided", "credential_refused",
