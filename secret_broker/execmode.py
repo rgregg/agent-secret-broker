@@ -159,6 +159,10 @@ def _check_text(text, what):
 
 _UNQUOTED_BAD = set(";&|<>()$`\\\n*?[]{}~!#\t\r")
 _DQ_BAD = set("$`\\")
+# Inside quotes a POSIX shell reads these literally, but fish (backslash), csh and tcsh (newline, `!` history) do not, and
+# the login shell on the target is not ours to know: a command with such a character in any word is not simple, so it is
+# never low, never matched by a rule, and is sent byte for byte for the model and the human to judge.
+_NON_POSIX_IN_QUOTES = "\\\n!"
 _ASSIGN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 _SAFE_WORD = re.compile(r"[A-Za-z0-9@%+=:,./_-]+", re.ASCII)      # what a shell reads literally, unquoted
 
@@ -198,6 +202,8 @@ def parse_simple(text):
             started, i = True, i + 1
     if started:
         argv.append("".join(cur))
+    if any(c in w for w in argv for c in _NON_POSIX_IN_QUOTES):
+        return None
     if not argv or _ASSIGN_RE.match(argv[0]):
         return None
     return argv
@@ -236,20 +242,21 @@ def _e(short="", flags=(), val=None, pos=_POS, lead=None, pre=()):
             "pre": frozenset(pre)}
 
 
-_SYSD = _e("lan", ("--no-pager", "--full", "--all", "--no-legend", "--failed"),
-           {"--type": _VAL["words"], "--state": _VAL["words"], "--lines": _VAL["num"]})
+# No --full/-l (untruncated command lines in the output) and no -n (a large count dumps journal lines): --lines is capped.
+_SYSD = _e("a", ("--no-pager", "--all", "--no-legend", "--failed"),
+           {"--type": _VAL["words"], "--state": _VAL["words"], "--lines": re.compile(r"[1-9]|[1-4][0-9]|50")})
 _IPF = ("-4", "-6", "-br", "-brief", "-j", "-o", "-s")
 _ZP = _e("vxHpDLPgo")
 READONLY = {
     "systemctl": {"subs": {s: _SYSD for s in ("status", "is-active", "is-enabled", "is-failed",
                                                 "list-units", "list-unit-files", "list-timers")},
-                  "pre": frozenset(("--no-pager", "--full", "--all", "--no-legend", "--failed"))},
+                  "pre": frozenset(("--no-pager", "--all", "--no-legend", "--failed"))},
     # Left OFF the table on purpose (they print environment or config that often holds secrets, or arbitrary
     # program output, so the model rates them): `docker inspect` (Config.Env), `docker info` (proxy URLs),
     # `docker logs` and `journalctl` (application output), `systemctl show` (Environment=), `ps` with an
     # environment modifier or a custom format.
     "docker": {"subs": {
-        "ps": _e("aqsl", ("--all", "--quiet", "--no-trunc", "--size", "--latest"),
+        "ps": _e("aqsl", ("--all", "--quiet", "--size", "--latest"),       # no --no-trunc: it prints whole command lines
                  {"--filter": _VAL["kv"], "--last": _VAL["num"]}, pos=None),
         "images": _e("aq", ("--all", "--quiet", "--no-trunc", "--digests"), {"--filter": _VAL["kv"]}),
         "version": _e(pos=None)}},
@@ -261,7 +268,9 @@ READONLY = {
     "date": {"entry": _e("uRI", ("--utc",), pos=_DATE_POS)},
     "ls": {"entry": _e("lahtrSR1dFiAnsLHGgopX", ("--all", "--almost-all", "--human-readable", "--long"),
                        {"--color": re.compile(r"auto|never|always")})},
-    "ps": {"entry": _e("", ("-ef", "-e", "-A"), pos=re.compile(r"aux"))},       # no `e` modifier, no -o formats
+    # `ps` alone (own terminal, command NAMES) or -o/-eo with plain columns. Never aux, -ef, an `e` modifier or a
+    # column that prints arguments (args, cmd, command): other processes' arguments often hold passwords.
+    "ps": {"special": lambda args: _ps_ok(args)},
     "ip": {"pre": frozenset(_IPF), "subs": {
         "addr": _e(lead={"show", "list"}, pos=_RESTWORD), "address": _e(lead={"show", "list"}, pos=_RESTWORD),
         "route": _e(lead={"show", "list", "get"}, pos=_RESTWORD), "link": _e(lead={"show"}, pos=_RESTWORD)}},
@@ -305,12 +314,26 @@ def _match_args(entry, args):
     return True
 
 
+_PS_COLUMNS = frozenset(("pid", "ppid", "comm", "etime", "stat", "%cpu", "%mem", "user"))
+
+
+def _ps_ok(args):
+    if not args:
+        return True
+    if len(args) != 2 or args[0] not in ("-o", "-eo"):
+        return False
+    cols = args[1].split(",")
+    return bool(cols) and all(c in _PS_COLUMNS for c in cols)
+
+
 def _builtin_low(argv):
     prog = _program(argv[0])
     spec = READONLY.get(prog)
     if spec is None:
         return None
     args = argv[1:]
+    if "special" in spec:
+        return prog if spec["special"](args) else None
     if "subs" not in spec:
         return prog if _match_args(spec["entry"], args) else None
     pre = spec.get("pre", frozenset())
