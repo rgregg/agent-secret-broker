@@ -2,6 +2,9 @@ asb: ask the broker for a secret, wait for approval, use it.
 
   asb NAME[,NAME2] -- command args...         run with secrets in the env
   asb sudo -- command args...                 run as root through the root helper; a human approves the exact command
+  asb exec NAME HOST [--user U] [--port P] [--timeout S] -- command args...
+  asb exec NAME HOST ... --script FILE [--interpreter sh|bash]
+                                              the broker runs a command or script on HOST over SSH with key NAME
   asb list [--json]                           what credentials exist? (no approval)
   asb store NAME --hosts H[,H] [--field F] [--item I] [--var V|--keys]  < value
   asb store NAME --ssh < private_key          move an SSH private key into the broker

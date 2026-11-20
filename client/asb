@@ -3,6 +3,9 @@
 
   asb NAME[,NAME2] -- command args...         run with secrets in the env
   asb sudo -- command args...                 run as root through the root helper; a human approves the exact command
+  asb exec NAME HOST [--user U] [--port P] [--timeout S] -- command args...
+  asb exec NAME HOST ... --script FILE [--interpreter sh|bash]
+                                              the broker runs a command or script on HOST over SSH with key NAME
   asb list [--json]                           what credentials exist? (no approval)
   asb store NAME --hosts H[,H] [--field F] [--item I] [--var V|--keys]  < value
   asb store NAME --ssh < private_key          move an SSH private key into the broker
@@ -127,8 +130,19 @@ Which command? (decision rule)
   A service that speaks WebSocket (e.g. Home Assistant's /api/websocket)   asb ws NAME URL (see below)
   A program that needs the secret itself (an official CLI, a library)   env mode: asb NAME -- command
   A command that needs root (the helper only runs what its admin allowed)  asb sudo -- command
+  Use for any command you would otherwise ssh for: asb exec NAME HOST -- command (see "Remote commands" below).
+  The broker runs it over SSH and returns the output; plain read-only commands can be approved without a human.
+  Not for an interactive session, scp/rsync/git over ssh or port forwarding (those stay on asb ssh-agent).
   Do not write a script around curl or requests to do an HTTP flow: use a session. The broker keeps
   the cookies and tokens, so the secret and the session never reach you.
+
+Remote commands (asb exec: instead of ssh)
+  asb exec NAME HOST [--user U] -- systemctl status nginx
+  asb exec NAME HOST --script check.sh [--interpreter bash]
+  NAME is an SSH key credential (asb list), HOST a name it is pinned for. The broker connects, runs exactly
+  that text and returns stdout and stderr; the exit code is the remote command's. The human and the risk check
+  see the command first and a plain read-only command can be auto-approved. After -- each word is one quoted
+  argument; for a pipe or redirect use `sh -c '...'` or --script. See `asb help exec` for limits and exit codes.
 
 HTTP sessions (multi-step flows; one human approval for a bounded unit of work)
   asb session open unifi --for "list clients and rename one" --host unifi.local:443 --methods GET,HEAD,POST,PUT
@@ -442,6 +456,32 @@ wrapper commands (env, xargs, timeout, ...) are refused. A denial or timeout is 
 what you needed. Exit codes: the command's own, or 2 usage, 3 broker, 4 denied, 5 expired, 10 refused locally
 (not allowed, or an unsafe file, config or directory), 11 approved but could not start.
 example: asb sudo -- /usr/bin/systemctl restart nginx""",
+    "exec": """usage: asb exec NAME HOST [--user U] [--port P] [--timeout S] -- command [args...]
+       asb exec NAME HOST [--user U] [--port P] [--timeout S] --script FILE [--interpreter sh|bash]
+
+Use for any command you would otherwise ssh for. The broker connects to HOST with the SSH key credential NAME,
+runs exactly the command or script you give, and returns the output; the key never leaves the broker. The
+human, the risk check and any auto-approve rule all see the command first, so a plain read-only command
+(systemctl status, docker ps, df, ...) can be approved without a tap. HOST must be a name the key is pinned
+for (its allowed hosts and known_hosts line); ask the human to add it otherwise. Output arrives when the command
+ends, not while it runs.
+After -- every word is one argument, joined with shell quoting, so `-- ls -l /var` runs `ls -l /var` and
+`-- echo 'a b'` passes one argument. A pipe, redirect or variable needs a shell: `-- sh -c 'a | b'`, or put
+the lines in a file and use --script (sent byte for byte to `sh -s` or `bash -s` on standard input; at most
+32 KiB of text; the human sees the whole script and its SHA-256). A script or a command with shell syntax
+is never treated as plain read-only: expect a human or the risk check to decide.
+--user and --port default to the broker's (port 22). --timeout is seconds, 1 to 600 (default 60), after
+which the broker stops the command. A command is at most 4096 characters; control characters other than
+tab and newline, and hidden characters, are refused before anything is sent.
+Prints the command's stdout and stderr to the same streams and exits with its exit code. If the broker could
+not run it, prints `asb: exec failed: LABEL` and exits 3; LABEL is one of host_key_mismatch, host_not_pinned,
+connect_failed, auth_failed, timeout, output_cap, ssh_unavailable, internal (any output captured before the
+failure is still printed). Output cut at the broker's cap prints `asb: output was truncated` on stderr.
+Other exits: 2 usage, 3 refused (exec not enabled for this client, host not allowed) or broker error, 4 denied,
+5 expired unanswered. A remote exit code can equal one of these; stderr tells them apart. A denial or timeout is
+final: stop and tell the human what you needed.
+example: asb exec agent-ssh nas --user ryan -- systemctl status nginx
+         asb exec agent-ssh nas --script ./check.sh --interpreter bash""",
     "run": """usage: asb NAME[,NAME] -- command [args...]
 
 Run a command with the credential's variables in its environment. Waits for
@@ -3137,6 +3177,161 @@ def env_payload(names, cmd):
     return payload, scripts
 
 
+# ---- remote exec (BEGIN) ----------------------------------------------------------------------
+EXEC_MAX_COMMAND = 4096            # characters of the text that is sent (secret_broker/execmode.py has the same limits)
+EXEC_MAX_SCRIPT = 32 * 1024        # bytes
+EXEC_MAX_TIMEOUT = 600
+EXEC_LABELS = ("host_key_mismatch", "host_not_pinned", "connect_failed", "auth_failed", "timeout", "output_cap",
+               "ssh_unavailable", "internal")
+_EXEC_SAFE = re.compile(r"[A-Za-z0-9_@%+=:,./-]+")          # shlex.quote's safe set: such a word needs no quotes
+_EXEC_USER = re.compile(r"[\x21-\x7e]{1,64}")               # secret_broker/sshkey.ACCOUNT_RE
+# Characters a reviewer cannot see but a model reads. The broker checks more (secret_broker/guidance.hidden_problem);
+# this is the courtesy list, written out so that the Rust client's list is the same one.
+_EXEC_HIDDEN = ((0xA0, 0xA0), (0xAD, 0xAD), (0x61C, 0x61C), (0x115F, 0x1160), (0x1680, 0x1680), (0x180E, 0x180E),
+                (0x2000, 0x200F), (0x2028, 0x202F), (0x205F, 0x206F), (0x3000, 0x3000), (0x3164, 0x3164),
+                (0xD800, 0xDFFF), (0xE000, 0xF8FF), (0xFE00, 0xFE0F), (0xFEFF, 0xFEFF), (0xFFA0, 0xFFA0),
+                (0xFFF9, 0xFFFD), (0xE0000, 0xE007F), (0xE0100, 0xE01EF), (0xF0000, 0x10FFFF))
+
+
+def exec_quote(word):
+    """One word as the broker's grammar reads it back (shlex.quote): bare when it is only safe characters, else in
+    single quotes with each ' written as '"'"'. Keep in step with secret_broker/execmode.rebuild."""
+    if word and _EXEC_SAFE.fullmatch(word):
+        return word
+    return "'" + word.replace("'", "'\"'\"'") + "'"
+
+
+def exec_join(words):
+    return " ".join(exec_quote(w) for w in words)
+
+
+def exec_text_problem(text):
+    """A fixed phrase for the first character the broker would refuse in command or script text, or None."""
+    for ch in text:
+        o = ord(ch)
+        if (o < 0x20 and ch not in "\t\n") or 0x7F <= o <= 0x9F:
+            return "a control character (only tab and newline are allowed)"
+        if any(lo <= o <= hi for lo, hi in _EXEC_HIDDEN):
+            return "a hidden or look-alike character"
+    return None
+
+
+def exec_number(text, what, lo, hi):
+    if not (text.isascii() and text.isdigit() and lo <= int(text) <= hi):
+        die(f"{what} must be a whole number from {lo} to {hi}")
+    return int(text)
+
+
+def exec_label(label):
+    """What to print for a failure label: only the broker's fixed words, as written; anything else is not echoed."""
+    return label if label in EXEC_LABELS else "unknown"
+
+
+def exec_wait(payload, timeout_s):
+    """POST the exec request, wait for the human, then for the run. Returns the released answer."""
+    base, key = config()
+    payload["source"] = f"{os.environ.get('USER', '?')}@{socket.gethostname()}"
+    code, r = call(base, key, "/v1/requests", payload)
+    if code != 202:
+        die(_srv(r.get("error", f"broker returned {code}")), EXIT_BROKER)
+    rid, first, running = r.get("id"), True, False
+    expires = r.get("expires_in")
+    deadline = time.time() + (expires if isinstance(expires, (int, float)) and expires > 0 else 300) + 15
+    while True:
+        status = r.get("status")
+        if status == "released":
+            return r
+        if status in ("denied", "expired", "failed"):
+            if first:
+                die(_srv(r.get("error") or status), status_exit(status))
+            die(f"request {status}" + (f": {_srv(r['error'])}" if r.get("error") else ""), status_exit(status))
+        if first and status not in ("approved", "running"):     # approved by policy: nobody is being waited for
+            print("asb: waiting for approval...", file=sys.stderr)
+        if status == "running" and not running:                 # the human has answered: now the command's own time
+            running, deadline = True, max(deadline, time.time() + timeout_s + 60)
+        if time.time() >= deadline or not isinstance(rid, str):
+            die("timed out waiting for the command", EXIT_EXPIRED)
+        code, r = call(base, key, f"/v1/requests/{rid}?wait=25")
+        if code != 200:
+            die(_srv(r.get("error", f"broker returned {code}")), EXIT_BROKER)
+        first = False
+
+
+def run_exec(argv):
+    """`asb exec NAME HOST [flags] -- command...` or `--script FILE`: the broker runs it over SSH, returns the output."""
+    if "--" in argv:
+        i = argv.index("--")
+        head, words = argv[:i], argv[i + 1:]
+    else:
+        head, words = argv, None
+    if len(head) < 2 or (words is not None and not words):
+        die(HELP["exec"])
+    name, host = head[0], head[1]
+    check_name(name)
+    check_name(host, "HOST")
+    if "," in name:
+        die("exec uses exactly one credential (an SSH key)")
+    allowed = {"--user": "user", "--port": "port", "--timeout": "timeout", "--script": "script",
+               "--interpreter": "interpreter"}
+    f = parse_flags(head[2:], allowed)
+    script = f.get("script")
+    if (script is None) == (words is None):
+        die(HELP["exec"])
+    if "interpreter" in f and script is None:
+        die("--interpreter goes with --script")
+    payload = {"mode": "exec", "names": [name], "host": host}
+    if "user" in f:
+        if not _EXEC_USER.fullmatch(f["user"]):
+            die("--user must be 1 to 64 printable ASCII characters without spaces")
+        payload["user"] = f["user"]
+    if "port" in f:
+        payload["port"] = exec_number(f["port"], "--port", 1, 65535)
+    if "timeout" in f:
+        payload["timeout_s"] = exec_number(f["timeout"], "--timeout", 1, EXEC_MAX_TIMEOUT)
+    if words is not None:
+        text = exec_join(words)
+        if len(text) > EXEC_MAX_COMMAND:
+            die(f"the command is longer than {EXEC_MAX_COMMAND} characters")
+        if exec_text_problem(text):
+            die(f"the command contains {exec_text_problem(text)}")
+        payload["command"] = text
+    else:
+        interpreter = f.get("interpreter", "sh")
+        if interpreter not in ("sh", "bash"):
+            die("--interpreter must be sh or bash")
+        try:
+            with open(script, "rb") as fh:
+                data = fh.read(EXEC_MAX_SCRIPT + 1)
+        except OSError as e:
+            die(f"cannot read the script: {e.strerror or 'error'}")
+        if len(data) > EXEC_MAX_SCRIPT:
+            die("the script is longer than 32 KiB")
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            die("the script is not UTF-8 text")
+        if exec_text_problem(text):
+            die(f"the script contains {exec_text_problem(text)}")
+        if not text.strip():
+            die("the script is empty")
+        payload["script"] = {"text": text, "interpreter": interpreter}
+    r = exec_wait(payload, payload.get("timeout_s", 60))
+    for stream, data in ((sys.stdout, r.get("stdout")), (sys.stderr, r.get("stderr"))):
+        if isinstance(data, str) and data:
+            stream.flush()
+            stream.buffer.write(data.encode("utf-8", "replace"))
+            stream.buffer.flush()
+    if r.get("label") is not None:
+        die(f"exec failed: {exec_label(r['label'])}", EXIT_BROKER)
+    code = r.get("exit_code")
+    if not isinstance(code, int) or isinstance(code, bool):
+        die("the broker's answer has neither an exit code nor a failure", EXIT_BROKER)
+    if r.get("truncated") is True:
+        print("asb: output was truncated at the broker's cap", file=sys.stderr)
+    return code & 0xFF
+# ---- remote exec (END) ------------------------------------------------------------------------
+
+
 ROOT_EXEC = "/usr/local/sbin/asb-root-exec"
 
 
@@ -3204,7 +3399,7 @@ def main(argv):
         # Flags are never credential names or values: --help anywhere before an
         # http body/header value, or anywhere for the commands without free text.
         scan = argv[1:4] if argv[0] == "http" else argv[1:]
-        if argv[0] == "sudo" and "--" in argv:
+        if argv[0] in ("sudo", "exec") and "--" in argv:
             scan = argv[1:argv.index("--")]       # the command's own --help is the command's
         if any(a in ("-h", "--help") for a in scan):
             print(HELP[argv[0]])
@@ -3273,6 +3468,9 @@ def main(argv):
 
     if argv[0] == "sudo":
         return run_sudo(argv[1:])
+
+    if argv[0] == "exec":
+        return run_exec(argv[1:])
 
     if argv[0] == "enroll":
         return run_enroll(argv[1:])
@@ -3429,7 +3627,7 @@ def main(argv):
         return 0 if r["status"] < 400 else EXIT_HTTP_ERROR
 
     if "--" not in argv:
-        die(f"unknown command {argv[0]!r}.\ncommands: list, which, status, version, audit, http, session, ws, plan, sudo, store, update, "
+        die(f"unknown command {argv[0]!r}.\ncommands: list, which, status, version, audit, http, session, ws, plan, sudo, exec, store, update, "
             "request-credential, guidance, enroll, ssh-agent, fingerprint, help, guide; or: asb NAME -- command\n"
             "start with `asb guide`")
     i = argv.index("--")
