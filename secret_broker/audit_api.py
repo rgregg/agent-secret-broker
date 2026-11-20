@@ -158,7 +158,8 @@ HIDDEN = frozenset({
     # server-identity policy (a key's allowed_hosts) is approval context
     "ssh_sign_refused",
     # remote commands: the run and its outcome (counts and a fixed label) are approval context, not for the agent's audit view
-    "exec_started", "exec_finished", "exec_host_refused",
+    "exec_started", "exec_finished", "exec_host_refused", "exec_probe", "exec_host_remembered",
+    "exec_host_replaced", "exec_host_remember_failed",
     # a credential request: the human's entry and any refused submission are approver activity;
     # the agent sees `requested` (name, mode, kind) and `stored` (the name) and the outcome
     "credential_provided", "credential_refused",

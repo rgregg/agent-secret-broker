@@ -32,9 +32,34 @@ def host_line(names, key=None):
 
 
 FP_ONLY = "SHA256:" + "A" * 43
-SSH_HOSTS = {"known_hosts": [host_line("nas.example.com"), host_line("[port.example.com]:2222"),
-                             host_line("127.0.0.1"), host_line("unlisted.example.com")],
+NAS, PORT, LOCAL, UNLISTED, FRESH = (ed25519.Ed25519PrivateKey.generate() for _ in range(5))
+SSH_HOSTS = {"known_hosts": [host_line("nas.example.com", NAS), host_line("[port.example.com]:2222", PORT),
+                             host_line("127.0.0.1", LOCAL), host_line("unlisted.example.com", UNLISTED)],
              "allowed_hosts": ["nas.example.com", "port.example.com", "127.0.0.1", "nopin.example.com", FP_ONLY]}
+
+
+def probe_result(key):
+    """What execprobe returns for a server that presents `key` (an ed25519 private key object)."""
+    blob = sshkey.public_blob(key)
+    line = sshkey.public_line(key)
+    k = {"key_type": "ssh-ed25519", "key": line, "fingerprint": sshkey.fingerprint(blob)}
+    return {"keys": [k], **k, "address": "93.184.216.34"}
+
+
+class Servers:
+    """A stand-in for the broker's probe: what each (host, port) presents. By default every host in SSH_HOSTS
+    presents its pinned key and anything else presents FRESH, so a test changes only what it is about."""
+
+    def __init__(self):
+        self.calls = []
+        self.table = {("nas.example.com", 22): NAS, ("port.example.com", 2222): PORT, ("127.0.0.1", 22): LOCAL,
+                      ("unlisted.example.com", 22): UNLISTED}
+        self.default = FRESH
+
+    def __call__(self, host, port, client_id):
+        self.calls.append((host, port, client_id))
+        got = self.table.get((host, port), self.default)
+        return got if isinstance(got, dict) else probe_result(got)
 
 
 class Model:
@@ -66,6 +91,8 @@ class ExecBase(ClientMixin, tg.Base):
         self.other = self.mk("someone-else")
         self.model = Model()
         self.broker.summarizer = self.model
+        self.servers = Servers()
+        self.broker.exec_probe = self.servers
         self.ran = []
         self.broker._exec_run = lambda req: self.ran.append(req.id) or {
             "exit_code": 0, "stdout": "ok\n", "stderr": "", "truncated": False, "label": None}
@@ -143,6 +170,9 @@ class Access(ExecBase):
 
 
 class Hosts(ExecBase):
+    """What a request for a host the key pins does, and that what is NOT pinned is no longer refused here (it goes
+    to a human: tests/test_exec_unpinned.py). What is still refused is a host that is not a plain name."""
+
     def refused(self, code_want, **body):
         before = len(self.events("requested"))
         code, b = self.ask(**body)
@@ -152,58 +182,40 @@ class Hosts(ExecBase):
         self.assertTrue(self.events("rejected"))
         return json.loads(b)["error"]
 
-    GENERIC = "that host is not approved for this key"      # one text for every host refusal: the policy is not shown
-
-    def test_the_two_host_refusals_differ_only_in_the_audit(self):
-        self.refused(403, host="other.example.com")
-        self.refused(403, host="nopin.example.com")
-        self.assertEqual([e["reason"] for e in self.events("exec_host_refused")], ["not_allowed", "not_pinned"])
-
-    def test_a_pinned_named_host_is_accepted(self):
+    def test_a_pinned_named_host_is_accepted_and_is_an_ordinary_request(self):
         self.enable(max_pending_per_client=20)
         for host, port in (("nas.example.com", 22), ("NAS.Example.COM", 22), ("port.example.com", 2222), ("127.0.0.1", 22)):
             for r in self.broker._by_id.values():           # nobody answers here: keep under MAX_PENDING
                 r.status = "expired"
             code, b = self.ask(host=host, port=port)
             self.assertEqual(code, 202, (host, b))
+            self.assertNotIn("host_state", self.broker._by_id[json.loads(b)["id"]].spec, host)
         sp = self.broker._by_id[json.loads(b)["id"]].spec
         self.assertEqual((sp["host"], sp["port"]), ("127.0.0.1", 22))
 
     def test_the_host_is_lowercased_before_it_is_compared_and_stored(self):
         rid = json.loads(self.ask(host="NAS.Example.COM")[1])["id"]
         self.assertEqual(self.broker._by_id[rid].spec["host"], "nas.example.com")
-
-    def test_host_not_named_in_allowed_hosts(self):
-        self.assertEqual(self.GENERIC, self.refused(403, host="other.example.com"))
-        # a known_hosts line alone does not allow it
-        self.assertEqual(self.GENERIC, self.refused(403, host="unlisted.example.com"))
+        self.assertEqual(self.servers.calls[-1][:2], ("nas.example.com", 22))
 
     def test_fingerprint_entry_is_not_a_name(self):
         self.assertIn("plain host name", self.refused(400, host=FP_ONLY))   # not even a host name
         self.assertEqual(self.ask()[0], 202)
 
-    def test_allowed_but_without_a_known_hosts_line(self):
-        self.assertEqual(self.GENERIC, self.refused(403, host="nopin.example.com"))
-
-    def test_pin_is_per_port(self):
-        self.assertEqual(self.GENERIC, self.refused(403, host="nas.example.com", port=2222))
-        self.assertEqual(self.GENERIC, self.refused(403, host="port.example.com", port=22))
-
-    def test_other_spellings_of_an_allowed_host_do_not_pass(self):
-        # valid host syntax, but not the name that is pinned: the exact-name check refuses them
-        for host in ("127.1", "0177.0.0.1", "2130706433", "127.000.000.001", "xn--nas.example.com", "nas2.example.com"):
-            self.assertEqual(self.GENERIC, self.refused(403, host=host), host)
-        # not host syntax at all (trailing dot, whitespace, port, userinfo, path, option, IPv6, non-ASCII look-alike)
+    def test_syntax_that_is_not_a_host_name_is_refused_before_any_probe(self):
         for host in ("nas.example.com.", "nas.example.com ", " nas.example.com", "nas.example.com\n", "nas.example.com:22",
                      "nas.example.com@x", "nas.example.com/", "nas.example.com%00", "-oProxyCommand=x", "[::1]",
                      "n\u0430s.example.com"):
             self.assertIn("plain host name", self.refused(400, host=host), repr(host))
+        self.assertEqual(self.servers.calls, [])                    # nothing odd was ever looked at
         self.assertEqual(self.ask(host="nas.example.com")[0], 202)
+        self.assertEqual(len(self.servers.calls), 1)                # positive control: a good one probes
 
     def test_user_and_port_are_checked(self):
         for body in ({"user": "-oProxyCommand=x"}, {"user": "a b"}, {"port": 0}, {"port": 70000}, {"port": "22"},
                      {"timeout_s": 0}, {"timeout_s": 601}, {"command": "-x"}, {"command": _OMIT}):
             self.refused(400, **body)
+        self.assertEqual(self.servers.calls, [])
         self.assertEqual(self.ask(user="ryan", port=22, timeout_s=600)[0], 202)
 
 

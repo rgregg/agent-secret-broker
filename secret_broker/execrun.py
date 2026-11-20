@@ -21,6 +21,7 @@ stderr is read only to choose a label when ssh itself failed (exit 255), and is 
 Everything that touches the system is injectable (`popen`, `timer_cls`, the binary directory) so tests drive
 it with stub binaries and a clock that fires at once.
 """
+import ipaddress
 import os
 import re
 import shutil
@@ -186,11 +187,13 @@ def sweep(base):
 
 
 def run(spec, key_pem, known_hosts_lines, cfg, mask, *, workdir_base=None, popen=subprocess.Popen,
-        timer_cls=threading.Timer, clock=time.monotonic):
+        timer_cls=threading.Timer, clock=time.monotonic, connect_ip=None):
     """Run `spec` (a validated exec spec) with the private key `key_pem` (bytes). Returns {"exit_code": int|None,
     "stdout", "stderr", "truncated", "label": str|None, "duration_ms"}. Never raises: a failure is a label.
     `mask(text)` hides credential values in the output; `known_hosts_lines` are the pinned lines for this host
-    and port (sshkey.known_host_lines); nothing is connected to when there are none."""
+    and port (sshkey.known_host_lines); nothing is connected to when there are none. `connect_ip` (an IP the
+    destination guard has just validated) makes ssh connect to that address while the host NAME stays what the
+    known_hosts lookup uses."""
     t0 = clock()
     res = {"exit_code": None, "stdout": "", "stderr": "", "truncated": False, "label": None, "duration_ms": 0}
 
@@ -202,6 +205,11 @@ def run(spec, key_pem, known_hosts_lines, cfg, mask, *, workdir_base=None, popen
 
     if not known_hosts_lines:
         return done("host_not_pinned")
+    if connect_ip is not None:
+        try:
+            connect_ip = str(ipaddress.ip_address(connect_ip))
+        except ValueError:
+            return done("internal")
     ssh, agent_bin, add_bin = (_binary(cfg, n) for n in ("ssh", "ssh-agent", "ssh-add"))
     if not (ssh and agent_bin and add_bin):
         return done("ssh_unavailable")
@@ -235,6 +243,7 @@ def run(spec, key_pem, known_hosts_lines, cfg, mask, *, workdir_base=None, popen
 
         command, stdin = execmode.remote_payload(spec)
         argv = ([ssh] + [o.format(known_hosts=known) for o in FIXED_OPTIONS]
+                + (["-o", f"HostName={connect_ip}"] if connect_ip else [])
                 + ["-l", spec["user"], "-p", str(spec["port"]), "--", spec["host"], command])
         try:
             proc = popen(argv, env={**env, "SSH_AUTH_SOCK": sock},
