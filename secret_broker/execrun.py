@@ -57,6 +57,9 @@ FIXED_OPTIONS = (
     "-o", "LogLevel=ERROR",
     "-o", "ConnectTimeout=10",
     "-o", "ServerAliveInterval=15",
+    # OpenSSH takes `~` from the passwd entry, not $HOME: without this it would also offer the broker user's own
+    # ~/.ssh keys. (Not IdentitiesOnly: that would stop it offering the private agent's key too.)
+    "-o", "IdentityFile=/dev/null",
 )
 READ_CHUNK = 65536
 _SOCK_MAX = 100                                 # sun_path is 108 bytes
@@ -160,6 +163,28 @@ def _stop(proc):
         pass
 
 
+def sweep(base):
+    """At broker start-up: end any ssh-agent a crashed run left behind and remove its private directory.
+    Nothing is in flight at start-up, so every `x-*` directory under `base` is a leftover. A pid in a pid file is
+    signalled only when that process really is an ssh-agent."""
+    try:
+        entries = [e for e in os.listdir(base) if e.startswith(("x-", "asbx-"))]
+    except OSError:
+        return
+    for e in entries:
+        d = os.path.join(base, e)
+        try:
+            with open(os.path.join(d, "agent.pid")) as f:
+                pid = int(f.read().strip())
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                words = f.read().split(b"\0")[:2]       # (a script run through an interpreter has it second)
+                if any(os.path.basename(w.decode("utf-8", "replace")) == "ssh-agent" for w in words):
+                    os.kill(pid, 15)
+        except (OSError, ValueError):
+            pass
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def run(spec, key_pem, known_hosts_lines, cfg, mask, *, workdir_base=None, popen=subprocess.Popen,
         timer_cls=threading.Timer, clock=time.monotonic):
     """Run `spec` (a validated exec spec) with the private key `key_pem` (bytes). Returns {"exit_code": int|None,
@@ -197,6 +222,8 @@ def run(spec, key_pem, known_hosts_lines, cfg, mask, *, workdir_base=None, popen
                 f.write("\n".join(known_hosts_lines) + "\n")
             env = _minimal_env(workdir)
             agent = _start_agent(agent_bin, sock, env)
+            with open(os.path.join(workdir, "agent.pid"), "w") as f:     # so a start-up sweep can end it after a crash
+                f.write(str(agent.pid))
             add = subprocess.run([add_bin, "-"], input=key_pem, env={**env, "SSH_AUTH_SOCK": sock},
                                  capture_output=True, timeout=10)
             if add.returncode != 0:

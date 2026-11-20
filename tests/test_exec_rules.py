@@ -95,6 +95,17 @@ class Parse(unittest.TestCase):
                                 "auto_rules": [stored_rule()]})
 
 
+class RuleWords(unittest.TestCase):
+    def test_hidden_and_look_alike_characters_in_a_rule_are_refused(self):
+        for word in ("systemctl\u202e", "syst\u0435mctl", "a\u200bb", "caf\u00e9"):
+            with self.assertRaises(ValueError) as cm:
+                autorules.parse([cfg_rule(argv=[word, "status"])])
+            self.assertIn("auto_approve[0].argv", str(cm.exception), word)
+            with self.assertRaises(ValueError):
+                autorules.parse_stored([stored_rule(argv=[word])], "deploy", ssh=True)
+        self.assertEqual(len(autorules.parse([cfg_rule()])), 1)                 # positive control
+
+
 class Matcher(unittest.TestCase):
     """One table, run over the config form and the stored form of the same rule."""
 
@@ -199,6 +210,24 @@ class ConfigRules(RulesBase):
         self.assertEqual(req.status, "pending")
         self.assertEqual(self.ran, [])
         self.assertEqual(self.ask_done(names=["deploy"]).status, "approved")        # control
+
+    def test_rule_approved_runs_count_against_the_per_client_cap_while_they_run(self):
+        import threading
+        gate = threading.Event()
+        self.broker._exec_run = lambda req: gate.wait(20) and {"exit_code": 0, "stdout": "", "stderr": "",
+                                                              "truncated": False, "label": None}
+        self.enable(clients=[self.agent.id], max_pending_per_client=2)
+        self.settle_auto = False
+        try:
+            reqs = [self.ask_done(wait=False) for _ in range(2)]
+            self.assertEqual([r.status for r in reqs], ["deciding", "deciding"])      # running, not pending
+            code, b = self.ask()
+            self.assertEqual((code, json.loads(b)["error"]), (403, "too many pending remote command requests"))
+        finally:
+            gate.set()
+        for r in reqs:
+            r.done.wait(10)
+        self.assertEqual(self.ask_done().status, "approved")                          # control: room again
 
     def test_a_client_set_to_never_auto_approve_still_prompts(self):
         self.assertEqual(self.ask_done().status, "approved")                         # control: the rule applies

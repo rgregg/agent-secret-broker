@@ -35,7 +35,7 @@ DESIGN_OPTIONS = ["-F", "/dev/null", "-o", "BatchMode=yes", "-o", "StrictHostKey
                   "-o", "ClearAllForwardings=yes", "-o", "RequestTTY=no", "-o", "ControlMaster=no",
                   "-o", "ControlPath=none", "-o", "ProxyCommand=none", "-o", "ProxyJump=none",
                   "-o", "PermitLocalCommand=no", "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=10",
-                  "-o", "ServerAliveInterval=15"]
+                  "-o", "ServerAliveInterval=15", "-o", "IdentityFile=/dev/null"]
 
 
 def alive(pid):
@@ -141,8 +141,8 @@ class Options(Rig):
         self.assertEqual([a for a in prefix(calls[1]) if not a.startswith("UserKnownHostsFile=")], base_prefix)
         i = argv.index("-l")
         self.assertEqual(argv[i:], ["-l", "-oProxyCommand=evil2", "-p", "2222", "--", "-oProxyCommand=evil",
-                                    "-oProxyCommand=evil3 x"])
-        self.assertEqual(sum(a.startswith("-oProxy") for a in argv), 3)       # only in their own slots
+                                    "'-oProxyCommand=evil3' x"])
+        self.assertEqual(sum(a.startswith("-oProxy") for a in argv), 2)       # only in their own slots (the command is quoted)
         self.assertEqual(base["exit_code"], 0)
 
     def test_the_command_that_ssh_receives_is_the_classified_text(self):
@@ -304,9 +304,35 @@ class Output(Rig):
         self.assertIn(masking.MARK, res["stderr"])
 
     def test_invalid_utf8_is_replaced(self):
-        self.configure(ssh={"stdout": "ok"})
-        # (decoding with replacement is exercised through the real pipe in the e2e test; here the stub speaks text)
-        self.assertEqual(self.run_()["stdout"], "ok")
+        self.configure(ssh={"stdout": "ok", "stdout_hex": "ff6fc3a9fe", "stderr_hex": "80"})
+        res = self.run_()
+        self.assertEqual(res["stdout"], "ok\ufffdo\u00e9\ufffd")          # valid bytes kept, invalid ones replaced
+        self.assertEqual(res["stderr"], "\ufffd")
+
+
+class Sweep(Rig):
+    def test_a_start_up_sweep_ends_a_leftover_agent_and_removes_its_directory(self):
+        import subprocess
+        os.makedirs(self.base)
+        leftover = os.path.join(self.base, "x-left")
+        os.mkdir(leftover)
+        agent = subprocess.Popen([os.path.join(self.dir, "ssh-agent"), "-D", "-a", os.path.join(leftover, "a")],
+                                 stdout=subprocess.PIPE)
+        agent.stdout.readline()
+        with open(os.path.join(leftover, "agent.pid"), "w") as f:
+            f.write(str(agent.pid))
+        os.mkdir(os.path.join(self.base, "x-empty"))
+        innocent = subprocess.Popen(["sleep", "30"])                     # a pid file naming something else is not killed
+        os.mkdir(os.path.join(self.base, "x-other"))
+        with open(os.path.join(self.base, "x-other", "agent.pid"), "w") as f:
+            f.write(str(innocent.pid))
+        self.addCleanup(innocent.kill)
+        self.assertIsNone(agent.poll())                                     # premise: it is running
+        execrun.sweep(self.base)
+        agent.wait(10)
+        self.assertEqual(os.listdir(self.base), [])
+        self.assertIsNone(innocent.poll())
+        execrun.sweep(os.path.join(self.dir, "nowhere"))                    # a missing directory is fine
 
 
 class Labels(Rig):

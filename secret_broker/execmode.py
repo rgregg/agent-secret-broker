@@ -203,8 +203,10 @@ def parse_simple(text):
     return argv
 
 
-def _quote(word):
-    if word and _SAFE_WORD.fullmatch(word):
+def _quote(word, first=False):
+    # a word that starts with `=` or `%` is expanded by zsh, and a first word starting with `-` could be read as an
+    # option by an old ssh client: those are quoted whatever else is safe about them
+    if word and _SAFE_WORD.fullmatch(word) and word[0] not in "=%" and not (first and word[0] == "-"):
         return word
     return "'" + word.replace("'", "'\"'\"'") + "'"
 
@@ -212,7 +214,7 @@ def _quote(word):
 def rebuild(argv):
     """`argv` as one shell string; parse_simple(rebuild(a)) == a for every simple argv. Anything
     beyond plain word characters is single-quoted, so what the remote shell sees is exactly argv."""
-    return " ".join(_quote(a) for a in argv)
+    return " ".join(_quote(a, i == 0) for i, a in enumerate(argv))
 
 
 # ---------------------------------------------------------------- read-only table
@@ -224,7 +226,6 @@ _VAL = {"num": re.compile(r"\d{1,6}"), "words": re.compile(r"[a-z,]+"), "pos": _
         "kv": re.compile(r"[A-Za-z0-9=_.:/-]{1,80}"), "out": re.compile(r"[a-z-]{1,20}")}
 _DATE_POS = re.compile(r"\+[A-Za-z0-9%:_.,/ -]*")
 _STD_DIRS = ("/bin", "/usr/bin", "/sbin", "/usr/sbin", "/usr/local/bin", "/usr/local/sbin")
-_EXT_FLAG = re.compile(r"--?[A-Za-z][A-Za-z0-9-]*(?:=[A-Za-z0-9@%+=:,./_ -]*)?", re.ASCII)
 
 
 def _e(short="", flags=(), val=None, pos=_POS, lead=None, pre=()):
@@ -432,7 +433,7 @@ def display_text(spec):
 
 def push_text(spec):
     """One line for a notification: where, as whom, and the command (clipped); never a script body."""
-    what = "a script" if "script" in spec else display_text(spec)[:200]
+    what = "a script" if "script" in spec else scrub(display_text(spec))[:200]
     return f"run on {spec['host']} as {spec['user']}: {what}"
 
 
@@ -444,13 +445,22 @@ def audit_fields(spec):
         out.update(script_len=len(spec["script"]["text"].encode("utf-8")), script_digest=script_sha256(spec),
                    interpreter=spec["script"]["interpreter"])
     else:
-        out["argv"] = [w[:AUDIT_WORD_CHARS] for w in spec["command"].split()[:AUDIT_WORDS]]
+        # scrubbed (the log is append-only) and with newlines and non-ASCII visible, so one line and two differ
+        out["argv"] = [w[:AUDIT_WORD_CHARS] for w in scrub(_shown(spec["command"])).split()[:AUDIT_WORDS]]
     return out
 
 
 _SECRETISH = re.compile(r"(?i)(pass(?:word|wd)?|pwd|secret|token|api[_-]?key|apikey|authorization|bearer|credential)"
-                        r"""(["']?\s*[=:]\s*["']?|\s+)[^\s"']{4,}""")
+                        r"""(["']?\s*[=:]\s*["']?|\s+)(?:(?:bearer|basic|token)\s+)?[^\s"']{4,}""")
 _OPAQUE = re.compile(r"[A-Za-z0-9+/_=-]{32,}")
+_OPAQUE_NO_SLASH = re.compile(r"[A-Za-z0-9+_=-]{32,}")      # for the audit log and notifications: paths stay readable
+
+
+def scrub(text):
+    """`text` with obvious secrets replaced (NAME=value after password/token/key words, `Authorization: Bearer ...`,
+    long opaque strings). For anything that is written down or sent on: the audit log, notifications. Linear."""
+    text = _SECRETISH.sub(lambda m: m.group(1) + m.group(2) + "<redacted>", text)
+    return _OPAQUE_NO_SLASH.sub("<redacted>", text)
 
 
 def model_text(spec, limit=4000):

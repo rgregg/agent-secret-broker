@@ -2581,8 +2581,8 @@ git over ssh, port or agent forwarding, jump hosts. Output is returned when the 
 - The host must be **named** in the key's `ssh_hosts.allowed_hosts` (a `SHA256:` fingerprint entry is not enough: the broker
   needs a name to connect to) **and** have a `known_hosts` line for that name and port (`[host]:2222` for a non-default
   port). It is lower-cased and compared exactly: a trailing dot, an IP spelled another way (`127.1`) or any other spelling
-  is a different, unpinned host. A refused host is 403 before anything is shown or run, and is checked again when the
-  command runs. The connection uses `StrictHostKeyChecking=yes` against only those pinned lines: no trust on first use.
+  is a different, unpinned host. A refused host is 403 before anything is shown or run (one text for every host refusal; the audit log's
+  `exec_host_refused` has the reason, `not_allowed` or `not_pinned`), and is checked again when the command runs. The connection uses `StrictHostKeyChecking=yes` against only those pinned lines: no trust on first use.
 - Off by default. `"exec": {"enabled": true, "clients": ["c-1a2b3c4d"], "max_concurrent": 4, "max_output_bytes": 262144,
   "max_seconds": 600, "max_pending_per_client": 3, "readonly": [...], "ssh_path": null}` (validated at startup). Only the
   listed client ids may ask (others, and the legacy shared key, get 403). `GET /v1/status` shows `features.exec`.
@@ -2631,7 +2631,9 @@ many words as the command needs to be specific). A script, or a command with she
 approves another; the port is not part of the rule (any port pinned for that host). They live in the same two places as http rules:
 in the configuration (`auto_approve`, `secret` names one key, `secrets` is not allowed) and, for one key, on its **Policies** page
 (stored in the key's `auto_rules`, with the confirmation tick and an optional expiry; an SSH key holds only `exec` rules).
-A malformed stored rule makes the credential invalid, naming the field.
+A malformed stored rule makes the credential invalid, naming the field. Rule words must be plain ASCII (no hidden or
+look-alike characters). Requests that were approved by a rule count against `max_pending_per_client` until they finish running.
+At start-up the broker ends any ssh-agent a crashed run left behind and removes its directory (`exec/x-*`).
 
 ### Running it
 
@@ -2647,8 +2649,10 @@ the key's pinned lines for that host only, starts a private `ssh-agent` serving 
 `BatchMode=yes`, `StrictHostKeyChecking=yes`, `UserKnownHostsFile=<generated>`, `GlobalKnownHostsFile=/dev/null`,
 `VerifyHostKeyDNS=no`, `CheckHostIP=no`, `UpdateHostKeys=no`, `PreferredAuthentications=publickey`, `ForwardAgent=no`,
 `ForwardX11=no`, `ClearAllForwardings=yes`, `RequestTTY=no`, `ControlMaster=no`, `ControlPath=none`, `ProxyCommand=none`,
-`ProxyJump=none`, `PermitLocalCommand=no`, `ConnectTimeout=10`, `ServerAliveInterval=15` and a minimal environment (a
-`PATH` and an empty `HOME`). The request supplies only the login name after `-l`, the port after `-p`, and, after `--`, the host
+`ProxyJump=none`, `PermitLocalCommand=no`, `ConnectTimeout=10`, `ServerAliveInterval=15`, `IdentityFile=/dev/null` (OpenSSH
+takes `~` from the passwd entry, so without it the broker user's own `~/.ssh` keys would also be offered) and a minimal
+environment (a `PATH` and an empty `HOME`). A command's first word that starts with `-`, and any word starting with `=` or
+`%`, is sent single-quoted. The request supplies only the login name after `-l`, the port after `-p`, and, after `--`, the host
 and the command, so none of them can be read as an option. (`IdentitiesOnly=yes` is deliberately not set: with the private agent
 as the only identity source it stops OpenSSH offering the agent's key.) The agent and the directory are removed in a `finally`.
 Each stream is read with a byte cap (`max_output_bytes`); a stream over the cap kills the run: `output_cap`, `truncated: true`,
@@ -2668,7 +2672,9 @@ tick. It exists so the exec vetting cannot be walked around; `exec` on the same 
 
 ### Audit and history
 
-`requested` carries `host`, `account`, `port`, `timeout_s` and, for a command, `argv` (its first 50 words, each clipped to 300), or
+`requested` carries `host`, `account`, `port`, `timeout_s` and, for a command, `argv` (its first 50 words, each clipped to 300,
+with obvious secrets such as `--password X`, `Authorization: Bearer X` and long opaque strings replaced by `<redacted>`, and
+newlines shown as `<U+000A>`; the same scrub applies to the notification text, while the approval card shows the whole command), or
 for a script only `script_len`, `script_digest` (SHA-256) and `interpreter`. `exec_started` and `exec_finished` (exit code,
 `stdout_bytes`, `stderr_bytes`, `duration_ms`, `truncated`, `label`) are hidden from the agent audit API. Command output is never
 in the audit log and never in a notification. History shows the mode as "remote command"; its pop-over shows the command or the

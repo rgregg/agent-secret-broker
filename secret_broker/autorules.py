@@ -37,6 +37,7 @@ import urllib.parse
 
 from . import clients as clients_mod
 from . import execmode
+from . import guidance as guidance_mod
 from . import sessionrules
 from . import sshrules
 from . import scripts as scripts_mod
@@ -154,6 +155,9 @@ def _parse_rule(r, where, *, implicit_secret=None, extra_keys=(), stored_modes=S
         if (not isinstance(argv, list) or not argv or len(argv) > 64 or not argv[0]
                 or not all(isinstance(a, str) and len(a) <= 4096 for a in argv)):
             raise ValueError(f"{where}.argv is required: the words every matching command starts with")
+        for w in argv:      # the rules table is where "run with no approval" is consented to: no look-alikes or hidden text
+            if not w.isascii() or guidance_mod.hidden_problem(w):
+                raise ValueError(f"{where}.argv words must be plain ASCII text (no hidden or look-alike characters)")
         rule.update(host=host.lower(), account=acct, argv=tuple(argv))
     else:
         argv = r.get("argv")

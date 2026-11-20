@@ -337,6 +337,8 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
         self.credreq_cfg = credreq_mod.parse_config(config.get("credential_requests"))
         self.sudo_cfg = sudo_mod.parse_config(config.get("sudo"))
         self.exec_cfg = exec_mod.parse_config(config.get("exec"))        # (a property: sizes the run slots)
+        if self.exec_cfg["enabled"] and self._exec_state_dir():
+            execrun_mod.sweep(self._exec_state_dir())       # a crashed run may have left an agent and a directory
         self.auto_rules = autorules_mod.parse(config.get("auto_approve"))
         # guidance applies: vault writes are serialized and spaced; transient errors are retried.
         # The clock, sleep and jitter are attributes so tests can drive them.
@@ -2137,7 +2139,8 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
                         err = "too many pending sudo requests"
                 if mode == "exec":
                     cid_ = (client or clients_mod.ClientStore.LEGACY_VIEW)["id"]
-                    if sum(r.status == "pending" and r.mode == "exec" and r.client["id"] == cid_
+                    # a rule-approved request is never `pending`: count it until it has finished running
+                    if sum(r.status in ("pending", "deciding") and r.mode == "exec" and r.client["id"] == cid_
                            for r in self._by_id.values()) >= self.exec_cfg["max_pending_per_client"]:
                         err = "too many pending remote command requests"
                 if mode == "credential":
@@ -2878,11 +2881,12 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
         sc = secrets_cfg[n]
         if not sc.get("ssh"):
             raise ValueError("a remote command needs an ssh key credential")
-        if spec["host"] not in ((sc.get("ssh_hosts") or {}).get("allowed") or []):
-            raise PermissionError("that host is not named in this key's allowed hosts")
         raw = ((sc.get("_meta") or {}).get("ssh_hosts") or {}).get("known_hosts") or []
-        if not sshkey.known_host_lines(raw, spec["host"], spec["port"]):
-            raise PermissionError("this key has no pinned host key (known_hosts line) for that host and port")
+        why = ("not_allowed" if spec["host"] not in ((sc.get("ssh_hosts") or {}).get("allowed") or []) else
+               "not_pinned" if not sshkey.known_host_lines(raw, spec["host"], spec["port"]) else None)
+        if why:      # one text for both: the key's host policy is never shown to an agent; the audit log has the reason
+            self.log("exec_host_refused", reason=why, names=names, port=spec["port"])
+            raise PermissionError("that host is not approved for this key")
 
     @property
     def exec_cfg(self):

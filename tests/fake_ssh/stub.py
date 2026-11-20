@@ -95,6 +95,12 @@ def ssh(cfg):
         sys.stderr.write(cfg["stderr"])
     sys.stdout.flush()
     sys.stderr.flush()
+    if cfg.get("stdout_hex"):
+        sys.stdout.buffer.write(bytes.fromhex(cfg["stdout_hex"]))
+    if cfg.get("stderr_hex"):
+        sys.stderr.buffer.write(bytes.fromhex(cfg["stderr_hex"]))
+    sys.stdout.flush()
+    sys.stderr.flush()
     log(phase="end", t0=t0, t1=time.time())
     return cfg.get("rc", 0)
 

@@ -6,6 +6,7 @@ model, and a flag outside the entry's set takes it off the table; the text the r
 receives is the text that was classified (`rebuild` round-trips); a script travels on stdin.
 """
 import hashlib
+import json
 import os
 import sys
 import unittest
@@ -120,6 +121,45 @@ class Grammar(unittest.TestCase):
     def test_rebuild_quotes_the_dangerous_words(self):
         out = execmode.rebuild(["echo", "a b", "x;y", "$HOME", "plain"])
         self.assertEqual(out, "echo 'a b' 'x;y' '$HOME' plain")
+
+
+class Review(unittest.TestCase):
+    """Findings of the branch review: scrubbing outside the model, option-looking first words, zsh word starts."""
+
+    def test_audit_and_push_never_carry_obvious_secrets(self):
+        for cmd, secret in (("mysql -u root --password hunter2xyz db", "hunter2xyz"),
+                            ("curl -H 'Authorization: Bearer abcd1234efgh5678' http://x/", "abcd1234efgh5678"),
+                            ("deploy --token=tok_live_12345 now", "tok_live_12345"),
+                            ("echo " + "A" * 40, "A" * 40)):
+            s = valid(command=cmd)
+            self.assertNotIn(secret, json.dumps(execmode.audit_fields(s)), cmd)
+            self.assertNotIn(secret, execmode.push_text(s), cmd)
+            self.assertIn(secret, execmode.display_text(s), cmd)          # the human's card still shows it all
+        a = execmode.audit_fields(valid(command="ls -la /var/log"))          # control: ordinary text is kept
+        self.assertEqual(a["argv"], ["ls", "-la", "/var/log"])
+
+    def test_the_model_text_scrubs_a_bearer_token(self):
+        s = valid(command="curl -H 'Authorization: Bearer abcd1234efgh5678' http://x/")
+        self.assertNotIn("abcd1234efgh5678", execmode.model_text(s))
+        self.assertIn("curl", execmode.model_text(s))
+
+    def test_audit_keeps_a_newline_visible(self):
+        a = execmode.audit_fields(valid(command="uptime\nrm -rf /srv"))
+        self.assertNotEqual(a["argv"], ["uptime", "rm", "-rf", "/srv"])
+        self.assertTrue(any("<U+000A>" in w for w in a["argv"]))
+
+    def test_a_first_word_that_looks_like_an_option_is_sent_quoted(self):
+        for typed in ("'-A'", "'-oFoo=bar' x", "'-F/tmp/x'"):
+            payload = execmode.remote_payload(valid(command=typed))[0]
+            self.assertFalse(payload.startswith("-"), payload)
+            self.assertEqual(execmode.parse_simple(payload), execmode.parse_simple(typed))
+        self.assertEqual(execmode.remote_payload(valid(command="ls -la"))[0], "ls -la")     # later words stay bare
+
+    def test_words_starting_with_zsh_expanders_are_quoted(self):
+        for w in ("=ls", "%1", "~"):
+            out = execmode.rebuild(["echo", w])
+            self.assertEqual(out, f"echo '{w}'")
+        self.assertEqual(execmode.rebuild(["echo", "a=b", "x%y"]), "echo a=b x%y")
 
 
 class Table(unittest.TestCase):
@@ -397,12 +437,13 @@ class Display(unittest.TestCase):
         self.assertIn("script", execmode.push_text(s))
 
     def test_audit_fields_command(self):
-        words = "w" + "x" * 400 + " " + " ".join(f"w{i}" for i in range(80))
+        long = "/" + "ab/" * 140
+        words = long + " " + " ".join(f"w{i}" for i in range(80))
         s = valid(command="echo " + words)
         a = execmode.audit_fields(s)
         self.assertEqual(len(a["argv"]), 50)
         self.assertEqual(max(len(w) for w in a["argv"]), 300)             # the long word was clipped
-        self.assertEqual(a["argv"][:2], ["echo", "w" + "x" * 299])
+        self.assertEqual(a["argv"][:2], ["echo", long[:300]])
         self.assertEqual((a["host"], a["account"], a["port"], a["timeout_s"]), ("nas.example.com", "ryan", 22, 60))
         self.assertNotIn("script_digest", a)
 

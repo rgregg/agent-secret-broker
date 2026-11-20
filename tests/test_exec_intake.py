@@ -152,6 +152,13 @@ class Hosts(ExecBase):
         self.assertTrue(self.events("rejected"))
         return json.loads(b)["error"]
 
+    GENERIC = "that host is not approved for this key"      # one text for every host refusal: the policy is not shown
+
+    def test_the_two_host_refusals_differ_only_in_the_audit(self):
+        self.refused(403, host="other.example.com")
+        self.refused(403, host="nopin.example.com")
+        self.assertEqual([e["reason"] for e in self.events("exec_host_refused")], ["not_allowed", "not_pinned"])
+
     def test_a_pinned_named_host_is_accepted(self):
         self.enable(max_pending_per_client=20)
         for host, port in (("nas.example.com", 22), ("NAS.Example.COM", 22), ("port.example.com", 2222), ("127.0.0.1", 22)):
@@ -167,25 +174,25 @@ class Hosts(ExecBase):
         self.assertEqual(self.broker._by_id[rid].spec["host"], "nas.example.com")
 
     def test_host_not_named_in_allowed_hosts(self):
-        self.assertIn("allowed hosts", self.refused(403, host="other.example.com"))
+        self.assertEqual(self.GENERIC, self.refused(403, host="other.example.com"))
         # a known_hosts line alone does not allow it
-        self.assertIn("allowed hosts", self.refused(403, host="unlisted.example.com"))
+        self.assertEqual(self.GENERIC, self.refused(403, host="unlisted.example.com"))
 
     def test_fingerprint_entry_is_not_a_name(self):
         self.assertIn("plain host name", self.refused(400, host=FP_ONLY))   # not even a host name
         self.assertEqual(self.ask()[0], 202)
 
     def test_allowed_but_without_a_known_hosts_line(self):
-        self.assertIn("no pinned host key", self.refused(403, host="nopin.example.com"))
+        self.assertEqual(self.GENERIC, self.refused(403, host="nopin.example.com"))
 
     def test_pin_is_per_port(self):
-        self.assertIn("no pinned host key", self.refused(403, host="nas.example.com", port=2222))
-        self.assertIn("no pinned host key", self.refused(403, host="port.example.com", port=22))
+        self.assertEqual(self.GENERIC, self.refused(403, host="nas.example.com", port=2222))
+        self.assertEqual(self.GENERIC, self.refused(403, host="port.example.com", port=22))
 
     def test_other_spellings_of_an_allowed_host_do_not_pass(self):
         # valid host syntax, but not the name that is pinned: the exact-name check refuses them
         for host in ("127.1", "0177.0.0.1", "2130706433", "127.000.000.001", "xn--nas.example.com", "nas2.example.com"):
-            self.assertIn("allowed hosts", self.refused(403, host=host), host)
+            self.assertEqual(self.GENERIC, self.refused(403, host=host), host)
         # not host syntax at all (trailing dot, whitespace, port, userinfo, path, option, IPv6, non-ASCII look-alike)
         for host in ("nas.example.com.", "nas.example.com ", " nas.example.com", "nas.example.com\n", "nas.example.com:22",
                      "nas.example.com@x", "nas.example.com/", "nas.example.com%00", "-oProxyCommand=x", "[::1]",
@@ -406,7 +413,7 @@ class Decisions(ExecBase):
 
 class Audit(ExecBase):
     def test_requested_event_has_the_words_and_where_not_the_script(self):
-        self.pending(command="systemctl status " + "x" * 400)
+        self.pending(command="systemctl status " + "/ab" * 140)
         ev = self.events("requested")[-1]
         self.assertEqual((ev["host"], ev["account"], ev["port"]), ("nas.example.com", "ryan", 22))
         self.assertEqual(ev["argv"][:2], ["systemctl", "status"])
