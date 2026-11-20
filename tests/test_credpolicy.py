@@ -72,7 +72,12 @@ class Cards(unittest.TestCase):
     def test_cards_do_not_apply_to_the_wrong_kind(self):
         self.assertEqual(sshhosts.card("svc", http_cred(), CSRF), "")
         self.assertEqual(sshrules.card("svc", http_cred(), CSRF, sshrules.Usage(None)), "")
-        self.assertEqual(uirules.card("deploy", SSH_CRED, [], CSRF, sshrules.Usage(None)), "")
+        # an ssh key's card holds remote-command (exec) rules only: no web, run-with-secret or session forms
+        ssh_card = uirules.card("deploy", SSH_CRED, [], CSRF, sshrules.Usage(None))
+        self.assertIn("Add rule for remote commands", ssh_card)
+        for kind in ("value=http", "value=env", "value=http_session", "value=ws_session"):
+            self.assertNotIn(kind, ssh_card)
+        self.assertIn("value=http selected", uirules.card("svc", http_cred(), [], CSRF, sshrules.Usage(None)))   # control
         self.assertNotEqual(sshhosts.card("deploy", SSH_CRED, CSRF), "")                    # controls
         self.assertNotEqual(uirules.card("svc", http_cred(), [], CSRF, sshrules.Usage(None)), "")
 
@@ -83,7 +88,8 @@ class Cards(unittest.TestCase):
         self.assertIn("cfg-ssh", out)
         self.assertIn("sign in as deploy on web.example.com", out)
         self.assertIn("<h3>Auto-approve rules (1)", out)
-        self.assertNotIn("action='/policies/auto_rules/add'", out)                 # read-only: an ssh key takes no stored rule
+        self.assertNotIn("value=http", out)                 # an ssh key takes only remote-command rules, never a web or env one
+        self.assertIn("Add rule for remote commands", out)
         self.assertNotIn("Auto-approve rules", credpolicy.body("deploy", dict(SSH_CRED), ctx()))   # none, no section
 
     def test_a_pair_config_rule_is_marked(self):
