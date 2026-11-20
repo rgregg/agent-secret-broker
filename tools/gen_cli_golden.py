@@ -271,9 +271,34 @@ def analyse_cases():
     return out
 
 
+def exec_cases():
+    """`asb exec`: words -> the command text sent (exec_join), and text -> the fixed phrase for the first character
+    the client refuses (exec_text_problem). Every code point from 0 to 0x3100 and the edges of the other ranges."""
+    asb = _python_client()
+    rng = random.Random(20261119)
+    pool = ["", "a", "ls", "-l", "/var/log", "a b", "it's", "'", "''", "\"", "$HOME", "`x`", "a\\b", "a;b", "a|b",
+            "a&b", "a>b", "a<b", "(x)", "*", "?", "[x]", "{x}", "~", "!", "#", "a=b", "x@y%z+w:u,t./s-_", "a\nb",
+            "a\tb", "caf\u00e9", "\u65e5\u672c", "\u202e", "a  b", " ", "\\", "a'b'c", "--", "--user"]
+    pool += [chr(c) for c in range(0x21, 0x7F)]
+    quote = [rng.sample(pool, rng.randrange(1, 5)) for _ in range(600)] + [[w] for w in pool]
+    cps = list(range(0, 0x3100)) + [0xD7FF, 0xD800, 0xDFFF, 0xE000, 0xF8FF, 0xF900, 0xFDFF, 0xFE00, 0xFE0F, 0xFE10,
+                                    0xFEFE, 0xFEFF, 0xFF00, 0xFF9F, 0xFFA0, 0xFFA1, 0xFFF8, 0xFFF9, 0xFFFB, 0xFFFC,
+                                    0xFFFF, 0x1F600, 0xE0000, 0xE007F, 0xE0080, 0xE00FF, 0xE0100, 0xE01EF, 0xE01F0,
+                                    0xEFFFF, 0xF0000, 0x10FFFF]
+    problem = []
+    for cp in cps:
+        if 0xD800 <= cp <= 0xDFFF:
+            continue                                    # JSON cannot carry a lone surrogate; Rust cannot hold one
+        text = "a" + chr(cp) + "b"
+        problem.append([text, asb.exec_text_problem(text)])
+    problem += [["", None], ["plain\ttext\nwith lines\n", None], ["x" * 10, None]]
+    return {"quote": [[w, asb.exec_join(w)] for w in quote], "problem": problem}
+
+
 def generate():
     return {"analyse.json": json.dumps(analyse_cases(), separators=(",", ":"), ensure_ascii=True) + "\n",
             "difflib.json": json.dumps(difflib_cases(), indent=1, ensure_ascii=True) + "\n",
+            "exec.json": json.dumps(exec_cases(), separators=(",", ":"), ensure_ascii=True) + "\n",
             "ssh_claim.json": json.dumps(ssh_claim_cases(), indent=0, ensure_ascii=True) + "\n"}
 
 

@@ -16,7 +16,7 @@ pub const RELEASE_URL: &str = "https://github.com/rgregg/agent-secret-broker/rel
 pub const UPDATE_STEPS: &str = include_str!("../text/update_steps.txt");
 
 /// The commands that have `asb help COMMAND` text, in the order the Python CLI lists them.
-pub const HELP_TOPICS: &[&str] = &["ws", "plan", "list", "which", "status", "version", "audit", "http", "session", "sudo", "run", "store", "request-credential", "update", "ssh-agent", "fingerprint", "guidance", "enroll", "agent-setup", "guide"];
+pub const HELP_TOPICS: &[&str] = &["ws", "plan", "list", "which", "status", "version", "audit", "http", "session", "sudo", "exec", "run", "store", "request-credential", "update", "ssh-agent", "fingerprint", "guidance", "enroll", "agent-setup", "guide"];
 
 /// The text of `asb help COMMAND`.
 pub fn help(topic: &str) -> Option<&'static str> {
@@ -31,6 +31,7 @@ pub fn help(topic: &str) -> Option<&'static str> {
         "http" => Some(include_str!("../text/help/http.txt")),
         "session" => Some(include_str!("../text/help/session.txt")),
         "sudo" => Some(include_str!("../text/help/sudo.txt")),
+        "exec" => Some(include_str!("../text/help/exec.txt")),
         "run" => Some(include_str!("../text/help/run.txt")),
         "store" => Some(include_str!("../text/help/store.txt")),
         "request-credential" => Some(include_str!("../text/help/request-credential.txt")),
