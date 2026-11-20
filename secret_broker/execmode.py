@@ -240,22 +240,18 @@ _SYSD = _e("lan", ("--no-pager", "--full", "--all", "--no-legend", "--failed"),
 _IPF = ("-4", "-6", "-br", "-brief", "-j", "-o", "-s")
 _ZP = _e("vxHpDLPgo")
 READONLY = {
-    "systemctl": {"subs": {s: _SYSD for s in ("status", "is-active", "is-enabled", "is-failed", "show",
+    "systemctl": {"subs": {s: _SYSD for s in ("status", "is-active", "is-enabled", "is-failed",
                                                 "list-units", "list-unit-files", "list-timers")},
                   "pre": frozenset(("--no-pager", "--full", "--all", "--no-legend", "--failed"))},
+    # Left OFF the table on purpose (they print environment or config that often holds secrets, or arbitrary
+    # program output, so the model rates them): `docker inspect` (Config.Env), `docker info` (proxy URLs),
+    # `docker logs` and `journalctl` (application output), `systemctl show` (Environment=), `ps` with an
+    # environment modifier or a custom format.
     "docker": {"subs": {
         "ps": _e("aqsl", ("--all", "--quiet", "--no-trunc", "--size", "--latest"),
                  {"--filter": _VAL["kv"], "--last": _VAL["num"]}, pos=None),
         "images": _e("aq", ("--all", "--quiet", "--no-trunc", "--digests"), {"--filter": _VAL["kv"]}),
-        "inspect": _e("s", ("--size",)),
-        "logs": _e("t", ("--timestamps", "--details"),
-                   {"--tail": re.compile(r"\d{1,6}|all"), "--since": _VAL["time"], "--until": _VAL["time"]}),
-        "version": _e(pos=None), "info": _e(pos=None)}},
-    "journalctl": {"entry": _e("bnrexkaqlpu", ("--no-pager", "--reverse", "--boot", "--utc", "--no-hostname",
-                                                 "--catalog", "--dmesg"),
-                               {"--unit": _VAL["pos"], "--user-unit": _VAL["pos"], "--lines": _VAL["num"],
-                                "--since": _VAL["time"], "--until": _VAL["time"], "--priority": _VAL["prio"],
-                                "--output": _VAL["out"]})},
+        "version": _e(pos=None)}},
     "df": {"entry": _e("hTikaPlHxB", ("--human-readable", "--si", "--local", "--all", "--print-type"))},
     "uptime": {"entry": _e("ps", ("--pretty", "--since"), pos=None)},
     "free": {"entry": _e("hmgbtwkl", ("--human", "--si", "--total", "--wide", "--lohi"), pos=None)},
@@ -264,7 +260,7 @@ READONLY = {
     "date": {"entry": _e("uRI", ("--utc",), pos=_DATE_POS)},
     "ls": {"entry": _e("lahtrSR1dFiAnsLHGgopX", ("--all", "--almost-all", "--human-readable", "--long"),
                        {"--color": re.compile(r"auto|never|always")})},
-    "ps": {"entry": _e("aefuxwlAHTjLmop", ("--forest", "--no-headers", "--no-header"))},
+    "ps": {"entry": _e("", ("-ef", "-e", "-A"), pos=re.compile(r"aux"))},       # no `e` modifier, no -o formats
     "ip": {"pre": frozenset(_IPF), "subs": {
         "addr": _e(lead={"show", "list"}, pos=_RESTWORD), "address": _e(lead={"show", "list"}, pos=_RESTWORD),
         "route": _e(lead={"show", "list", "get"}, pos=_RESTWORD), "link": _e(lead={"show"}, pos=_RESTWORD)}},
@@ -329,27 +325,43 @@ def _builtin_low(argv):
 
 _EXT_PROG = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.+-]{0,63}", re.ASCII)
 _EXT_SUB = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.:-]{0,63}", re.ASCII)
+_EXT_FLAG = re.compile(r"--?[A-Za-z][A-Za-z0-9-]{0,31}", re.ASCII)
+
+
+def _extension_split(entry):
+    """(prefix words, flags) of an `exec.readonly` entry, or None when malformed: a program (a bare name, or
+    an absolute path in a standard bin directory), up to two plain subcommand words, then up to 10 flags
+    the owner allows (each `-x` or `--long`, no value, listed exactly)."""
+    if not isinstance(entry, str) or len(entry) > 300:
+        return None
+    words = entry.split(" ")
+    flags = [w for w in words if w.startswith("-")]
+    prefix = words[:len(words) - len(flags)]
+    if words[len(prefix):] != flags or not 1 <= len(prefix) <= 3 or len(flags) > 10:
+        return None
+    prog = _program(prefix[0])
+    if prog is None or not _EXT_PROG.fullmatch(prog) or not all(_EXT_SUB.fullmatch(w) for w in prefix[1:]):
+        return None
+    if not all(_EXT_FLAG.fullmatch(f) for f in flags):
+        return None
+    return prefix, frozenset(flags)
 
 
 def _extension_ok(entry):
-    if not isinstance(entry, str):
-        return False
-    words = entry.split(" ")
-    if not 1 <= len(words) <= 3 or len(entry) > 200:
-        return False
-    return (_program(words[0]) is not None and (_EXT_PROG.fullmatch(_program(words[0])) is not None)
-            and all(_EXT_SUB.fullmatch(w) for w in words[1:]))
+    return _extension_split(entry) is not None
 
 
 def _extension_low(argv, cfg):
+    """The owner's entry an argv matches: the program and subcommand words, then only the flags that entry
+    lists and plain positional words. Any other argument starting with a dash does not match."""
     for entry in cfg["readonly"]:
-        words = entry.split(" ")
-        n = len(words)
-        if len(argv) < n or [_program(argv[0])] + argv[1:n] != [_program(words[0])] + words[1:]:
+        prefix, flags = _extension_split(entry)
+        n = len(prefix)
+        if len(argv) < n or [_program(argv[0])] + argv[1:n] != [_program(prefix[0])] + prefix[1:]:
             continue
         if _program(argv[0]) is None:
             continue
-        if all(_POS.fullmatch(a) or _EXT_FLAG.fullmatch(a) for a in argv[n:]):
+        if all((a in flags) if a.startswith("-") else _POS.fullmatch(a) is not None for a in argv[n:]):
             return entry
     return None
 
@@ -429,11 +441,26 @@ def audit_fields(spec):
     a script only its size and SHA-256; where and as whom."""
     out = {"host": spec["host"], "account": spec["user"], "port": spec["port"], "timeout_s": spec["timeout_s"]}
     if "script" in spec:
-        out.update(script_bytes=len(spec["script"]["text"].encode("utf-8")), script_sha256=script_sha256(spec),
+        out.update(script_len=len(spec["script"]["text"].encode("utf-8")), script_digest=script_sha256(spec),
                    interpreter=spec["script"]["interpreter"])
     else:
-        out["command"] = [w[:AUDIT_WORD_CHARS] for w in spec["command"].split()[:AUDIT_WORDS]]
+        out["argv"] = [w[:AUDIT_WORD_CHARS] for w in spec["command"].split()[:AUDIT_WORDS]]
     return out
+
+
+_SECRETISH = re.compile(r"(?i)(pass(?:word|wd)?|pwd|secret|token|api[_-]?key|apikey|authorization|bearer|credential)"
+                        r"""(["']?\s*[=:]\s*["']?|\s+)[^\s"']{4,}""")
+_OPAQUE = re.compile(r"[A-Za-z0-9+/_=-]{32,}")
+
+
+def model_text(spec, limit=4000):
+    """The command or script text for the risk model: non-ASCII shown as <U+XXXX>, obvious secrets
+    (NAME=value after password/token/key words, long opaque strings) replaced, clipped to `limit`.
+    The model treats it as untrusted data. Both patterns are linear in the length of the text."""
+    text = spec["script"]["text"] if "script" in spec else remote_payload(spec)[0]
+    text = _SECRETISH.sub(lambda m: m.group(1) + m.group(2) + "<redacted>", text[:limit * 2])
+    text = _OPAQUE.sub("<redacted>", text)
+    return _shown(text)[:limit]
 
 
 def describe_html(req):

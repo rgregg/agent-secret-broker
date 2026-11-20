@@ -82,10 +82,10 @@ class Table(unittest.TestCase):
         return execmode.classify(valid(command=text), CFG)["level"]
 
     def test_allowed(self):
-        for text in ("systemctl status nginx", "systemctl is-active nginx.service", "docker ps -a",
-                     "docker logs --tail=100 web", "journalctl -u nginx -n 50 --no-pager", "df -h",
+        for text in ("systemctl status nginx", "systemctl is-active nginx.service", "docker ps -a", "docker version",
+                     "df -h",
                      "uptime", "free -h", "uname -a", "hostname", "date +%s", "ls -la /var/log",
-                     "ps aux", "ip addr show", "ip -4 addr", "ip route", "ss -tlnp",
+                     "ps aux", "ps -ef", "ps", "ip addr show", "ip -4 addr", "ip route", "ss -tlnp",
                      "zpool status -v", "zfs list -t snapshot", "/usr/bin/systemctl status nginx"):
             with self.subTest(text=text):
                 c = execmode.classify(valid(command=text), CFG)
@@ -102,7 +102,11 @@ class Table(unittest.TestCase):
                      "zpool destroy tank", "zfs destroy tank/x", "ss -K", "ls --color=always x/../..;x",
                      "/tmp/systemctl status x", "/usr/bin/../../tmp/systemctl status x", "./systemctl status x",
                      "systemctl", "docker", "systemctl status -x", "docker ps --format {{.ID}}", "ls -la; id",
-                     "uptime | sh", "ls $(id)"):
+                     "uptime | sh", "ls $(id)",
+                     # entries that print environment or config (secrets): the model decides, not the table
+                     "docker inspect web", "systemctl show nginx", "systemctl show", "ps e", "ps aux e", "ps eww",
+                     "ps -eo pid,args", "ps axe", "docker info", "docker logs web", "docker logs --tail=100 web",
+                     "journalctl -u nginx -n 50 --no-pager", "journalctl --no-pager"):
             with self.subTest(text=text):
                 self.assertIsNone(self.low(text))
 
@@ -122,14 +126,36 @@ class Table(unittest.TestCase):
                 self.assertIsNone(self.low(f"uptime {ch}"))
         self.assertEqual(self.low("uptime"), "low")
 
+    def test_environment_dumpers_are_not_low_but_their_siblings_are(self):
+        for text in ("systemctl status nginx", "docker ps", "docker images", "ps aux"):         # positive control
+            self.assertEqual(self.low(text), "low", text)
+        for text in ("docker inspect web", "systemctl show nginx", "ps e", "ps aux e"):
+            self.assertIsNone(self.low(text), text)
+
     def test_readonly_extension(self):
-        cfg = execmode.parse_config({"readonly": ["smartctl", "systemctl list-sockets"]})
+        cfg = execmode.parse_config({"readonly": ["smartctl -a", "systemctl list-sockets"]})
         ok = lambda t: execmode.classify(valid(command=t), cfg)["level"]            # noqa: E731
         self.assertEqual(ok("smartctl -a /dev/sda"), "low")
         self.assertEqual(ok("systemctl list-sockets"), "low")
         self.assertIsNone(ok("systemctl restart x"))
         self.assertIsNone(execmode.classify(valid(command="smartctl -a /dev/sda"), CFG)["level"])   # default table lacks it
         self.assertIsNone(ok("smartctl -a; id"))
+
+    def test_readonly_extension_allows_only_the_flags_the_owner_lists(self):
+        cfg = execmode.parse_config({"readonly": ["smartctl -a --health", "lsblk"]})
+        ok = lambda t: execmode.classify(valid(command=t), cfg)["level"]            # noqa: E731
+        self.assertEqual(ok("smartctl -a /dev/sda"), "low")                         # listed flag, positional
+        self.assertEqual(ok("smartctl --health -a /dev/sda"), "low")
+        self.assertEqual(ok("lsblk"), "low")
+        for text in ("smartctl -s on /dev/sda", "smartctl --xall /dev/sda", "smartctl -a --scan",
+                     "smartctl -aX /dev/sda", "lsblk -f", "lsblk --json", "smartctl -a --health=x /dev/sda"):
+            self.assertIsNone(ok(text), text)
+
+    def test_readonly_extension_flags_must_be_plain(self):
+        for bad in ("smartctl -a;b", "smartctl -", "smartctl --", "smartctl -a=b", "smartctl -a x", "-a smartctl",
+                    "smartctl " + " ".join(f"-f{i}" for i in range(11))):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                execmode.parse_config({"readonly": [bad]})
 
     def test_readonly_extension_cannot_name_a_shell_character(self):
         for bad in ("a;b", "a b|c", "$x", "a`b`", "-x", "", "a\nb", "x" * 200, "../x", "a b c d", 5, "ls &"):
@@ -329,19 +355,19 @@ class Display(unittest.TestCase):
         words = "w" + "x" * 400 + " " + " ".join(f"w{i}" for i in range(80))
         s = valid(command="echo " + words)
         a = execmode.audit_fields(s)
-        self.assertEqual(len(a["command"]), 50)
-        self.assertEqual(max(len(w) for w in a["command"]), 300)             # the long word was clipped
-        self.assertEqual(a["command"][:2], ["echo", "w" + "x" * 299])
+        self.assertEqual(len(a["argv"]), 50)
+        self.assertEqual(max(len(w) for w in a["argv"]), 300)             # the long word was clipped
+        self.assertEqual(a["argv"][:2], ["echo", "w" + "x" * 299])
         self.assertEqual((a["host"], a["account"], a["port"], a["timeout_s"]), ("nas.example.com", "ryan", 22, 60))
-        self.assertNotIn("script_sha256", a)
+        self.assertNotIn("script_digest", a)
 
     def test_audit_fields_script_has_hash_and_length_only(self):
         s = valid(script={"text": "echo S3CR3T-body\n"})
         a = execmode.audit_fields(s)
-        self.assertEqual(a["script_sha256"], hashlib.sha256(b"echo S3CR3T-body\n").hexdigest())
-        self.assertEqual(a["script_bytes"], 17)
+        self.assertEqual(a["script_digest"], hashlib.sha256(b"echo S3CR3T-body\n").hexdigest())
+        self.assertEqual(a["script_len"], 17)
         self.assertNotIn("S3CR3T", repr(a))
-        self.assertNotIn("command", a)
+        self.assertNotIn("argv", a)
 
 
 if __name__ == "__main__":
