@@ -8,8 +8,11 @@ import _fast  # noqa: F401  (test-only: prompt server shutdown, fake-clock helpe
 import hashlib
 import json
 import os
+import shutil
 import sys
+import tempfile
 import unittest
+from unittest import mock
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -17,9 +20,11 @@ import urllib.request
 sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import test_exec_intake as ti  # noqa: E402
-from test_exec_intake import FRESH, NAS, PORT, UNLISTED, _OMIT, probe_result  # noqa: E402
+from test_exec_intake import FRESH, NAS, PORT, UNLISTED, probe_result  # noqa: E402
 from secret_broker import audit_api, autorules, destguard, execmode, execprobe  # noqa: E402
+from secret_broker import sshkey  # noqa: E402
 from secret_broker.notify import FakeNotifier  # noqa: E402
+from test_execrun import STUB  # noqa: E402
 
 FP = {k: probe_result(v)["fingerprint"] for k, v in (("nas", NAS), ("port", PORT), ("fresh", FRESH),
                                                       ("unlisted", UNLISTED))}
@@ -415,6 +420,179 @@ class Decisions(Unpinned):
         self.assertIn("needs a person's decision", str(cm.exception))
         req.spec.update(spec)
         self.assertTrue(execmode.host_fields_ok(req.spec))              # premise: the real fields pass the shape check
+
+
+SSH_BEFORE = ti.SSH_HOSTS
+
+
+class Run(Unpinned):
+    """Decisions through the REAL runner (stub ssh programs): what is persisted, what is connected to."""
+
+    def tweak(self, cfg):
+        super().tweak(cfg)
+        self.stubs = tempfile.mkdtemp(prefix="stubs-")
+        self.addCleanup(shutil.rmtree, self.stubs, True)
+        for name in ("ssh", "ssh-agent", "ssh-add"):
+            shutil.copy(STUB, os.path.join(self.stubs, name))
+            os.chmod(os.path.join(self.stubs, name), 0o755)
+        with open(os.path.join(self.stubs, "config.json"), "w") as f:
+            json.dump({"ssh": {"stdout": "ran\n", "rc": 0}}, f)
+
+    def setUp(self):
+        super().setUp()
+        del self.broker._exec_run
+        self.enable(ssh_path=self.stubs, max_pending_per_client=20)
+        self.broker.dest_guard._resolver = lambda h, p: ["93.184.216.34"]
+        self.meta0 = json.dumps(self.meta(), sort_keys=True)
+
+    def meta(self):
+        return self.broker.cfg["secrets"]["deploy"]["_meta"].get("ssh_hosts")
+
+    def ssh_calls(self):
+        try:
+            with open(os.path.join(self.stubs, "calls.jsonl")) as f:
+                return [c for c in map(json.loads, f) if c["tool"] == "ssh" and c.get("phase") != "end"]
+        except FileNotFoundError:
+            return []
+
+    def go(self, decision, state="new", **fields):
+        rid = self.pending(**self.states()[state])
+        self.assertEqual(self.decide_form(rid, decision, **fields)[0], 303)
+        self.req(rid).done.wait(20)
+        return self.req(rid)
+
+    def lines(self, host, port=22):
+        return sshkey.known_host_lines(self.meta()["known_hosts"], host, port)
+
+    def test_approve_once_connects_to_the_shown_key_and_persists_nothing(self):
+        req = self.go("approve")
+        self.assertEqual(self.poll(req.id)["exit_code"], 0)                  # premise: it really ran
+        [c] = self.ssh_calls()
+        self.assertEqual(c["known_hosts"], f"{NEW} {req.spec['presented_key']}\n")
+        self.assertIn("HostName=93.184.216.34", c["argv"])                   # connected to the guard-validated address
+        self.assertEqual(json.dumps(self.meta(), sort_keys=True), self.meta0)
+        self.assertEqual(self.events("exec_host_remembered") + self.events("exec_host_replaced"), [])
+        rid = self.pending(host=NEW)                                          # still unpinned next time
+        self.assertEqual(self.req(rid).spec["host_state"], "new")
+
+    def test_the_runner_is_given_only_the_fingerprint_shown_never_the_catalogs_lines(self):
+        req = self.go("approve", "changed")                                   # the old pinned line must not travel along
+        [c] = self.ssh_calls()
+        self.assertEqual(c["known_hosts"], f"nas.example.com {req.spec['presented_key']}\n")
+        self.assertNotIn(sshkey.public_line(NAS).split()[1], c["known_hosts"])
+        self.assertEqual(json.dumps(self.meta(), sort_keys=True), self.meta0)
+
+    def test_a_pinned_request_still_gets_its_catalog_lines_and_no_hostname_override(self):
+        self.broker.auto_rules = autorules.parse([{"name": "up", "mode": "exec", "secret": "deploy",
+                                                   "host": "nas.example.com", "account": "ryan", "argv": ["uptime"]}])
+        rid = json.loads(self.ask(command="uptime")[1])["id"]
+        self.req(rid).done.wait(20)
+        [c] = self.ssh_calls()
+        self.assertEqual(c["known_hosts"], f"nas.example.com {sshkey.public_line(NAS)}\n")
+        self.assertFalse([a for a in c["argv"] if a.startswith("HostName=")])
+
+    def test_remember_pins_the_line_and_allows_the_host_and_the_next_call_is_pinned(self):
+        req = self.go("approve_remember")
+        self.assertEqual(self.poll(req.id)["exit_code"], 0)
+        self.assertEqual(self.lines(NEW), [f"{NEW} {req.spec['presented_key']}"])
+        self.assertIn(NEW, self.meta()["allowed_hosts"])
+        self.assertEqual(self.disk()["secrets"]["deploy"]["ssh_hosts"], self.meta())    # the vault, not just memory
+        self.assertIn(NEW, self.broker.cfg["secrets"]["deploy"]["ssh_hosts"]["allowed"])
+        for old in SSH_BEFORE["known_hosts"]:                                 # nothing else was touched
+            self.assertIn(old, self.meta()["known_hosts"])
+        ev = self.events("exec_host_remembered")[-1]
+        self.assertEqual((ev["host"], ev["port"], ev["fingerprint"], ev["approver"], ev["channel"], ev["changed"]),
+                         (NEW, 22, FP["fresh"], "alice", "dashboard", True))
+        self.assertIn(NEW, self.get("/credentials/deploy?tab=policies")[1])    # the credential editor shows it
+        rid = self.pending(host=NEW)                                          # now an ordinary pinned request
+        self.assertNotIn("host_state", self.req(rid).spec)
+
+    def test_remember_for_another_port_adds_the_bracketed_line(self):
+        rid = self.pending(**self.elsewhere())
+        self.decide_form(rid, "approve_remember")
+        self.req(rid).done.wait(20)
+        self.assertEqual(self.lines("nas.example.com", 2222),
+                         [f"[nas.example.com]:2222 {self.req(rid).spec['presented_key']}"])
+        self.assertEqual(len(self.lines("nas.example.com", 22)), 1)           # the port-22 line is untouched
+
+    def test_remembering_the_same_host_twice_does_not_duplicate_the_line_or_the_allowed_entry(self):
+        a, b = self.pending(**self.new()), self.pending(**self.new())         # two cards for one unpinned host
+        for rid in (a, b):
+            self.assertEqual(self.decide_form(rid, "approve_remember")[0], 303)
+            self.req(rid).done.wait(20)
+            self.assertEqual(self.req(rid).status, "approved")
+        self.assertEqual(len(self.lines(NEW)), 1)
+        self.assertEqual(self.meta()["allowed_hosts"].count(NEW), 1)
+        self.assertEqual(sum(1 for ln in self.meta()["known_hosts"] if ln.startswith(NEW + " ")), 1)
+        self.assertEqual([e["changed"] for e in self.events("exec_host_remembered")], [True, False])
+
+    def test_replace_swaps_the_line_in_place_and_audits_both_fingerprints(self):
+        req = self.go("approve_replace", "changed", confirm_replace="1")
+        self.assertEqual(self.poll(req.id)["exit_code"], 0)
+        self.assertEqual(self.lines("nas.example.com"), [f"nas.example.com {req.spec['presented_key']}"])
+        self.assertNotIn(sshkey.public_line(NAS), "\n".join(self.meta()["known_hosts"]))     # the old key is gone
+        self.assertEqual(len(self.lines("port.example.com", 2222)), 1)                         # others stay
+        ev = self.events("exec_host_replaced")[-1]
+        self.assertEqual((ev["fingerprint"], ev["replaced_fingerprint"], ev["approver"], ev["channel"]),
+                         (FP["fresh"], FP["nas"], "alice", "dashboard"))
+        self.assertEqual(self.events("exec_host_remembered"), [])
+        rid = self.pending(host="nas.example.com")                                             # pinned again
+        self.assertNotIn("host_state", self.req(rid).spec)
+
+    def test_replace_keeps_other_names_on_a_shared_line(self):
+        sc = self.broker.cfg["secrets"]["deploy"]
+        shared = f"nas.example.com,backup.example.com {sshkey.public_line(NAS)}"
+        raw = {**sc["_meta"]["ssh_hosts"], "known_hosts": [shared] + sc["_meta"]["ssh_hosts"]["known_hosts"][1:]}
+        self.broker._persist_ssh_hosts("deploy", raw, "alice")
+        self.go("approve_replace", "changed", confirm_replace="1")
+        self.assertEqual(len(self.lines("backup.example.com")), 1)
+        self.assertEqual(self.lines("backup.example.com")[0].split()[2], sshkey.public_line(NAS).split()[1])
+
+    def test_a_vault_failure_leaves_the_old_metadata_runs_nothing_and_says_so(self):
+        with mock.patch.object(self.broker.backend, "set_meta", side_effect=OSError("S3CR3T-vault-path")):
+            req = self.go("approve_remember")
+        self.assertEqual(req.status, "failed")
+        got = self.poll(req.id)
+        self.assertEqual(got["status"], "failed")
+        self.assertNotIn("S3CR3T", json.dumps(got) + open(self.audit).read())
+        self.assertEqual(json.dumps(self.meta(), sort_keys=True), self.meta0)
+        self.assertEqual(self.disk()["secrets"]["deploy"]["ssh_hosts"], json.loads(self.meta0))   # nor the vault
+        self.assertEqual(self.ssh_calls(), [])                                # the command never ran
+        self.assertEqual(len(self.events("exec_host_remember_failed")), 1)
+        self.assertEqual(self.events("exec_host_remembered"), [])
+        req2 = self.go("approve_remember")                                    # positive control: it works when the vault does
+        self.assertEqual(req2.status, "approved")
+
+    def test_a_plain_remember_refuses_to_overwrite_a_different_pinned_key(self):
+        # a rekey raced two cards: the second plain remember must never silently replace the first one's line
+        a = self.pending(**self.new())
+        self.go("approve_remember")
+        self.req(a).spec["presented_key"] = sshkey.public_line(UNLISTED)
+        self.req(a).spec["presented_fp"] = FP["unlisted"]
+        self.decide_form(a, "approve_remember")
+        self.req(a).done.wait(20)
+        self.assertEqual(self.req(a).status, "failed")
+        self.assertEqual(len(self.lines(NEW)), 1)
+        self.assertNotIn(sshkey.public_line(UNLISTED).split()[1], " ".join(self.lines(NEW)))
+
+    def test_a_dns_answer_that_became_forbidden_after_the_probe_fails_closed(self):
+        self.broker.dest_guard._resolver = lambda h, p: ["169.254.169.254"]
+        req = self.go("approve")
+        got = self.poll(req.id)
+        self.assertEqual((got["status"], got["label"], got["exit_code"]), ("released", "connect_failed", None))
+        self.assertEqual(self.ssh_calls(), [])
+
+    def test_a_forbidden_second_address_also_fails_closed(self):
+        self.broker.dest_guard._resolver = lambda h, p: ["93.184.216.34", "::ffff:10.0.0.1"]
+        req = self.go("approve")
+        self.assertEqual(self.poll(req.id)["label"], "connect_failed")
+        self.assertEqual(self.ssh_calls(), [])
+
+    def test_the_connect_address_is_the_probed_one_when_it_is_still_valid(self):
+        self.broker.dest_guard._resolver = lambda h, p: ["93.184.216.35", "93.184.216.34"]
+        self.go("approve")
+        [c] = self.ssh_calls()
+        self.assertIn("HostName=93.184.216.34", c["argv"])                    # the address the human's key was read from
 
 
 if __name__ == "__main__":

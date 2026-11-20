@@ -128,6 +128,19 @@ class Options(Rig):
             "-l", "ryan", "-p", "22", "--", "nas.example.com", "uptime"]
         self.assertEqual(call["argv"], want)
 
+    def test_a_connect_address_adds_one_hostname_option_and_only_a_real_ip_is_accepted(self):
+        self.run_(connect_ip="93.184.216.34")
+        argv = self.ssh_call()["argv"]
+        self.assertEqual(argv[argv.index("-l") - 2:argv.index("-l")], ["-o", "HostName=93.184.216.34"])
+        self.assertEqual(argv[-2:], ["nas.example.com", "uptime"])                    # the name is still what ssh looks up
+        self.run_(connect_ip="::1")
+        self.assertIn("HostName=::1", [c for c in self.calls("ssh") if c.get("phase") != "end"][1]["argv"])
+        n = len([c for c in self.calls("ssh") if c.get("phase") != "end"])
+        for bad in ("evil.example.com", "-oProxyCommand=x", "1.2.3.4,5.6.7.8", "1.2.3.4 -x", ""):
+            res = self.run_(connect_ip=bad)
+            self.assertEqual((res["label"], res["exit_code"]), ("internal", None), bad)
+        self.assertEqual(len([c for c in self.calls("ssh") if c.get("phase") != "end"]), n)   # none of them ran
+
     def test_option_looking_values_change_no_option(self):
         base = self.run_()
         prefix = lambda c: c["argv"][:c["argv"].index("-l")]   # noqa: E731
