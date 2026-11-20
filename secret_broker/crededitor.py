@@ -24,7 +24,8 @@ SENTINEL = "\u2022" * 6
 _CTRL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f  ]")
 
 # the keys the form manages; every other key in the metadata is carried through untouched
-FORM_KEYS = ("allowed_hosts", "tls_fingerprint", "tls_verify", "approval", "plans", "ws")
+FORM_KEYS = ("allowed_hosts", "tls_fingerprint", "tls_verify", "approval", "plans", "ws", "ssh_agent")
+SSH_AGENT_ORDER = ("off", "ask", "allow")     # most closed first: moving right widens what `asb ssh-agent` may do
 TLS_MODES = ("verify", "pin", "skip")
 WS_MODES = ("off", "home-assistant", "custom")
 
@@ -228,6 +229,12 @@ def build(old, form):
         new["tls_fingerprint"] = pins[0] if len(pins) == 1 else pins
     elif mode == "skip":
         new["tls_verify"] = False
+    if old.get("ssh"):                      # how far the agent-signing path is open (a key only)
+        sa = form.get("ssh_agent", old.get("ssh_agent", "allow"))
+        if sa not in SSH_AGENT_ORDER:
+            raise ValueError("choose whether ssh signing is allowed, asks every time, or is off")
+        if sa != "allow" or "ssh_agent" in old:
+            new["ssh_agent"] = sa
     approval = form.get("approval", "")
     if approval and (approval != old.get("approval", "prompt") or "approval" in old):
         new["approval"] = approval          # an untouched default is not written, so an untouched form is a no-op
@@ -258,6 +265,11 @@ def _pins(meta):
             for x in (fp if isinstance(fp, list) else [fp])}
 
 
+def _agent_rank(meta):
+    v = meta.get("ssh_agent", "allow")
+    return SSH_AGENT_ORDER.index(v) if v in SSH_AGENT_ORDER else len(SSH_AGENT_ORDER) - 1     # unknown counts as open
+
+
 def widened(old, new):
     """Closed labels for each way `new` lets the credential do more, or be checked less, than `old`.
     Narrowing (removing a host, adding verification) returns nothing. The save needs a tick for any label."""
@@ -274,6 +286,8 @@ def widened(old, new):
         out.append("approval_allow")
     if not old.get("plans") and new.get("plans"):
         out.append("plans_enabled")
+    if _agent_rank(new) > _agent_rank(old):
+        out.append("ssh_agent_widened")
     if [r for r in new.get("auto_rules") or [] if r not in (old.get("auto_rules") or [])]:
         out.append("auto_rules_added")      # a rule that is new or changed: it releases requests with no approval
     if new.get("ws") is not None:           # any change to how a session signs in or what it may send
@@ -291,6 +305,7 @@ WIDEN_TEXT = {
     "tls_unverified": "turns TLS verification off",
     "approval_allow": "lets requests through without asking",
     "plans_enabled": "allows plans for this credential",
+    "ssh_agent_widened": "opens the agent-signing path (asb ssh-agent) further for this key",
     "auto_rules_added": "adds or changes an auto-approve rule (matching requests are released with no approval)",
     "ws_enabled": "allows WebSocket sessions (the broker signs in; the agent may then send any message not blocked)",
     "ws_changed": "changes how WebSocket sessions sign in or which messages they may send",
@@ -850,6 +865,15 @@ def edit_section(name, meta, token, stored, *, can_write, error="", preview=None
     off = "" if can_write else ("<p class=err>This vault backend cannot store metadata, so credentials cannot "
                                 "be edited here.</p>")
     dis = "" if can_write else " disabled"
+    agent = meta.get("ssh_agent", "allow")
+    agent_sel = ("<p class=hint>The agent-signing path (<code>asb ssh-agent</code>) for this key. Turn it off or "
+                 "to ask every time once a host works through <code>asb exec</code>.</p>"
+                 f"<select name=ssh_agent aria-label='Agent signing'{dis}>"
+                 + "".join(f"<option value={v}{' selected' if agent == v else ''}>{t}</option>" for v, t in (
+                     ("allow", "allow: today's behavior (rules and grants apply)"),
+                     ("ask", "ask: a human decides every signature, no rule or grant"),
+                     ("off", "off: refuse agent signing for this key")))
+                 + "</select>")
     close = f"<a class=btn id=cclose href='/credentials'>Close</a>"
     if preview is not None:
         ticks = ""
@@ -919,8 +943,9 @@ def edit_section(name, meta, token, stored, *, can_write, error="", preview=None
                    f"<p class=hint>Whether each use waits for you.</p>"
                    f"<select name=approval aria-label=Approval{dis}>{sel}</select>"
                    f"<label style='font-weight:400'><input type=checkbox name=plans value=1"
-                   f"{' checked' if meta.get('plans') else ''}{dis}> Allow plans (a batch of calls approved once)</label>",
-                   differs("approval", "plans"))
+                   f"{' checked' if meta.get('plans') else ''}{dis}> Allow plans (a batch of calls approved once)</label>"
+                   + (agent_sel if meta.get("ssh") else ""),
+                   differs("approval", "plans", "ssh_agent"))
             + f"{wcard}"
             f"<details><summary>Advanced: the whole metadata as JSON</summary>"
             f"<p class=hint>Edit this only for keys the form does not cover. If you change it, it "

@@ -193,6 +193,7 @@ class SshRefused(PermissionError):
         self.reason, self.fields = reason, fields
 
 
+SSH_AGENT_VALUES = ("allow", "ask", "off")      # key metadata `ssh_agent`: what `asb ssh-agent` signing may do
 _CLAIM_RE = re.compile(r"[A-Za-z0-9@._:\[\]%,()+ -]{1,200}")
 
 
@@ -458,6 +459,11 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
             raise ValueError("ssh must be true or false")
         if "plans" in meta and not isinstance(meta["plans"], bool):
             raise ValueError("plans must be true or false")
+        if "ssh_agent" in meta:
+            if not ssh:
+                raise ValueError("ssh_agent only applies to an ssh key secret")
+            if meta["ssh_agent"] not in SSH_AGENT_VALUES:
+                raise ValueError("ssh_agent must be one of allow, ask, off")
         if ssh:
             if len(raw_vars) != 1:
                 raise ValueError("an ssh key secret has exactly one variable (the private key)")
@@ -2190,14 +2196,17 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
         if a.get("rating_late") is not None:
             a["rating_late"].add_done_callback(lambda f, r=req: self._rating_arrived(r, f))
         cid = req.client["id"]
-        never = self.client_never_auto(cid)
+        ask_key = self._ssh_ask(req)
+        never = self.client_never_auto(cid) or ask_key      # an `ask` key: a human, whatever any rule, grant or policy says
         if not never and self._ssh_rule_claim(req):   # standing per-host rule: explicit policy, any risk limit
             return req
         if not never and self._rule_claim(req):   # `auto_approve` rule in the config: same standing, any risk
             return req
         auto = self._auto_allowed(mode, names, spec, cid)
         if never and auto:
-            self.audit("escalated", req, auto_max="none", reason="this client is set to never auto-approve")
+            self.audit("escalated", req, auto_max="none",
+                       reason=("this key is set to ask for every ssh signature" if ask_key
+                               else "this client is set to never auto-approve"))
             auto = False
         auto_max = self.auto_max_for(cid)
         if auto and self._script_not_visible(mode, spec):
@@ -2833,6 +2842,9 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
     def _validate_ssh_sign(self, names, spec):
         if len(names) != 1 or not self.cfg["secrets"][names[0]].get("ssh"):
             raise ValueError("ssh signing needs exactly one ssh key secret")
+        if self.cfg["secrets"][names[0]].get("ssh_agent") == "off":
+            # the host has moved to `asb exec`: signing is closed for this key (refused before any host policy)
+            raise SshRefused("ssh signing is turned off for this key", "ssh_agent_off")
         try:
             data = base64.b64decode(spec.get("data_b64") or "", validate=True)
         except (binascii.Error, ValueError):
@@ -2920,6 +2932,12 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
                    duration_ms=res["duration_ms"])
         self._retain_exec_result(req, out)
         return out
+
+    def _ssh_ask(self, req):
+        """True for an ssh signature request for a key whose `ssh_agent` is `ask`."""
+        if req.mode != "ssh_sign" or len(req.names) != 1:
+            return False
+        return (self.cfg["secrets"].get(req.names[0]) or {}).get("ssh_agent") == "ask"
 
     def _exec_assess(self, req, notes):
         """The risk of a remote command: LOW with no model call for a plain command on the read-only table
@@ -3951,6 +3969,9 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
                         always or grant_minutes is not None or ssh_rule is not None or credential is not None
                         or plan is not None or session_limits is not None):
                     req, code = None, 400   # a root command is approved once, as shown; nothing is claimed
+                if req is not None and self._ssh_ask(req) and (
+                        always or grant_minutes is not None or ssh_rule is not None):
+                    req, code = None, 400   # this key asks every time: nothing standing can be created from it
                 if req is not None and req.mode == "exec" and (
                         always or grant_minutes is not None or ssh_rule is not None or credential is not None
                         or plan is not None or session_limits is not None):
@@ -4053,6 +4074,8 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
             return False, "time-boxed grants are off"
         if self._internal_hit(req.names) is not None:
             return False, "this credential is internal"
+        if self._ssh_ask(req):
+            return False, "this key asks for every ssh signature"
         if req.mode not in grants_mod.ELIGIBLE_MODES:
             return False, "storing a credential always needs a fresh approval"
         if self._script_not_visible(req.mode, req.spec):
