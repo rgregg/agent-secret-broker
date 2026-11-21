@@ -21,6 +21,8 @@ import tempfile
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PY = [sys.executable, "-m", "unittest", "test_sudo_mode", "test_asb_sudo", "test_user_agent"]
+PYX = [sys.executable, "-m", "unittest", "test_execprobe", "test_exec_unpinned", "test_exec_intake", "test_execrun",
+       "test_exec_rules", "test_execmode"]
 RS = ["cargo", "test", "--workspace", "--locked"]
 
 # (id, file, exact text, replacement, runner, what it protects)
@@ -66,6 +68,29 @@ MUTATIONS = [
  ("R16","crates/asb-root-exec/src/scriptcheck.rs",'if code.starts_with(\'-\') || code.starts_with(\'+\') {','if false {',"rs","inline code must be next word"),
  ("R17","crates/asb-root-exec/src/scriptcheck.rs",'!POSITIONAL_AFTER_CODE.contains(&interpreter.as_str())','false',"rs","switches after inline code"),
  ("R18","crates/asb-root-exec/src/scriptcheck.rs",'file_args(args, 1, cwd, trusted_uid, trust_root, &mut out)?;','',"rs","file arguments trusted"),
+
+ # remote exec for unpinned and changed hosts (runner "pyx": tests/test_execprobe.py, test_exec_unpinned.py, ...)
+ ("X1","secret_broker/execprobe.py",'sock = guard.connect(host, port, timeout=CONNECT_TIMEOUT_S, max_addresses=MAX_ADDRESSES,\n                             deadline=time.monotonic() + PROBE_DEADLINE_S)','sock = socket.create_connection((host, port), CONNECT_TIMEOUT_S)',"pyx","the probe goes through the destination guard"),
+ ("X2","secret_broker/execprobe.py",'if ip is None or guard.address_refused(ip, port):','if ip is None:',"pyx","the connected peer is checked again"),
+ ("X3","secret_broker/execprobe.py",'if hit is not None and allowed:','if hit is not None:',"pyx","a pinned line for a name that is not allowed is not pinned"),
+ ("X4","secret_broker/execprobe.py",'if name.startswith(host + ":"):','if name.startswith(host):',"pyx","same key elsewhere means the same host name"),
+ ("X5","secret_broker/execprobe.py",'if hit is None:\n            return {"state": "changed"','if False:\n            return {"state": "changed"',"pyx","a different key for a pinned name and port is changed"),
+ ("X6","secret_broker/execprobe.py",'if not allowed_hosts:\n        return True','if not allowed_hosts:\n        return False',"pyx","no allowed list: a pinned line is enough"),
+ ("X7","secret_broker/broker.py",'if mode == "exec" and spec.get("host_state"):\n            return self._exec_unpinned_pending(req)','if False:\n            return self._exec_unpinned_pending(req)',"pyx","an unpinned host reaches only a human"),
+ ("X8","secret_broker/broker.py",'if exec_host == "remember" and (st == "changed" or self._exec_remember_why(req) is not None):','if exec_host == "remember" and self._exec_remember_why(req) is not None:',"pyx","no plain remember for a changed key"),
+ ("X9","secret_broker/broker.py",'or confirm_replace is not True','or False',"pyx","replace needs its confirmation tick"),
+ ("X10","secret_broker/broker.py",'or (match.mode == "exec" and match.spec.get("host_state"))):','):',"pyx","no token channel decides an unpinned host"),
+ ("X11","secret_broker/broker.py",'elif req is not None and exec_host is not None:','elif False:',"pyx","a host choice on another request claims nothing"),
+ ("X12","secret_broker/broker.py",'            pinned = [execprobe_mod.pin_line(sp["host"], sp["port"], sp["presented_key"])]','            pinned = pinned + [execprobe_mod.pin_line(sp["host"], sp["port"], sp["presented_key"])]',"pyx","the connection pins exactly the key on the card"),
+ ("X13","secret_broker/broker.py",'if req.exec_choice is None or not exec_mod.host_fields_ok(sp):','if False:',"pyx","the run needs a person's decision"),
+ ("X14","secret_broker/broker.py",'addrs = self.dest_guard.resolve(sp["host"], sp["port"])','addrs = ["93.184.216.34"]',"pyx","the destination is checked again at connect time"),
+ ("X15","secret_broker/broker.py",'            raise PermissionError(self.PROBE_REFUSED)       # pinned or not','            if not was_pinned:\n                raise PermissionError(self.PROBE_REFUSED)       # pinned or not',"pyx","a probe failure looks the same for pinned and unpinned hosts"),
+ ("X16","secret_broker/broker.py",'if allowed and host not in allowed:','if host not in allowed:',"pyx","remember never creates an allowed list"),
+ ("X17","secret_broker/broker.py",'                if expect_fp not in old_fps:\n                    raise ValueError("the pinned key changed since the card was shown")','                pass',"pyx","replace only replaces the line the human saw"),
+ ("X18","secret_broker/execprobe.py",'if flight[1] == 0 and self._flights.get(key) is flight:','if False:',"pyx","probe flight entries are always cleaned up"),
+ ("X19","secret_broker/execprobe.py",'if self._inflight.get(client_id, 0) >= MAX_INFLIGHT_PER_CLIENT:','if False:',"pyx","one client cannot hold every probe slot"),
+ ("X20","secret_broker/execmode.py",'and _key_fingerprint(sp["presented_key"]) == sp["presented_fp"]','and True',"pyx","the fingerprint shown is the fingerprint of the key pinned"),
+ ("X21","secret_broker/execrun.py",'f"HostKeyAlias={_known_name(spec)}"','f"HostKeyAlias={spec[\'host\']}"',"pyx","the alias names the host and port in full"),
 ]
 
 def main():
@@ -94,8 +119,8 @@ def main():
                 if runner == "e2e":
                     r = subprocess.run([os.path.join(wt, "tests", "e2e_root_exec", "run.sh")], cwd=wt,
                                        capture_output=True, text=True, timeout=900)
-                elif runner == "py":
-                    r = subprocess.run(PY, cwd=os.path.join(wt, "tests"), capture_output=True, text=True, timeout=300)
+                elif runner in ("py", "pyx"):
+                    r = subprocess.run(PY if runner == "py" else PYX, cwd=os.path.join(wt, "tests"), capture_output=True, text=True, timeout=300)
                 else:
                     r = subprocess.run(RS, cwd=wt, capture_output=True, text=True, timeout=500, env=env)
             finally:
