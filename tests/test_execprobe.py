@@ -533,8 +533,8 @@ class Deadlines(Cache):
 class AllowedGate(unittest.TestCase):
     """classify, the intake check and the run all use execprobe.host_allowed: one rule."""
     CASES = [("nas", ["nas"], True), ("nas", ["nas:2222"], False), ("nas", ["NAS"], False), ("nas", ["nas."], False),
-             ("127.0.0.1", ["127.0.0.1"], True), ("127.0.0.1", ["127.0.0.1:22"], False), ("nas", [], False),
-             ("nas", None, False), ("nas", ["SHA256:" + "A" * 43], False), ("nas", ["other", "nas"], True)]
+             ("127.0.0.1", ["127.0.0.1"], True), ("127.0.0.1", ["127.0.0.1:22"], False), ("nas", [], True),
+             ("nas", None, True), ("nas", ["SHA256:" + "A" * 43], False), ("nas", ["other", "nas"], True)]
 
     def test_classify_agrees_with_the_gate_for_every_spelling(self):
         k = key_of("ed")

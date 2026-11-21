@@ -2985,19 +2985,17 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
 
     def _exec_remember_why(self, req):
         """None when this unpinned request may also be remembered (pinned on the key), else the reason in words
-        for the card. Needs the key to restrict hosts already (an `allowed_hosts` list: remembering on a key that
-        has none would start restricting ssh signing for it), a backend that can write metadata, and room."""
+        for the card. Needs a backend that can write metadata and room in the key's lists. A key with no
+        `allowed_hosts` list gets only the `known_hosts` line (a list is never created: that would start
+        restricting the key's ordinary ssh signing)."""
         sc = self.cfg["secrets"].get(req.names[0]) or {}
         if not sc.get("ssh"):
             return "this is not an ssh key"
         if "set_meta" not in self.backend.capabilities:
             return "this vault cannot store the change"
-        if not (sc.get("ssh_hosts") or {}).get("allowed"):
-            return ("this key has no Allowed hosts list, so remembering would start restricting ssh signing "
-                    "with it; add the list in the credential editor first")
         raw = sshhosts_mod.normalize((sc.get("_meta") or {}).get("ssh_hosts"))
-        if len(raw.get("known_hosts", [])) >= sshhosts_mod.MAX_KNOWN or len(
-                raw.get("allowed_hosts", [])) >= sshhosts_mod.MAX_ALLOWED:
+        if len(raw.get("known_hosts", [])) >= sshhosts_mod.MAX_KNOWN or (
+                raw.get("allowed_hosts") and len(raw["allowed_hosts"]) >= sshhosts_mod.MAX_ALLOWED):
             return "the key's host lists are full"
         return None
 
@@ -3039,11 +3037,13 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
                 raise ValueError("another key is pinned for this host and port")     # a rekey raced a plain remember
             if want not in have:
                 known.append(want)
-            if not execprobe_mod.host_allowed(allowed, host):
+            if allowed and host not in allowed:         # only a list that already exists grows; none is ever created
                 allowed.append(host)
             if len(known) > sshhosts_mod.MAX_KNOWN or len(allowed) > sshhosts_mod.MAX_ALLOWED:
                 raise ValueError("the key's host lists are full")
-            new = {"known_hosts": known, "allowed_hosts": allowed}
+            new = {"known_hosts": known}
+            if allowed:
+                new["allowed_hosts"] = allowed
             if raw.get("allow_forwarded"):
                 new["allow_forwarded"] = True
             if new == raw:
@@ -6336,7 +6336,9 @@ def _approve_actions(broker, req):
         credlinks_mod.link(req.names[0], tab="policies", text="the credential's Policies page")
         if len(req.names) == 1 else "the Policies page") + "."
     if req.mode == "exec" and req.spec.get("host_state"):
-        return exec_mod.host_actions_html(req.spec, broker._exec_remember_why(req))
+        return exec_mod.host_actions_html(
+            req.spec, broker._exec_remember_why(req),
+            restricts=bool(((broker.cfg["secrets"].get(req.names[0]) or {}).get("ssh_hosts") or {}).get("allowed")))
     if req.mode == "exec":          # Approve or Deny only: standing permission for remote commands is a rule
         return ("<div class=decide-row><button class='btn approve' name=decision value=approve>"
                 "Approve</button><button class='btn deny' name=decision value=deny>Deny</button></div>"

@@ -288,10 +288,14 @@ def _name_port(name, host):
 
 
 def host_allowed(allowed_hosts, host):
-    """THE rule for "this host name is on the key's allowed list": exact membership of the (lower-case) name, as
-    the exec gate has always applied it. Intake, classification and the run all call this one function, so they
-    cannot disagree. (`host:port` entries, fingerprint entries and other spellings do not allow a bare name.)"""
-    return host in (allowed_hosts or [])
+    """THE rule for "this host name passes the key's host validation": with an `allowed_hosts` list, exact membership
+    of the (lower-case) name (`host:port` entries, fingerprint entries and other spellings do not allow a bare name);
+    with NO list the key restricts no host, so every name passes and only a pinned `known_hosts` line makes a host
+    pinned. Intake, classification and the run all call this one function, so they cannot disagree. The list is host
+    validation, not approval policy: nothing here approves anything."""
+    if not allowed_hosts:
+        return True
+    return host in allowed_hosts
 
 
 def classify(host, port, presented, known_lines, allowed_hosts):

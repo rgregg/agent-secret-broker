@@ -32,6 +32,23 @@ NEW = "new.example.com"          # not on the key at all
 
 
 class Unpinned(ti.ExecBase):
+    def no_allowed_list(self):
+        """The key as many keys are: pinned `known_hosts` lines and NO `allowed_hosts` list."""
+        from secret_broker.broker import Broker
+        raw = {"known_hosts": list(self.broker.cfg["secrets"]["deploy"]["_meta"]["ssh_hosts"]["known_hosts"])}
+        self.broker._persist_ssh_hosts("deploy", raw, "alice")
+        self.broker.cfg["secrets"]["deploy"]["ssh_hosts"] = Broker._ssh_hosts(raw)
+        self.assertIsNone(self.broker.cfg["secrets"]["deploy"]["ssh_hosts"]["allowed"])      # premise
+
+    def restore_allowed_list(self):
+        from secret_broker.broker import Broker
+        self.broker._persist_ssh_hosts("deploy", ti.SSH_HOSTS, "alice")
+        self.broker.cfg["secrets"]["deploy"]["ssh_hosts"] = Broker._ssh_hosts(ti.SSH_HOSTS)
+
+    def req_cleanup(self):
+        for r in self.broker._by_id.values():
+            r.status = "expired"
+
     def new(self, **kw):
         return {"host": NEW, **kw}
 
@@ -236,6 +253,22 @@ class Intake(Unpinned):
         rid = self.pending(**self.elsewhere())                          # positive control: the right name is recognised
         self.assertIn("Same key as nas.example.com:22", self.card(rid))
 
+    def test_a_key_with_no_allowed_hosts_list_needs_only_a_pinned_line(self):
+        self.no_allowed_list()
+        self.enable(max_pending_per_client=20)
+        rid = self.pending()                                              # nas.example.com: a line, no list
+        self.assertNotIn("host_state", self.req(rid).spec)
+        rid = self.pending(host="port.example.com", port=2222)
+        self.assertNotIn("host_state", self.req(rid).spec)
+        rid = self.pending(host=NEW)                                      # no line: a human decides, list or no list
+        self.assertEqual(self.req(rid).spec["host_state"], "new")
+        self.req_cleanup()
+        rid = self.pending(**self.changed())
+        self.assertEqual(self.req(rid).spec["host_state"], "changed")
+        self.req_cleanup()
+        rid = self.pending(**self.elsewhere())
+        self.assertEqual(self.req(rid).spec["host_state"], "same_key_elsewhere")
+
     def test_a_pinned_line_for_a_host_that_is_not_allowed_is_not_pinned(self):
         self.servers.table[("unlisted.example.com", 22)] = UNLISTED     # line present, name not on allowed_hosts
         rid = self.pending(host="unlisted.example.com")
@@ -273,13 +306,20 @@ class Card(Unpinned):
             self.assertNotIn(never, card)
         self.assertIn("value=approve>", card)
 
-    def test_remember_is_not_offered_on_a_key_that_does_not_restrict_hosts(self):
-        sc = self.broker.cfg["secrets"]["deploy"]
-        sc["ssh_hosts"] = {**sc["ssh_hosts"], "allowed": None}
+    def test_remember_is_offered_on_a_key_with_no_allowed_hosts_list_and_says_signing_is_not_restricted(self):
+        self.no_allowed_list()
+        self.enable(max_pending_per_client=20)
+        card = self.card(self.pending(**self.changed()))
+        self.assertNotIn("Not offered", card)
+        self.assertIn("value=approve_replace>", card)
         card = self.card(self.pending(**self.new()))
-        self.assertIn("Not offered: this key has no Allowed hosts list", card)
-        self.assertNotIn("approve_remember", card)
-        self.assertIn("value=approve>Approve once", card)             # approving once still works
+        self.assertIn("ssh signing is not restricted by this", card)
+        self.assertIn("value=approve_remember>", card)
+        self.assertNotIn("Not offered", card)
+        self.assertNotIn("lets ssh signing with it accept this server", card)
+        self.req_cleanup()
+        self.restore_allowed_list()                                   # control: with a list the card says it widens
+        self.assertIn("lets ssh signing with it accept this server", self.card(self.pending(**self.new())))
 
     def test_the_card_names_the_key_type_of_the_fingerprint(self):
         card = self.card(self.pending(**self.new()))
@@ -436,12 +476,10 @@ class Decisions(Unpinned):
         self.assertEqual(code, 200)                                     # positive control
         self.assertEqual(self.req(rid).exec_choice, "replace")
 
-    def test_remember_is_refused_when_the_key_does_not_restrict_hosts(self):
-        sc = self.broker.cfg["secrets"]["deploy"]
-        sc["ssh_hosts"] = {**sc["ssh_hosts"], "allowed": None}
+    def test_remember_is_accepted_on_a_key_with_no_allowed_hosts_list(self):
+        self.no_allowed_list()
         rid = self.pending(**self.new())
-        self.assertEqual(self.broker.decide_via("dashboard", rid, "approve", "alice", exec_host="remember")[0], 400)
-        self.assertEqual(self.broker.decide_via("dashboard", rid, "approve", "alice", exec_host="once")[0], 200)
+        self.assertEqual(self.broker.decide_via("dashboard", rid, "approve", "alice", exec_host="remember")[0], 200)
 
     def test_the_run_refuses_an_unpinned_request_no_person_decided(self):
         # defence in depth: even if some path released it, the real runner stops without a human's choice
@@ -545,6 +583,35 @@ class Run(Unpinned):
         self.assertIn(NEW, self.get("/credentials/deploy?tab=policies")[1])    # the credential editor shows it
         rid = self.pending(host=NEW)                                          # now an ordinary pinned request
         self.assertNotIn("host_state", self.req(rid).spec)
+
+    def test_remember_on_a_key_with_no_list_writes_only_the_line_and_signing_is_unaffected(self):
+        from secret_broker.broker import Broker
+        import test_ssh_host as th
+        self.no_allowed_list()
+        stranger = th.Host()
+        data, binds = th.login(th.SID_A), [stranger.bind(th.SID_A)]
+        sc = self.broker.cfg["secrets"]["deploy"]
+        Broker._ssh_host(data, binds, None, sc)                           # premise: any server signs today
+        req = self.go("approve_remember")
+        self.assertEqual(self.poll(req.id)["exit_code"], 0)
+        self.assertEqual(self.lines(NEW), [f"{NEW} {req.spec['presented_key']}"])
+        self.assertNotIn("allowed_hosts", self.meta())                    # no list was created
+        self.assertIsNone(sc["ssh_hosts"]["allowed"])
+        self.assertNotIn("allowed_hosts", self.disk()["secrets"]["deploy"]["ssh_hosts"])
+        Broker._ssh_host(data, binds, None, sc)                           # signing for another host is unaffected
+        rid = self.pending(host=NEW)                                      # and the host is pinned now
+        self.assertNotIn("host_state", self.req(rid).spec)
+        # control: with a list the same remember DOES add the name 
+        self.restore_allowed_list()
+        req = self.go("approve_remember")
+        self.assertIn(NEW, self.meta()["allowed_hosts"])
+
+    def test_replace_on_a_key_with_no_list_writes_only_the_line(self):
+        self.no_allowed_list()
+        req = self.go("approve_replace", "changed", confirm_replace="1")
+        self.assertEqual(self.poll(req.id)["exit_code"], 0)
+        self.assertEqual(self.lines("nas.example.com"), [f"nas.example.com {req.spec['presented_key']}"])
+        self.assertNotIn("allowed_hosts", self.meta())
 
     def test_remember_for_another_port_adds_the_bracketed_line(self):
         rid = self.pending(**self.elsewhere())

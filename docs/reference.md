@@ -2579,9 +2579,10 @@ git over ssh, port or agent forwarding, jump hosts. Output is returned when the 
   control characters other than tab and newline and hidden characters (bidi, zero-width, ...) are refused (400); a command
   may not start with `-`. `user` is a plain account name (not starting with `-`), `port` defaults to 22, `timeout_s`
   to 60 (at most `exec.max_seconds`).
-- **A host the key pins** is **named** in the key's `ssh_hosts.allowed_hosts` (a `SHA256:` fingerprint entry is not enough: the
-  broker needs a name to connect to) **and** has a `known_hosts` line for that name and port (`[host]:2222` for a non-default
-  port). It is lower-cased and compared exactly: a trailing dot, an IP spelled another way (`127.1`) or any other spelling
+- **A host the key pins** has a `known_hosts` line for that name and port (`[host]:2222` for a non-default port) **and**, when
+  the key has an `ssh_hosts.allowed_hosts` list, is **named** on it (a `SHA256:` fingerprint entry is not enough: the broker
+  needs a name to connect to). A key with no `allowed_hosts` list restricts no host: a pinned line is all it takes. The list
+  is host validation, not approval policy. It is lower-cased and compared exactly: a trailing dot, an IP spelled another way (`127.1`) or any other spelling
   is a different host. One function (`execprobe.host_allowed`) decides "allowed" for intake, classification and the run.
   The connection uses `StrictHostKeyChecking=yes` against only the pinned lines.
 - **A host or port the key does not pin, or whose key changed, is not refused: it goes to a human** (see "Unpinned and
@@ -2594,7 +2595,7 @@ OpenSSH `ssh-keyscan` from `exec.ssh_path`) and compares it with what the key pi
 
 - `pinned`: a line pins this name and port, the key is on it and the name is allowed. An ordinary request (the rest of this
   section: rules, `approval: allow` and the risk rating work as before).
-- `new`: no pinned line for this name and port (or a line whose name is not on `allowed_hosts`), and the key matches nothing
+- `new`: no pinned line for this name and port (or a line whose name is not on a set `allowed_hosts`), and the key matches nothing
   pinned for this name on another port. A key pinned only under a **different** name counts for nothing.
 - `same_key_elsewhere`: no line for this port, but the presented key is pinned for the **same name** on another port; the card
   says "same key as nas:22".
@@ -2610,9 +2611,10 @@ the presented and the pinned fingerprints and the man-in-the-middle caution abov
 
 - **Approve once**: connect using exactly the key shown, save nothing.
 - **Approve and remember** (`new`, `same_key_elsewhere`): also write the pinned line (`name` or `[name]:port`) and, when it is
-  missing, the name to `allowed_hosts` in the key's `ssh_hosts` metadata (the same path as the Policies editor; vault first;
-  never duplicated; revocable there). Offered only when the key already restricts hosts (has an `allowed_hosts` list), the
-  vault can write metadata and the lists have room; otherwise the card says why, and Approve once still works.
+  missing **and the key already has an `allowed_hosts` list**, the name to it, in the key's `ssh_hosts` metadata (the same
+  path as the Policies editor; vault first; never duplicated; revocable there). A key with no list gets only the `known_hosts`
+  line: remember never creates a list, because that would start restricting the key's ordinary ssh signing to the listed
+  hosts. Always offered unless the vault cannot write metadata or the lists are full (the card then says why).
 - **Approve and replace the pinned key** (`changed` only, instead of remember): needs an extra tick, replaces the old line
   for that name and port in place (other names on a shared line stay) and audits both fingerprints.
 

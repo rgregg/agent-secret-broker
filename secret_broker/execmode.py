@@ -641,7 +641,7 @@ def host_html(sp):
             f"{html.escape(FIRST_USE)}</div>")
 
 
-def host_actions_html(sp, remember_why=None):
+def host_actions_html(sp, remember_why=None, restricts=True):
     """The decision controls of an unpinned request. Approve once (nothing is saved) and Deny always; then, only
     when the key can store it (`remember_why` is None): Approve and remember for a new host or port, or, for a
     changed key, Approve and replace the pinned key behind an extra tick. No Always, no timed approval, no rule."""
@@ -658,6 +658,7 @@ def host_actions_html(sp, remember_why=None):
     else:
         extra = ("<div class=scope><button class='btn sm approve' name=decision value=approve_remember>Approve and "
                  "remember</button> <small class=muted>also pins this key for this host and port on the credential "
-                 "(and lets ssh signing with it accept this server); revoke it in the credential editor.</small></div>")
+                 + ("(and lets ssh signing with it accept this server)" if restricts else "(the key's ssh signing is "
+                    "not restricted by this)") + "; revoke it in the credential editor.</small></div>")
     return (row + extra + "<p class=scope><small class=muted>Approves this one command, as shown, connecting only to "
             "the key shown above. There is no Always or timed approval for an unpinned host.</small></p>")
