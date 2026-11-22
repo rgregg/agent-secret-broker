@@ -2590,8 +2590,13 @@ git over ssh, port or agent forwarding, jump hosts. Output is returned when the 
 
 ### Unpinned and changed hosts
 
-Before the request exists the broker reads the server's host key (an SSH handshake, no authentication, no command; the
-OpenSSH `ssh-keyscan` from `exec.ssh_path`) and compares it with what the key pins. Four states:
+**The request exists first; the host key is read in the background.** `POST /v1/requests` creates the request and returns at
+once, the same answer and the same time whatever the host does (no probe runs on the request thread). A background check then
+reads the server's host key (an SSH handshake, no authentication, no command; the OpenSSH `ssh-keyscan` from `exec.ssh_path`)
+and compares it with what the key pins. Until it is done the card says "Checking the host key..." and has a **Deny** button
+and nothing else; a decision to approve (once, remember or replace) is 400 and claims nothing, for a pinned host as well. Both
+are counted against `exec.max_pending_per_client` (the refusal when it is full does not depend on the host). When the check
+finishes there are four states:
 
 - `pinned`: a line pins this name and port, the key is on it and the name is allowed. An ordinary request (the rest of this
   section: rules, `approval: allow` and the risk rating work as before).
@@ -2601,6 +2606,14 @@ OpenSSH `ssh-keyscan` from `exec.ssh_path`) and compares it with what the key pi
   says "same key as nas:22".
 - `changed`: a line pins this name and port and none of the keys the server presents is on it. This is also what a
   man-in-the-middle looks like; it is what a rekeyed or reinstalled server looks like too.
+
+If the check **fails** (any label: `unreachable`, `not_ssh`, `timeout`, `refused_destination` which also covers
+`exec.probe_allow_cidrs`, `rate_limited`, `ssh_unavailable`), an unpinned host's card says plainly what happened ("Could not
+reach that host.", "That destination is not allowed." ...; fixed sentences, no exception text), offers **Deny** only, and sends no
+notification; the agent still sees a pending request, then a denial or an expiry, exactly as for a host that answered. A pinned
+host whose check fails ends with the label `connect_failed`, as an unreachable pinned host always did. A pinned request is
+rated, rule-approved or sent to the human only after its check shows the pinned key; if the check finds a different key it
+becomes a `changed` card instead.
 
 The three non-pinned states are **always a human decision**, rated high by code: no auto-approve rule (config or stored),
 `approval: allow`, grant, Always or SSH-rule chip is consulted, a decision carrying one is 400 and claims nothing, there is no
@@ -2616,32 +2629,39 @@ the presented and the pinned fingerprints and the man-in-the-middle caution abov
   line: remember never creates a list, because that would start restricting the key's ordinary ssh signing to the listed
   hosts. Always offered unless the vault cannot write metadata or the lists are full (the card then says why).
 - **Approve and replace the pinned key** (`changed` only, instead of remember): needs an extra tick, replaces the old line
-  for that name and port in place (other names on a shared line stay) and audits both fingerprints.
+  for that name and port in place (other names on a shared line stay) and audits both fingerprints. It never adds the
+  host to `allowed_hosts` (a changed host is allowed already); if the list was edited between the card and the click so that the
+  host is no longer on it, the decision is refused (400) and nothing is written.
 
 The connection that runs the command pins the key on the card: the runner is given one `known_hosts` line for that request
 and nothing from the catalog, connects to an address the destination guard validates **again** at run time
 (`-o HostName=IP` with `HostKeyAlias` spelled `name` or `[name]:port`, since ssh's alias does not add the port), and a server
 whose key changed since the card fails closed with `host_key_mismatch` (`connect_failed` when the guard now refuses the name).
 
-**Probe limits.** An enrolled client can now make the broker open a connection to a host and port it names, so: only clients in
+**Probe limits.** An enrolled client can make the broker open a connection to a host and port it names, so: only clients in
 `exec.clients`, only for an SSH key it may use; the destination goes through the destination guard first (loopback, link-local,
 metadata names, the broker's own addresses, IPv4-mapped and similar forms, every address a name resolves to, and
-`destination_deny_cidrs`), the name is resolved once and the probe connects to the validated address; a short timeout; one
-result cached 30 s (5 s for a failure) per host and port with concurrent requests sharing one probe; a per-client and an overall
-rate limit (`exec.probe_per_client`, default 30 a minute, `exec.probe_overall`, default 120); and the pending cap
-(`exec.max_pending_per_client`, checked before any probe); one 8 s deadline covers the connection and the banner however slowly
-a server drips, at most 3 addresses of a name are tried, one client may have at most 4 probes running or waiting, and a caller
-waiting on another's probe gives up after 25 s (all answered as `rate_limited`). The banner and everything but the public keys
-are dropped. **Cost for pinned hosts:** every exec request now probes first (cached 30 s): one banner connection plus
-`ssh-keyscan` (one connection per key type), so the target sees a few extra pre-auth connections, and a pinned host that is down,
-that resolves to a loopback, link-local, own or denied address, or a `ssh_path` without `ssh-keyscan` is refused at intake (the
-same text) instead of failing later as `connect_failed`.
-**A probe failure for any host, pinned or not, is refused with one text, status and code path** ("could not read that host's
-key", 403) so the agent learns nothing from the text about which hosts the key pins. What stays observable: whether an SSH
-server answers from the broker at an address the guard allows (a request that reaches a human versus a refusal), and, by
-timing, roughly how a probe failed (a refused destination is immediate, a timeout takes seconds). The label (`unreachable`, `not_ssh`,
-`timeout`, `refused_destination`, `rate_limited`, `ssh_unavailable`) is in the hidden `exec_probe` event only. The agent never
-sees a fingerprint or any probe detail, only the request status. `ssh_path` must also hold `ssh-keyscan`.
+`destination_deny_cidrs`), the name is resolved once and the probe connects to the validated address; optionally
+**`exec.probe_allow_cidrs`** (a list of CIDRs, unset by default: today's behavior) refuses the probe when ANY resolved address,
+or any IPv4 address an IPv6 form embeds, is outside it (shown to the human as "That destination is not allowed."); a short
+timeout; one result cached 30 s (5 s for a failure) per host and port with concurrent requests sharing one probe; a per-client
+and an overall rate limit (`exec.probe_per_client`, default 30 a minute, `exec.probe_overall`, default 120); one 8 s deadline
+covers the connection and the banner however slowly a server drips, at most 3 addresses of a name are tried, one client may
+have at most 4 probes running or waiting, and a caller waiting on another's probe gives up after 25 s (all shown as a
+`rate_limited` card). The banner and everything but the public keys are dropped. **Cost for pinned hosts:** every exec request
+probes (cached 30 s): one banner connection plus `ssh-keyscan` (one connection per key type), so the target sees a few extra
+pre-auth connections; a pinned host that is down, that resolves to a loopback, link-local, own or denied address, or a
+`ssh_path` without `ssh-keyscan` ends with `connect_failed` instead of failing later. The label of a failure is in the hidden
+`exec_probe` event, and `exec_host_checked` records the outcome (state and fingerprints, or the failure label) once the check is done.
+
+**What the agent can and cannot learn.** For an UNPINNED host nothing in the status, the body or the timing of any call depends
+on whether anything answers: the POST is the same, the request is pending, and the agent then sees a denial or an expiry whichever
+way the check went. It never sees a fingerprint or a probe detail. What remains: (1) the agent can tell a pinned host from an
+unpinned one (a pinned host is auto-approved or asks, and an unreachable pinned host ends with `connect_failed`; this is inherent,
+the key's owner pinned it); (2) a human who denies a failed card quickly but leaves a reachable one waiting shows through the
+timing of the denial, and the broker's per-credential denial cooldown ("denied recently") is visible to the agent; (3) the
+broker's rate and pending limits are shared by hosts that answer and hosts that do not, which is a covert channel of at most a
+few bits per window, not a scan. `ssh_path` must also hold `ssh-keyscan`.
 
 Rules: `host` may be a name or a list of up to 20 names and `port` a number or a list of up to 20 (every combination listed
 matches; one entry behaves exactly as the single value, and is stored as the bare value). The Policies form takes
@@ -2649,7 +2669,7 @@ comma-separated lists. A listed host that the key does not pin still goes to a h
 
 - Off by default. `"exec": {"enabled": true, "clients": ["c-1a2b3c4d"], "max_concurrent": 4, "max_output_bytes": 262144,
   "max_seconds": 600, "max_pending_per_client": 3, "readonly": [...], "ssh_path": null, "probe_per_client": 30,
-  "probe_overall": 120}` (validated at startup). Only the
+  "probe_overall": 120, "probe_allow_cidrs": null}` (validated at startup). Only the
   listed client ids may ask (others, and the legacy shared key, get 403). `GET /v1/status` shows `features.exec`.
   `max_concurrent` bounds how many ssh runs go at once (the rest wait for a slot). `ssh_path` is a directory holding
   `ssh`, `ssh-agent`, `ssh-add` and `ssh-keyscan` (default: the `PATH`; the container image installs `openssh-client`); tests point it at stubs.

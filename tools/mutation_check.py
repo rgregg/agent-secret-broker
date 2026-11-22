@@ -70,7 +70,7 @@ MUTATIONS = [
  ("R18","crates/asb-root-exec/src/scriptcheck.rs",'file_args(args, 1, cwd, trusted_uid, trust_root, &mut out)?;','',"rs","file arguments trusted"),
 
  # remote exec for unpinned and changed hosts (runner "pyx": tests/test_execprobe.py, test_exec_unpinned.py, ...)
- ("X1","secret_broker/execprobe.py",'sock = guard.connect(host, port, timeout=CONNECT_TIMEOUT_S, max_addresses=MAX_ADDRESSES,\n                             deadline=time.monotonic() + PROBE_DEADLINE_S)','sock = socket.create_connection((host, port), CONNECT_TIMEOUT_S)',"pyx","the probe goes through the destination guard"),
+ ("X1","secret_broker/execprobe.py",'sock = guard.connect(a, port, timeout=CONNECT_TIMEOUT_S, deadline=hard)','sock = socket.create_connection((a, port), CONNECT_TIMEOUT_S)',"pyx","the probe goes through the destination guard"),
  ("X2","secret_broker/execprobe.py",'if ip is None or guard.address_refused(ip, port):','if ip is None:',"pyx","the connected peer is checked again"),
  ("X3","secret_broker/execprobe.py",'if hit is not None and allowed:','if hit is not None:',"pyx","a pinned line for a name that is not allowed is not pinned"),
  ("X4","secret_broker/execprobe.py",'if name.startswith(host + ":"):','if name.startswith(host):',"pyx","same key elsewhere means the same host name"),
@@ -84,7 +84,7 @@ MUTATIONS = [
  ("X12","secret_broker/broker.py",'            pinned = [execprobe_mod.pin_line(sp["host"], sp["port"], sp["presented_key"])]','            pinned = pinned + [execprobe_mod.pin_line(sp["host"], sp["port"], sp["presented_key"])]',"pyx","the connection pins exactly the key on the card"),
  ("X13","secret_broker/broker.py",'if req.exec_choice is None or not exec_mod.host_fields_ok(sp):','if False:',"pyx","the run needs a person's decision"),
  ("X14","secret_broker/broker.py",'addrs = self.dest_guard.resolve(sp["host"], sp["port"])','addrs = ["93.184.216.34"]',"pyx","the destination is checked again at connect time"),
- ("X16","secret_broker/broker.py",'if allowed and host not in allowed:','if host not in allowed:',"pyx","remember never creates an allowed list"),
+ ("X16","secret_broker/broker.py",'elif allowed and host not in allowed:       # only a list that already exists grows','elif host not in allowed:       # only a list that already exists grows',"pyx","remember never creates an allowed list"),
  ("X17","secret_broker/broker.py",'                if expect_fp not in old_fps:\n                    raise ValueError("the pinned key changed since the card was shown")','                pass',"pyx","replace only replaces the line the human saw"),
  ("X18","secret_broker/execprobe.py",'if flight[1] == 0 and self._flights.get(key) is flight:','if False:',"pyx","probe flight entries are always cleaned up"),
  ("X19","secret_broker/execprobe.py",'if self._inflight.get(client_id, 0) >= MAX_INFLIGHT_PER_CLIENT:','if False:',"pyx","one client cannot hold every probe slot"),
