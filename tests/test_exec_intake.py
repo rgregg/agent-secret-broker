@@ -101,11 +101,20 @@ class ExecBase(ClientMixin, tg.Base):
     def enable(self, **kw):
         self.broker.exec_cfg = execmode.parse_config({"enabled": True, "clients": [self.agent.id], **kw})
 
-    def ask(self, c=None, **body):
+    def ask_raw(self, c=None, **body):
+        """The POST alone: what the agent gets back, with the background host check left to finish on its own."""
         body = {"mode": "exec", "names": ["deploy"], "host": "nas.example.com", "user": "ryan",
                 "command": "uptime", **body}
         return self.api("POST", "/v1/requests", {k: v for k, v in body.items() if v is not _OMIT},
                         key=(c or self.agent).secret)
+
+    def ask(self, c=None, **body):
+        """The POST, then wait for the request's background host check to be fully acted on (the tests that are about
+        what happens after it want it done; test_exec_unpinned.Background drives it by hand)."""
+        code, b = self.ask_raw(c, **body)
+        if code == 202:
+            self.assertTrue(self.broker._by_id[json.loads(b)["id"]].exec_settled.wait(20), "the host check never finished")
+        return code, b
 
     def pending(self, **body):
         code, b = self.ask(**body)

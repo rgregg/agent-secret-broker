@@ -24,6 +24,7 @@ by `ipaddress`.
 import base64
 import collections
 import binascii
+import ipaddress
 import os
 import shutil
 import socket
@@ -111,6 +112,13 @@ def _parse_scan(stdout):
     return out[:MAX_KEYS]
 
 
+def _in_nets(addr, nets):
+    """True when `addr` AND every IPv4 address an IPv6 form embeds (mapped, 6to4, NAT64...) are inside one of `nets`:
+    `::ffff:10.0.0.5` is not 'inside 10.0.0.0/8' just because its embedded address is."""
+    ip = destguard.parse_ip(addr)
+    return ip is not None and all(any(e in n for n in nets) for e in destguard._embedded(ip))
+
+
 def _binary(cfg, name):
     d = cfg.get("ssh_path")
     path = os.path.join(d, name) if d else shutil.which(name)
@@ -125,9 +133,25 @@ def probe(host, port, cfg, guard, clock=time.monotonic, run=subprocess.run):
     if keyscan is None:
         return _fail("ssh_unavailable")
     deadline = clock() + PROBE_DEADLINE_S
+    hard = time.monotonic() + PROBE_DEADLINE_S
+    nets = [ipaddress.ip_network(c) for c in cfg.get("probe_allow_cidrs") or ()]
     try:
-        sock = guard.connect(host, port, timeout=CONNECT_TIMEOUT_S, max_addresses=MAX_ADDRESSES,
-                             deadline=time.monotonic() + PROBE_DEADLINE_S)
+        addrs = guard.resolve(host, port)               # once, every address validated; connections go to these literals
+        if nets and not all(_in_nets(a, nets) for a in addrs):
+            return _fail("refused_destination")         # `probe_allow_cidrs`: any address outside it refuses the probe
+        sock, last = None, "unreachable"
+        for a in addrs[:MAX_ADDRESSES]:
+            try:
+                sock = guard.connect(a, port, timeout=CONNECT_TIMEOUT_S, deadline=hard)
+                break
+            except destguard.DestinationRefused:
+                return _fail("refused_destination")
+            except socket.timeout:
+                last = "timeout"
+            except OSError:
+                last = "unreachable"
+        if sock is None:
+            return _fail(last)
     except destguard.DestinationRefused:
         return _fail("refused_destination")
     except socket.timeout:

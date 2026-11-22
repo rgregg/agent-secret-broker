@@ -378,6 +378,63 @@ class Cache(Rig):
         self.assertEqual(len(self.connected), 3)                        # the limited call connected to nothing
 
 
+class Cidrs(Rig):
+    """`exec.probe_allow_cidrs`: when set, a destination with any address outside it is refused before any connection."""
+
+    def allow(self, *cidrs):
+        self.cfg = execmode.parse_config({"enabled": True, "ssh_path": self.dir, "probe_allow_cidrs": list(cidrs)})
+
+    def test_an_address_inside_is_probed_and_one_outside_is_refused_with_nothing_sent(self):
+        self.allow("93.184.216.0/24")
+        got = self.probe()
+        self.assertNotIn("label", got)                                    # positive control: inside the list
+        self.assertEqual(self.connected, [(PUBLIC, 22)])
+        self.connected.clear()
+        for what, addrs in (("outside", ["93.185.0.7"]), ("one of two outside", [PUBLIC, "8.8.8.8"]),
+                            ("first outside", ["8.8.8.8", PUBLIC])):
+            self.resolved["x.example.com"] = addrs
+            self.assertEqual(self.probe("x.example.com"), {"label": "refused_destination"}, what)
+        self.assertEqual(self.connected, [])
+        self.assertEqual(self.calls()[1:], [])                            # ssh-keyscan never ran for them either
+
+    def test_an_ip_literal_outside_the_list_is_refused(self):
+        self.allow("93.184.216.0/24")
+        self.assertEqual(self.probe("93.185.0.7"), {"label": "refused_destination"})
+        self.assertNotIn("label", self.probe("93.184.216.34"))            # control
+
+    def test_a_dns_name_that_resolves_outside_the_list_is_refused_even_though_the_guard_allows_it(self):
+        self.assertNotIn("label", self.probe())                           # without the list the same name is fine
+        self.connected.clear()
+        self.allow("10.0.0.0/8")
+        self.assertEqual(self.probe(), {"label": "refused_destination"})
+        self.assertEqual(self.connected, [])
+
+    def test_ipv4_mapped_and_embedded_forms_are_never_inside_a_list_of_plain_ranges(self):
+        self.allow("10.0.0.0/8", "93.184.216.0/24")
+        for addr in ("::ffff:10.0.0.5", "::ffff:93.184.216.34", "64:ff9b::a00:5", "2002:0a00:0005::1"):
+            self.resolved["m.example.com"] = [addr]
+            self.assertEqual(self.probe("m.example.com"), {"label": "refused_destination"}, addr)
+        self.assertEqual(self.connected, [])
+        nets = [__import__("ipaddress").ip_network("10.0.0.0/8")]
+        self.assertTrue(execprobe._in_nets("10.0.0.5", nets))
+        self.assertFalse(execprobe._in_nets("::ffff:10.0.0.5", nets))     # the unit under it: embedded alone is not enough
+        self.assertFalse(execprobe._in_nets("64:ff9b::a00:5", nets))
+
+    def test_unset_is_todays_behavior(self):
+        self.assertIsNone(self.cfg["probe_allow_cidrs"])
+        self.resolved["far.example.com"] = ["8.8.8.8"]
+        self.assertNotIn("label", self.probe("far.example.com"))
+
+    def test_the_name_is_resolved_once_and_the_connection_goes_to_the_checked_literal(self):
+        n = []
+        base = self.guard._resolver
+        self.guard._resolver = lambda h, p: n.append(h) or base(h, p)
+        self.allow("93.184.216.0/24")
+        self.probe()
+        self.assertEqual(n, ["nas.example.com"])                          # one lookup: the connect used the literal
+        self.assertEqual(self.connected, [(PUBLIC, 22)])
+
+
 class Flights(Cache):
     def test_rate_limited_and_failing_probes_leave_no_flight_behind(self):
         cfg = execmode.parse_config({"enabled": True, "ssh_path": self.dir, "probe_per_client": 1})

@@ -76,7 +76,7 @@ MUTATIONS = [
  ("X4","secret_broker/execprobe.py",'if name.startswith(host + ":"):','if name.startswith(host):',"pyx","same key elsewhere means the same host name"),
  ("X5","secret_broker/execprobe.py",'if hit is None:\n            return {"state": "changed"','if False:\n            return {"state": "changed"',"pyx","a different key for a pinned name and port is changed"),
  ("X6","secret_broker/execprobe.py",'if not allowed_hosts:\n        return True','if not allowed_hosts:\n        return False',"pyx","no allowed list: a pinned line is enough"),
- ("X7","secret_broker/broker.py",'if mode == "exec" and spec.get("host_state"):\n            return self._exec_unpinned_pending(req)','if False:\n            return self._exec_unpinned_pending(req)',"pyx","an unpinned host reaches only a human"),
+ ("X7","secret_broker/broker.py",'pinned_fp=cls["pinned_fp"], same_as=cls["matches"])\n        self._exec_unpinned_pending(req)','pinned_fp=cls["pinned_fp"], same_as=cls["matches"])\n        self._assess_and_route(req)',"pyx","an unpinned host reaches only a human"),
  ("X8","secret_broker/broker.py",'if exec_host == "remember" and (st == "changed" or self._exec_remember_why(req) is not None):','if exec_host == "remember" and self._exec_remember_why(req) is not None:',"pyx","no plain remember for a changed key"),
  ("X9","secret_broker/broker.py",'or confirm_replace is not True','or False',"pyx","replace needs its confirmation tick"),
  ("X10","secret_broker/broker.py",'or (match.mode == "exec" and match.spec.get("host_state"))):','):',"pyx","no token channel decides an unpinned host"),
@@ -84,13 +84,23 @@ MUTATIONS = [
  ("X12","secret_broker/broker.py",'            pinned = [execprobe_mod.pin_line(sp["host"], sp["port"], sp["presented_key"])]','            pinned = pinned + [execprobe_mod.pin_line(sp["host"], sp["port"], sp["presented_key"])]',"pyx","the connection pins exactly the key on the card"),
  ("X13","secret_broker/broker.py",'if req.exec_choice is None or not exec_mod.host_fields_ok(sp):','if False:',"pyx","the run needs a person's decision"),
  ("X14","secret_broker/broker.py",'addrs = self.dest_guard.resolve(sp["host"], sp["port"])','addrs = ["93.184.216.34"]',"pyx","the destination is checked again at connect time"),
- ("X15","secret_broker/broker.py",'            raise PermissionError(self.PROBE_REFUSED)       # pinned or not','            if not was_pinned:\n                raise PermissionError(self.PROBE_REFUSED)       # pinned or not',"pyx","a probe failure looks the same for pinned and unpinned hosts"),
  ("X16","secret_broker/broker.py",'if allowed and host not in allowed:','if host not in allowed:',"pyx","remember never creates an allowed list"),
  ("X17","secret_broker/broker.py",'                if expect_fp not in old_fps:\n                    raise ValueError("the pinned key changed since the card was shown")','                pass',"pyx","replace only replaces the line the human saw"),
  ("X18","secret_broker/execprobe.py",'if flight[1] == 0 and self._flights.get(key) is flight:','if False:',"pyx","probe flight entries are always cleaned up"),
  ("X19","secret_broker/execprobe.py",'if self._inflight.get(client_id, 0) >= MAX_INFLIGHT_PER_CLIENT:','if False:',"pyx","one client cannot hold every probe slot"),
  ("X20","secret_broker/execmode.py",'and _key_fingerprint(sp["presented_key"]) == sp["presented_fp"]','and True',"pyx","the fingerprint shown is the fingerprint of the key pinned"),
  ("X21","secret_broker/execrun.py",'f"HostKeyAlias={_known_name(spec)}"','f"HostKeyAlias={spec[\'host\']}"',"pyx","the alias names the host and port in full"),
+
+ # the background host check, the failed-check card, probe_allow_cidrs and replace
+ ("X22","secret_broker/broker.py",'elif req is not None and req.mode == "exec" and approve and req.spec.get("probe") != "ready":','elif False:',"pyx","nothing is approved before the host check is done"),
+ ("X23","secret_broker/execmode.py",'if sp.get("probe") != "ready" or st not in HOST_STATES:','if False:',"pyx","a failed or unfinished check offers no approve, remember or replace"),
+ ("X24","secret_broker/broker.py",'            sp.update(probe="failed", host_state="probe_failed", probe_label=label)\n','            sp.update(probe="failed", host_state="probe_failed", probe_label=label)\n            req.status = "denied"\n',"pyx","a failed check on an unpinned host looks like any pending request to the agent"),
+ ("X25","secret_broker/broker.py",'threading.Thread(target=self._exec_probe_job, args=(req,), daemon=True).start()','self._exec_probe_job(req)',"pyx","the probe never runs on the request thread"),
+ ("X26","secret_broker/execprobe.py",'if nets and not all(_in_nets(a, nets) for a in addrs):','if False:',"pyx","probe_allow_cidrs refuses a destination outside the list"),
+ ("X27","secret_broker/broker.py",'            if replace:                                 # a changed host is allowed by definition: never add, and refuse','            if False:                                 # a changed host is allowed by definition: never add, and refuse',"pyx","replace never appends to allowed_hosts"),
+ ("X28","secret_broker/broker.py",'                if allowed and host not in allowed:     # if the list was edited between the card and the click','                if False:     # if the list was edited between the card and the click',"pyx","replace refuses a host the list no longer allows (write)"),
+ ("X29","secret_broker/broker.py",'                                       or not execprobe_mod.host_allowed(','                                       or False and execprobe_mod.host_allowed(',"pyx","replace refuses a host the list no longer allows (decision)"),
+ ("X30","secret_broker/broker.py",'        if sp.get("pinned_at_intake"):\n            with self._lock:','        if False:\n            with self._lock:',"pyx","a pinned host whose check fails ends with connect_failed"),
 ]
 
 def main():

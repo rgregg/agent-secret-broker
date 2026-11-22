@@ -11,6 +11,7 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 import urllib.error
@@ -131,50 +132,62 @@ class Intake(Unpinned):
             self.assertEqual(len(self.ran), before, state)
         self.assertEqual(len(self.events("auto_rule_used")) + len(self.events("rule_used")), 1)   # only the control
 
-    def test_a_probe_failure_is_one_text_and_the_label_is_only_in_the_audit(self):
-        labels = ("unreachable", "not_ssh", "timeout", "refused_destination", "rate_limited", "ssh_unavailable")
-        texts = set()
-        for label in labels:
+    LABELS = ("unreachable", "not_ssh", "timeout", "refused_destination", "rate_limited", "ssh_unavailable")
+
+    def test_a_failed_host_check_is_a_pending_card_that_says_so_and_offers_deny_only(self):
+        self.enable(max_pending_per_client=20)
+        for label in self.LABELS:
             self.servers.table[(NEW, 22)] = {"label": label}
-            before = len(self.events("requested"))
-            code, b = self.ask(host=NEW)
-            self.assertEqual(code, 403, label)
-            err = json.loads(b)["error"]
-            texts.add(err)
-            self.assertNotIn(label, err)
-            self.assertEqual(len(self.events("requested")), before)
-        self.assertEqual(texts, {"could not read that host's key"})
-        self.assertEqual([e["outcome"] for e in self.events("exec_probe")], list(labels))
-        self.assertEqual({e["host"] for e in self.events("exec_probe")}, {NEW})
+            sent = len(self.notifier.notifications)
+            rid = self.pending(host=NEW)
+            sp = self.req(rid).spec
+            self.assertEqual((sp["host_state"], sp["probe"], sp["probe_label"]), ("probe_failed", "failed", label))
+            card = self.card(rid)
+            self.assertIn(execmode.probe_text(label).replace("'", "&#x27;"), card)
+            self.assertIn("value=deny>", card)                               # premise: the card has its Deny
+            for never in ("value=approve", "approve_remember", "approve_replace", "confirm_replace"):
+                self.assertNotIn(never, card, (label, never))
+            self.assertEqual(self.poll(rid), {"status": "pending", "error": None})     # the agent sees nothing new
+            self.assertEqual(len(self.notifier.notifications), sent)                   # and the human is not paged
+            for choice in (None, "once", "remember"):
+                self.assertEqual(self.broker.decide_via("dashboard", rid, "approve", "alice", exec_host=choice)[0], 400)
+            self.assertEqual(self.decide_form(rid, "approve")[2], "")                  # the form post claims nothing either
+            self.assertEqual(self.req(rid).status, "pending")
+            self.req_cleanup()
+        self.assertEqual([e["outcome"] for e in self.events("exec_probe")], list(self.LABELS))
+        self.assertEqual([e["probe_label"] for e in self.events("exec_host_checked")], list(self.LABELS))
         self.assertEqual(self.ran, [])
 
-    def test_a_probe_that_raises_is_a_failure_with_no_exception_text(self):
+    def test_a_failed_check_can_still_be_denied(self):
+        self.servers.table[(NEW, 22)] = {"label": "unreachable"}
+        rid = self.pending(host=NEW)
+        self.assertEqual(self.broker.decide_via("dashboard", rid, "deny", "alice")[0], 200)
+        self.assertEqual(self.poll(rid)["status"], "denied")
+
+    def test_a_probe_that_raises_is_a_failed_card_with_no_exception_text(self):
         def boom(host, port, cid):
             raise RuntimeError("S3CR3T-probe-exception")
         self.broker.exec_probe = boom
-        code, b = self.ask(host=NEW)
-        self.assertEqual((code, json.loads(b)["error"]), (403, "could not read that host's key"))
-        self.assertNotIn("S3CR3T", open(self.audit).read() + b)
+        rid = self.pending(host=NEW)
+        self.assertEqual(self.req(rid).spec["probe_label"], "unreachable")
+        self.assertNotIn("S3CR3T", open(self.audit).read() + self.card(rid) + json.dumps(self.poll(rid)))
         self.assertEqual(self.events("exec_probe")[-1]["outcome"], "unreachable")
 
-    def test_a_probe_failure_looks_the_same_for_a_pinned_and_an_unpinned_host(self):
-        # the agent must not learn from a refusal which hosts the key pins: same status, same body, same code path
-        self.enable(max_pending_per_client=20)
-        for label in ("unreachable", "not_ssh", "timeout", "refused_destination", "rate_limited", "ssh_unavailable"):
-            got = {}
-            for what, host, port in (("pinned", "nas.example.com", 22), ("pinned other port", "port.example.com", 2222),
-                                     ("unpinned", NEW, 22), ("not allowed", "unlisted.example.com", 22),
-                                     ("changed port", "nas.example.com", 2222)):
-                self.servers.table[(host, port)] = {"label": label}
-                code, b = self.ask(host=host, port=port)
-                got[what] = (code, b)
-            self.assertEqual(len(set(got.values())), 1, (label, got))
-            self.assertEqual(next(iter(got.values()))[0], 403)
-        self.assertEqual(self.events("requested"), [])
-        self.assertEqual({e["pinned"] for e in self.events("exec_probe")}, {True, False})   # the audit alone knows
+    def test_a_pinned_host_whose_check_fails_ends_with_connect_failed(self):
+        for label in self.LABELS:
+            self.servers.table[("nas.example.com", 22)] = {"label": label}
+            code, b = self.ask()
+            self.assertEqual(code, 202, b)
+            rid = json.loads(b)["id"]
+            got = self.poll(rid)
+            self.assertEqual((got["status"], got["label"], got["exit_code"]), ("released", "connect_failed", None), label)
+            self.assertIn(self.req(rid).status, ("approved", "released"))
         self.assertEqual(self.ran, [])
-        self.servers.table[("nas.example.com", 22)] = NAS                                    # control: it works when the probe does
-        self.assertEqual(self.ask()[0], 202)
+        self.assertEqual(len(self.events("exec_finished")), len(self.LABELS))
+        self.servers.table[("nas.example.com", 22)] = NAS                     # control: with a good check it is an ordinary request
+        rid = self.pending()
+        self.assertEqual(self.req(rid).spec["probe"], "ready")
+        self.assertEqual(self.poll(rid), {"status": "pending", "error": None})
 
     def test_the_other_refusals_do_not_depend_on_whether_the_host_is_pinned(self):
         pair = lambda **kw: {h: self.ask(host=h, **kw) for h in ("nas.example.com", NEW)}   # noqa: E731
@@ -202,15 +215,16 @@ class Intake(Unpinned):
         self.assertEqual((code, json.loads(b)["error"]), (403, "too many pending remote command requests"))
         self.assertEqual(len(self.servers.calls), n)                 # no probe for a request that is refused anyway
 
-    def test_a_name_that_resolves_to_a_forbidden_address_is_refused_by_the_real_probe(self):
+    def test_a_name_that_resolves_to_a_forbidden_address_is_a_card_saying_the_destination_is_not_allowed(self):
         hit = []
         guard = destguard.DestGuard(resolver=lambda h, p: ["93.184.216.34", "::ffff:10.1.2.3"], local_addrs=lambda: [],
                                     connector=lambda *a, **k: hit.append(a))
         cfg = self.broker.exec_cfg
         self.broker.exec_probe = execprobe.Prober(guard, lambda: cfg).probe
-        code, b = self.ask(host=NEW)
-        self.assertEqual((code, json.loads(b)["error"]), (403, "could not read that host's key"))
+        rid = self.pending(host=NEW)
         self.assertEqual(hit, [])                                    # nothing was connected to
+        self.assertEqual(self.req(rid).spec["probe_label"], "refused_destination")
+        self.assertIn("That destination is not allowed.", self.card(rid))
         self.assertEqual(self.events("exec_probe")[-1]["outcome"], "refused_destination")
 
     def test_the_rate_limit_follows_the_config(self):
@@ -239,11 +253,13 @@ class Intake(Unpinned):
             self.assertNotIn(k, audit_api.WHITELIST["requested"])
         self.assertIn("exec_probe", audit_api.HIDDEN)
 
-    def test_the_audit_requested_event_has_the_state_and_fingerprints(self):
+    def test_the_audit_has_the_state_and_fingerprints_once_the_host_is_checked(self):
         self.pending(**self.changed())
-        ev = self.events("requested")[-1]
+        ev = self.events("exec_host_checked")[-1]
         self.assertEqual((ev["host_state"], ev["presented_fp"], ev["pinned_fp"]), ("changed", FP["fresh"], FP["nas"]))
         self.assertNotIn("presented_key", ev)
+        self.assertNotIn("presented_fp", self.events("requested")[-1])      # the request was recorded before anything was read
+        self.assertIn("exec_host_checked", audit_api.HIDDEN)
 
     def test_a_key_pinned_under_another_name_is_not_the_same_key(self):
         self.servers.table[("evil.example.com", 22)] = UNLISTED        # pinned, but for unlisted.example.com
@@ -273,6 +289,109 @@ class Intake(Unpinned):
         self.servers.table[("unlisted.example.com", 22)] = UNLISTED     # line present, name not on allowed_hosts
         rid = self.pending(host="unlisted.example.com")
         self.assertEqual(self.req(rid).spec["host_state"], "new")
+
+
+class Background(Unpinned):
+    """The host check runs in the background and the agent cannot tell from a call whether anything answers."""
+
+    def setUp(self):
+        super().setUp()
+        self.enable(max_pending_per_client=20)
+        self.gate = threading.Event()
+        inner = self.servers
+        self.broker.exec_probe = lambda h, p, c: (self.gate.wait(10), inner(h, p, c))[1]
+        self.servers.table[("dead.example.com", 22)] = {"label": "unreachable"}
+        self.servers.table[("blocked.example.com", 22)] = {"label": "refused_destination"}
+
+    HOSTS = ("alive.example.com", "dead.example.com", "blocked.example.com")
+
+    @staticmethod
+    def shape(b):
+        d = json.loads(b)
+        d.pop("id"), d.pop("expires_in")
+        return d
+
+    def test_the_post_does_not_wait_for_the_check_and_is_the_same_whatever_the_host_does(self):
+        got = {h: self.ask_raw(host=h) for h in self.HOSTS}
+        self.assertEqual(self.servers.calls, [])                 # no probe has even started: not on the request thread
+        self.assertEqual({h: c for h, (c, _) in got.items()}, {h: 202 for h in self.HOSTS})
+        self.assertEqual(len({json.dumps(self.shape(b), sort_keys=True) for _, b in got.values()}), 1)
+        self.assertEqual(self.shape(next(iter(got.values()))[1])["status"], "pending")
+        rids = {h: json.loads(b)["id"] for h, (_, b) in got.items()}
+        seq = {h: [self.poll(rid)] for h, rid in rids.items()}                 # while the checks are unfinished
+        self.gate.set()
+        for rid in rids.values():
+            self.assertTrue(self.req(rid).exec_settled.wait(20))
+        for h, rid in rids.items():
+            seq[h].append(self.poll(rid))                                      # after the checks finished
+        self.assertEqual(len(self.servers.calls), 3)                           # premise: the three checks really ran
+        self.assertEqual({h: self.req(r).spec["host_state"] for h, r in rids.items()},
+                         {"alive.example.com": "new", "dead.example.com": "probe_failed",
+                          "blocked.example.com": "probe_failed"})              # premise: they did differ
+        self.offset += 700                                                 # nobody answers: every card expires (not yet purged)
+        for h, rid in rids.items():
+            seq[h].append(self.poll(rid))
+        self.assertEqual(len({json.dumps(v, sort_keys=True) for v in seq.values()}), 1, seq)
+        self.assertEqual([x["status"] for x in seq["alive.example.com"]], ["pending", "pending", "expired"])
+
+    def test_the_card_says_checking_and_offers_only_deny_until_the_check_is_done(self):
+        rid = json.loads(self.ask_raw(host=NEW)[1])["id"]
+        card = self.card(rid)
+        self.assertIn("Checking the host key...", card)
+        self.assertIn("value=deny>", card)
+        for never in ("value=approve", "approve_remember", "Approve once"):
+            self.assertNotIn(never, card)
+        rid2 = json.loads(self.ask_raw()[1])["id"]                             # a pinned host looks the same while it waits
+        self.assertIn("Checking the host key...", self.card(rid2))
+        self.assertNotIn("value=approve", self.card(rid2))
+        self.gate.set()
+        for r in (rid, rid2):
+            self.assertTrue(self.req(r).exec_settled.wait(20))
+        self.assertIn("value=approve_remember>", self.card(rid))
+        self.assertNotIn("Checking the host key...", self.card(rid))
+        self.assertIn("value=approve>", self.card(rid2))
+
+    def test_nothing_can_be_approved_before_the_check_is_done_and_nothing_is_claimed(self):
+        for host in (NEW, "nas.example.com"):
+            rid = json.loads(self.ask_raw(host=host)[1])["id"]
+            self.assertEqual(self.req(rid).spec["probe"], "checking")
+            for choice in (None, "once", "remember", "replace"):
+                code, got = self.broker.decide_via("dashboard", rid, "approve", "alice", exec_host=choice,
+                                                   confirm_replace=True)
+                self.assertEqual((code, got), (400, None), (host, choice))
+            self.assertEqual(self.decide_form(rid, "approve")[1], "/?note=bad")
+            self.assertEqual((self.req(rid).status, self.req(rid).exec_choice), ("pending", None))
+        self.assertEqual((self.ran, self.events("decided")), ([], []))
+        self.gate.set()
+        for r in list(self.broker._by_id.values()):
+            self.assertTrue(r.exec_settled.wait(20))
+        for r in list(self.broker._by_id.values()):                            # control: the same decision works afterwards
+            self.assertEqual(self.broker.decide_via("dashboard", r.id, "approve", "alice")[0], 200)
+
+    def test_a_denial_during_the_check_is_final_and_the_check_then_does_nothing(self):
+        rid = json.loads(self.ask_raw(host=NEW)[1])["id"]
+        self.assertEqual(self.broker.decide_via("dashboard", rid, "deny", "alice")[0], 200)
+        sent = len(self.notifier.notifications)
+        self.gate.set()
+        self.assertTrue(self.req(rid).exec_settled.wait(20))
+        self.assertEqual((self.req(rid).status, len(self.notifier.notifications)), ("denied", sent))
+        self.assertEqual(self.ran, [])
+
+    def test_the_pending_cap_refusal_does_not_depend_on_the_host(self):
+        self.enable(max_pending_per_client=1)
+        self.assertEqual(self.ask_raw(host="dead.example.com")[0], 202)
+        refused = {h: self.ask_raw(host=h) for h in (*self.HOSTS, "nas.example.com")}
+        self.assertEqual(len(set(refused.values())), 1)
+        self.assertEqual(next(iter(refused.values()))[0], 403)
+        self.assertIn("too many pending", next(iter(refused.values()))[1])
+
+    def test_a_checked_unpinned_host_sends_one_notification_after_the_check(self):
+        sent = len(self.notifier.notifications)
+        rid = json.loads(self.ask_raw(host=NEW)[1])["id"]
+        self.assertEqual(len(self.notifier.notifications), sent)               # nothing while it is being checked
+        self.gate.set()
+        self.assertTrue(self.req(rid).exec_settled.wait(20))
+        self.assertEqual(len(self.notifier.notifications), sent + 1)
 
 
 class Card(Unpinned):
@@ -709,6 +828,32 @@ class Run(Unpinned):
         self.assertEqual(self.poll(req.id)["label"], "connect_failed")
         self.assertEqual(json.dumps(self.meta(), sort_keys=True), self.meta0)
         self.assertEqual(self.events("exec_host_remembered"), [])
+
+    def test_replace_never_adds_the_host_to_the_list_and_refuses_when_it_is_no_longer_allowed(self):
+        rid = self.pending(**self.changed())                                   # the card: nas is allowed and pinned
+        raw = {**self.meta(), "allowed_hosts": [h for h in self.meta()["allowed_hosts"] if h != "nas.example.com"]}
+        self.broker._persist_ssh_hosts("deploy", raw, "bob")                   # the list is edited between card and click
+        from secret_broker.broker import Broker
+        self.broker.cfg["secrets"]["deploy"]["ssh_hosts"] = Broker._ssh_hosts(raw)
+        after = json.dumps(self.meta(), sort_keys=True)
+        self.assertEqual(self.broker.decide_via("dashboard", rid, "approve", "alice", exec_host="replace",
+                                                confirm_replace=True)[0], 400)    # refused at the decision, nothing claimed
+        self.assertEqual(self.req(rid).status, "pending")
+        self.assertEqual(self.decide_form(rid, "approve_replace", confirm_replace="1")[1], "/?note=bad")
+        self.assertEqual(json.dumps(self.meta(), sort_keys=True), after)
+        # and the write itself refuses too (a decision that got past the check): the list is never appended to
+        key = {"key": self.req(rid).spec["presented_key"], "fingerprint": FP["fresh"]}
+        with self.assertRaises(ValueError):
+            self.broker._remember_host("deploy", "nas.example.com", 22, key, "alice", replace=True, expect_fp=FP["nas"])
+        self.assertEqual(json.dumps(self.meta(), sort_keys=True), after)
+        self.assertNotIn("nas.example.com", self.meta()["allowed_hosts"])
+        # control: with the host still on the list a replace goes through and leaves the list exactly as it was
+        self.broker._persist_ssh_hosts("deploy", ti.SSH_HOSTS, "bob")
+        self.broker.cfg["secrets"]["deploy"]["ssh_hosts"] = Broker._ssh_hosts(ti.SSH_HOSTS)
+        listed = list(self.meta()["allowed_hosts"])
+        req = self.go("approve_replace", "changed", confirm_replace="1")
+        self.assertEqual(req.status, "approved")
+        self.assertEqual(self.meta()["allowed_hosts"], listed)
 
     def test_a_forbidden_second_address_also_fails_closed(self):
         self.broker.dest_guard._resolver = lambda h, p: ["93.184.216.34", "::ffff:10.0.0.1"]

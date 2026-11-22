@@ -22,6 +22,7 @@ import base64
 import binascii
 import hashlib
 import html
+import ipaddress
 import os
 import re
 
@@ -33,7 +34,7 @@ from . import sudomode
 MODE = "exec"
 DEFAULTS = {"enabled": False, "clients": [], "max_concurrent": 4, "max_output_bytes": 262144,
             "max_seconds": 600, "max_pending_per_client": 3, "readonly": [], "ssh_path": None,
-            "probe_per_client": 30, "probe_overall": 120}
+            "probe_per_client": 30, "probe_overall": 120, "probe_allow_cidrs": None}
 MAX_COMMAND_CHARS = 4096
 MAX_SCRIPT_BYTES = 32 * 1024
 DEFAULT_TIMEOUT_S = 60
@@ -88,6 +89,20 @@ def parse_config(raw, field="exec"):
         raise ValueError(f"{field}.readonly must be a list of up to 100 entries, each a program name "
                          "(or an absolute path in a standard bin directory) and up to two plain subcommand words")
     out["readonly"] = sorted(set(ro))
+    cidrs = out["probe_allow_cidrs"]
+    if cidrs is not None:
+        if not isinstance(cidrs, list) or len(cidrs) > 50 or not cidrs:
+            raise ValueError(f"{field}.probe_allow_cidrs must be a list of 1 to 50 CIDR strings (leave it out to allow any "
+                             "destination the guard allows)")
+        nets = []
+        for c in cidrs:
+            try:
+                nets.append(str(ipaddress.ip_network(c, strict=False)) if isinstance(c, str) else None)
+            except ValueError:
+                nets.append(None)
+        if None in nets:
+            raise ValueError(f"{field}.probe_allow_cidrs entries must be CIDR strings such as 10.0.0.0/8")
+        out["probe_allow_cidrs"] = sorted(set(nets))
     sp = out["ssh_path"]
     if sp is not None and not (isinstance(sp, str) and os.path.isabs(sp) and "\x00" not in sp):
         raise ValueError(f"{field}.ssh_path must be an absolute directory holding ssh, ssh-agent, ssh-add and ssh-keyscan")
@@ -618,10 +633,36 @@ def _type_html(sp):
     return f" ({html.escape(t)})" if t in sshkey._HOSTKEY_TYPES else ""
 
 
+PROBE_TEXT = {"unreachable": "Could not reach that host.", "not_ssh": "That host did not answer as an SSH server.",
+              "timeout": "That host did not answer in time.", "refused_destination": "That destination is not allowed.",
+              "rate_limited": "Too many host-key checks are running; try again later.",
+              "ssh_unavailable": "The broker cannot read host keys (ssh-keyscan is not installed)."}
+
+
+def probe_text(label):
+    """The fixed sentence for a failed host check (the label is one of execprobe.LABELS; anything else reads as unreachable)."""
+    return PROBE_TEXT.get(label, PROBE_TEXT["unreachable"])
+
+
+def deny_only_html(note):
+    return ("<div class=decide-row><button class='btn deny' name=decision value=deny>Deny</button></div>"
+            f"<p class=scope><small class=muted>{html.escape(note)} Nothing can be approved yet.</small></p>")
+
+
 def host_html(sp):
     """The block above the command for an unpinned request: what is new, the fingerprint the server presented, and
-    for a changed key a large red caution with both fingerprints. Empty for an ordinary request."""
+    for a changed key a large red caution with both fingerprints. While the host key is being read, or when it could
+    not be, a plain statement of that. Empty for an ordinary request whose host key is checked."""
     st = sp.get("host_state")
+    if sp.get("probe") == "checking":
+        return ("<div class=hostban style='border:2px solid var(--line);border-radius:.5rem;padding:.5rem .8rem;"
+                "margin:.4rem 0'><b>Checking the host key...</b> The broker is reading the server's key; "
+                "this card can be approved once it has.</div>")
+    if st == "probe_failed":
+        return ("<div class=hostban role=alert style='border:2px solid var(--bad);color:var(--bad);border-radius:.5rem;"
+                f"padding:.5rem .8rem;margin:.4rem 0'><b>{html.escape(probe_text(sp.get('probe_label')))}</b> "
+                f"The host key of {html.escape(sp['host'])}, port {int(sp['port'])}, could not be read, so this "
+                "request cannot be approved. Deny it.</div>")
     if st not in HOST_STATES:
         return ""
     where = f"{html.escape(sp['host'])}, port {int(sp['port'])}"
@@ -646,6 +687,9 @@ def host_actions_html(sp, remember_why=None, restricts=True):
     when the key can store it (`remember_why` is None): Approve and remember for a new host or port, or, for a
     changed key, Approve and replace the pinned key behind an extra tick. No Always, no timed approval, no rule."""
     st = sp.get("host_state")
+    if sp.get("probe") != "ready" or st not in HOST_STATES:       # not checked, or the check failed: Deny only
+        return deny_only_html("The host key could not be read." if st == "probe_failed" else
+                              "The host key is still being checked.")
     row = ("<div class=decide-row><button class='btn approve' name=decision value=approve>Approve once</button>"
            "<button class='btn deny' name=decision value=deny>Deny</button></div>")
     if remember_why is not None:

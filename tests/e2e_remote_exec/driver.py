@@ -142,7 +142,7 @@ class E2E:
         # `localhost` is 127.0.0.1 here (a container resolves it to ::1 as well, which the guard's test-only loopback
         # switch does not pass; the sshd listens on 127.0.0.1 only). Same device as tests/test_e2e.py.
         real_resolver = self.broker.dest_guard._resolver
-        self.broker.dest_guard._resolver = lambda h, p: ["127.0.0.1"] if h.lower() == "localhost" else real_resolver(h, p)
+        self.broker.dest_guard._resolver = lambda h, p: ["127.0.0.1"] if h.lower() in ("localhost", "alias.example.com") else real_resolver(h, p)
         client, approval = serve(self.broker, ("127.0.0.1", 0), ("127.0.0.1", 0), "legacy-" + pysecrets.token_urlsafe(16))
         self.servers = (client, approval)
         self.base = f"http://127.0.0.1:{client.server_address[1]}"
@@ -185,8 +185,10 @@ class E2E:
             return code, got
         rid = got["id"]
         if approve:
+            self.check(self.broker._by_id[rid].exec_settled.wait(30), "the background host check finished")
             self.check(self.broker.decide_via("dashboard", rid, "approve", "alice")[0] == 200, "human approval accepted")
         if not wait:
+            self.check(self.broker._by_id[rid].exec_settled.wait(30), "the background host check finished")
             return 202, {"id": rid}
         deadline = time.monotonic() + 60
         while time.monotonic() < deadline:
@@ -395,12 +397,50 @@ class E2E:
         self.check(known_now.count(self.host_line()) == 1, "no pinned line was duplicated")
         meta["ssh_hosts"]["known_hosts"] = good_pin + [ln for ln in known_now if ln not in good_pin]
 
-        # 6. a forbidden destination is never probed or connected to
+        # 6. the agent cannot tell a host that answers from one that does not: same POST, same status sequence
+        import socket
+        closed = socket.socket()
+        closed.bind(("127.0.0.1", 0))
+        dead_port = closed.getsockname()[1]
+        closed.close()                                               # nothing listens there now
+        shape = lambda r: {k: v for k, v in r.items() if k not in ("id", "expires_in")}  # noqa: E731
+        probe_cache.clear()
+        body = lambda host, port: {"mode": "exec", "names": ["deploy"], "host": host, "user": self.me, "port": port,  # noqa: E731
+                                   "command": "echo x", "source": "e2e"}
+        code_a, alive = self.api("POST", "/v1/requests", body("alias.example.com", self.port))
+        code_d, dead = self.api("POST", "/v1/requests", body("alias.example.com", dead_port))
+        self.eq((code_a, code_d, shape(alive)), (202, 202, shape(dead)), "a live and a dead destination get the same POST answer")
+        for r in (alive, dead):
+            self.check(broker._by_id[r["id"]].exec_settled.wait(30), "the background host check finished")
+        self.eq((broker._by_id[alive["id"]].spec["host_state"], broker._by_id[dead["id"]].spec["host_state"],
+                 broker._by_id[dead["id"]].spec["probe_label"]), ("new", "probe_failed", "unreachable"),
+                "(premise) the two requests really differed, as the human sees it")
+        self.eq([self.api("GET", f"/v1/requests/{r['id']}")[1] for r in (alive, dead)],
+                [{"status": "pending", "error": None}] * 2, "the agent's status for both is the same: pending")
+        self.eq(self.decide(dead["id"]), 400, "a failed host check cannot be approved")
+        self.eq(broker._by_id[dead["id"]].status, "pending", "and the request stays as it was")
+        for r in (alive, dead):
+            broker._by_id[r["id"]].status = "expired"
+
+        # 7. a forbidden destination is a card that says so, never connected to
         broker.dest_guard.allow_loopback = False
         probe_cache.clear()
-        code, r = self.exec_("echo x", host="localhost")
-        self.eq(code, 403, "with the guard on, a loopback destination is refused at intake")
+        code, r = self.exec_("echo x", host="alias.example.com", wait=False)
+        self.eq((code, broker._by_id[r["id"]].spec.get("probe_label")), (202, "refused_destination"),
+                "with the guard on, a loopback destination is a failed host check (destination not allowed)")
         broker.dest_guard.allow_loopback = True
+        broker._by_id[r["id"]].status = "expired"
+
+        # 8. a pinned host that cannot be reached ends with connect_failed
+        self.sshds.pop(self.port).terminate()
+        probe_cache.clear()
+        code, r = self.exec_("echo x")
+        self.eq((r.get("label"), r.get("exit_code")), ("connect_failed", None), "a pinned host that does not answer ends with connect_failed")
+        proc, _ = self.spawn_sshd("hostkey", self.port)
+        self.sshd = proc
+        probe_cache.clear()
+        code, r = self.exec_("echo back-again")
+        self.eq(r.get("stdout"), "back-again\n", "(control) the pinned host works once it answers")
 
     def run(self):
         self.sshd_bin = find_sshd()

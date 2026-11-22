@@ -377,7 +377,7 @@ class Config(unittest.TestCase):
         c = execmode.parse_config(None)
         self.assertEqual(c, {"enabled": False, "clients": [], "max_concurrent": 4, "max_output_bytes": 262144,
                              "max_seconds": 600, "max_pending_per_client": 3, "readonly": [], "ssh_path": None,
-                             "probe_per_client": 30, "probe_overall": 120})
+                             "probe_per_client": 30, "probe_overall": 120, "probe_allow_cidrs": None})
         self.assertEqual(execmode.parse_config({}), c)
 
     def test_values(self):
@@ -392,10 +392,20 @@ class Config(unittest.TestCase):
                     {"max_output_bytes": 10}, {"max_output_bytes": 10 ** 9}, {"max_seconds": 0},
                     {"max_seconds": 601}, {"max_pending_per_client": 0}, {"readonly": "ls"},
                     {"ssh_path": "relative/dir"}, {"ssh_path": 5}, {"probe_per_client": 0}, {"probe_per_client": 1001},
-                    {"probe_overall": 0}, {"probe_overall": True}, "x", [], 5):
+                    {"probe_overall": 0}, {"probe_overall": True}, {"probe_allow_cidrs": []}, {"probe_allow_cidrs": "10.0.0.0/8"},
+                    {"probe_allow_cidrs": ["nope"]}, {"probe_allow_cidrs": [5]}, {"probe_allow_cidrs": ["10.0.0.0/8", None]},
+                    {"probe_allow_cidrs": ["10.0.0.0/33"]}, {"probe_allow_cidrs": ["10.0.0.0/8"] * 51}, "x", [], 5):
             with self.subTest(raw=raw), self.assertRaises(ValueError) as cm:
                 execmode.parse_config(raw)
             self.assertIn("exec", str(cm.exception))
+
+    def test_probe_allow_cidrs_is_validated_and_normalized_and_never_echoes_a_value(self):
+        c = execmode.parse_config({"probe_allow_cidrs": ["10.1.2.3/8", "192.168.0.0/16", "10.0.0.0/8", "fd00::/8"]})
+        self.assertEqual(c["probe_allow_cidrs"], ["10.0.0.0/8", "192.168.0.0/16", "fd00::/8"])
+        with self.assertRaises(ValueError) as cm:
+            execmode.parse_config({"probe_allow_cidrs": ["S3CR3T-not-a-cidr"]})
+        self.assertNotIn("S3CR3T", str(cm.exception))
+        self.assertIn("exec.probe_allow_cidrs", str(cm.exception))
 
     def test_check_allowed(self):
         client = {"id": "c-1a2b3c4d"}
