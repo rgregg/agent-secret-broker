@@ -208,7 +208,10 @@ class SBase(CBase):
             p.start()
             self.addCleanup(p.stop)
         if self.inject_clock:       # the production clock is time.monotonic; tests move this one with `advance`
-            self.broker.sessions_clock = lambda: time.monotonic() + self.offset
+            # A FROZEN base, not time.monotonic(): real time must not leak into a test that places a call one fake
+            # second before a deadline (a loaded CI runner that took over a second made such a call land late).
+            t0 = time.monotonic()
+            self.broker.sessions_clock = lambda: t0 + self.offset
         self.out = []                       # CLI output seen
         self.dir = os.path.dirname(self.audit)
 
@@ -634,7 +637,7 @@ class TimeBound(SBase):
             code, r = self.call(sid, "GET", "/proxy/network/api/s/default/stat/sta")
             self.assertEqual(r["http"]["status"], 200)
             self.assertEqual(s.expires, deadline)       # nothing moved it
-        self.advance(99)                                # 599 s: the last second of the session
+        self.advance(99.5)                              # 599.5 s: the last second of the session (expires_in floors to 0)
         code, r = self.call(sid, "GET", "/proxy/network/api/s/default/stat/sta")
         self.assertEqual(r["http"]["status"], 200)
         self.assertEqual(r["session"]["expires_in"], 0)
