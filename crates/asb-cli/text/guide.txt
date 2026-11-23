@@ -197,6 +197,10 @@ Updating asb
        replace it with the new one and keep it executable.
     4. Run `asb version` to confirm. If it fails, put the backup back.
     Never pipe a download into a shell (no curl | sh).
+  Stale agent instructions: when the block `asb agent-setup` wrote into an instruction file is older than the one
+  this asb writes, asb says so on stderr (once a day; ASB_NO_UPDATE_CHECK=1 turns it off; local files only,
+  nothing is sent) and `asb version` shows `agent instructions:`. Tell the human; do not edit your own
+  instruction files. They run `asb agent-setup` to refresh them.
 
 Debugging
   asb audit --request ID      what happened to one request (ID is in the broker's reply)

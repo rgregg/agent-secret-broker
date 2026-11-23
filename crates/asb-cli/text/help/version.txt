@@ -5,4 +5,8 @@ available, and the release page to get it from. Asks the broker one status quest
 approval); if the broker cannot be reached it still shows the client version. When an
 update is available it prints the steps for an agent: ask the human first, download only
 the release page's asset, verify the .sha256, keep a backup, never pipe a download into a shell.
+The `agent instructions:` line says whether the block `asb agent-setup` put in an instruction file
+(user files and this directory's project files) is "not installed", "up to date" or "out of date: FILE
+(vN, current vM): run asb agent-setup". Local files only; nothing is written. Without a broker it still shows
+all of this.
 example: asb version
