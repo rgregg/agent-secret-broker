@@ -3617,6 +3617,17 @@ enable (or revoke) disabled clients first.
   of `asb` downloads or installs anything. A fork changes the release URL in `client/asb` and
   `crates/asb-cli` (`RELEASE_URL`); it is deliberately not configurable at run time.
 
+  The same machinery tells the human when the instruction blocks `asb agent-setup` wrote are older than the block this
+  `asb` writes (`AGENT_BLOCK_VERSION`). That check is entirely local: no field from the broker, no request, no
+  instruction file is ever written. It reads, at most 256 KiB each and without following a link further than
+  `agent-setup` itself would, the user-scope and current-directory project instruction files, and reports only a
+  well-formed block of a lower version (a damaged one, an absent one and a newer one are silence, so someone who never
+  ran `agent-setup` or removed the block is not nagged). The line names at most three files (paths with control
+  characters escaped, nothing else from a file) and tells the human to run `asb agent-setup` and agents not to edit
+  their own instruction files. Same rules as the update notice: stderr, once a day (`agent-notice` beside
+  `update-notice`; unwritable means skipped), `ASB_NO_UPDATE_CHECK=1`, never from `status`, `version` or
+  `agent-setup`. `asb version` always shows the state (`agent instructions: ...`).
+
 - **Revoke** takes effect on the next request and sets state in memory under the lock before
   anything else; `Broker.create` re-checks the client under the request lock, so no request of a
   revoked client can be created or stay pending, and approving one that was pending is refused. The

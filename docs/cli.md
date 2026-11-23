@@ -61,7 +61,10 @@ Check it:
   deploy ([deploy.md](deploy.md)).
 - `asb version` prints this client's version, the newest one the broker expects (from `GET /v1/status`),
   whether an update is available and the release page, and when one is, the steps for an agent. It works
-  without a broker (it then says "not reachable") and exits 0.
+  without a broker (it then says "not reachable") and exits 0. A last line, `agent instructions:`, says whether
+  the block `asb agent-setup` wrote into your agents' instruction files is `not installed`, `up to date` or
+  `out of date: FILE (v1, current v2): run asb agent-setup` (see "Stale agent instructions" below). It reads those
+  files, ignores `ASB_NO_UPDATE_CHECK` and the daily record, and writes nothing.
 - **Update notice.** When the broker expects a newer `asb` than yours, the first answer you get from it (at most
   once a day per machine) is followed by two lines on stderr:
 
@@ -74,6 +77,22 @@ Check it:
   downloads or installs anything itself: updating is a download from the release page, a `.sha256` check, a
   backup of the old binary and a replacement of the file `command -v asb` shows, done by the agent only after the
   human agrees (`asb guide`, "Updating asb").
+- **Stale agent instructions.** `asb agent-setup` copies a versioned block (`<!-- asb:agent-setup begin vN -->`) into
+  an agent's instruction file, and a copy stays as it was until `agent-setup` is run again. When a new `asb`
+  changes the block, the first broker answer you get (at most once a day per machine, wherever the update notice
+  runs) is followed by one line on stderr:
+
+      asb: your agent instructions are out of date (/home/me/.claude/CLAUDE.md has v1, this asb writes v2). Ask the human to run `asb agent-setup`; agents: do not edit your own instruction files.
+
+  It is local: `asb` reads the three user-scope files (`~/.claude/CLAUDE.md`, `$CODEX_HOME` or `~/.codex/AGENTS.md`,
+  `$COPILOT_HOME` or `~/.copilot/copilot-instructions.md`) and the project files for the current directory, at most
+  256 KiB each, following a link only where `agent-setup` would write. Nothing is sent to the broker and no
+  instruction file is ever written. It says something only for a well-formed block with a lower version: no file,
+  no block, a damaged block, an unreadable or oversized file, or a block that is current or newer than this `asb`
+  is silence. At most three files are named (then "and N more"); a path is printed with control characters
+  escaped. The daily record is `$XDG_STATE_HOME/asb/agent-notice` (else `~/.local/state/asb/`), beside
+  `update-notice`, and a state directory that cannot be written silences it rather than repeating it.
+  `ASB_NO_UPDATE_CHECK=1` turns it off; `asb status`, `asb version` and `asb agent-setup` never print it.
 - `asb ssh-agent -- ssh|scp|sftp|rsync|git ...` also reads the destination from the
   wrapped command line and sends it as an unverified "claimed destination" with
   each signature request (nothing is sent if it cannot be told; `eval "$(asb
