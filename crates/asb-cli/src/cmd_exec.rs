@@ -197,6 +197,19 @@ pub fn run(argv: &[String]) -> R {
             ));
         }
         payload.insert("user".into(), json!(u));
+    } else {
+        // the local login name by default: the account on the host is usually the same
+        match std::env::var("USER") {
+            Ok(u) if user_ok(&u) && !u.starts_with('-') => {
+                payload.insert("user".into(), json!(u));
+            }
+            _ => {
+                return Err(die(
+                    "no --user given and $USER is not a usable account name: pass --user NAME",
+                    USAGE,
+                ))
+            }
+        }
     }
     if let Some(p) = get("port") {
         payload.insert("port".into(), json!(number(p, "--port", 1, 65535)?));

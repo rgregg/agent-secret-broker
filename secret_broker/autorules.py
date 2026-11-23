@@ -145,9 +145,10 @@ def _parse_rule(r, where, *, implicit_secret=None, extra_keys=(), stored_modes=S
     elif mode in sessionrules.MODES:
         rule.update(sessionrules.parse(mode, r, where))
     elif mode == "exec":
-        host = r.get("host")
-        if not isinstance(host, str) or not _HOST.fullmatch(host.lower()):
-            raise ValueError(f"{where}.host is required (the server's name, as named in the key's allowed hosts)")
+        hosts = _exec_list(r.get("host"), where, "host", str)
+        if not hosts or not all(_HOST.fullmatch(h.lower()) for h in hosts):
+            raise ValueError(f"{where}.host is required (the server's name, as named in the key's allowed hosts; "
+                             f"a list of up to {MAX_EXEC_LIST} names is allowed)")
         acct = r.get("account")
         if not isinstance(acct, str) or not re.fullmatch(r"[\x21-\x7e]{1,64}", acct) or acct.startswith("-"):
             raise ValueError(f"{where}.account is required (the login name, e.g. \"ryan\")")
@@ -158,10 +159,12 @@ def _parse_rule(r, where, *, implicit_secret=None, extra_keys=(), stored_modes=S
         for w in argv:      # the rules table is where "run with no approval" is consented to: no look-alikes or hidden text
             if not w.isascii() or guidance_mod.hidden_problem(w):
                 raise ValueError(f"{where}.argv words must be plain ASCII text (no hidden or look-alike characters)")
-        port = r.get("port", 22)
-        if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
-            raise ValueError(f"{where}.port must be a whole number from 1 to 65535 (default 22)")
-        rule.update(host=host.lower(), account=acct, port=port, argv=tuple(argv))
+        ports = _exec_list(r.get("port", 22), where, "port", int)
+        if not ports or not all(not isinstance(q, bool) and 1 <= q <= 65535 for q in ports):
+            raise ValueError(f"{where}.port must be a whole number from 1 to 65535 (default 22), or a list of up to "
+                             f"{MAX_EXEC_LIST} of them")
+        rule.update(hosts=tuple(dict.fromkeys(h.lower() for h in hosts)), account=acct,
+                    ports=tuple(dict.fromkeys(ports)), argv=tuple(argv))
     else:
         argv = r.get("argv")
         if (not isinstance(argv, list) or not argv or len(argv) > 64
@@ -192,6 +195,24 @@ def parse(raw, field="auto_approve"):
 
 
 _STORED_ID = re.compile(r"[A-Za-z0-9_-]{4,16}")
+
+
+MAX_EXEC_LIST = 20
+
+
+def _exec_list(v, where, field, kind):
+    """An exec rule's `host` or `port`: one value, or a list of 1 to MAX_EXEC_LIST values of `kind`. Returns the
+    list (a one-element list behaves exactly as the single value always did). ValueError naming the field."""
+    items = v if isinstance(v, list) else [v]
+    if not 1 <= len(items) <= MAX_EXEC_LIST or not all(isinstance(x, kind) for x in items):
+        raise ValueError(f"{where}.{field} must be one value or a list of up to {MAX_EXEC_LIST}")
+    return items
+
+
+def _exec_json(values):
+    """The stored form of an exec rule's hosts or ports: the bare value for one (the shape every earlier version
+    wrote and reads), else a list."""
+    return values[0] if len(values) == 1 else list(values)
 
 
 def parse_stored(raw, credential, field="auto_rules", ssh=False):
@@ -246,7 +267,8 @@ def serialize_stored(rules):
         elif r["mode"] in sessionrules.MODES:
             d.update(sessionrules.serialize(r))
         elif r["mode"] == "exec":
-            d.update(host=r["host"], account=r["account"], port=r["port"], argv=list(r["argv"]))
+            d.update(host=_exec_json(r["hosts"]), account=r["account"], port=_exec_json(r["ports"]),
+                     argv=list(r["argv"]))
         else:
             d["argv"] = list(r["argv"])
         if r["clients"]:
@@ -361,8 +383,8 @@ def _exec_ok(rule, spec):
     """A remote command matches only when it is a plain command (execmode.parse_simple) on the rule's host and
     port as the rule's account whose words begin with the rule's words. Never a script and never a command that
     uses shell syntax: those are compared on nothing a rule can read."""
-    if ("command" not in spec or spec.get("host") != rule["host"] or spec.get("user") != rule["account"]
-            or spec.get("port") != rule["port"]):
+    if ("command" not in spec or spec.get("host") not in rule["hosts"] or spec.get("user") != rule["account"]
+            or spec.get("port") not in rule["ports"]):
         return False
     argv = execmode.parse_simple(spec["command"])
     return argv is not None and tuple(argv[:len(rule["argv"])]) == rule["argv"]

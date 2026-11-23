@@ -73,6 +73,7 @@ pub fn call(
     if let Ok((code, answer)) = &result {
         if (200..300).contains(code) {
             crate::update_notice::maybe_notice(answer);
+            crate::agent_notice::maybe_notice();
         }
     }
     result.map_err(|e| match e {

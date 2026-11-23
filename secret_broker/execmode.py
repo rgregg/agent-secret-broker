@@ -18,8 +18,11 @@ audit text. Invariants (enforced in broker.py and execrun.py, tested in tests/te
   * the request chooses host, user, port, the command and a timeout; nothing else, and none of it
     can become an ssh option (validate refuses a host, user or command that begins with a dash).
 """
+import base64
+import binascii
 import hashlib
 import html
+import ipaddress
 import os
 import re
 
@@ -30,7 +33,8 @@ from . import sudomode
 
 MODE = "exec"
 DEFAULTS = {"enabled": False, "clients": [], "max_concurrent": 4, "max_output_bytes": 262144,
-            "max_seconds": 600, "max_pending_per_client": 3, "readonly": [], "ssh_path": None}
+            "max_seconds": 600, "max_pending_per_client": 3, "readonly": [], "ssh_path": None,
+            "probe_per_client": 30, "probe_overall": 120, "probe_allow_cidrs": None}
 MAX_COMMAND_CHARS = 4096
 MAX_SCRIPT_BYTES = 32 * 1024
 DEFAULT_TIMEOUT_S = 60
@@ -42,6 +46,12 @@ LABELS = ("host_key_mismatch", "host_not_pinned", "connect_failed", "auth_failed
 _BAD_CHARS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")       # tab and newline are legal
 _HOST_RE = re.compile(r"[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?")
 _FIELDS = {"host", "user", "port", "command", "script", "timeout_s"}
+HOST_STATES = ("new", "same_key_elsewhere", "changed")      # a request for a host the key does not fully pin (execprobe)
+FIRST_USE = "First time seeing this key. Compare the fingerprint with the host before approving."
+CHANGED_TEXT = ("This server's key is not the one you pinned. This is what a man-in-the-middle looks like; it is "
+                "also what a reinstalled or rekeyed server looks like. Approve only if you expect that.")
+_FP_RE = re.compile(r"SHA256:[A-Za-z0-9+/]{43}")
+_KEY_RE = re.compile(r"(?:ssh-ed25519|ecdsa-sha2-nistp(?:256|384|521)|ssh-rsa) [A-Za-z0-9+/]{20,}={0,2}")
 WARNING = ("An agent asked the broker to run this on a remote host over SSH. The text shown is exactly what "
            "will run. Approve only a command you recognise and meant to allow.")
 
@@ -70,7 +80,8 @@ def parse_config(raw, field="exec"):
         raise ValueError(f"{field}.clients must be a list of client ids such as c-1a2b3c4d")
     out["clients"] = sorted(set(out["clients"]))
     for key, lo, hi in (("max_concurrent", 1, 32), ("max_output_bytes", 1024, 16 * 1024 * 1024),
-                        ("max_seconds", 1, 600), ("max_pending_per_client", 1, 20)):
+                        ("max_seconds", 1, 600), ("max_pending_per_client", 1, 20),
+                        ("probe_per_client", 1, 1000), ("probe_overall", 1, 5000)):
         if not _int(out[key]) or not lo <= out[key] <= hi:
             raise ValueError(f"{field}.{key} must be a whole number from {lo} to {hi}")
     ro = out["readonly"]
@@ -78,9 +89,23 @@ def parse_config(raw, field="exec"):
         raise ValueError(f"{field}.readonly must be a list of up to 100 entries, each a program name "
                          "(or an absolute path in a standard bin directory) and up to two plain subcommand words")
     out["readonly"] = sorted(set(ro))
+    cidrs = out["probe_allow_cidrs"]
+    if cidrs is not None:
+        if not isinstance(cidrs, list) or len(cidrs) > 50 or not cidrs:
+            raise ValueError(f"{field}.probe_allow_cidrs must be a list of 1 to 50 CIDR strings (leave it out to allow any "
+                             "destination the guard allows)")
+        nets = []
+        for c in cidrs:
+            try:
+                nets.append(str(ipaddress.ip_network(c, strict=False)) if isinstance(c, str) else None)
+            except ValueError:
+                nets.append(None)
+        if None in nets:
+            raise ValueError(f"{field}.probe_allow_cidrs entries must be CIDR strings such as 10.0.0.0/8")
+        out["probe_allow_cidrs"] = sorted(set(nets))
     sp = out["ssh_path"]
     if sp is not None and not (isinstance(sp, str) and os.path.isabs(sp) and "\x00" not in sp):
-        raise ValueError(f"{field}.ssh_path must be an absolute directory holding ssh, ssh-agent and ssh-add")
+        raise ValueError(f"{field}.ssh_path must be an absolute directory holding ssh, ssh-agent, ssh-add and ssh-keyscan")
     return out
 
 
@@ -457,13 +482,19 @@ def display_text(spec):
 def push_text(spec):
     """One line for a notification: where, as whom, and the command (clipped); never a script body."""
     what = "a script" if "script" in spec else scrub(display_text(spec))[:200]
-    return f"run on {spec['host']} as {spec['user']}: {what}"
+    where = f"{spec['host']}:{spec['port']}" if spec.get("host_state") else spec["host"]
+    lead = {"new": "NEW HOST, ", "same_key_elsewhere": "NEW PORT, SAME KEY, ",
+            "changed": "HOST KEY CHANGED, "}.get(spec.get("host_state"), "")
+    return f"{lead}run on {where} as {spec['user']}: {what}"
 
 
 def audit_fields(spec):
     """Fields for the audit log's `requested` event: the command's first words (each clipped), or for
     a script only its size and SHA-256; where and as whom."""
     out = {"host": spec["host"], "account": spec["user"], "port": spec["port"], "timeout_s": spec["timeout_s"]}
+    if spec.get("host_state"):          # fingerprints are public values and shaped by code (see host_fields_ok)
+        out.update(host_state=spec["host_state"], presented_fp=spec.get("presented_fp"),
+                   pinned_fp=spec.get("pinned_fp"), same_as=spec.get("same_as"))
     if "script" in spec:
         out.update(script_len=len(spec["script"]["text"].encode("utf-8")), script_digest=script_sha256(spec),
                    interpreter=spec["script"]["interpreter"])
@@ -500,6 +531,9 @@ def details_record(spec):
     """What the history pop-over keeps of the request itself (the request-details store, never the audit
     log): the text as shown, and for a script its full text."""
     out = {"shown": display_text(spec), "host": spec["host"], "account": spec["user"]}
+    if spec.get("host_state"):
+        out.update(host_state=spec["host_state"], port=spec["port"], presented_fp=spec.get("presented_fp"),
+                   pinned_fp=spec.get("pinned_fp"), same_as=spec.get("same_as"))
     if "script" in spec:
         out.update(script=spec["script"]["text"], interpreter=spec["script"]["interpreter"])
     return out
@@ -517,6 +551,11 @@ def retained_html(rec):
         return ""
     e = sudomode._esc
     parts = ["<details class=reqdetails open><summary>Remote command</summary>"]
+    if rec.get("host_state") in HOST_STATES:
+        parts.append(f"<p class=note>{html.escape(_STATE_LABEL[rec['host_state']])}: "
+                     f"{html.escape(str(rec.get('host') or ''))}:{html.escape(str(rec.get('port') or ''))}, key "
+                     f"{fp_html(rec.get('presented_fp'))}"
+                     + (f" (pinned {fp_html(rec['pinned_fp'])})" if rec.get("pinned_fp") else "") + "</p>")
     if rec.get("script") is not None:
         parts.append(f"<p class=note>{html.escape(str(rec.get('interpreter') or 'sh'))} script</p>"
                      f"<pre class=reqtext tabindex=0>{e(rec['script'])}</pre>")
@@ -553,4 +592,117 @@ def describe_html(req):
     na = guidance_mod.non_ascii_count(text)
     if na:
         flag += f" <span class='pill warn'>Non-ASCII characters: {na} (shown as U+XXXX)</span>"
-    return f"{where}{body}{flag}", WARNING
+    return f"{host_html(sp)}{where}{body}{flag}", WARNING
+
+
+# ---------------------------------------------------------------- unpinned hosts
+
+_STATE_LABEL = {"new": "New host key", "same_key_elsewhere": "New port, same key", "changed": "HOST KEY CHANGED"}
+
+
+def fp_html(fp):
+    """A fingerprint for a page: only a well-formed `SHA256:...` value is shown (it came from the broker's own probe,
+    never from the agent), anything else is a fixed placeholder; escaped as everything is."""
+    if isinstance(fp, str) and _FP_RE.fullmatch(fp):
+        return f"<code class=fp>{html.escape(fp)}</code>"
+    return "<code>(unavailable)</code>"
+
+
+def _key_fingerprint(key):
+    """The SHA256 fingerprint of a `type base64` key, or None when it does not decode."""
+    try:
+        return sshkey.fingerprint(base64.b64decode(key.split(" ", 1)[1], validate=True))
+    except (IndexError, ValueError, binascii.Error):
+        return None
+
+
+def host_fields_ok(sp):
+    """True when the host-key fields of a request spec are what the broker's probe produces: a known state, SHA256
+    fingerprints, and a `type base64` key. Checked wherever they are used to connect or to persist."""
+    st = sp.get("host_state")
+    return (st in HOST_STATES and bool(_FP_RE.fullmatch(sp.get("presented_fp") or ""))
+            and bool(_KEY_RE.fullmatch(sp.get("presented_key") or ""))
+            and _key_fingerprint(sp["presented_key"]) == sp["presented_fp"]     # what the card shows is what is pinned
+            and (st != "changed" or bool(_FP_RE.fullmatch(sp.get("pinned_fp") or ""))))
+
+
+def _type_html(sp):
+    """` (ssh-ed25519)`: the key type the fingerprint is of (a server has several keys; `ssh-keygen -lf` lists them
+    by type), only when it is one of the known types."""
+    t = sp.get("presented_type")
+    return f" ({html.escape(t)})" if t in sshkey._HOSTKEY_TYPES else ""
+
+
+PROBE_TEXT = {"unreachable": "Could not reach that host.", "not_ssh": "That host did not answer as an SSH server.",
+              "timeout": "That host did not answer in time.", "refused_destination": "That destination is not allowed.",
+              "rate_limited": "Too many host-key checks are running; try again later.",
+              "ssh_unavailable": "The broker cannot read host keys (ssh-keyscan is not installed)."}
+
+
+def probe_text(label):
+    """The fixed sentence for a failed host check (the label is one of execprobe.LABELS; anything else reads as unreachable)."""
+    return PROBE_TEXT.get(label, PROBE_TEXT["unreachable"])
+
+
+def deny_only_html(note):
+    return ("<div class=decide-row><button class='btn deny' name=decision value=deny>Deny</button></div>"
+            f"<p class=scope><small class=muted>{html.escape(note)} Nothing can be approved yet.</small></p>")
+
+
+def host_html(sp):
+    """The block above the command for an unpinned request: what is new, the fingerprint the server presented, and
+    for a changed key a large red caution with both fingerprints. While the host key is being read, or when it could
+    not be, a plain statement of that. Empty for an ordinary request whose host key is checked."""
+    st = sp.get("host_state")
+    if sp.get("probe") == "checking":
+        return ("<div class=hostban style='border:2px solid var(--line);border-radius:.5rem;padding:.5rem .8rem;"
+                "margin:.4rem 0'><b>Checking the host key...</b> The broker is reading the server's key; "
+                "this card can be approved once it has.</div>")
+    if st == "probe_failed":
+        return ("<div class=hostban role=alert style='border:2px solid var(--bad);color:var(--bad);border-radius:.5rem;"
+                f"padding:.5rem .8rem;margin:.4rem 0'><b>{html.escape(probe_text(sp.get('probe_label')))}</b> "
+                f"The host key of {html.escape(sp['host'])}, port {int(sp['port'])}, could not be read, so this "
+                "request cannot be approved. Deny it.</div>")
+    if st not in HOST_STATES:
+        return ""
+    where = f"{html.escape(sp['host'])}, port {int(sp['port'])}"
+    if st == "changed":
+        return ("<div class=hostban role=alert style='border:3px solid var(--bad);background:var(--badbg);"
+                "color:var(--bad);border-radius:.5rem;padding:.7rem .9rem;margin:.4rem 0;font-size:1.05rem'>"
+                f"<b style='font-size:1.25rem'>HOST KEY CHANGED</b> for {where}<br>"
+                f"Presented now: {fp_html(sp.get('presented_fp'))}{_type_html(sp)}<br>"
+                f"Pinned: {fp_html(sp.get('pinned_fp'))}<br>{html.escape(CHANGED_TEXT)}</div>")
+    if st == "same_key_elsewhere":
+        head = (f"A host and port this key has not pinned: {where}. Same key as "
+                f"{html.escape(str(sp.get('same_as') or '?'))}")
+    else:
+        head = f"A host this key has not pinned: {where}"
+    return ("<div class=hostban style='border:2px solid var(--warn);border-radius:.5rem;padding:.5rem .8rem;"
+            f"margin:.4rem 0'><b>{head}.</b><br>Key presented: {fp_html(sp.get('presented_fp'))}{_type_html(sp)}<br>"
+            f"{html.escape(FIRST_USE)}</div>")
+
+
+def host_actions_html(sp, remember_why=None, restricts=True):
+    """The decision controls of an unpinned request. Approve once (nothing is saved) and Deny always; then, only
+    when the key can store it (`remember_why` is None): Approve and remember for a new host or port, or, for a
+    changed key, Approve and replace the pinned key behind an extra tick. No Always, no timed approval, no rule."""
+    st = sp.get("host_state")
+    if sp.get("probe") != "ready" or st not in HOST_STATES:       # not checked, or the check failed: Deny only
+        return deny_only_html("The host key could not be read." if st == "probe_failed" else
+                              "The host key is still being checked.")
+    row = ("<div class=decide-row><button class='btn approve' name=decision value=approve>Approve once</button>"
+           "<button class='btn deny' name=decision value=deny>Deny</button></div>")
+    if remember_why is not None:
+        extra = f"<p class=scope><small class=muted>Not offered: {html.escape(remember_why)}.</small></p>"
+    elif st == "changed":
+        extra = ("<div class=scope><label><input type=checkbox name=confirm_replace value=1> I expect this server's key "
+                 "to have changed, and I want to replace the pinned key with the one shown.</label> "
+                 "<button class='btn sm approve' name=decision value=approve_replace>Approve and replace the pinned "
+                 "key</button></div>")
+    else:
+        extra = ("<div class=scope><button class='btn sm approve' name=decision value=approve_remember>Approve and "
+                 "remember</button> <small class=muted>also pins this key for this host and port on the credential "
+                 + ("(and lets ssh signing with it accept this server)" if restricts else "(the key's ssh signing is "
+                    "not restricted by this)") + "; revoke it in the credential editor.</small></div>")
+    return (row + extra + "<p class=scope><small class=muted>Approves this one command, as shown, connecting only to "
+            "the key shown above. There is no Always or timed approval for an unpinned host.</small></p>")

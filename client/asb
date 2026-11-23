@@ -88,6 +88,10 @@ Updating asb
   off), tell the human and ask before doing anything. Do not update silently. `asb version` shows the
   versions and these steps again.
   {UPDATE_STEPS.replace(chr(10), chr(10) + "  ")}
+  Stale agent instructions: when the block `asb agent-setup` wrote into an instruction file is older than the one
+  this asb writes, asb says so on stderr (once a day; ASB_NO_UPDATE_CHECK=1 turns it off; local files only,
+  nothing is sent) and `asb version` shows `agent instructions:`. Tell the human; do not edit your own
+  instruction files. They run `asb agent-setup` to refresh them.
 """
 
 GUIDE = """asb guide (for agents)
@@ -391,6 +395,10 @@ available, and the release page to get it from. Asks the broker one status quest
 approval); if the broker cannot be reached it still shows the client version. When an
 update is available it prints the steps for an agent: ask the human first, download only
 the release page's asset, verify the .sha256, keep a backup, never pipe a download into a shell.
+The `agent instructions:` line says whether the block `asb agent-setup` put in an instruction file
+(user files and this directory's project files) is "not installed", "up to date" or "out of date: FILE
+(vN, current vM): run asb agent-setup". Local files only; nothing is written. Without a broker it still shows
+all of this.
 example: asb version""",
     "audit": """usage: asb audit [--request ID] [--event E[,E]] [--secret NAME] [--since T]
                  [--until T] [--source S] [--limit N] [--before SEQ | --after SEQ]
@@ -462,22 +470,24 @@ example: asb sudo -- /usr/bin/systemctl restart nginx""",
 Use for any command you would otherwise ssh for. The broker connects to HOST with the SSH key credential NAME,
 runs exactly the command or script you give, and returns the output; the key never leaves the broker. The
 human, the risk check and any auto-approve rule all see the command first, so a plain read-only command
-(systemctl status, docker ps, df, ...) can be approved without a tap. HOST must be a name the key is pinned
-for (its allowed hosts and known_hosts line); ask the human to add it otherwise. Output arrives when the command
+(systemctl status, docker ps, df, ...) can be approved without a tap. A HOST and port the key does not pin
+yet, or whose SSH key changed, is not refused: the human is asked, sees the server's key fingerprint and can approve
+it once or remember it (never an auto-approve rule). Name the host exactly as the human knows it. Output arrives when the command
 ends, not while it runs.
 After -- every word is one argument, joined with shell quoting, so `-- ls -l /var` runs `ls -l /var` and
 `-- echo 'a b'` passes one argument. A pipe, redirect or variable needs a shell: `-- sh -c 'a | b'`, or put
 the lines in a file and use --script (sent byte for byte to `sh -s` or `bash -s` on standard input; at most
 32 KiB of text; the human sees the whole script and its SHA-256). A script or a command with shell syntax
 is never treated as plain read-only: expect a human or the risk check to decide.
---user and --port default to the broker's (port 22). --timeout is seconds, 1 to 600 (default 60), after
+--user defaults to your local $USER (pass --user when the account on HOST differs; with no usable $USER it is
+required); --port defaults to 22. --timeout is seconds, 1 to 600 (default 60), after
 which the broker stops the command. A command is at most 4096 characters; control characters other than
 tab and newline, and hidden characters, are refused before anything is sent.
 Prints the command's stdout and stderr to the same streams and exits with its exit code. If the broker could
 not run it, prints `asb: exec failed: LABEL` and exits 3; LABEL is one of host_key_mismatch, host_not_pinned,
 connect_failed, auth_failed, timeout, output_cap, ssh_unavailable, internal (any output captured before the
 failure is still printed). Output cut at the broker's cap prints `asb: output was truncated at the broker's cap` on stderr.
-Other exits: 2 usage, 3 refused (exec not enabled for this client, host not allowed) or broker error, 4 denied,
+Other exits: 2 usage, 3 refused (exec not enabled for this client, or the host's key could not be read) or broker error, 4 denied,
 5 expired unanswered. A remote exit code can equal one of these; stderr tells them apart. A denial or timeout is
 final: stop and tell the human what you needed.
 example: asb exec agent-ssh nas --user ryan -- systemctl status nginx
@@ -686,17 +696,17 @@ def update_available(have, expected):
     return a + (0,) * (n - len(a)) < b + (0,) * (n - len(b))
 
 
-def _notice_state_path():
+def _notice_state_path(name="update-notice"):
     base = os.environ.get("XDG_STATE_HOME", "")
     if not os.path.isabs(base):
         base = os.path.join(os.path.expanduser("~"), ".local", "state")
-    return os.path.join(base, "asb", "update-notice")
+    return os.path.join(base, "asb", name)
 
 
-def _notice_due():
+def _notice_due(name="update-notice"):
     """True, and recorded, when no notice was shown in the last day. False when one was, or when the record cannot
     be written (a read-only home would otherwise print it on every call). Never raises."""
-    path, now = _notice_state_path(), int(time.time())
+    path, now = _notice_state_path(name), int(time.time())
     try:
         with open(path, encoding="ascii") as f:
             last = int(f.read(40).strip())
@@ -737,6 +747,94 @@ def maybe_update_notice(answer):
         pass
 
 
+AGENT_READ_MAX = 256 * 1024         # an instruction file is small; a bigger one is not read at all
+_agent_notice_done = [False]
+
+
+def _escape_path(path):
+    """A path for a terminal with control and bidi/format characters shown as \\xNN or \\uNNNN, so a hostile
+    directory name cannot move the cursor, recolour the line or hide text. Same rule in crates/asb-cli."""
+    out = []
+    for ch in str(path):
+        o = ord(ch)
+        bad = (o < 32 or 0x7f <= o <= 0x9f or o in (0x2028, 0x2029, 0xfeff) or 0x200b <= o <= 0x200f
+               or 0x202a <= o <= 0x202e or 0x2066 <= o <= 0x2069)
+        out.append((f"\\x{o:02x}" if o < 256 else f"\\u{o:04x}") if bad else ch)
+    return "".join(out)
+
+
+def installed_agent_blocks(home=None, cwd=None, env=None):
+    """[(path, version)] for each instruction file asb agent-setup writes (the three user-scope files and the three
+    project-scope ones for `cwd`) that holds a well-formed block. Local and read-only. A file that is absent, not a
+    regular file, unreadable, over AGENT_READ_MAX, not UTF-8, without a block or with a damaged one is left out:
+    silence, never a guess. A symlink is followed only as far as agent-setup would write (a project file must stay
+    inside the project; a user file's directory must be yours)."""
+    home = home if home is not None else os.path.expanduser("~")
+    cwd = cwd if cwd is not None else os.getcwd()
+    env = env if env is not None else os.environ
+    found, seen = [], set()
+    for scope in ("user", "project"):
+        for agent in AGENT_NAMES:
+            path = agent_targets(agent, scope, home, cwd, env)[1]
+            try:
+                real = os.path.realpath(path)
+                if real in seen:
+                    continue
+                seen.add(real)
+                if scope == "project":
+                    root = os.path.realpath(cwd)
+                    if os.path.commonpath([root, real]) != root:
+                        continue
+                st = os.stat(real)
+                if not stat.S_ISREG(st.st_mode) or st.st_size > AGENT_READ_MAX:
+                    continue
+                if scope == "user" and os.stat(os.path.dirname(real)).st_uid != os.geteuid():
+                    continue
+                fd = os.open(real, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+                with os.fdopen(fd, "rb") as f:
+                    raw = f.read(AGENT_READ_MAX + 1)
+                if len(raw) > AGENT_READ_MAX:
+                    continue
+                block = find_block(raw.decode("utf-8"))
+            except (OSError, ValueError, SetupError):
+                continue
+            if block:
+                found.append((path, block[2]))
+    return found
+
+
+def stale_agent_blocks(found=None):
+    """The installed blocks written by an older asb than this one: [(path, version)]."""
+    return [(p, v) for p, v in (installed_agent_blocks() if found is None else found) if v < AGENT_BLOCK_VERSION]
+
+
+def agent_notice_text(stale):
+    shown = ", ".join(f"{_escape_path(p)} has v{v}" for p, v in stale[:3])
+    if len(stale) > 3:
+        shown += f", and {len(stale) - 3} more"
+    return (f"asb: your agent instructions are out of date ({shown}, this asb writes v{AGENT_BLOCK_VERSION}). "
+            "Ask the human to run `asb agent-setup`; agents: do not edit your own instruction files.")
+
+
+def maybe_agent_notice():
+    """Tell the user, on stderr and at most once a day, that a block `asb agent-setup` wrote is older than this asb's.
+    Local only (nothing is sent anywhere) and read-only; nothing is said when there is no block, a damaged one or a
+    current one. Runs wherever the update notice does, and is off wherever it is (ASB_NO_UPDATE_CHECK, status,
+    version, agent-setup)."""
+    if _agent_notice_done[0] or _notice["off"]:
+        return
+    if os.environ.get("ASB_NO_UPDATE_CHECK", "") not in ("", "0"):
+        return
+    _agent_notice_done[0] = True
+    stale = stale_agent_blocks()
+    if not stale or not _notice_due("agent-notice"):
+        return
+    try:
+        print(agent_notice_text(stale), file=sys.stderr)
+    except (OSError, ValueError):
+        pass
+
+
 def call(base, key, path, body=None, timeout=40):
     req = urllib.request.Request(
         base + path, headers={"X-Client-Key": key, "Content-Type": "application/json", "User-Agent": USER_AGENT},
@@ -745,6 +843,7 @@ def call(base, key, path, body=None, timeout=40):
         with urllib.request.urlopen(req, timeout=timeout) as r:
             answer = json.load(r)
             maybe_update_notice(answer)
+            maybe_agent_notice()
             return r.status, answer
     except urllib.error.HTTPError as e:
         try:
@@ -2706,7 +2805,7 @@ def mask(text, values):
 
 
 # -- agent-setup: instruction block for coding agents (local only) --------------
-AGENT_BLOCK_VERSION = 1
+AGENT_BLOCK_VERSION = 2
 AGENT_MARK = "asb:agent-setup"
 AGENT_BLOCK_BODY = """## Credentials (asb)
 
@@ -2717,6 +2816,7 @@ files or hunt for API keys, and never ask for a secret in chat.
   never reaches you.
 - No credential covers the service: run `asb request-credential`. The human enters the
   value; you never see it.
+- To run something on another machine use `asb exec NAME HOST -- cmd`, not ssh (`asb help exec`).
 - Every use asks the human to approve. A denial or timeout is final: stop and tell them
   what you needed.
 - If `asb` says an update is available, tell the human and ask first; do not update silently.
@@ -3284,6 +3384,11 @@ def run_exec(argv):
         if not _EXEC_USER.fullmatch(f["user"]):
             die("--user must be 1 to 64 printable ASCII characters without spaces")
         payload["user"] = f["user"]
+    else:                       # the local login name by default: the account on the host is usually the same
+        local = os.environ.get("USER", "")
+        if not _EXEC_USER.fullmatch(local) or local.startswith("-"):
+            die("no --user given and $USER is not a usable account name: pass --user NAME")
+        payload["user"] = local
     if "port" in f:
         payload["port"] = exec_number(f["port"], "--port", 1, 65535)
     if "timeout" in f:
@@ -3353,6 +3458,16 @@ def run_sudo(argv):
     die(HELP["sudo"])
 
 
+def agent_instructions_state():
+    """The `agent instructions:` value of `asb version`. Reads the files; never writes, never touches the daily record."""
+    found = installed_agent_blocks()
+    stale = stale_agent_blocks(found)
+    if stale:
+        return ("out of date: " + ", ".join(f"{_escape_path(p)} (v{v}, current v{AGENT_BLOCK_VERSION})"
+                                            for p, v in stale) + ": run asb agent-setup")
+    return "up to date" if found else "not installed"
+
+
 def run_version():
     """The client's version, the broker's expected one and whether to update. One status question; never fails because
     the broker cannot be asked."""
@@ -3369,7 +3484,8 @@ def run_version():
         pass                    # die() already said why on stderr
     newer = update_available(CLI_VERSION, expected)
     update = "unknown" if newer is None else (f"available ({CLI_VERSION} -> {expected})" if newer else "none needed")
-    print(f"asb:      {CLI_VERSION}\nbroker:   {broker}\nupdate:   {update}\nrelease:  {RELEASE_URL}")
+    print(f"asb:      {CLI_VERSION}\nbroker:   {broker}\nupdate:   {update}\nrelease:  {RELEASE_URL}\n"
+          f"agent instructions: {agent_instructions_state()}")
     if newer:
         print("\n" + UPDATE_STEPS)
     return 0
@@ -3383,6 +3499,7 @@ def main(argv):
         print(GUIDE)
         return 0
     if argv[0] == "agent-setup":
+        _notice["off"] = True           # it is about to refresh the very files the notice would name
         return run_agent_setup(argv[1:])
     if argv[0] == "plan" and not any(a in ("-h", "--help") for a in argv[1:3]):
         return run_plan(argv[1:])

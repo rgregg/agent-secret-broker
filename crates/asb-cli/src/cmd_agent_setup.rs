@@ -14,7 +14,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
-const AGENT_NAMES: [&str; 3] = ["claude", "codex", "copilot"];
+pub(crate) const AGENT_NAMES: [&str; 3] = ["claude", "codex", "copilot"];
 
 fn agent_block(eol: &str) -> String {
     let mut lines = vec![
@@ -85,7 +85,7 @@ fn ends(text: &str) -> Vec<(usize, usize)> {
 }
 
 /// (start, end, version) of the marked block, or `None`; an error if it is damaged.
-fn find_block(text: &str) -> Result<Option<(usize, usize, u64)>, String> {
+pub(crate) fn find_block(text: &str) -> Result<Option<(usize, usize, u64)>, String> {
     let marks = any_marks(text);
     let (bs, es) = (begins(text), ends(text));
     if marks == 0 && bs.is_empty() && es.is_empty() {
@@ -247,7 +247,7 @@ fn access(path: &Path, mode: libc::c_int) -> bool {
     })
 }
 
-fn euid() -> u32 {
+pub(crate) fn euid() -> u32 {
     // SAFETY: geteuid has no preconditions.
     unsafe { libc::geteuid() }
 }
@@ -261,7 +261,7 @@ fn which(name: &str, path_var: Option<&str>) -> bool {
 }
 
 /// (config dir that shows the agent is installed, instruction file path)
-fn agent_targets(
+pub(crate) fn agent_targets(
     agent: &str,
     scope: &str,
     home: &str,
@@ -557,6 +557,7 @@ fn write_target(r: &mut Plan) -> std::io::Result<()> {
 }
 
 pub fn run(args: &[String]) -> R {
+    crate::update_notice::silence(); // it is about to refresh the very files the stale-block notice would name
     let help = || text_gen::help("agent-setup").unwrap_or_default();
     let (mut agent, mut scope, mut dry, mut remove) =
         (None::<String>, "user".to_string(), false, false);
@@ -716,7 +717,7 @@ mod tests {
     fn install_update_and_remove_round_trip_on_plain_text() {
         let (installed, st) = apply_block("# mine\n", false).unwrap();
         assert_eq!(st, "installed");
-        assert!(installed.starts_with("# mine\n\n<!-- asb:agent-setup begin v1 -->"));
+        assert!(installed.starts_with("# mine\n\n<!-- asb:agent-setup begin v2 -->"));
         assert_eq!(apply_block(&installed, false).unwrap().1, "unchanged");
         let (removed, st) = apply_block(&installed, true).unwrap();
         assert_eq!((removed.as_str(), st.as_str()), ("# mine\n", "removed"));
@@ -786,6 +787,6 @@ mod tests {
     fn splitlines_of_the_block_text_is_stable() {
         // the embedded body is the Python client's, byte for byte (tests/test_cli_text_sync.py keeps it so)
         assert!(AGENT_BLOCK_BODY.starts_with("## Credentials (asb)"));
-        assert_eq!(AGENT_BLOCK_VERSION, 1);
+        assert_eq!(AGENT_BLOCK_VERSION, 2);
     }
 }

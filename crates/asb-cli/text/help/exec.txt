@@ -4,22 +4,24 @@ usage: asb exec NAME HOST [--user U] [--port P] [--timeout S] -- command [args..
 Use for any command you would otherwise ssh for. The broker connects to HOST with the SSH key credential NAME,
 runs exactly the command or script you give, and returns the output; the key never leaves the broker. The
 human, the risk check and any auto-approve rule all see the command first, so a plain read-only command
-(systemctl status, docker ps, df, ...) can be approved without a tap. HOST must be a name the key is pinned
-for (its allowed hosts and known_hosts line); ask the human to add it otherwise. Output arrives when the command
+(systemctl status, docker ps, df, ...) can be approved without a tap. A HOST and port the key does not pin
+yet, or whose SSH key changed, is not refused: the human is asked, sees the server's key fingerprint and can approve
+it once or remember it (never an auto-approve rule). Name the host exactly as the human knows it. Output arrives when the command
 ends, not while it runs.
 After -- every word is one argument, joined with shell quoting, so `-- ls -l /var` runs `ls -l /var` and
 `-- echo 'a b'` passes one argument. A pipe, redirect or variable needs a shell: `-- sh -c 'a | b'`, or put
 the lines in a file and use --script (sent byte for byte to `sh -s` or `bash -s` on standard input; at most
 32 KiB of text; the human sees the whole script and its SHA-256). A script or a command with shell syntax
 is never treated as plain read-only: expect a human or the risk check to decide.
---user and --port default to the broker's (port 22). --timeout is seconds, 1 to 600 (default 60), after
+--user defaults to your local $USER (pass --user when the account on HOST differs; with no usable $USER it is
+required); --port defaults to 22. --timeout is seconds, 1 to 600 (default 60), after
 which the broker stops the command. A command is at most 4096 characters; control characters other than
 tab and newline, and hidden characters, are refused before anything is sent.
 Prints the command's stdout and stderr to the same streams and exits with its exit code. If the broker could
 not run it, prints `asb: exec failed: LABEL` and exits 3; LABEL is one of host_key_mismatch, host_not_pinned,
 connect_failed, auth_failed, timeout, output_cap, ssh_unavailable, internal (any output captured before the
 failure is still printed). Output cut at the broker's cap prints `asb: output was truncated at the broker's cap` on stderr.
-Other exits: 2 usage, 3 refused (exec not enabled for this client, host not allowed) or broker error, 4 denied,
+Other exits: 2 usage, 3 refused (exec not enabled for this client, or the host's key could not be read) or broker error, 4 denied,
 5 expired unanswered. A remote exit code can equal one of these; stderr tells them apart. A denial or timeout is
 final: stop and tell the human what you needed.
 example: asb exec agent-ssh nas --user ryan -- systemctl status nginx

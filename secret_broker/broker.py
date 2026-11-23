@@ -60,6 +60,7 @@ from . import proposals as proposals_mod
 from . import credreq as credreq_mod
 from . import sudomode as sudo_mod
 from . import execmode as exec_mod
+from . import execprobe as execprobe_mod
 from . import execrun as execrun_mod
 from . import riskmodel as riskmodel_mod
 from . import autorules as autorules_mod
@@ -237,6 +238,9 @@ class Request:
         self._sent_to = None      # leaf transports that sent it; None = all (presence hold)
         self.offered = frozenset()  # action ids offered on any token-carrying transport
         self.apply = None         # guidance proposal: the entry indexes the approver ticked
+        self.exec_settled = threading.Event()   # exec: set when the background host check has been fully acted on
+        self.exec_choice = None   # unpinned exec: what the human chose ("once", "remember", "replace"); None until decided
+        self.exec_channel = None  # unpinned exec: the channel that decision came through (audit)
         self.call_spec = None     # session call: the full call (bodies included) until it has been sent; then None
         self.sess_state = None    # session call: {"sent": bool}, whether the request left the broker
         self.session = None       # http session this call runs in (sessions.py); None for a normal request
@@ -337,6 +341,8 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
         self.credreq_cfg = credreq_mod.parse_config(config.get("credential_requests"))
         self.sudo_cfg = sudo_mod.parse_config(config.get("sudo"))
         self.exec_cfg = exec_mod.parse_config(config.get("exec"))        # (a property: sizes the run slots)
+        self._exec_prober = execprobe_mod.Prober(self.dest_guard, lambda: self.exec_cfg)
+        self.exec_probe = self._exec_prober.probe       # (host, port, client_id) -> keys or {"label"}; tests replace it
         if self.exec_cfg["enabled"] and self._exec_state_dir():
             execrun_mod.sweep(self._exec_state_dir())       # a crashed run may have left an agent and a directory
         self.auto_rules = autorules_mod.parse(config.get("auto_approve"))
@@ -2067,6 +2073,7 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
                 exec_mod.check_allowed(self.exec_cfg, client)   # before anything about the names is revealed
                 exec_mod.validate(spec, self.exec_cfg)
                 self._validate_exec(names, spec, secrets_cfg, internal)
+                self._exec_intake_state(names, spec)
             else:
                 if not names or any(n not in secrets_cfg or n in internal for n in names):
                     if not self._backend_ok:
@@ -2171,12 +2178,22 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
         # unlock while the human is reaching to approve (a backend that cannot
         # or should not do this does not declare "warm")
         self.warm_backend()
+        if mode == "exec":
+            return self._exec_probe_start(req)          # pending at once, whatever the host does; the check runs in the background
         if mode == "guidance":
             return self._propose(req)
         if mode == "credential":
             return self._credential_pending(req)
         if mode == "session":
             return self._session_pending(req)
+        return self._assess_and_route(req)
+
+    def _assess_and_route(self, req):
+        """Rate a request, then let a rule, a policy or a standing approval release it, or ask the human. The rest of
+        create(), also what a pinned remote command continues with once its host key has been checked."""
+        mode, names, spec = req.mode, req.names, req.spec
+        if req.status != "pending":     # denied, expired or revoked while it waited (a remote command waits for its host check)
+            return req
         # ssh_sign never reaches a model, so it carries no guidance either
         notes = {} if mode == "ssh_sign" else guidance_mod.for_names(self.cfg["secrets"], names)
         if mode == "exec":
@@ -2224,6 +2241,8 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
             if mode == "store":
                 req.approver = "policy:auto-create"
             with self._lock:                # no longer pending: a human cannot decide it while it is released
+                if req.status != "pending":
+                    return req
                 req.status = "deciding"
             self._release_by_policy(req, auto_max=auto_max)
             return req
@@ -2501,6 +2520,37 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
         req.risk = {k: a[k] for k in ("level", "model", "reasons")}
         self.audit("assessed", req, model=None, reasons=a["reasons"], summary_source=None,
                    summary_reason=None)
+        try:
+            self._push(req)
+        except Exception:  # noqa: BLE001 -- a request must always settle; the notify error text is never kept
+            self._finish(req, "failed", error="could not notify")
+        return req
+
+    def _exec_unpinned_pending(self, req):
+        """Hand a remote command for a new, same-key-elsewhere or changed host to the human. Assessed like any
+        remote command (description and the model's reasons), but the level is HIGH by code and nothing can
+        approve it but a person on the approval page: no rule, `approval: allow`, grant, Always or SSH-rule chip
+        is consulted, and no notification button exists (as for sudo)."""
+        notes = guidance_mod.for_names(self.cfg["secrets"], req.names)
+        a = self._exec_assess(req, notes)
+        why = {"new": "the host key has not been pinned for this host and port",
+               "same_key_elsewhere": "this host and port are not pinned (the key is pinned on another port)",
+               "changed": "the host key differs from the pinned one"}[req.spec["host_state"]]
+        a["level"], a["reasons"] = "high", [why] + list(a["reasons"])
+        req.summary, req.risk = a["summary"], {k: a[k] for k in ("level", "model", "reasons")}
+        req.summary_model = a.get("summary_model") if a.get("summary_source") != "deterministic" else None
+        req.summary_source = a.get("summary_source")
+        req.summary_reason, req.summary_rule = a.get("summary_reason"), a.get("summary_rule")
+        req.summary_pending = bool(a.get("summary_pending"))
+        if not req.summary_pending:
+            self._count_description(req)
+        self.audit("assessed", req, model=a["model"], reasons=a["reasons"],
+                   summary_source=a.get("summary_source"), summary_reason=a.get("summary_reason"),
+                   summary_rule=a.get("summary_rule"))
+        if a.get("summary_late") is not None:
+            a["summary_late"].add_done_callback(lambda f, r=req: self._description_arrived(r, f))
+        if a.get("rating_late") is not None:
+            a["rating_late"].add_done_callback(lambda f, r=req: self._rating_arrived(r, f))
         try:
             self._push(req)
         except Exception:  # noqa: BLE001 -- a request must always settle; the notify error text is never kept
@@ -2869,24 +2919,103 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
         spec.pop("bind_overflow", None)
 
     def _validate_exec(self, names, spec, secrets_cfg, internal):
-        """The key and host of a remote command (`spec` is already validated and normalized). The host
-        must be NAMED in the key's allowed_hosts (a fingerprint entry is not enough: the broker needs a
-        name to connect to) and have a pinned known_hosts line for that name and port. Refused here,
-        before anything is shown or run; the messages never echo the host."""
+        """The key of a remote command (`spec` is already validated and normalized): exactly one ssh key
+        credential in the catalog. The HOST is judged by _exec_host_state (a host the key does not pin is no
+        longer refused: it goes to a human). The messages never echo the name."""
         if len(names) != 1:
             raise ValueError("a remote command names exactly one ssh key credential")
         n = names[0]
         if n not in secrets_cfg or n in internal:
             raise ValueError("unknown secret name")
-        sc = secrets_cfg[n]
-        if not sc.get("ssh"):
+        if not secrets_cfg[n].get("ssh"):
             raise ValueError("a remote command needs an ssh key credential")
+
+    def _exec_intake_state(self, names, spec):
+        """Mark a validated remote command as waiting for its host check. Nothing is probed here and nothing about the
+        host is looked at but the key's own policy: a host the key pins (a `known_hosts` line for the name and port, and
+        on `allowed_hosts` when there is a list) is an ordinary request that continues once the check shows the same
+        key; any other host is an unpinned request, a human decision whatever the check finds. The request is created
+        and returned to the agent at once either way, so what the agent sees never depends on the host answering."""
+        sc = self.cfg["secrets"][names[0]]
         raw = ((sc.get("_meta") or {}).get("ssh_hosts") or {}).get("known_hosts") or []
-        why = ("not_allowed" if spec["host"] not in ((sc.get("ssh_hosts") or {}).get("allowed") or []) else
-               "not_pinned" if not sshkey.known_host_lines(raw, spec["host"], spec["port"]) else None)
-        if why:      # one text for both: the key's host policy is never shown to an agent; the audit log has the reason
-            self.log("exec_host_refused", reason=why, names=names, port=spec["port"])
-            raise PermissionError("that host is not approved for this key")
+        allowed = (sc.get("ssh_hosts") or {}).get("allowed") or []
+        host, port = spec["host"], spec["port"]
+        pinned = bool(execprobe_mod.host_allowed(allowed, host) and sshkey.known_host_lines(raw, host, port))
+        spec.update(pinned_at_intake=pinned, probe="checking")
+        if not pinned:
+            spec["host_state"] = "checking"
+
+    def _exec_probe_start(self, req):
+        threading.Thread(target=self._exec_probe_job, args=(req,), daemon=True).start()
+        return req
+
+    def _exec_probe_job(self, req):
+        """The background host check of a remote command (see _exec_intake_state). Always ends by settling."""
+        try:
+            self._exec_probe_run(req)
+        except Exception:  # noqa: BLE001 -- a check must always settle on a fixed label; nothing of it is kept
+            try:
+                self._exec_probe_failed(req, "unreachable")
+            except Exception:  # noqa: BLE001
+                pass
+        finally:
+            req.exec_settled.set()
+
+    def _exec_probe_failed(self, req, label):
+        """The check could not read a host key. A host the key pins ends with the label an unreachable host always had;
+        any other host becomes a card that says what happened and offers Deny only (and sends no notification), so the
+        agent's view (pending, then a denial or an expiry) is the same whatever the host did."""
+        sp = req.spec
+        if sp.get("pinned_at_intake"):
+            with self._lock:
+                if req.status != "pending":
+                    return
+                req.status = "deciding"
+            out = self._exec_failed(req, "connect_failed")
+            self._finish(req, "approved", result=out, via="probe")
+            return
+        with self._lock:
+            if req.status != "pending":
+                return
+            sp.update(probe="failed", host_state="probe_failed", probe_label=label)
+            req.risk = {"level": "high", "model": None, "reasons": [exec_mod.probe_text(label)]}
+        self.audit("exec_host_checked", req, host_state="probe_failed", probe_label=label)
+
+    def _exec_probe_run(self, req):
+        sp, names, host, port = req.spec, req.names, req.spec["host"], req.spec["port"]
+        cid = req.client["id"]
+        try:
+            res = self.exec_probe(host, port, cid)
+        except Exception:  # noqa: BLE001 -- nothing of the exception is kept
+            res = {"label": "unreachable"}
+        pinned_before = bool(sp.get("pinned_at_intake"))
+        if "label" in res:
+            self.log("exec_probe", host=host, port=port, outcome=res["label"], pinned=pinned_before, names=names,
+                     **self._client_fields(req.client))
+            return self._exec_probe_failed(req, res["label"])
+        sc = self.cfg["secrets"].get(names[0]) or {}
+        raw = ((sc.get("_meta") or {}).get("ssh_hosts") or {}).get("known_hosts") or []
+        allowed = (sc.get("ssh_hosts") or {}).get("allowed") or []
+        cls = execprobe_mod.classify(host, port, [k["fingerprint"] for k in res["keys"]], raw, allowed)
+        self.log("exec_probe", host=host, port=port, outcome="ok", state=cls["state"], pinned=pinned_before,
+                 names=names, **self._client_fields(req.client))
+        key = next(k for k in res["keys"] if k["fingerprint"] == cls["fingerprint"])
+        with self._lock:
+            if req.status != "pending":
+                return
+            if cls["state"] == "pinned":
+                sp.pop("host_state", None)
+                sp["probe"] = "ready"
+            else:
+                sp.update(host_state=cls["state"], probe="ready", presented_fp=key["fingerprint"],
+                          presented_key=key["key"], presented_type=key["key_type"], pinned_fp=cls["pinned_fp"],
+                          same_as=cls["matches"], probe_address=res.get("address"))
+        if cls["state"] == "pinned":
+            self._assess_and_route(req)
+            return
+        self.audit("exec_host_checked", req, host_state=cls["state"], presented_fp=key["fingerprint"],
+                   pinned_fp=cls["pinned_fp"], same_as=cls["matches"])
+        self._exec_unpinned_pending(req)
 
     @property
     def exec_cfg(self):
@@ -2896,11 +3025,97 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
     def exec_cfg(self, cfg):
         self._exec_cfg = cfg
         self._exec_slots = threading.BoundedSemaphore(cfg["max_concurrent"])     # at most this many ssh runs at once
+        if hasattr(self, "_exec_prober"):
+            self._exec_prober.reconfigure()
 
     def _exec_state_dir(self):
         """Where a run's private directory goes: beside the audit log (the broker's own state directory)."""
         apath = self._audit._path
         return os.path.join(os.path.dirname(os.path.abspath(apath)), "exec") if apath else None
+
+    def _exec_failed(self, req, label):
+        """A remote command that did not run, settled with a label exactly as a failed run is."""
+        out = {"exit_code": None, "stdout": "", "stderr": "", "truncated": False, "label": label}
+        self.audit("exec_finished", req, exit_code=None, stdout_bytes=0, stderr_bytes=0, truncated=False,
+                   label=label, duration_ms=0)
+        self._retain_exec_result(req, out)
+        return out
+
+    def _exec_remember_why(self, req):
+        """None when this unpinned request may also be remembered (pinned on the key), else the reason in words
+        for the card. Needs a backend that can write metadata and room in the key's lists. A key with no
+        `allowed_hosts` list gets only the `known_hosts` line (a list is never created: that would start
+        restricting the key's ordinary ssh signing)."""
+        sc = self.cfg["secrets"].get(req.names[0]) or {}
+        if not sc.get("ssh"):
+            return "this is not an ssh key"
+        if "set_meta" not in self.backend.capabilities:
+            return "this vault cannot store the change"
+        raw = sshhosts_mod.normalize((sc.get("_meta") or {}).get("ssh_hosts"))
+        if len(raw.get("known_hosts", [])) >= sshhosts_mod.MAX_KNOWN or (
+                raw.get("allowed_hosts") and len(raw["allowed_hosts"]) >= sshhosts_mod.MAX_ALLOWED):
+            return "the key's host lists are full"
+        return None
+
+    def _exec_choice_problem(self, req, approve, exec_host, confirm_replace):
+        """A reason a decision on an unpinned exec request is not acceptable, else None. Called under the lock."""
+        if exec_host not in (None, "once", "remember", "replace"):
+            return "unknown choice"
+        if not approve:
+            return "a denial carries no choice" if exec_host is not None else None
+        st = req.spec["host_state"]
+        if exec_host == "remember" and (st == "changed" or self._exec_remember_why(req) is not None):
+            return "remember is not available"
+        if exec_host == "replace" and (st != "changed" or confirm_replace is not True
+                                       or self._exec_remember_why(req) is not None
+                                       or not execprobe_mod.host_allowed(
+                                           ((self.cfg["secrets"].get(req.names[0]) or {}).get("ssh_hosts") or {}).get("allowed"),
+                                           req.spec["host"])):
+            return "replace needs a changed key, its confirmation, a writable policy and a host the key still allows"
+        return None
+
+    def _remember_host(self, name, host, port, presented, user, replace=False, expect_fp=None):
+        """Pin `presented` ({"key": "type base64", "fingerprint"}) for `host`:`port` on credential `name` and allow
+        the host name, in the key's `ssh_hosts` metadata: read, change and write under the config lock, vault
+        first (the same path as _persist_ssh_hosts), memory after. `replace` drops the existing line for this
+        host and port first, and only when the line being replaced is still the one the human saw (`expect_fp`).
+        Never duplicates a line. Returns (the new `ssh_hosts` metadata or None when nothing had to change, the
+        fingerprints that were pinned for this host and port before); raises ValueError for a refusal, BackendError
+        or OSError when the vault write fails (the old metadata is then untouched)."""
+        with self._cfg_lock:
+            sc = self.cfg["secrets"][name]
+            raw = sshhosts_mod.normalize((sc.get("_meta") or {}).get("ssh_hosts"))
+            known, allowed = list(raw.get("known_hosts", [])), list(raw.get("allowed_hosts", []))
+            have = sshkey.known_host_lines(known, host, port)
+            old_fps = sorted(sshkey.parse_known_hosts(have))
+            if replace:
+                if expect_fp not in old_fps:
+                    raise ValueError("the pinned key changed since the card was shown")
+                known = execprobe_mod.drop_pin(known, host, port)
+                have = []
+            want = execprobe_mod.pin_line(host, port, presented["key"])
+            if have and want not in have:
+                raise ValueError("another key is pinned for this host and port")     # a rekey raced a plain remember
+            if want not in have:
+                known.append(want)
+            if replace:                                 # a changed host is allowed by definition: never add, and refuse
+                if allowed and host not in allowed:     # if the list was edited between the card and the click
+                    raise ValueError("the host is no longer allowed on this key")
+            elif allowed and host not in allowed:       # only a list that already exists grows; none is ever created
+                allowed.append(host)
+            if len(known) > sshhosts_mod.MAX_KNOWN or len(allowed) > sshhosts_mod.MAX_ALLOWED:
+                raise ValueError("the key's host lists are full")
+            new = {"known_hosts": known}
+            if allowed:
+                new["allowed_hosts"] = allowed
+            if raw.get("allow_forwarded"):
+                new["allow_forwarded"] = True
+            if new == raw:
+                return None, old_fps
+            parsed = Broker._ssh_hosts(new)
+            self._persist_ssh_hosts(name, new, user)
+            sc["ssh_hosts"] = parsed
+        return new, old_fps
 
     def _exec_run(self, req):
         """Run the approved remote command and return the wire result {"exit_code", "stdout", "stderr",
@@ -2914,7 +3129,33 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
             raise BackendError(f"{name} is no longer an ssh key in the vault catalog")
         raw = ((sc.get("_meta") or {}).get("ssh_hosts") or {}).get("known_hosts") or []
         pinned = (sshkey.known_host_lines(raw, sp["host"], sp["port"])
-                  if sp["host"] in ((sc.get("ssh_hosts") or {}).get("allowed") or []) else [])
+                  if execprobe_mod.host_allowed((sc.get("ssh_hosts") or {}).get("allowed"), sp["host"]) else [])
+        connect_ip = None
+        if sp.get("host_state"):
+            # A host the key does not fully pin: only after a human chose, and only the key shown on the card
+            if req.exec_choice is None or not exec_mod.host_fields_ok(sp):
+                raise BackendError("an unpinned host needs a person's decision")
+            presented = {"key": sp["presented_key"], "fingerprint": sp["presented_fp"]}
+            pinned = [execprobe_mod.pin_line(sp["host"], sp["port"], sp["presented_key"])]
+            try:                        # connect to an address the guard allows NOW (DNS may have moved since the probe)
+                addrs = self.dest_guard.resolve(sp["host"], sp["port"])
+            except OSError:
+                addrs = []
+            if not addrs:               # before anything is saved: a host that cannot be reached is not remembered
+                return self._exec_failed(req, "connect_failed")
+            connect_ip = sp.get("probe_address") if sp.get("probe_address") in addrs else addrs[0]
+            if req.exec_choice in ("remember", "replace"):
+                replace = req.exec_choice == "replace"
+                try:
+                    changed, removed = self._remember_host(name, sp["host"], sp["port"], presented, req.approver,
+                                                           replace=replace, expect_fp=sp.get("pinned_fp"))
+                except (ValueError, OSError, KeyError, BackendError):
+                    self.audit("exec_host_remember_failed", req, host=sp["host"], port=sp["port"], choice=req.exec_choice)
+                    raise BackendError("the host could not be saved to the key's policy") from None
+                self.audit("exec_host_replaced" if replace else "exec_host_remembered", req, host=sp["host"],
+                           port=sp["port"], fingerprint=sp["presented_fp"],
+                           replaced_fingerprint=",".join(removed) if replace else None,
+                           approver=req.approver, channel=req.exec_channel, changed=changed is not None)
         with self._exec_slots:
             (var, ref), = sc["vars"].items()
             pem = self.backend.get(ref["item"], ref.get("field") or "auto")
@@ -2928,7 +3169,7 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
             masker = masking.Masker((text,))
             self.audit("exec_started", req)
             res = execrun_mod.run(sp, (text if text.endswith("\n") else text + "\n").encode(), pinned, cfg,
-                                  masker.mask, workdir_base=self._exec_state_dir())
+                                  masker.mask, workdir_base=self._exec_state_dir(), connect_ip=connect_ip)
         del text, pem
         out = {k: res[k] for k in ("exit_code", "stdout", "stderr", "truncated", "label")}
         self.audit("exec_finished", req, exit_code=res["exit_code"], stdout_bytes=len(res["stdout"].encode()),
@@ -3142,6 +3383,10 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
         elif req.mode == "plan":        # names only: never the task, description or any rule text
             msg = f"{what}\nOpen the approval page to read the plan and approve or deny it."
             title = "Plan requested"
+        elif req.mode == "exec" and req.spec.get("host_state"):     # host and port, never the fingerprint; no buttons
+            msg = f"{what}\n{head}From {req.source}. Open the approval page to compare the host key and approve or deny."
+            title = ("Remote command: host key CHANGED [HIGH]" if req.spec["host_state"] == "changed"
+                     else "Remote command on an unpinned host [HIGH]")
         elif req.mode == "sudo":        # the command is the point; the card has the rest. No buttons below.
             msg = f"{what}\n{head}From {req.source}. Open the approval page to read it and approve or deny."
             title = "Root command requested [HIGH]"
@@ -3155,7 +3400,8 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
             source=req.source if req.mode != "plan" else req.client["name"],
             summary=req.summary, expires_at=req.expires, transport=self.notifier,
             default_policy=self.action_policy)
-        if req.mode in ("guidance", "credential", "plan", "session", "sudo"):
+        if req.mode in ("guidance", "credential", "plan", "session", "sudo") or (
+                req.mode == "exec" and req.spec.get("host_state")):
             # no buttons on any transport: only the dashboard or the link page can decide
             n = dataclasses.replace(n, actions=[], action_token=None, transport_actions={
                 id(leaf): [] for leaf in notify_mod.leaves(self.notifier)})
@@ -3853,7 +4099,8 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
 
     def decide_via(self, channel, rid, decision, actor, *, token=None, always=False,
                    nonce=None, peer=None, client_ip=None, grant_minutes=None, ssh_rule=None,
-                   apply=None, credential=None, rule_scope="client", plan=None, session_limits=None, **audit_extra):
+                   apply=None, credential=None, rule_scope="client", plan=None, session_limits=None,
+                   exec_host=None, confirm_replace=False, **audit_extra):
         """The single entry for every decision. Returns (http_status, req):
         200 decided; 403 wrong/missing token; 404 unknown; 410 already decided,
         expired or token spent (no state change). `decision` is "approve" or
@@ -3921,7 +4168,8 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
                     if match is None:
                         code, refused_log = (403 if cands else 410), True
                     elif ch.token_required and (decision not in match.offered
-                                                or match.mode in ("guidance", "credential", "plan", "session", "sudo")):
+                                                or match.mode in ("guidance", "credential", "plan", "session", "sudo")
+                                                or (match.mode == "exec" and match.spec.get("host_state"))):
                         # Token is valid but this action was never offered (action
                         # policy): refuse like a bad token and do NOT spend it.
                         code, refused_log, unoffered = 403, True, match
@@ -3980,6 +4228,16 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
                         always or grant_minutes is not None or ssh_rule is not None or credential is not None
                         or plan is not None or session_limits is not None):
                     req, code = None, 400   # a remote command is approved once, as shown; standing permission is a rule
+                elif req is not None and req.mode == "exec" and approve and req.spec.get("probe") != "ready":
+                    req, code = None, 400   # the host check is unfinished or failed: nothing can be approved, nothing is claimed
+                elif req is not None and req.mode == "exec" and req.spec.get("host_state"):
+                    # a host the key does not fully pin: a person on a web channel decides, once; the choice
+                    # (once, remember, replace) is validated here against what the card could have offered
+                    problem = self._exec_choice_problem(req, approve, exec_host, confirm_replace)
+                    if problem or ch.token_required:
+                        req, code = None, 400
+                elif req is not None and exec_host is not None:
+                    req, code = None, 400   # a host-key choice on anything else claims nothing
                 if req is not None and req.mode == "session":
                     # no Always, grant or SSH rule; the approver may only shorten the limits
                     fin = sessions_mod.check_limits(session_limits, req.spec) if approve else (0, 0)
@@ -3995,6 +4253,8 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
                         rule_refused, req, code = (req, cls_r), None, 409
                 if req is not None:
                     req.status = "deciding"     # claim it: a second submit must not also act
+                    if req.mode == "exec" and req.spec.get("host_state") and approve:
+                        req.exec_choice, req.exec_channel = exec_host or "once", channel
         if req is None:
             if gone is not None:
                 self._finish(gone, "denied", error="this client was revoked", via="client_revoked")
@@ -6141,6 +6401,12 @@ def _approve_actions(broker, req):
     revoke_hint = "Revoke any time on " + (        # where a standing approval for these secrets is listed and revoked
         credlinks_mod.link(req.names[0], tab="policies", text="the credential's Policies page")
         if len(req.names) == 1 else "the Policies page") + "."
+    if req.mode == "exec" and req.spec.get("probe") == "checking":
+        return exec_mod.deny_only_html("The host key is still being checked.")
+    if req.mode == "exec" and req.spec.get("host_state"):
+        return exec_mod.host_actions_html(
+            req.spec, broker._exec_remember_why(req),
+            restricts=bool(((broker.cfg["secrets"].get(req.names[0]) or {}).get("ssh_hosts") or {}).get("allowed")))
     if req.mode == "exec":          # Approve or Deny only: standing permission for remote commands is a rule
         return ("<div class=decide-row><button class='btn approve' name=decision value=approve>"
                 "Approve</button><button class='btn deny' name=decision value=deny>Deny</button></div>"
@@ -6240,6 +6506,11 @@ def _apply_set(form):
 
 def _fmt_minutes(m):
     return f"{m} min" if m < 60 or m % 60 else f"{m // 60} hr"
+
+
+def _exec_host_choice(decision):
+    """The host-key choice a form button stands for: "remember" or "replace", else None."""
+    return {"approve_remember": "remember", "approve_replace": "replace"}.get(decision)
 
 
 def _parse_decision(decision):
@@ -6364,6 +6635,11 @@ def _detail_html(r, evs, retained=""):
         req_ev, fin = first("requested") or {}, last("exec_finished") or {}
         add("Operation", "run a command or script on a remote host over SSH")
         add("Host", r.get("exec_host"))
+        chk = last("exec_host_checked") or {}
+        if chk.get("host_state"):
+            add("Host key", f"{chk['host_state']}: presented {chk.get('presented_fp')}"
+                              + (f", pinned {chk['pinned_fp']}" if chk.get("pinned_fp") else "")
+                              + (f", check failed: {chk['probe_label']}" if chk.get("probe_label") else ""))
         add("Account", req_ev.get("account"))
         add("Port", req_ev.get("port"))
         if r.get("script_digest"):
@@ -8043,11 +8319,13 @@ def approval_handler(broker):
                 decision = form.get("decision", [""])[0]
                 r = broker._by_id.get(rid)
                 rule = sshrules_mod.parse_decision(decision, form)
-                parsed = ("approve", False, None) if rule else _parse_decision(decision)
+                exec_host = _exec_host_choice(decision)
+                parsed = (("approve", False, None) if rule or exec_host else _parse_decision(decision))
                 if parsed is None or r is None or rule is False:
                     return self._redirect("/?note=stale")
                 code, done = broker.decide_via(
                     "dashboard", rid, parsed[0], user, always=parsed[1], grant_minutes=parsed[2],
+                    exec_host=exec_host, confirm_replace=form.get("confirm_replace", [""])[0] == "1",
                     ssh_rule=rule, apply=_apply_set(form), rule_scope=_rule_scope(form),
                     session_limits=_session_limits(form, r),
                     peer=self._ip, client_ip=self._fwd())
@@ -8195,12 +8473,14 @@ def approval_handler(broker):
             nonce = self._nonce()
             decision = form.get("decision", [""])[0]
             rule = sshrules_mod.parse_decision(decision, form)
-            parsed = (("approve", False, None) if rule else
+            exec_host = _exec_host_choice(decision)
+            parsed = (("approve", False, None) if rule or exec_host else
                       _parse_decision(decision) or ("deny", False, None))
             approve = parsed[0] == "approve"
             code, req = (broker.decide_via("link", None, parsed[0], user, nonce=nonce,
                                            always=parsed[1], grant_minutes=parsed[2],
                                            ssh_rule=rule or None, apply=_apply_set(form),
+                                           exec_host=exec_host, confirm_replace=form.get("confirm_replace", [""])[0] == "1",
                                            rule_scope=_rule_scope(form),
                                            session_limits=_session_limits(form, broker._by_nonce.get(nonce)),
                                            peer=self._ip, client_ip=self._fwd())
@@ -8217,6 +8497,9 @@ def approval_handler(broker):
                 return _page(self, 400, "<h1>Nothing selected</h1>"
                              "<p>Go back, tick at least one entry to apply (or press Deny all). "
                              "The proposal is still waiting.</p>")
+            if code == 400 and held is not None and held.mode == "exec":
+                return _page(self, 400, "<h1>That choice is not available</h1><p>Go back and use one of the buttons "
+                             "on the card. The request is still waiting.</p>")
             if code == 400:
                 return _page(self, 400, "<h1>That duration is not available</h1>"
                              "<p>Go back and pick one of the offered options.</p>")
