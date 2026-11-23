@@ -716,7 +716,7 @@ mod tests {
     fn install_update_and_remove_round_trip_on_plain_text() {
         let (installed, st) = apply_block("# mine\n", false).unwrap();
         assert_eq!(st, "installed");
-        assert!(installed.starts_with("# mine\n\n<!-- asb:agent-setup begin v1 -->"));
+        assert!(installed.starts_with("# mine\n\n<!-- asb:agent-setup begin v2 -->"));
         assert_eq!(apply_block(&installed, false).unwrap().1, "unchanged");
         let (removed, st) = apply_block(&installed, true).unwrap();
         assert_eq!((removed.as_str(), st.as_str()), ("# mine\n", "removed"));
@@ -786,6 +786,6 @@ mod tests {
     fn splitlines_of_the_block_text_is_stable() {
         // the embedded body is the Python client's, byte for byte (tests/test_cli_text_sync.py keeps it so)
         assert!(AGENT_BLOCK_BODY.starts_with("## Credentials (asb)"));
-        assert_eq!(AGENT_BLOCK_VERSION, 1);
+        assert_eq!(AGENT_BLOCK_VERSION, 2);
     }
 }

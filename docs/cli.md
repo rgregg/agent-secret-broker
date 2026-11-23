@@ -356,6 +356,8 @@ tools. Do not put your broker's URL or key in a public repository.
     - `asb which HOST|URL` / `asb list` find the credential and its {{VAR}} names (no approval).
     - `asb http NAME METHOD URL -H 'Authorization: Bearer {{VAR}}'` makes the call;
       the value never reaches you.
+    - To run something on another machine use `asb exec NAME HOST -- cmd`, not ssh
+      (`asb help exec`).
     - Every use asks the user to approve. A denial or timeout is final: stop and
       tell them what you needed.
     - Run `asb guide` for the full manual (store/update, exit codes).

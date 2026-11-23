@@ -9,7 +9,7 @@ pub const GUIDE: &str = include_str!("../text/guide.txt");
 /// The instruction block `asb agent-setup` writes between its markers (without the marker lines).
 pub const AGENT_BLOCK_BODY: &str = include_str!("../text/agent_block_body.txt");
 pub const AGENT_MARK: &str = "asb:agent-setup";
-pub const AGENT_BLOCK_VERSION: u32 = 1;
+pub const AGENT_BLOCK_VERSION: u32 = 2;
 
 /// Where an update comes from, and the steps an agent follows: compiled in, never read from the broker.
 pub const RELEASE_URL: &str = "https://github.com/rgregg/agent-secret-broker/releases/latest";

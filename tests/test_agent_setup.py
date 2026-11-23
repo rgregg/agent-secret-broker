@@ -180,9 +180,9 @@ class Content(Base):
         self.write(self.f, old)
         r = self.asb("--agent", "claude")
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn("updated (v0 -> v1)", r.stdout)
+        self.assertIn("updated (v0 -> v2)", r.stdout)
         text = self.read(self.f, "r")
-        self.assertTrue(text.startswith("intro\n<!-- asb:agent-setup begin v1 -->"))
+        self.assertTrue(text.startswith("intro\n<!-- asb:agent-setup begin v2 -->"))
         self.assertTrue(text.endswith(END + "\noutro\n"))
         self.assertNotIn("stale", text)
 
@@ -426,7 +426,7 @@ class DryRunAndRemove(Base):
     def test_dry_run_new_file_writes_nothing(self):
         r = self.asb("--agent", "claude", "--dry-run")
         self.assertEqual(r.returncode, 0)
-        self.assertIn("+<!-- asb:agent-setup begin v1 -->", r.stdout)
+        self.assertIn("+<!-- asb:agent-setup begin v2 -->", r.stdout)
         self.assertIn("/dev/null", r.stdout)
         self.assertEqual(os.listdir(self.home), [])
 
@@ -448,7 +448,7 @@ class DryRunAndRemove(Base):
         self.asb("--agent", "claude")
         before = self.read(self.f)
         r = self.asb("--agent", "claude", "--remove", "--dry-run")
-        self.assertIn("-<!-- asb:agent-setup begin v1 -->", r.stdout)
+        self.assertIn("-<!-- asb:agent-setup begin v2 -->", r.stdout)
         self.assertEqual(self.read(self.f), before)
 
     def test_dry_run_autodetect_creates_nothing(self):

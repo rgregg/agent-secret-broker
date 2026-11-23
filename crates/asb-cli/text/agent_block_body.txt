@@ -7,6 +7,7 @@ files or hunt for API keys, and never ask for a secret in chat.
   never reaches you.
 - No credential covers the service: run `asb request-credential`. The human enters the
   value; you never see it.
+- To run something on another machine use `asb exec NAME HOST -- cmd`, not ssh (`asb help exec`).
 - Every use asks the human to approve. A denial or timeout is final: stop and tell them
   what you needed.
 - If `asb` says an update is available, tell the human and ask first; do not update silently.
