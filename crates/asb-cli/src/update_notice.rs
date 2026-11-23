@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const NOTICE_EVERY_S: i64 = 86400;
+pub(crate) const NOTICE_EVERY_S: i64 = 86400;
 
 static DONE: AtomicBool = AtomicBool::new(false);
 static OFF: AtomicBool = AtomicBool::new(false);
@@ -50,14 +50,14 @@ pub fn update_available(have: &str, expected: &str) -> Option<bool> {
     Some(a < b)
 }
 
-fn state_path() -> Option<PathBuf> {
+fn state_path(name: &str) -> Option<PathBuf> {
     let base = match std::env::var("XDG_STATE_HOME") {
         Ok(x) if std::path::Path::new(&x).is_absolute() => PathBuf::from(x),
         _ => PathBuf::from(std::env::var("HOME").ok()?)
             .join(".local")
             .join("state"),
     };
-    Some(base.join("asb").join("update-notice"))
+    Some(base.join("asb").join(name))
 }
 
 fn now_s() -> i64 {
@@ -77,7 +77,7 @@ fn due_after(record: &str, now: i64) -> bool {
 
 /// True, and recorded, when no notice was shown in the last day. False when one was, or when the record cannot be
 /// written (a read-only home would otherwise print it on every call). Never fails.
-fn due(path: &std::path::Path, now: i64) -> bool {
+pub(crate) fn due(path: &std::path::Path, now: i64) -> bool {
     if let Ok(f) = std::fs::File::open(path) {
         use std::io::Read;
         let mut buf = Vec::new();
@@ -96,7 +96,21 @@ fn due(path: &std::path::Path, now: i64) -> bool {
     write().is_ok()
 }
 
-fn switched_off() -> bool {
+/// This command shows the state itself (`status`, `version`, `agent-setup`): no notices from it.
+pub(crate) fn is_silenced() -> bool {
+    OFF.load(Ordering::SeqCst)
+}
+
+/// The record of the daily notice called `name` (`update-notice`, `agent-notice`), if a home can be found.
+pub(crate) fn record_path(name: &str) -> Option<PathBuf> {
+    state_path(name)
+}
+
+pub(crate) fn now() -> i64 {
+    now_s()
+}
+
+pub(crate) fn switched_off() -> bool {
     !matches!(
         std::env::var("ASB_NO_UPDATE_CHECK").as_deref(),
         Err(_) | Ok("") | Ok("0")
@@ -125,7 +139,7 @@ pub fn maybe_notice(answer: &Value) {
         return;
     }
     DONE.store(true, Ordering::SeqCst);
-    if let Some(path) = state_path() {
+    if let Some(path) = state_path("update-notice") {
         if due(&path, now_s()) {
             {
                 use std::io::Write;
@@ -168,7 +182,8 @@ pub fn run(rest: &[String]) -> R {
         (Some(false), _) => "none needed".to_string(),
     };
     println!(
-        "asb:      {CLI_VERSION}\nbroker:   {broker}\nupdate:   {update}\nrelease:  {RELEASE_URL}"
+        "asb:      {CLI_VERSION}\nbroker:   {broker}\nupdate:   {update}\nrelease:  {RELEASE_URL}\nagent instructions: {}",
+        crate::agent_notice::state_text()
     );
     if newer == Some(true) {
         println!("\n{UPDATE_STEPS}");
