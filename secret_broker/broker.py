@@ -301,6 +301,8 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
         self._ha_rate = {}              # source ip -> {"t", "n", "drop"}; <= RATE_MAP_CAP
         self._ha_unauth = {"t": 0.0, "n": 0, "drop": 0}   # shared bad-key bucket
         self._ha_rate_lock = threading.Lock()
+        self._app_rate = {}             # approver API, valid tokens: source ip -> {"t", "n", "drop"}
+        self._app_unauth = {"t": 0.0, "n": 0, "drop": 0}  # approver API: shared bucket for refused tokens
         self._tg_refusals = {"t": None, "n": 0, "drop": 0}   # coalescing window for telegram_decide_refused
         self._tg_lock = threading.Lock()
         # the macOS approver app (approver_api.py): None, or {cfg, verifier, feed} plus an `app` notify leaf
@@ -4030,6 +4032,48 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
                      unauthenticated=True)
         return False
 
+    APP_LIMIT_PER_MIN = 60          # approver API, per source IP, valid OIDC tokens
+    APP_UNAUTH_LIMIT_PER_MIN = 120  # approver API: ONE shared bucket for missing/refused tokens
+
+    def app_rate_ok(self, ip):
+        """Fixed-window limit on the approver API per source IP, for requests whose OIDC token
+        verified (the HA hook shape). The first drop in a window is audited."""
+        now = time.time()
+        ip = clients_mod.src_key(ip)
+        with self._ha_rate_lock:
+            st = self._app_rate.get(ip)
+            if st is None:
+                self.rate_map_make_room(self._app_rate, now)
+                st = self._app_rate[ip] = {"t": now, "n": 0, "drop": 0}
+            if now - st["t"] >= 60:
+                st.update(t=now, n=0, drop=0)
+            st["n"] += 1
+            if st["n"] <= self.APP_LIMIT_PER_MIN:
+                return True
+            st["drop"] += 1
+            first = st["drop"] == 1
+        if first:
+            self.log("approver_rate_limited", peer=ip, limit_per_min=self.APP_LIMIT_PER_MIN)
+        return False
+
+    def app_unauth_ok(self, ip):
+        """Shared fixed-window limit for approver API requests whose token was missing or refused.
+        No per-source state, so a flood cannot fill the per-IP map or lock out the real app."""
+        now = time.time()
+        with self._ha_rate_lock:
+            st = self._app_unauth
+            if now - st["t"] >= 60:
+                st.update(t=now, n=0, drop=0)
+            st["n"] += 1
+            if st["n"] <= self.APP_UNAUTH_LIMIT_PER_MIN:
+                return True
+            st["drop"] += 1
+            first = st["drop"] == 1
+        if first:
+            self.log("approver_rate_limited", peer=ip, limit_per_min=self.APP_UNAUTH_LIMIT_PER_MIN,
+                     unauthenticated=True)
+        return False
+
     CSRF_COOKIE = "sb_csrf"
     TEST_NONCE = "test-harness-nonce"
 
@@ -6978,6 +7022,8 @@ def client_handler(broker, client_key):
             return _json(self, code, {"ok": False})
 
         def do_POST(self):
+            if approver_mod.handle(self, broker, "POST", self.path):
+                return
             if self.path.split("?")[0] == "/v1/hooks/ha/decide":
                 return self._ha_decide()
             if self.path.split("?")[0] == "/v1/enroll":
@@ -7117,12 +7163,16 @@ def client_handler(broker, client_key):
             _json(self, 200, out)
 
         def _no_write(self):
+            if approver_mod.handle(self, broker, self.command, self.path):
+                return
             if self._authed():
                 _json(self, 405, {"error": "method not allowed"})
 
         do_PUT = do_PATCH = do_DELETE = _no_write
 
         def do_GET(self):
+            if approver_mod.handle(self, broker, "GET", self.path):
+                return
             u = urllib.parse.urlsplit(self.path)
             if u.path == "/healthz" and broker._is_self_peer(self.client_address[0]):
                 raw = b"ok"         # no information: for a container healthcheck on loopback
