@@ -42,10 +42,13 @@ def rec(event, seq=1, **fields):
 def event_names_in_broker():
     """Every audit event name the broker source can emit."""
     src = ""
-    for mod in ("broker.py", "sshrules.py", "sessions.py"):         # modules that emit audit events
+    # modules that emit audit events (notify.py is not one: its poller's `log` takes a
+    # fixed label that broker.py wraps in a telegram_poll_error event)
+    for mod in ("broker.py", "sshrules.py", "sessions.py", "approver_api.py", "oidc.py"):
         with open(os.path.join(ROOT, "secret_broker", mod)) as f:
             src += f.read()
-    names = set(re.findall(r'\.(?:log|audit)\(\s*"([a-z_]+)"', src))
+    # self.log(...), self._log(...), log(...) and _log(...) forms
+    names = set(re.findall(r'(?:\.|\b)_?(?:log|audit)\(\s*"([a-z_]+)"', src))
     names |= {f"{c}_decide_refused" for c in re.findall(r'self\.log\(f"\{channel\}(_decide_refused)"', src)
               for c in ("dashboard", "push", "ha", "link")}
     names |= set(re.findall(r'self\._finish\(\s*req,\s*"([a-z]+)"', src))
@@ -59,7 +62,8 @@ class Redaction(unittest.TestCase):
         names = event_names_in_broker()
         self.assertGreater(len(names), 35, names)               # the grep itself works
         for n in ("requested", "approved", "http_executed", "client_event", "ha_decide_refused",
-                  "push_decide_refused", "decision_refused", "policy_changed", "assessed"):
+                  "push_decide_refused", "decision_refused", "policy_changed", "assessed",
+                  "approver_auth_refused", "approver_api_discovery_failed", "notify_failed"):
             self.assertIn(n, names)
         unknown = names - set(audit_api.WHITELIST) - audit_api.HIDDEN
         self.assertEqual(unknown, set(), "new audit event: add it to WHITELIST or HIDDEN")
