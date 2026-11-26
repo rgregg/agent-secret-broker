@@ -141,8 +141,12 @@ class ParseConfigTests(unittest.TestCase):
 
 
 class ConfigRulesTests(unittest.TestCase):
-    def tearDown(self):
+    def setUp(self):
+        # production rules for each test; the process-wide switch is restored afterwards
+        # (other modules in the same run turn it on at import)
+        prior = destguard.test_loopback_allowed()
         destguard.allow_loopback_for_tests(False)
+        self.addCleanup(destguard.allow_loopback_for_tests, prior)
 
     def test_allowed_user_required(self):
         for bad in (None, "", 5):
