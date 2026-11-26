@@ -1,0 +1,128 @@
+{
+  "version": 3,
+  "requests": [
+    {
+      "id": "Kj1GZvGJdOU3JxoV_aTa2g",
+      "mode": "http",
+      "created": 1795719249.4102335,
+      "expires": 1795719309.4102335,
+      "credentials": [
+        "svc"
+      ],
+      "client": {
+        "name": "shared key (legacy)",
+        "id": "legacy"
+      },
+      "summary": "Lists the files in a bucket",
+      "summary_source": null,
+      "risk": {
+        "level": "low",
+        "reasons": [
+          "model rated it low"
+        ]
+      },
+      "target": "GET http://api.example.test/v1/files",
+      "details": {
+        "headers": [
+          [
+            "Authorization",
+            "Bearer {{SVC_TOKEN}}"
+          ]
+        ],
+        "headers_total": 1,
+        "headers_truncated": false,
+        "ctype": null,
+        "body": null
+      },
+      "notified": true,
+      "banner_actions": [
+        "deny",
+        "approve"
+      ],
+      "actions": [
+        "deny",
+        "approve",
+        "grant:15",
+        "grant:60",
+        "always"
+      ],
+      "browser_url": "https://secrets.example/a/j4pdMDApbb-zmWQOJ4pfquJFfgqXbJ8b"
+    },
+    {
+      "id": "yp0AMtxaiswUwoPToq_2DA",
+      "mode": "credential",
+      "created": 1795719249.4184117,
+      "expires": 1795720149.4184117,
+      "credentials": [
+        "newapi"
+      ],
+      "client": {
+        "name": "shared key (legacy)",
+        "id": "legacy"
+      },
+      "summary": null,
+      "summary_source": null,
+      "risk": {
+        "level": "high",
+        "reasons": [
+          "credential requests always need a human to supply the value; always high"
+        ]
+      },
+      "target": "Credential requested: newapi",
+      "details": null,
+      "notified": true,
+      "banner_actions": [],
+      "actions": [
+        "deny"
+      ],
+      "browser_url": "https://secrets.example/a/QRaIHVnYxHH77Ty_b9BeD3Fg8Bougbbd"
+    },
+    {
+      "id": "gETteyPmc1A4oCMSd9ulSA",
+      "mode": "http",
+      "created": 1795719249.4233387,
+      "expires": 1795719309.4233387,
+      "credentials": [
+        "svc"
+      ],
+      "client": {
+        "name": "shared key (legacy)",
+        "id": "legacy"
+      },
+      "summary": "Creates a release",
+      "summary_source": null,
+      "risk": {
+        "level": "medium",
+        "reasons": [
+          "model rated it medium"
+        ]
+      },
+      "target": "GET http://api.example.test/v1/releases",
+      "details": {
+        "headers": [
+          [
+            "Authorization",
+            "Bearer {{SVC_TOKEN}}"
+          ]
+        ],
+        "headers_total": 1,
+        "headers_truncated": false,
+        "ctype": null,
+        "body": null
+      },
+      "notified": true,
+      "banner_actions": [
+        "deny",
+        "approve"
+      ],
+      "actions": [
+        "deny",
+        "approve",
+        "grant:15",
+        "grant:60",
+        "always"
+      ],
+      "browser_url": "https://secrets.example/a/pZEANAo-tNh62N2IbBtlIxNZh1J3wl_Q"
+    }
+  ]
+}

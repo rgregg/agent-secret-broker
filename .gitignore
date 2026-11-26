@@ -9,3 +9,7 @@ __pycache__/
 .beads-credential-key
 .beads/proxieddb/
 *.gate.lock*
+
+# Swift (macos/)
+.build/
+.swiftpm/

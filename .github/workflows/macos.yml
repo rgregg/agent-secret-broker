@@ -1,0 +1,27 @@
+name: macos
+
+# The macOS approver app (macos/). Runs only when that code or this workflow changes.
+on:
+  push:
+    paths:
+      - "macos/**"
+      - ".github/workflows/macos.yml"
+  pull_request:
+    paths:
+      - "macos/**"
+      - ".github/workflows/macos.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # ASBApproverKit: models, API client, OIDC/PKCE, token store, long-poll feed (Foundation only).
+  kit:
+    name: ASBApproverKit
+    runs-on: macos-14
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - run: swift --version
+      - run: swift test --package-path macos/ASBApproverKit
