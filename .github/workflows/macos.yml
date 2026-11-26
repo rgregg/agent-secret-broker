@@ -1,6 +1,7 @@
 name: macos
 
-# The macOS approver app (macos/). Runs only when that code or this workflow changes.
+# The macOS approver app (macos/). Runs when that code or this workflow changes, and on every tag push
+# (GitHub does not evaluate path filters for tags), so v* tags attach the app to the release.
 on:
   push:
     paths:
@@ -25,3 +26,127 @@ jobs:
       - uses: actions/checkout@v4
       - run: swift --version
       - run: swift test --package-path macos/ASBApproverKit
+
+  # The ASBApprover menu bar app (macos/ASBApprover, generated with XcodeGen). Without signing secrets
+  # the build is ad-hoc signed and uploaded as an artifact. With MACOS_SIGNING_CERT (a base64 .p12
+  # holding a "Developer ID Application" identity) and MACOS_SIGNING_CERT_PASSWORD it is signed with
+  # Developer ID and the hardened runtime; with MACOS_NOTARY_KEY (a base64 App Store Connect API key
+  # .p8), MACOS_NOTARY_KEY_ID and MACOS_NOTARY_ISSUER as well, it is notarized and stapled.
+  # Secrets cannot appear in `if:`, so the job env carries whether they are set (not their values).
+  app:
+    name: ASBApprover app
+    needs: kit
+    runs-on: macos-14
+    timeout-minutes: 45
+    env:
+      HAS_SIGNING: ${{ secrets.MACOS_SIGNING_CERT != '' && secrets.MACOS_SIGNING_CERT_PASSWORD != '' }}
+      HAS_NOTARY: ${{ secrets.MACOS_SIGNING_CERT != '' && secrets.MACOS_SIGNING_CERT_PASSWORD != '' && secrets.MACOS_NOTARY_KEY != '' && secrets.MACOS_NOTARY_KEY_ID != '' && secrets.MACOS_NOTARY_ISSUER != '' }}
+      APP: macos/ASBApprover/build/Build/Products/Release/ASBApprover.app
+    steps:
+      - uses: actions/checkout@v4
+      - run: xcodebuild -version
+      - name: install XcodeGen
+        run: brew install xcodegen
+      - name: generate the Xcode project
+        run: xcodegen --spec macos/ASBApprover/project.yml
+      - name: build
+        run: >
+          xcodebuild -project macos/ASBApprover/ASBApprover.xcodeproj -scheme ASBApprover
+          -configuration Release -derivedDataPath macos/ASBApprover/build
+          CODE_SIGNING_ALLOWED=NO build
+      - name: ad-hoc sign (no signing secret)
+        if: env.HAS_SIGNING != 'true'
+        run: |
+          codesign --force --options runtime --sign - "$APP"
+          codesign --verify --strict --verbose=2 "$APP"
+      - name: import the Developer ID certificate into a temporary keychain
+        if: env.HAS_SIGNING == 'true'
+        env:
+          MACOS_SIGNING_CERT: ${{ secrets.MACOS_SIGNING_CERT }}
+          MACOS_SIGNING_CERT_PASSWORD: ${{ secrets.MACOS_SIGNING_CERT_PASSWORD }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/asb-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 24)"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          echo "KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
+          security set-keychain-settings -lut 3600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          printf '%s' "$MACOS_SIGNING_CERT" | base64 --decode > "$RUNNER_TEMP/signing.p12"
+          security import "$RUNNER_TEMP/signing.p12" -k "$KEYCHAIN" -P "$MACOS_SIGNING_CERT_PASSWORD" \
+            -f pkcs12 -T /usr/bin/codesign
+          rm -f "$RUNNER_TEMP/signing.p12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" > /dev/null
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+      - name: sign with Developer ID (hardened runtime)
+        if: env.HAS_SIGNING == 'true'
+        run: |
+          IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN" | awk '/Developer ID Application/ {print $2; exit}')"
+          test -n "$IDENTITY" || { echo "no Developer ID Application identity in MACOS_SIGNING_CERT"; exit 1; }
+          codesign --force --timestamp --options runtime --keychain "$KEYCHAIN" --sign "$IDENTITY" "$APP"
+          codesign --verify --strict --verbose=2 "$APP"
+      - name: notarize and staple
+        if: env.HAS_NOTARY == 'true'
+        env:
+          MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_ISSUER: ${{ secrets.MACOS_NOTARY_ISSUER }}
+        run: |
+          KEY="$RUNNER_TEMP/notary.p8"
+          trap 'rm -f "$KEY"' EXIT
+          printf '%s' "$MACOS_NOTARY_KEY" | base64 --decode > "$KEY"
+          ditto -c -k --keepParent "$APP" "$RUNNER_TEMP/notarize.zip"
+          # notarytool can exit 0 with status "Invalid": decide on the reported status.
+          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" --key "$KEY" --key-id "$MACOS_NOTARY_KEY_ID" \
+            --issuer "$MACOS_NOTARY_ISSUER" --wait --timeout 30m --output-format json > "$RUNNER_TEMP/notary.json" || true
+          cat "$RUNNER_TEMP/notary.json"
+          STATUS="$(jq -r '.status // empty' "$RUNNER_TEMP/notary.json" || true)"
+          if [ "$STATUS" != "Accepted" ]; then
+            ID="$(jq -r '.id // empty' "$RUNNER_TEMP/notary.json" || true)"
+            if [ -n "$ID" ]; then
+              xcrun notarytool log "$ID" --key "$KEY" --key-id "$MACOS_NOTARY_KEY_ID" --issuer "$MACOS_NOTARY_ISSUER" || true
+            fi
+            echo "notarization status: ${STATUS:-none}"
+            exit 1
+          fi
+          xcrun stapler staple "$APP"
+          xcrun stapler validate "$APP"
+      - name: zip the app
+        run: |
+          mkdir -p dist
+          ditto -c -k --keepParent "$APP" dist/ASBApprover-macos.zip
+          (cd dist && shasum -a 256 ASBApprover-macos.zip > ASBApprover-macos.zip.sha256)
+          echo "signed with Developer ID: $HAS_SIGNING; notarized: $HAS_NOTARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ASBApprover-macos
+          path: dist/
+          if-no-files-found: error
+      - name: remove the temporary keychain
+        if: always() && env.KEYCHAIN != ''
+        run: security delete-keychain "$KEYCHAIN" || true
+
+  # A pushed v* tag attaches the app zip to the GitHub release (created here if the ci workflow has
+  # not created it yet). Path filters are not evaluated for tag pushes, so every tag runs this
+  # workflow. Only this job can write to the repository, and it sees no signing secrets.
+  app-release:
+    name: attach the app to the release
+    needs: app
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ASBApprover-macos
+          path: dist
+      - name: upload to the release
+        run: |
+          gh release view "$TAG" >/dev/null 2>&1 \
+            || gh release create "$TAG" --title "$TAG" --generate-notes \
+            || gh release view "$TAG" >/dev/null      # the ci workflow created it meanwhile
+          gh release upload "$TAG" dist/ASBApprover-macos.zip dist/ASBApprover-macos.zip.sha256 --clobber

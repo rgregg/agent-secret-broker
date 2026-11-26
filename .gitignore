@@ -13,3 +13,7 @@ __pycache__/
 # Swift (macos/)
 .build/
 .swiftpm/
+# XcodeGen output and local builds (macos/ASBApprover)
+macos/ASBApprover/*.xcodeproj/
+macos/ASBApprover/Info.plist
+macos/ASBApprover/build/
