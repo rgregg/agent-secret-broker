@@ -84,10 +84,10 @@ final class Notifications: NSObject, UNUserNotificationCenterDelegate {
         let note = UNNotificationRequest(identifier: id, content: content, trigger: nil)
         // After a relaunch every notified request is "new" to the feed: do not alert twice for a
         // banner that is still on screen.
-        center.getDeliveredNotifications { [weak self] delivered in
+        center.getDeliveredNotifications { delivered in
             let shown = delivered.contains { $0.request.identifier == id }
             guard !shown else { return }
-            Task { @MainActor in
+            Task { @MainActor [weak self] in
                 self?.center.add(note) { _ in }
             }
         }
@@ -101,10 +101,10 @@ final class Notifications: NSObject, UNUserNotificationCenterDelegate {
 
     /// Removes delivered banners whose request is no longer pending.
     func removeDelivered(notIn pending: Set<String>) {
-        center.getDeliveredNotifications { [weak self] delivered in
+        center.getDeliveredNotifications { delivered in
             let stale = delivered.map { $0.request.identifier }.filter { !pending.contains($0) }
             guard !stale.isEmpty else { return }
-            Task { @MainActor in
+            Task { @MainActor [weak self] in
                 self?.removeDelivered(stale)
             }
         }

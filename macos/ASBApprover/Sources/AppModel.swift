@@ -47,6 +47,11 @@ final class AppModel {
     private let webAuth = WebAuthSession()
     @ObservationIgnored private var workspaceObservers: [NSObjectProtocol] = []
     @ObservationIgnored private var launched = false
+    /// False until the current feed delivers its first page. Banner actions that arrive before
+    /// then (the app relaunched by a banner button, or any launch race) wait in
+    /// `queuedBannerActions` and are checked against that page.
+    @ObservationIgnored private var receivedFirstPage = false
+    @ObservationIgnored private var queuedBannerActions: [(id: String, decision: Decision)] = []
 
     let notifications: Notifications
     let presence: PresenceReporter
@@ -60,21 +65,24 @@ final class AppModel {
         loginItem = LoginItem()
         device = Self.deviceLabel(Host.current().localizedName)
         brokerURLText = UserDefaults.standard.string(forKey: Self.brokerURLKey) ?? ""
-    }
-
-    // MARK: - Launch
-
-    /// Called from `applicationDidFinishLaunching` (the notification delegate is set earlier, in
-    /// `applicationWillFinishLaunching`, so a banner action that launched the app is not lost).
-    func launch() {
-        guard !launched else { return }
-        launched = true
+        // Wired here rather than in `launch()`: the model is created in
+        // `applicationWillFinishLaunching`, before any notification response can be delivered.
         notifications.onAction = { [weak self] id, decision in
             self?.decideFromBanner(id: id, decision)
         }
         notifications.onOpen = { [weak self] id in
             self?.focus(id)
         }
+    }
+
+    // MARK: - Launch
+
+    /// Called from `applicationDidFinishLaunching`. The notification delegate and the banner
+    /// handlers are set earlier (`applicationWillFinishLaunching`), so a banner action that launched
+    /// the app reaches the model; it is queued until the first page and validated against it.
+    func launch() {
+        guard !launched else { return }
+        launched = true
         Task { [weak self] in
             let allowed = await Notifications.requestAuthorization()
             self?.notificationsDenied = !allowed
@@ -93,8 +101,17 @@ final class AppModel {
                     self.startFeed()
                 } else {
                     self.state = .signedOut
+                    // No session: this feed never starts, so later banner actions are dropped
+                    // at once (`feed == nil`) instead of queuing for a page that never comes.
+                    self.feedTask?.cancel()
+                    self.feedTask = nil
+                    self.feed = nil
+                    self.api = nil
+                    self.dropQueuedBannerActions()
                 }
             }
+        } else {
+            dropQueuedBannerActions()       // no session: nothing can decide them
         }
     }
 
@@ -171,6 +188,7 @@ final class AppModel {
         feed = nil
         api = nil
         oidc = nil
+        dropQueuedBannerActions()
         requests = []
         expandedIDs = []
         busyIDs = []
@@ -186,6 +204,7 @@ final class AppModel {
         self.oidc = client
         self.api = api
         self.feed = feed
+        receivedFirstPage = false
         feedTask?.cancel()
         feedTask = Task { [weak self] in
             for await event in feed.updates {
@@ -218,6 +237,10 @@ final class AppModel {
             }
             // Also banners left over from an earlier run, or posted for rows that vanished meanwhile.
             notifications.removeDelivered(notIn: ids)
+            if !receivedFirstPage {
+                receivedFirstPage = true
+                applyQueuedBannerActions()
+            }
         case .newlyNotified(let notified):
             guard state != .signedOut else { return }
             for request in notified {
@@ -239,6 +262,8 @@ final class AppModel {
             requests = []
             expandedIDs = []
             busyIDs = []
+            dropQueuedBannerActions()
+            receivedFirstPage = true        // stopped feed: later banner actions find no row and are dropped
             notifications.removeAllDelivered()
         }
     }
@@ -251,8 +276,17 @@ final class AppModel {
         send(id: request.id, decision)
     }
 
-    /// A banner button. The banner offered only the request's `banner_actions`.
+    /// A banner button. The banner offered only the request's `banner_actions`. Before the first
+    /// page the list is not known yet, so the action is queued (never sent unchecked).
     private func decideFromBanner(id: String, _ decision: Decision) {
+        if launched && feed == nil {
+            notifications.removeDelivered([id])     // signed out: no page will come
+            return
+        }
+        guard receivedFirstPage else {
+            queuedBannerActions.append((id: id, decision: decision))
+            return
+        }
         guard let request = requests.first(where: { $0.id == id }),
               request.bannerActions.contains(decision), request.actions.contains(decision) else {
             // Not shown any more (decided elsewhere, expired): drop the stale banner.
@@ -260,6 +294,24 @@ final class AppModel {
             return
         }
         send(id: id, decision)
+    }
+
+    /// The first page arrived: each queued action is sent only if its request is in the page and
+    /// the decision is in that request's `banner_actions` and `actions`; otherwise its banner is
+    /// removed and nothing is sent.
+    private func applyQueuedBannerActions() {
+        let queued = queuedBannerActions
+        queuedBannerActions = []
+        for action in queued {
+            decideFromBanner(id: action.id, action.decision)
+        }
+    }
+
+    /// No session will deliver a page: forget queued actions and remove their banners.
+    private func dropQueuedBannerActions() {
+        let ids = queuedBannerActions.map { $0.id }
+        queuedBannerActions = []
+        notifications.removeDelivered(ids)
     }
 
     private func send(id: String, _ decision: Decision) {
