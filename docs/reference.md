@@ -1255,7 +1255,7 @@ every `/v1/approver/*` path answers 404 and nothing else changes. Config:
       "username_claim": "preferred_username",     // optional, default shown
       "required_group": "asb-approvers",          // optional: must be in the token's `groups`
       "scopes": ["openid", "profile", "offline_access"],   // optional, default shown
-      "actions": {"approve_max_risk": "medium"}   // optional: narrows the banner buttons
+      "actions": {"approve_max_risk": "medium"}   // optional: the app banners' action policy
     }
 
 - `issuer` and `client_id` are required; `issuer` must be an `https://` URL. Unknown keys are
@@ -1263,8 +1263,11 @@ every `/v1/approver/*` path answers 404 and nothing else changes. Config:
   must be set: the token's `username_claim` must equal it.
 - `scopes` are what the app asks the provider for (served by `/v1/approver/config`).
   `offline_access` lets the app refresh its token without signing you in again.
-- `actions` has the same shape as the `actions` object of a `notify` entry and narrows only the
-  buttons on the app's banners. The popover's buttons come from each request's `actions` list.
+- `actions` has the same shape as the `actions` object of a `notify` entry. For the app's banners
+  it replaces `notify_actions` (like a per-entry `actions` object does for its transport), so it can
+  offer fewer or more banner buttons than other transports; it changes nothing else. The popover's
+  buttons come from each request's `actions` list, and `decide` still accepts only a decision that
+  list offers.
 - Discovery (`<issuer>/.well-known/openid-configuration`, then its `jwks_uri`) runs at startup
   through the same outbound guard as other operator-configured calls. If it fails the broker still
   starts, logs one `approver_api_discovery_failed` warning, and answers 503 until a refetch succeeds.
@@ -1277,15 +1280,29 @@ Anything running as you on the Mac where the approver app is signed in can act a
   key is refused on `/v1/approver/*`, but a stolen approver token works from anywhere that can reach
   the port. The client listener has no trusted-peer allow-list; restrict who can reach it at the
   network level if that matters.
-- The identity provider must issue JWT access tokens (Authentik, Keycloak, Auth0, Okta and Entra
-  can). Providers whose access tokens are opaque are not supported.
+- The identity provider must issue JWT access tokens whose `aud` the broker can match (see Token
+  rules). Providers whose access tokens are opaque are not supported. The tested design target is
+  Authentik (example below). Notes on others, untested:
+  - Keycloak: add an audience mapper to the client so `aud` contains the client id (by default
+    `aud` is the string `account`), or set `audience` to what your tokens carry.
+  - Okta: the org authorization server puts the org URL in `aud`; use a custom authorization
+    server, or set `audience` to the value its tokens carry.
+  - Entra ID: expose a custom API scope, list it in `scopes`, and set `audience` to match. Tokens
+    for Microsoft Graph cannot be validated by anyone but Graph.
+  - Auth0: not supported in this version. Auth0 issues a JWT access token only when the authorize
+    request carries an `audience` parameter, and the app does not send one yet.
+- An agent that can drive a browser where you are signed in to the identity provider could complete
+  the app's PKCE sign-in itself; that is the same power as clicking Approve on the dashboard in that
+  browser. Require explicit consent for the approver client at the provider, and keep access-token
+  lifetimes short.
 - To cut the app off: revoke its sessions (refresh tokens) at the identity provider, or remove
   `approver_api` and restart. Access tokens already issued work until they expire, normally minutes.
 - The app's banner shows only the same title and text line as a Web Push notification, never the
   request details. Request text in the app is shown as plain text.
 - Requests in the modes `guidance`, `credential`, `plan`, `session` and `sudo`, and `exec`
   requests that need host-state input, can only be denied in the app (`actions: ["deny"]`); the
-  row carries a `browser_url` for the approval site.
+  row carries a `browser_url` for the approval site. An `exec` request whose host check has not
+  finished (or failed) is also deny-only in the app until the check is ready.
 
 #### Token rules
 
@@ -1307,8 +1324,9 @@ and a flood of made-up `kid`s cannot make the broker hammer the provider.
 
 #### Endpoints
 
-All on the client listener; all answers are JSON; request bodies are JSON, at most 4 KB. Any other
-method on these paths answers 405.
+All on the client listener; all answers are JSON; request bodies are JSON, at most 4 KB. `PUT`,
+`PATCH` and `DELETE` (and the wrong one of `GET`/`POST`) on these paths answer 405; `HEAD` and
+`OPTIONS` are not implemented on the client listener and answer 501.
 
 | Request | Auth | Answer |
 | --- | --- | --- |
@@ -1377,7 +1395,8 @@ fake presence.
 #### Audit
 
 The approver is recorded as `app:<username>`, with `channel: app`, `device` (a label chosen by the
-app: at most 64 characters of `A-Za-z0-9_.:-`, asserted not verified), `approver_ip` and `token_id`
+app: at most 64 characters of `A-Za-z0-9_.:-`, asserted not verified), `approver_peer` (the
+connecting address; `approver_ip` is null, since the client listener reads no proxy header) and `token_id`
 (the token's `jti`, or the first 16 hex characters of its SHA-256). New events, all hidden from the
 agent audit API:
 

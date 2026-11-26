@@ -10,9 +10,10 @@ request is waiting, and clicking the notification or the menubar icon shows the 
 you decide them.
 
 The app signs in to an OIDC provider itself and calls a new broker API with a bearer token that **the
-broker validates**. That works with any OIDC provider (Authentik, Keycloak, Auth0, Okta, Entra, ...) and
-with or without an SSO proxy in front of the web app: not every install uses Authentik the way the author's
-does.
+broker validates**. That is not tied to one provider (the tested design target is Authentik; Keycloak,
+Okta and Entra need audience setup, and Auth0 needs an `audience` authorize parameter the app does not send
+yet, so it is not supported in this version) and works with or without an SSO proxy in front of the web
+app: not every install uses Authentik the way the author's does.
 
 An iPhone app is planned later. This design builds the parts both apps share (sign-in, API client, request
 models, the broker API) so the iPhone app is a second front end, not a second project.
@@ -120,8 +121,9 @@ today.
 - Checks: signature against the cached JWKS; `iss` equals `issuer` exactly; `aud` contains `audience` (or
   `azp` equals it when `aud` is a list); `exp` and `nbf` with 60 s skew; username claim equals
   `allowed_user`; `required_group`, if set, is in `groups`.
-- The provider must issue JWT access tokens (Authentik, Keycloak, Auth0, Okta and Entra do; providers with
-  opaque access tokens are not supported in this version, which the docs say).
+- The provider must issue JWT access tokens whose `aud` matches `audience` (providers with opaque access
+  tokens are not supported in this version, which the docs say, with per-provider notes: Authentik is the
+  tested target; Keycloak, Okta and Entra need audience setup; Auth0 is not supported yet).
 - The agent client key is refused on `/v1/approver/*` (401), and a JWT is refused on every other client
   listener path (401), like the HA hook key.
 - Refusals are audited as `approver_auth_refused` with a fixed reason (`missing`, `malformed`, `alg`,
