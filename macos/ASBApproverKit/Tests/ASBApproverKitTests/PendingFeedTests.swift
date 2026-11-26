@@ -50,10 +50,8 @@ final class PendingFeedTests: XCTestCase {
                 c += 1
                 return c
             }
-            if n > pages.count {
-                Thread.sleep(forTimeInterval: 0.05)    // a long poll that keeps answering the same page
-            }
-            return .raw(200, pages[min(n, pages.count) - 1])
+            // after the three pages: a long poll that keeps answering the same page
+            return .raw(200, pages[min(n, pages.count) - 1]).after(n > pages.count ? 0.05 : 0)
         }
         let (f, events) = feed(s)
         await f.start()
@@ -93,10 +91,7 @@ final class PendingFeedTests: XCTestCase {
                 decided.update { $0 = true }
                 return .json(410, ["ok": false])
             case "/v1/approver/pending":
-                if rec.query["since"] != nil {
-                    Thread.sleep(forTimeInterval: 0.05)
-                }
-                return .raw(200, decided.get ? afterData : before)
+                return .raw(200, decided.get ? afterData : before).after(rec.query["since"] != nil ? 0.05 : 0)
             default:
                 return .json(404, ["error": "not found"])
             }
@@ -165,10 +160,7 @@ final class PendingFeedTests: XCTestCase {
             if n == 2 {
                 throw URLError(.cannotConnectToHost)
             }
-            if n > 3 {
-                Thread.sleep(forTimeInterval: 0.05)
-            }
-            return .raw(200, same)
+            return .raw(200, same).after(n > 3 ? 0.05 : 0)
         }
         let (f, events) = feed(s, sleep: { _ in })
         await f.start()

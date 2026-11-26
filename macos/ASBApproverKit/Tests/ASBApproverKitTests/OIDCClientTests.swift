@@ -203,10 +203,7 @@ final class OIDCClientTests: XCTestCase {
 
     func testConcurrentRefreshesShareOne() async throws {
         let fresh = try Self.tokenBody(access: "new", refresh: "r2")
-        let s = server { _ in
-            Thread.sleep(forTimeInterval: 0.3)         // keep the first refresh in flight
-            return .raw(200, fresh)
-        }
+        let s = server { _ in .raw(200, fresh).after(0.3) }    // keep the first refresh in flight
         let store = MemoryTokenStore(Tokens(accessToken: "old", refreshToken: "r1",
                                             expiresAt: start.addingTimeInterval(3600)))
         let client = oidc(s, store: store)
@@ -217,30 +214,36 @@ final class OIDCClientTests: XCTestCase {
         XCTAssertEqual(s.recorded(path: "/token").count, 1)
     }
 
+    // The two races below drive `TokenState` directly: the refresh's `perform` suspends on a gate
+    // that opens only after the sign-out / sign-in has run, so the refresh always finishes late.
+
     /// A refresh still in flight when the user signs out must not sign them back in.
     func testSignOutDuringRefreshStaysSignedOut() async throws {
-        let late = try Self.tokenBody(access: "resurrected", refresh: "r2")
-        let s = server { _ in
-            Thread.sleep(forTimeInterval: 0.5)         // the response arrives after the sign-out
-            return .raw(200, late)
-        }
         let store = MemoryTokenStore(Tokens(accessToken: "old", refreshToken: "r1",
                                             expiresAt: start.addingTimeInterval(3600)))
-        let client = oidc(s, store: store)
-        let refreshing = Task { try await client.refreshAfter401() }
-        try await Task.sleep(nanoseconds: 100_000_000)  // the refresh is in flight
-        await client.signOut()
+        let state = TokenState(store: store)
+        let started = Gate()
+        let release = Gate()
+        let refreshing = Task {
+            try await state.refresh { _ in
+                started.open()
+                await release.wait()
+                return Tokens(accessToken: "resurrected", refreshToken: "r2")
+            }
+        }
+        await started.wait()                    // the refresh is in flight
+        await state.signOut()
+        release.open()                          // its response arrives after the sign-out
         let outcome = await refreshing.result
         XCTAssertThrowsError(try outcome.get()) {
             XCTAssertEqual($0 as? OIDCError, .signInRequired)
         }
-        try await Task.sleep(nanoseconds: 600_000_000)  // past the delayed response
         XCTAssertNil(store.load())
-        let signedIn = await client.isSignedIn()
-        XCTAssertFalse(signedIn)
+        let current = await state.current()
+        XCTAssertNil(current)
         do {
-            _ = try await client.accessToken()
-            XCTFail("signed out")
+            _ = try await state.refresh { _ in Tokens(accessToken: "never") }
+            XCTFail("signed out: nothing to refresh with")
         } catch {
             XCTAssertEqual(error as? OIDCError, .signInRequired)
         }
@@ -248,26 +251,27 @@ final class OIDCClientTests: XCTestCase {
 
     /// A new sign-in during a refresh wins; the waiter gets the new session's token.
     func testExchangeDuringRefreshKeepsNewSession() async throws {
-        let late = try Self.tokenBody(access: "stale", refresh: "r2")
-        let fresh = try Self.tokenBody(access: "new-session", refresh: "n1")
-        let s = server { rec in
-            if rec.form["grant_type"] == "refresh_token" {
-                Thread.sleep(forTimeInterval: 0.5)
-                return .raw(200, late)
-            }
-            return .raw(200, fresh)
-        }
         let store = MemoryTokenStore(Tokens(accessToken: "old", refreshToken: "r1",
                                             expiresAt: start.addingTimeInterval(3600)))
-        let client = oidc(s, store: store)
-        let refreshing = Task { try await client.refreshAfter401() }
-        try await Task.sleep(nanoseconds: 100_000_000)
-        try await client.exchange(code: "c", pkce: PKCE.make())
+        let state = TokenState(store: store)
+        let started = Gate()
+        let release = Gate()
+        let refreshing = Task {
+            try await state.refresh { _ in
+                started.open()
+                await release.wait()
+                return Tokens(accessToken: "stale", refreshToken: "r2")
+            }
+        }
+        await started.wait()
+        await state.signIn(Tokens(accessToken: "new-session", refreshToken: "n1"))
+        release.open()
         let token = try await refreshing.value
-        XCTAssertEqual(token, "new-session")
-        try await Task.sleep(nanoseconds: 600_000_000)
+        XCTAssertEqual(token.accessToken, "new-session")
         XCTAssertEqual(store.load()?.accessToken, "new-session")
         XCTAssertEqual(store.load()?.refreshToken, "n1")
+        let current = await state.current()
+        XCTAssertEqual(current?.accessToken, "new-session")
     }
 
     func testDiscoveryChecksIssuer() async throws {

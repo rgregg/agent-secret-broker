@@ -20,6 +20,16 @@ struct StubResponse: Sendable {
         for (k, v) in headers { h[k] = v }
         return StubResponse(status: status, headers: h, body: body)
     }
+
+    /// Seconds before the response is delivered. Delivery is scheduled on a global queue, so a
+    /// slow answer never blocks the URL loading thread (or other tests' stub traffic).
+    var delay: TimeInterval = 0
+
+    func after(_ seconds: TimeInterval) -> StubResponse {
+        var r = self
+        r.delay = seconds
+        return r
+    }
 }
 
 /// One recorded request (URLSession turns `httpBody` into a stream; the body is read back here).
@@ -109,15 +119,36 @@ final class StubURLProtocol: URLProtocol {
                 client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
                 return
             }
-            client?.urlProtocol(self, didReceive: resp, cacheStoragePolicy: .notAllowed)
-            client?.urlProtocol(self, didLoad: r.body)
-            client?.urlProtocolDidFinishLoading(self)
+            if r.delay > 0 {
+                DispatchQueue.global().asyncAfter(deadline: .now() + r.delay) { [self] in
+                    deliver(resp, r.body)
+                }
+            } else {
+                deliver(resp, r.body)
+            }
         } catch {
             client?.urlProtocol(self, didFailWithError: error)
         }
     }
 
-    override func stopLoading() {}
+    private let stateLock = NSLock()
+    private var stopped = false
+
+    private func deliver(_ resp: HTTPURLResponse, _ body: Data) {
+        stateLock.lock()
+        let cancelled = stopped
+        stateLock.unlock()
+        guard !cancelled else { return }        // the task was cancelled meanwhile
+        client?.urlProtocol(self, didReceive: resp, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: body)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {
+        stateLock.lock()
+        stopped = true
+        stateLock.unlock()
+    }
 
     static func body(of request: URLRequest) -> Data? {
         if let b = request.httpBody { return b }
@@ -290,5 +321,34 @@ extension FeedEvent {
         case .unreachable: return "unreachable"
         case .signInRequired: return "signInRequired"
         }
+    }
+}
+
+/// A one-shot gate: `wait()` suspends until `open()` (at once if it is already open).
+final class Gate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var isOpen = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+            lock.lock()
+            if isOpen {
+                lock.unlock()
+                c.resume()
+            } else {
+                waiters.append(c)
+                lock.unlock()
+            }
+        }
+    }
+
+    func open() {
+        lock.lock()
+        isOpen = true
+        let ready = waiters
+        waiters = []
+        lock.unlock()
+        ready.forEach { $0.resume() }
     }
 }
