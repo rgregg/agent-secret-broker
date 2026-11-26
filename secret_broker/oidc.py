@@ -11,6 +11,7 @@ A token, or any part of one, never goes into an exception message, a reason or a
 import base64
 import binascii
 import json
+import re
 import threading
 import time
 import urllib.request
@@ -28,9 +29,26 @@ REASONS = ("missing", "malformed", "alg", "signature", "issuer", "audience", "ex
 SKEW = 60                # seconds of clock skew allowed on exp / nbf
 REFETCH_INTERVAL = 60    # seconds between JWKS fetches triggered by an unknown kid
 FETCH_TIMEOUT = 5
+MAX_TOKEN = 8192
+CLAIM_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
+_LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "[::1]")
 ALGS = ("RS256", "ES256")
 DEFAULT_SCOPES = ["openid", "profile", "offline_access"]
 _KEYS = ("issuer", "client_id", "audience", "username_claim", "required_group", "scopes", "actions")
+
+
+def _url_ok(url):
+    """https:// always; http:// only to loopback, and only under the test allowance."""
+    if url.startswith("https://") and len(url) > len("https://"):
+        return True
+    if url.startswith("http://") and destguard.test_loopback_allowed():
+        host = url[len("http://"):].split("/", 1)[0]
+        if host.startswith("["):
+            host = host.split("]", 1)[0] + "]"
+        else:
+            host = host.rsplit(":", 1)[0] if ":" in host else host
+        return host in _LOOPBACK_HOSTS
+    return False
 
 
 def parse_config(raw, allowed_user, field="approver_api"):
@@ -40,6 +58,8 @@ def parse_config(raw, allowed_user, field="approver_api"):
         return None
     if not isinstance(raw, dict):
         raise ValueError(f"{field} must be an object")
+    if not isinstance(allowed_user, str) or not allowed_user:
+        raise ValueError(f"{field}: allowed_user must be a non-empty string")
     for k in raw:
         if k not in _KEYS:
             raise ValueError(f"{field}.{k} is not a known option")
@@ -53,9 +73,12 @@ def parse_config(raw, allowed_user, field="approver_api"):
         return v
 
     issuer = text("issuer", required=True)
-    if not issuer.startswith("https://") or len(issuer) <= len("https://"):
+    if not _url_ok(issuer):
         raise ValueError(f"{field}.issuer must be an https:// URL")
     client_id = text("client_id", required=True)
+    username_claim = text("username_claim", "preferred_username")
+    if not CLAIM_RE.match(username_claim):
+        raise ValueError(f"{field}.username_claim must be 1-64 chars of A-Za-z0-9_.:-")
     scopes = raw.get("scopes", list(DEFAULT_SCOPES))
     if (not isinstance(scopes, list) or not scopes
             or not all(isinstance(s, str) and s and " " not in s for s in scopes)):
@@ -65,7 +88,7 @@ def parse_config(raw, allowed_user, field="approver_api"):
         "issuer": issuer,
         "client_id": client_id,
         "audience": text("audience", client_id),
-        "username_claim": text("username_claim", "preferred_username"),
+        "username_claim": username_claim,
         "required_group": text("required_group"),
         "scopes": list(scopes),
         "actions": None if actions is None else notify.parse_action_policy(actions, f"{field}.actions"),
@@ -126,7 +149,7 @@ class Verifier:
         try:
             disc = self._fetch(self.cfg["issuer"].rstrip("/") + "/.well-known/openid-configuration")
             uri = disc["jwks_uri"]
-            if not isinstance(uri, str) or not uri.startswith(("https://", "http://")):
+            if not isinstance(uri, str) or not _url_ok(uri):
                 return False
             doc = self._fetch(uri)
             keys = {}
@@ -156,6 +179,14 @@ class Verifier:
         """-> (claims, None) or (None, reason) with reason one of REASONS."""
         if not isinstance(token, str) or not token:
             return None, "missing"
+        if len(token) > MAX_TOKEN:
+            return None, "malformed"
+        try:
+            return self._verify(token)
+        except (ValueError, RecursionError, TypeError, AttributeError):
+            return None, "malformed"
+
+    def _verify(self, token):
         parts = token.split(".")
         if len(parts) != 3:
             return None, "malformed"
@@ -209,8 +240,11 @@ class Verifier:
         if claims.get("iss") != cfg["issuer"]:
             return None, "issuer"
         aud = claims.get("aud")
-        auds = aud if isinstance(aud, list) else [aud]
-        if cfg["audience"] not in auds and claims.get("azp") != cfg["audience"]:
+        if isinstance(aud, list):       # azp stands in only next to a list aud
+            ok = cfg["audience"] in aud or claims.get("azp") == cfg["audience"]
+        else:
+            ok = aud == cfg["audience"]
+        if not ok:
             return None, "audience"
         now = self._clock()
         exp, nbf = claims.get("exp"), claims.get("nbf")
@@ -218,7 +252,8 @@ class Verifier:
             return None, "expired"
         if nbf is not None and (not _is_num(nbf) or nbf > now + SKEW):
             return None, "expired"
-        if claims.get(cfg["username_claim"]) != cfg["allowed_user"]:
+        who = claims.get(cfg["username_claim"])
+        if not isinstance(who, str) or not who or who != cfg.get("allowed_user"):
             return None, "user"
         group = cfg["required_group"]
         if group is not None:

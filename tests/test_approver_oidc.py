@@ -12,7 +12,7 @@ from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa  # noqa: 
 from cryptography.hazmat.primitives import hashes  # noqa: E402
 from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature  # noqa: E402
 
-from secret_broker import oidc  # noqa: E402
+from secret_broker import destguard, oidc  # noqa: E402
 
 ISSUER = "https://idp.example.com/realms/home"
 CLIENT = "asb-approver"
@@ -139,6 +139,70 @@ class ParseConfigTests(unittest.TestCase):
             oidc.parse_config([], "ryan")
 
 
+class ConfigRulesTests(unittest.TestCase):
+    def tearDown(self):
+        destguard.allow_loopback_for_tests(False)
+
+    def test_allowed_user_required(self):
+        for bad in (None, "", 5):
+            with self.assertRaises(ValueError) as cm:
+                oidc.parse_config({"issuer": ISSUER, "client_id": CLIENT}, bad)
+            self.assertIn("allowed_user", str(cm.exception))
+
+    def test_loopback_http_issuer_only_under_test_allowance(self):
+        raw = {"issuer": "http://127.0.0.1:8080/realm", "client_id": CLIENT}
+        with self.assertRaises(ValueError):
+            oidc.parse_config(raw, "ryan")
+        destguard.allow_loopback_for_tests(True)
+        self.assertEqual(oidc.parse_config(raw, "ryan")["issuer"], raw["issuer"])
+        for host in ("localhost", "[::1]"):
+            oidc.parse_config({"issuer": f"http://{host}:1/r", "client_id": CLIENT}, "ryan")
+        with self.assertRaises(ValueError):
+            oidc.parse_config({"issuer": "http://idp.example.com", "client_id": CLIENT}, "ryan")
+
+    def test_username_claim_must_be_a_short_identifier(self):
+        for bad in ("a b", "x" * 65, "a/b", ""):
+            with self.assertRaises(ValueError) as cm:
+                oidc.parse_config({"issuer": ISSUER, "client_id": CLIENT,
+                                   "username_claim": bad}, "ryan")
+            self.assertIn("approver_api.username_claim", str(cm.exception))
+
+    def test_http_jwks_uri_makes_refresh_fail(self):
+        k = Key("k")
+        env = Env(k)
+        env.docs[DISCOVERY]["jwks_uri"] = "http://idp.example.com/certs"
+        env.docs["http://idp.example.com/certs"] = {"keys": [k.jwk]}
+        v = env.verifier()
+        self.assertFalse(v.refresh())
+        self.assertEqual(v.verify(k.token()), (None, "jwks_unavailable"))
+        destguard.allow_loopback_for_tests(True)
+        env.docs[DISCOVERY]["jwks_uri"] = "http://127.0.0.1:9/certs"
+        env.docs["http://127.0.0.1:9/certs"] = {"keys": [k.jwk]}
+        self.assertTrue(v.refresh())
+
+    def test_missing_username_never_matches_a_missing_allowed_user(self):
+        k = Key("k")
+        env = Env(k)
+        cfg = oidc.parse_config({"issuer": ISSUER, "client_id": CLIENT}, "ryan")
+        del cfg["allowed_user"]
+        v = oidc.Verifier(cfg, fetch_json=env.fetch, clock=env.clock)
+        claims = {"preferred_username": None}
+        self.assertEqual(v.verify(k.token(claims)), (None, "user"))
+        cfg["allowed_user"] = None
+        self.assertEqual(v.verify(k.token(claims)), (None, "user"))
+        cfg["allowed_user"] = "ryan"
+        self.assertEqual(v.verify(k.token({"preferred_username": ""})), (None, "user"))
+
+    def test_hostile_tokens_are_malformed_not_exceptions(self):
+        k = Key("k")
+        v = Env(k).verifier()
+        nested = b64(b"[" * 7000)               # under the cap, deep enough to recurse
+        self.assertEqual(v.verify(nested + ".e30.AA"), (None, "malformed"))
+        self.assertEqual(v.verify("a" * 8193), (None, "malformed"))
+        self.assertEqual(v.verify(b64(b"{}") + "." + b64(b"[" * 7000) + ".AA"),
+                         (None, "malformed"))
+
+
 class VerifyTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -187,7 +251,10 @@ class VerifyTests(unittest.TestCase):
 
     def test_audience_and_azp(self):
         self.check(self.rsa.token({"aud": "other"}), "audience")
-        self.check(self.rsa.token({"aud": "other", "azp": CLIENT}), None)
+        # azp counts only next to a list aud; a string aud naming someone else is refused
+        self.check(self.rsa.token({"aud": "other", "azp": CLIENT}), "audience")
+        self.check(self.rsa.token({"aud": ["x", "y"], "azp": CLIENT}), None)
+        self.check(self.rsa.token({"aud": ["x", "y"], "azp": "other"}), "audience")
         self.check(self.rsa.token({"aud": ["x", CLIENT]}), None)
         self.check(self.rsa.token({"aud": ["x", "y"]}), "audience")
         self.check(self.rsa.token({"aud": "other"}), None, audience="other")
