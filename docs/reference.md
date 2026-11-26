@@ -1034,6 +1034,26 @@ Config with an explicit `type` rejects unknown keys at startup, naming the field
 to it). Everything else uses the model's verdict only; no verdict is HIGH. See
 [risk.md](risk.md) for the rubric and the evaluation harness.
 
+## Watchdog (hang detection and self-restart)
+
+A hung broker keeps its port open while every request waits, and Docker's restart policy only acts when the
+process exits; an `unhealthy` container is never restarted by plain Docker or Komodo. So the broker watches itself:
+a daemon thread takes each lock that every request path goes through (`cfg`, the catalog; `state`, requests and
+grants) every 10 s, for at most 1 s, and releases it at once.
+
+* A lock that cannot be taken for 30 s in a row makes `GET /healthz` answer `503 stuck` (it answers `ok` again as
+  soon as the lock is free). `/healthz` reads only the watchdog's state, so it still answers while the broker hangs.
+* A lock stuck for `stuck_s` makes the broker audit `watchdog_restart` (`lock`, `stuck_s`; the audit write gets 5 s,
+  as it may be behind the same hang), print a line on stderr and exit with code 70. `restart: unless-stopped`
+  starts it again. In-flight approvals and sessions are lost, as with any restart.
+
+```json
+"watchdog": {"enabled": true, "stuck_s": 120}
+```
+
+`enabled` (default `true`) and `stuck_s` (default 120, 60 to 3600) are the only options; anything else is refused at
+startup. Raise `stuck_s` if the vault is slow enough that a single read or write can hold the catalog lock for minutes.
+
 ## Notification transports
 
 A transport only delivers the **link** to the approval page; approving always
@@ -4004,7 +4024,7 @@ only to the user, never rotated) out of the page and then POST `/decide` for any
   click from another site shows a freshly minted page; submits from that page work).
 * **Client API gate.** With `trusted_proxies` set, the client API answers 403 `forbidden` to any socket peer outside
   it (before authentication and before enrollment), audits `client_peer_refused` (once a minute per peer, operator
-  only), and serves `GET /healthz` (`ok`) to loopback / own addresses only. `client_api_allow_direct: true` opts out
+  only), and serves `GET /healthz` (`ok`, or 503 `stuck` while the watchdog sees a hang) to loopback / own addresses only. `client_api_allow_direct: true` opts out
   with a startup warning. The check uses the real peer; also restrict the published port at the host firewall.
 * **Defence in depth.** Every outbound call carries `X-Secret-Broker-Egress: 1` (the agent cannot remove or set
   it); both listeners answer 403 to any request that has it. The CSRF token is derived from the user **and** a

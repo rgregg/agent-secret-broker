@@ -267,6 +267,7 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
         self._backend_ok = True         # False while the last vault read failed
         self._refreshing = threading.Lock()
         self._cfg_lock = threading.Lock()
+        self.watchdog = None            # set by __main__: hang detection for /healthz (see watchdog.py)
         self._cfg_gen = 0               # bumped by every write of a credential's rules; see refresh_catalog
         self.summarizer = summarizer
         self._kp_seen = set()           # summary key credentials seen in the catalog (see _summary_key_read)
@@ -936,6 +937,14 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
         """`answer` (a client-API reply) plus `latest_client_version` when there is one to tell. The only place it is added."""
         v = self.expected_client_version()
         return dict(answer, latest_client_version=v) if v else answer
+
+    def watched_locks(self):
+        """The locks every request path goes through, for the watchdog: one that stays taken is a hung broker."""
+        return {"cfg": self._cfg_lock, "state": self._lock}
+
+    def healthy(self):
+        """For /healthz. Reads only the watchdog's own state, never a broker lock, so a hang cannot hide itself."""
+        return self.watchdog is None or self.watchdog.healthy()
 
     def status(self):
         """Deploy-verification summary for GET /v1/status. Counts and type names
@@ -7107,10 +7116,11 @@ def client_handler(broker, client_key):
         def do_GET(self):
             u = urllib.parse.urlsplit(self.path)
             if u.path == "/healthz" and broker._is_self_peer(self.client_address[0]):
-                raw = b"ok"         # no information: for a container healthcheck on loopback
-                self.send_response(200)
+                ok = broker.healthy()   # a lock every request needs has been stuck: say so to the healthcheck
+                raw = b"ok" if ok else b"stuck"     # no information: for a container healthcheck on loopback
+                self.send_response(200 if ok else 503)
                 self.send_header("Content-Type", "text/plain")
-                self.send_header("Content-Length", "2")
+                self.send_header("Content-Length", str(len(raw)))
                 self.end_headers()
                 return self.wfile.write(raw)
             if u.path.startswith("/v1/enroll/"):
