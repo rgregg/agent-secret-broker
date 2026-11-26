@@ -136,7 +136,60 @@ class Leaf(Base):
         self.broker.flush_notifications(10)
         v = self.view(req)
         self.assertEqual((v["notified"], v["banner_actions"]), (True, ["deny", "approve"]))
-        self.assertEqual(req.offered, frozenset({"deny", "approve"}))   # the app's actions count
+        # the app never uses the shared action token: its actions do not widen it, and with no
+        # action-capable real transport no token is minted at all
+        self.assertEqual(req.offered, frozenset())
+        self.assertIsNone(req.notification.action_token)
+        self.assertIsNone(req.action_hash)
+
+    def test_app_leaf_does_not_widen_push_token(self):
+        wp = FakeNotifier(type_name="webpush", supports_actions=("approve", "deny"))
+        wp.action_policy = notify.parse_action_policy({"approve_max_risk": "none"}, "x")
+        self.broker.notifier = notify.MultiNotifier([wp])
+        req = self.pushed()
+        (n,) = wp.notifications
+        self.assertEqual([a.id for a in n.actions], ["deny"])
+        self.assertIsNotNone(n.action_token)
+        self.assertEqual(req.offered, frozenset({"deny"}))
+        self.assertEqual(self.view(req)["banner_actions"], ["deny", "approve"])    # the app's own entry
+        code, _ = self.broker.decide_via("push", req.id, "approve", "push:alice", token=n.action_token)
+        self.assertEqual(code, 403)
+        self.assertEqual(req.status, "pending")
+        self.assertEqual(self.events("decided"), [])
+        self.assertEqual(self.broker.decide_via("push", req.id, "deny", "push:alice", token=n.action_token)[0],
+                         200)
+
+    def test_real_transport_failure_is_logged_and_request_waits(self):
+        class Boom(FakeNotifier):
+            def send(self, n):
+                raise notify.NotifyError("secret detail must not be logged")
+        self.broker.notifier = notify.MultiNotifier([Boom(type_name="ticker")])
+        req = self.pushed()
+        self.assertEqual(req.status, "pending")
+        self.assertTrue(self.view(req)["notified"])
+        (ev,) = self.events("notify_failed")
+        self.assertEqual((ev["id"], ev["transports"], ev["errors"]), (req.id, ["ticker"], ["NotifyError"]))
+        self.assertIn("warning", ev)
+        self.assertNotIn("secret detail", json.dumps(ev))
+        ok = FakeNotifier(type_name="telegram")
+        self.broker.notifier = notify.MultiNotifier([Boom(type_name="ticker"), ok])
+        self.pushed("/two")
+        self.assertEqual(len(self.events("notify_failed")), 1)          # one real transport delivered
+
+    def test_failure_of_released_held_transport_is_logged(self):
+        class Boom(FakeNotifier):
+            def send(self, n):
+                raise notify.NotifyError("down")
+        self.broker.notifier = notify.MultiNotifier([Boom(type_name="ticker")])
+        self.broker._presence_autostart = False
+        self.broker.presence.beat("alice", True, "t1")
+        req = self.pushed()
+        self.assertIn(req.id, self.broker._held)
+        self.assertEqual(self.events("notify_failed"), [])
+        self.broker._release_held(req, "presence_lapsed")
+        self.assertEqual(req.status, "pending")
+        (ev,) = self.events("notify_failed")
+        self.assertEqual((ev["transports"], ev["errors"]), (["ticker"], ["NotifyError"]))
 
     def test_channel_registry(self):
         ch = CHANNELS["app"]

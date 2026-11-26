@@ -132,8 +132,11 @@ def make_notification(*, rid, tag, title, text, names, risk, url, source, summar
         pol = getattr(leaf, "action_policy", None) or default_policy or DEFAULT_POLICY
         ids = action_ids_for(pol, risk, tuple(getattr(leaf, "supports_actions", ()) or ()))
         per[id(leaf)] = [Action(i, ACTION_LABELS[i]) for i in ids]
+    # the shared token (and so what it may decide) covers only transports that carry it; a leaf
+    # with `carries_token = False` (the approver app) keeps its own entry in `per` only
+    carriers = [per[id(leaf)] for leaf in leaves(transport) if getattr(leaf, "carries_token", True)]
     union = [Action(i, ACTION_LABELS[i]) for i in ACTION_LABELS
-             if any(a.id == i for acts in per.values() for a in acts)]
+             if any(a.id == i for acts in carriers for a in acts)]
     return Notification(
         rid=rid, tag=tag, title=title, text=text, names=list(names), risk=risk, url=url,
         source=source, summary=summary, expires_at=expires_at, actions=union,
@@ -235,18 +238,38 @@ def transport_type(transport):
     return getattr(getattr(transport, "wrapped", transport), TRANSPORT_TYPE_ATTR, None)
 
 
-def send_to(transports, n):
-    """Deliver `n` to just these (leaf) transports, with MultiNotifier's rule:
-    NotifyError if none of them succeeded."""
-    errors, ok = [], 0
+def _deliver(transports, n, on_undelivered=None):
+    """Send `n` to each transport. NotifyError (with `.failures`) if none succeeded. A transport with
+    `counts_as_delivery = False` (the approver app) still receives it; when it is the only one that
+    succeeded while real transports failed, `on_undelivered(n, failures)` is called (never raises).
+    `failures` is [(transport type or class name, exception class name)]: never error text."""
+    errors, failures, ok, real, real_ok = [], [], 0, 0, 0
     for t in transports:
+        counts = getattr(t, "counts_as_delivery", True)
+        real += counts
         try:
             t.send(n.for_transport(t))
             ok += 1
+            real_ok += counts
         except (NotifyError, OSError) as e:
-            errors.append(f"{type(getattr(t, 'wrapped', t)).__name__}: {type(e).__name__}")
+            cls = type(getattr(t, "wrapped", t)).__name__
+            errors.append(f"{cls}: {type(e).__name__}")
+            failures.append((transport_type(t) or cls, type(e).__name__))
     if not ok:
-        raise NotifyError("; ".join(errors) or "no transports configured")
+        err = NotifyError("; ".join(errors) or "no transports configured")
+        err.failures = failures
+        raise err
+    if real and not real_ok and on_undelivered is not None:
+        try:
+            on_undelivered(n, failures)
+        except Exception:   # noqa: BLE001
+            pass
+
+
+def send_to(transports, n, on_undelivered=None):
+    """Deliver `n` to just these (leaf) transports, with MultiNotifier's rule:
+    NotifyError if none of them succeeded."""
+    _deliver(transports, n, on_undelivered)
 
 
 class TickerNotifier:
@@ -510,17 +533,10 @@ class MultiNotifier:
 
     def __init__(self, notifiers):
         self.transports = [adapt(t) for t in notifiers]
+        self.on_undelivered = None      # see _deliver: only a non-counting leaf got it
 
     def send(self, n):
-        errors, ok = [], 0
-        for t in self.transports:
-            try:
-                t.send(n.for_transport(t))
-                ok += 1
-            except (NotifyError, OSError) as e:
-                errors.append(f"{type(getattr(t, 'wrapped', t)).__name__}: {type(e).__name__}")
-        if not ok:
-            raise NotifyError("; ".join(errors) or "no transports configured")
+        _deliver(self.transports, n, self.on_undelivered)
 
     def resolved(self, n, status):
         for t in self.transports:

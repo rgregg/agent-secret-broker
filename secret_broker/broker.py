@@ -403,7 +403,7 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
     def notifier(self, value):
         value = notify_mod.adapt(value)             # signature detection happens once, here
         ap = getattr(self, "approver", None)
-        self._notifier = value if ap is None else approver_mod.with_app_leaf(value, ap.notifier)
+        self._notifier = value if ap is None else approver_mod.with_app_leaf(value, ap.notifier, ap.on_undelivered)
 
     def _initial_load(self, locked=True):
         try:
@@ -3488,7 +3488,7 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
                 if rest is None:
                     self.notifier.send(n)
                 else:
-                    notify_mod.send_to(rest, n)
+                    notify_mod.send_to(rest, n, getattr(self.notifier, "on_undelivered", None))
             except Exception as e:      # noqa: BLE001
                 ok, err = False, e
             if ok:
@@ -3600,9 +3600,13 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
             {notify_mod.transport_type(t) or "?" for t in leaves}))
         try:
             notify_mod.send_to(leaves, h["n"])
-        except Exception:  # noqa: BLE001 -- a request must always settle; the notify error text is never kept
-            if not req._sent_to[:-len(leaves)]:         # nothing was ever delivered
+        except Exception as e:  # noqa: BLE001 -- a request must always settle; the notify error text is never kept
+            before = req._sent_to[:-len(leaves)]
+            if not before:                              # nothing was ever delivered
                 self._finish(req, "failed", error="could not notify")
+            elif self.approver is not None and not any(
+                    getattr(t, "counts_as_delivery", True) for t in before):
+                self.approver.on_undelivered(h["n"], getattr(e, "failures", None) or [])   # only the app has it
         else:
             self.audit("notified", req)
         if req.status not in ("pending", "deciding"):   # settled while sending

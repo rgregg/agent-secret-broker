@@ -134,8 +134,13 @@ class AppFeed:
 
 class AppNotifier:
     """The internal `app` notify leaf. Sending only records that the request was notified (and
-    with which banner actions); it never raises, so it never fails or slows a request."""
+    with which banner actions); it never raises, so it never fails or slows a request. It never
+    carries the shared action token (the app decides through `offered_actions`), so its actions do
+    not widen what a push/ha/telegram token may do; and reaching it alone is not a delivery that
+    hides failing real transports (see notify._deliver)."""
     supports_actions = ("approve", "deny")
+    carries_token = False
+    counts_as_delivery = False
 
     def __init__(self, feed, action_policy=None):
         self.feed = feed
@@ -159,8 +164,18 @@ class AppNotifier:
 class Approver:
     """What `Broker.approver` holds when `approver_api` is configured."""
 
-    def __init__(self, cfg, verifier, feed, notifier):
+    def __init__(self, cfg, verifier, feed, notifier, log=None):
         self.cfg, self.verifier, self.feed, self.notifier = cfg, verifier, feed, notifier
+        self._log = log
+
+    def on_undelivered(self, n, failures):
+        """Every real transport failed and only the app got the request: it stays pending (the app
+        shows it), and the failure is logged by transport type and exception class, never text."""
+        if self._log is None:
+            return
+        self._log("notify_failed", id=n.rid, transports=sorted({a for a, _ in failures}),
+                  errors=sorted({b for _, b in failures}),
+                  warning="no notification transport delivered this request; it waits in the approver app")
 
 
 def setup(raw, allowed_user, log):
@@ -176,15 +191,18 @@ def setup(raw, allowed_user, log):
             warning="approver_api: the identity provider's discovery document or keys could not be "
                     "fetched; the approver API answers 503 until they can")
     feed = AppFeed()
-    return Approver(cfg, verifier, feed, AppNotifier(feed, cfg["actions"]))
+    return Approver(cfg, verifier, feed, AppNotifier(feed, cfg["actions"]), log)
 
 
-def with_app_leaf(notifier, app):
-    """`notifier` with the app leaf among its leaves (unchanged if it already is)."""
-    if any(leaf is app for leaf in notify.leaves(notifier)):
-        return notifier
-    inner = getattr(notifier, "transports", None)
-    return notify.MultiNotifier((list(inner) if isinstance(inner, list) else [notifier]) + [app])
+def with_app_leaf(notifier, app, on_undelivered=None):
+    """`notifier` with the app leaf among its leaves (unchanged if it already is), reporting
+    app-only deliveries to `on_undelivered`."""
+    if not any(leaf is app for leaf in notify.leaves(notifier)):
+        inner = getattr(notifier, "transports", None)
+        notifier = notify.MultiNotifier((list(inner) if isinstance(inner, list) else [notifier]) + [app])
+    if isinstance(notifier, notify.MultiNotifier):
+        notifier.on_undelivered = on_undelivered
+    return notifier
 
 
 def browser_only(req):
