@@ -49,6 +49,7 @@ from . import errclass
 from . import httpcheck
 from . import masking
 from . import notify as notify_mod
+from . import approver_api as approver_mod
 from . import presence as presence_mod
 from .notify import NotifyError  # noqa: F401 -- re-exported
 from . import grants as grants_mod
@@ -139,6 +140,8 @@ CHANNELS = {
     "push": Channel(token_required=True, may_create_always=False),        # POST /push/decide
     "ha": Channel(token_required=True, may_create_always=False),          # POST /v1/hooks/ha/decide
     "telegram": Channel(token_required=True, may_create_always=False),    # Telegram callback button
+    # the macOS approver app (POST /v1/approver/decide): the OIDC bearer check is its authentication
+    "app": Channel(token_required=False, may_create_always=True, may_create_grant=True),
 }
 
 
@@ -300,6 +303,9 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
         self._ha_rate_lock = threading.Lock()
         self._tg_refusals = {"t": None, "n": 0, "drop": 0}   # coalescing window for telegram_decide_refused
         self._tg_lock = threading.Lock()
+        # the macOS approver app (approver_api.py): None, or {cfg, verifier, feed} plus an `app` notify leaf
+        self.approver = approver_mod.setup(config.get("approver_api"), config.get("allowed_user"), self.log)
+        self.notifier = self._notifier              # adds the app leaf when configured
         if self.ha_hook is not None and not self.ha_hook["allowed_devices"]:
             self.log("ha_hook_any_device", warning="ha_hook.allowed_devices is empty: "
                      "any device id is accepted (it is recorded, not verified)")
@@ -395,7 +401,9 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
 
     @notifier.setter
     def notifier(self, value):
-        self._notifier = notify_mod.adapt(value)    # signature detection happens once, here
+        value = notify_mod.adapt(value)             # signature detection happens once, here
+        ap = getattr(self, "approver", None)
+        self._notifier = value if ap is None else approver_mod.with_app_leaf(value, ap.notifier)
 
     def _initial_load(self, locked=True):
         try:
@@ -3322,48 +3330,56 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
                 if var not in known:
                     raise ValueError(f"placeholder {httpcheck.clip(var, 60)} not provided by requested secrets")
 
-    def _push(self, req):
-        url = f"{self.cfg['approve_base_url'].rstrip('/')}/a/{req.nonce}"
+    def _approve_url(self, req):
+        """The request's page on the approval site (the link every notification carries)."""
+        return f"{self.cfg['approve_base_url'].rstrip('/')}/a/{req.nonce}"
+
+    def _what(self, req):
+        """The one-line (ssh_sign: multi-line) target text of a request, as notifications show it."""
         if req.mode == "http":
-            what = f"{req.spec['method']} {req.spec['url']}"
+            return f"{req.spec['method']} {req.spec['url']}"
         elif req.mode == "store":
             sp = req.spec
             if sp.get("hosts_after") is not None:
-                what = f"change allowed hosts of {req.names[0]}{_host_change_text(sp)}"
+                return f"change allowed hosts of {req.names[0]}{_host_change_text(sp)}"
             else:
-                what = (f"{sp['op']} credential: item {sp['item']!r} field {sp['field']}"
+                return (f"{sp['op']} credential: item {sp['item']!r} field {sp['field']}"
                         f"{' key ' + sp['key'] if sp.get('key') else ''}"
                         f"{', variables ' + ', '.join(sorted(sp['vars'])) if sp.get('vars') else ''} "
                         f"({sp['value_bytes']} bytes, value not shown)")
         elif req.mode == "guidance":
             k = len(req.names)
-            what = f"Guidance change proposed for {k} credential{'' if k == 1 else 's'}"
+            return f"Guidance change proposed for {k} credential{'' if k == 1 else 's'}"
         elif req.mode == "credential":
-            what = (f"Credential replacement requested: {req.names[0]}" if req.spec.get("replace")
+            return (f"Credential replacement requested: {req.names[0]}" if req.spec.get("replace")
                     else f"WebSocket setup change requested: {req.names[0]}" if req.spec.get("ws_change")
                     else f"Credential requested: {req.names[0]}")
         elif req.mode == "plan":
             k = len(req.spec["rules"])
-            what = (f"Plan requested: {req.client['name']}, {k} rule{'' if k == 1 else 's'}: "
+            return (f"Plan requested: {req.client['name']}, {k} rule{'' if k == 1 else 's'}: "
                     f"{', '.join(req.names)}")
         elif req.mode == "session":
             sp = req.spec
             if sp.get("kind") == "ws":
-                what = (f"WebSocket session requested: {req.names[0]} on {', '.join(sp['hosts'])} "
+                return (f"WebSocket session requested: {req.names[0]} on {', '.join(sp['hosts'])} "
                         f"({sp['scheme']}), {sessions_mod._fmt_ttl(sp['ttl_s'])}, up to {sp['max_calls']} frames")
             else:
-                what = (f"HTTP session requested: {req.names[0]} on {', '.join(sp['hosts'])} "
+                return (f"HTTP session requested: {req.names[0]} on {', '.join(sp['hosts'])} "
                         f"({', '.join(sp['methods'])}), {sessions_mod._fmt_ttl(sp['ttl_s'])}, up to {sp['max_calls']} calls")
         elif req.mode == "sudo":
-            what = sudo_mod.push_text(req.spec)
+            return sudo_mod.push_text(req.spec)
         elif req.mode == "exec":
-            what = exec_mod.push_text(req.spec)
+            return exec_mod.push_text(req.spec)
         elif req.mode == "ssh_sign":
-            what = "\n".join([req.spec["ssh"].get("headline") or req.spec["ssh"]["text"],
+            return "\n".join([req.spec["ssh"].get("headline") or req.spec["ssh"]["text"],
                               f"SSH key {req.spec['fingerprint']}: {req.spec['ssh']['text']}"]
                              + sshkey.host_lines(req.spec.get("host")))
         else:
-            what = "run: " + " ".join(req.spec.get("argv") or [])[:200]
+            return "run: " + " ".join(req.spec.get("argv") or [])[:200]
+
+    def _push(self, req):
+        url = self._approve_url(req)
+        what = self._what(req)
         head = f"{req.summary} (unverified)\n" if req.summary and req.mode != "ssh_sign" else ""
         if req.mode == "ssh_sign":      # the summary IS the headline (built by code, not a model): lead with it once
             msg_lead, what = what.split("\n", 1)[0] + "\n", what.split("\n", 1)[1]
@@ -3697,6 +3713,8 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
         if extra.get("via") not in ("policy", "session") and status != "approved":
             self._resolved(req, status)     # approvals were announced at decision time
         req.done.set()
+        if self.approver is not None:
+            self.approver.feed.bump()       # wakes the approver app's long poll
         return True
 
     def _load_proxy_secret(self, config):
