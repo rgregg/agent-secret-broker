@@ -193,6 +193,12 @@ or reload button, the header shows a small refresh button in this mode.
   manifest `scope` and `start_url` are `/`; a login on another origin leaves that scope, which is
   normal for SSO.
 
+### Optional: approve from a Mac
+
+The macOS approver app is a menu bar app that signs in through your OpenID Connect identity provider
+and shows pending requests with banners and Approve/Deny buttons. Anything running as you on the Mac where the approver app is signed in can act as the app and approve requests. Set `allowed_user` and an `approver_api` block
+(see "Approver app API" in the [reference](reference.md#approver-app-api-approver_api)), and read its Security notes first.
+
 ## 6. Start it and check
 
     docker compose up -d

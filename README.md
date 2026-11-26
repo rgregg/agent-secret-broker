@@ -46,6 +46,9 @@ push notification or the dashboard.
   per-credential handshake set by the operator), so the token never reaches the agent; one always-high approval,
   fixed deadline, frame and byte caps ([docs](docs/reference.md#websocket-sessions-the-broker-holds-the-connection)).
   A `ws_session` rule can approve a session for one server and path with capped time and frames.
+- **Approve from a Mac.** An optional menu bar app (macOS 14+) signs in through your OpenID Connect provider,
+  shows pending requests and posts banners ([docs](docs/reference.md#approver-app-api-approver_api)).
+  Do not run agents on a Mac where you approve.
 - **Every use is approved or explicitly allow-listed**, rated by a risk model, and
   written to a hash-chained audit log.
 

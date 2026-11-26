@@ -1139,6 +1139,7 @@ own authentication (SSO header, CSRF/origin, `X-Requested-With`):
 | `push` | yes | no | no | no |
 | `ha` (`/v1/hooks/ha/decide`) | yes | no | no | no |
 | `telegram` (callback button) | yes | no | no | no |
+| `app` (`/v1/approver/decide`) | no | yes | yes | no |
 
 ### Home Assistant action buttons (`ha_hook`)
 
@@ -1238,6 +1239,168 @@ Home Assistant example (placeholders only). `secrets.yaml`: `asb_hook_key`.
 (approver `ha:unknown`; refused if `allowed_devices` is set). The companion-app docs do not document `device_id` in the event
 data; check the event in Developer Tools before relying on it.
 
+
+### Approver app API (`approver_api`)
+
+An optional API on the client listener for the macOS approver app (a menu bar app, macOS 14 or
+later). The app signs you in through your OpenID Connect identity provider, shows pending requests,
+posts a banner when a request needs a human, and lets you approve or deny. Without `approver_api`
+every `/v1/approver/*` path answers 404 and nothing else changes. Config:
+
+    "allowed_user": "you",                        // required: the one person who may approve
+    "approver_api": {
+      "issuer": "https://idp.example.com/application/o/asb-approver/",
+      "client_id": "<client id>",
+      "audience": "<client id>",                  // optional, default client_id
+      "username_claim": "preferred_username",     // optional, default shown
+      "required_group": "asb-approvers",          // optional: must be in the token's `groups`
+      "scopes": ["openid", "profile", "offline_access"],   // optional, default shown
+      "actions": {"approve_max_risk": "medium"}   // optional: narrows the banner buttons
+    }
+
+- `issuer` and `client_id` are required; `issuer` must be an `https://` URL. Unknown keys are
+  refused at startup, and the error names the field (`approver_api.issuer`, ...). `allowed_user`
+  must be set: the token's `username_claim` must equal it.
+- `scopes` are what the app asks the provider for (served by `/v1/approver/config`).
+  `offline_access` lets the app refresh its token without signing you in again.
+- `actions` has the same shape as the `actions` object of a `notify` entry and narrows only the
+  buttons on the app's banners. The popover's buttons come from each request's `actions` list.
+- Discovery (`<issuer>/.well-known/openid-configuration`, then its `jwks_uri`) runs at startup
+  through the same outbound guard as other operator-configured calls. If it fails the broker still
+  starts, logs one `approver_api_discovery_failed` warning, and answers 503 until a refetch succeeds.
+
+#### Security
+
+Anything running as you on the Mac where the approver app is signed in can act as the app and approve requests. Do not run agents on a Mac where you approve. ASB exists so an agent cannot approve its own requests; an approver app on the agent's machine undoes that.
+
+- Port 8800 (the client listener) now carries approvals as well as agent calls. The agent client
+  key is refused on `/v1/approver/*`, but a stolen approver token works from anywhere that can reach
+  the port. The client listener has no trusted-peer allow-list; restrict who can reach it at the
+  network level if that matters.
+- The identity provider must issue JWT access tokens (Authentik, Keycloak, Auth0, Okta and Entra
+  can). Providers whose access tokens are opaque are not supported.
+- To cut the app off: revoke its sessions (refresh tokens) at the identity provider, or remove
+  `approver_api` and restart. Access tokens already issued work until they expire, normally minutes.
+- The app's banner shows only the same title and text line as a Web Push notification, never the
+  request details. Request text in the app is shown as plain text.
+- Requests in the modes `guidance`, `credential`, `plan`, `session` and `sudo`, and `exec`
+  requests that need host-state input, can only be denied in the app (`actions: ["deny"]`); the
+  row carries a `browser_url` for the approval site.
+
+#### Token rules
+
+The broker validates the bearer token itself; the identity provider is not asked per request.
+
+| Check | Rule |
+| --- | --- |
+| Algorithm | RS256 or ES256 only (never `none`, never HMAC); key chosen by `kid` from the provider's JWKS |
+| Size | tokens over 8192 characters are refused |
+| `iss` | equals `issuer` exactly |
+| `aud` | equals `audience` (default `client_id`); when `aud` is a list it may contain it, or `azp` may equal it |
+| `exp`, `nbf` | checked with 60 s of clock skew |
+| user | `username_claim` (default `preferred_username`) equals `allowed_user` |
+| group | when `required_group` is set, it is in the token's `groups` list |
+| URLs | `issuer` and `jwks_uri` must be `https://` |
+
+An unknown `kid` refetches the keys, at most once per 60 s, so a provider can rotate its signing key
+and a flood of made-up `kid`s cannot make the broker hammer the provider.
+
+#### Endpoints
+
+All on the client listener; all answers are JSON; request bodies are JSON, at most 4 KB. Any other
+method on these paths answers 405.
+
+| Request | Auth | Answer |
+| --- | --- | --- |
+| `GET /v1/approver/config` | none, not rate limited | `{"issuer", "client_id", "scopes", "api_version": 1}`, so the app only needs the broker URL |
+| `GET /v1/approver/pending?since=<n>&wait=<s>` | bearer token | `{"version": n, "requests": [...]}`, oldest first |
+| `POST /v1/approver/decide` | bearer token | `{"ok": true}` (200), or an error below |
+| `POST /v1/approver/presence` | bearer token | `{"ok": true}` (200), 400 for a bad body, 429 over the presence limit |
+
+`pending`: `since` and `wait` are plain non-negative integers (400 otherwise). `wait` is capped at
+25 s. The call returns at once when `since` is not the broker's current version (a broker restart
+resets it, so an app that remembers an older, larger number does not hang) or when `wait` is 0 or
+absent. Otherwise it blocks until the version changes: a request is created, notified, decided,
+expires, or has its risk or summary arrive. At most 8 calls wait at once; beyond that the call
+answers at once with `Retry-After: 2` and the app should back off.
+
+Each request row: `id`, `mode`, `created`, `expires`, `credentials` (names), `client` (`name`,
+`id`), `summary` and `summary_source`, `risk` (`level`, `reasons`), `target` (what the dashboard
+shows: method and URL, host, or argv), `details` (the masked request-details view, or null),
+`notified` (true once a human is really being asked; before that the row is still being assessed),
+`banner_actions` (the action ids the banner offered), `actions` (the decisions the app may offer:
+`deny`, `approve`, `grant:<minutes>` for each offered duration, `always`, `always_script`) and
+`browser_url`. Text fields are cleaned of control and invisible characters and capped (the summary
+at 500 characters); no secret value is ever in a row.
+
+`decide` body: `id`, `decision` (`approve` or `deny`), and optionally `grant_minutes`, `always`
+(`true` or `"script"`), `rule_scope` (`client` or `any`) and `device`. Unknown keys, `grant_minutes`
+together with `always`, and either of them with `deny` are refused (400). It goes through
+`decide_via("app", ...)`.
+
+| Status | Meaning |
+| --- | --- |
+| 200 | decided |
+| 400 | malformed body, or an action that request does not offer |
+| 401 | missing or refused token (with `WWW-Authenticate: Bearer`), or the agent client key was sent |
+| 404 | unknown request id |
+| 410 | already decided or expired (for example, decided on your phone first) |
+| 413 | body over 4 KB |
+| 429 | rate limited (`Retry-After: 60`) |
+| 503 | the identity provider's keys are unavailable (`Retry-After: 30`) |
+
+Rate limits: valid tokens get 60 requests per minute per source IP. Missing or refused tokens share
+ONE bucket of 120 per minute across all sources, with no per-source state, so a flood of bad tokens
+cannot lock the app out (the same pattern as the Home Assistant hook).
+
+#### The app as a notification target
+
+When `approver_api` is set the broker adds an internal `app` notify target. It is reached after
+assessment and auto-approval, like every other transport, so a banner appears only for a request a
+human must decide. It is never held back by `notify_presence`. It does not carry the single-use
+action token, so it never widens what a Web Push, Home Assistant or Telegram button may do. A
+decision from the app goes through the `app` channel (see Decision channels). If every real
+transport fails but the app received the request, the request stays pending (you can decide it in
+the app) and a `notify_failed` warning is logged with the transport types and error classes.
+
+#### Presence
+
+While you are active at the Mac, the app counts as presence for `notify_presence`: the screen is
+unlocked and there was keyboard or mouse input within the last 120 s. The app sends
+`POST /v1/approver/presence` with `{"active": true, "device"?}` about every 10 s while active, and
+`{"active": false}` at once when you go idle or lock the screen. It follows the same expiry rules as
+the approval page's heartbeat, shares its per-user rate limit (429 when exceeded), and is not
+presence merely because the app is running. With `notify_presence.enabled` false the call is
+accepted and ignored. The endpoint needs the approver's OIDC token, so an agent's client key cannot
+fake presence.
+
+#### Audit
+
+The approver is recorded as `app:<username>`, with `channel: app`, `device` (a label chosen by the
+app: at most 64 characters of `A-Za-z0-9_.:-`, asserted not verified), `approver_ip` and `token_id`
+(the token's `jti`, or the first 16 hex characters of its SHA-256). New events, all hidden from the
+agent audit API:
+
+- `approver_auth_refused`: `reason` (`missing`, `malformed`, `alg`, `signature`, `issuer`,
+  `audience`, `expired`, `user`, `group`, `jwks_unavailable`), `peer`, and `suppressed` (refusals
+  with that reason swallowed since the last line). At most one line per reason per 60 s; never the token.
+- `approver_rate_limited`: `peer`, `limit_per_min`.
+- `approver_api_discovery_failed`: startup discovery failed.
+- `notify_failed`: only the app received a request and the real transports failed.
+
+#### Example: Authentik
+
+Create an OAuth2/OpenID provider (placeholders; adapt names to your install):
+
+1. Client type **Public**, so no secret is stored on the Mac. Copy the generated client ID into
+   `client_id`.
+2. Redirect URI (strict): `asb-approver://callback`. The app always uses PKCE (S256).
+3. Signing key: an RSA key (RS256). Authentik issues JWT access tokens.
+4. Scopes: `openid`, `profile`, and the `offline_access` scope mapping (so refresh tokens are
+   issued); add the `groups` scope mapping if you use `required_group`.
+5. Create an application for it with slug `asb-approver` and bind your user (or a group) to it.
+6. The issuer is shown on the provider page, like `https://idp.example.com/application/o/asb-approver/`
+   (use it exactly as shown, trailing slash included).
 
 ### Telegram action buttons (`allowed_users`)
 
@@ -1637,7 +1800,9 @@ with `X-Requested-With: asb`, `Content-Type: application/json` and a body
 page is left (fetch `keepalive`; it never throws and never blocks the page). The answer is 204
 (403 guard/identity, 413 over 256 bytes, 400 bad body, 429 over 120 per minute per user).
 It sits behind the same SSO identity and trusted-peer checks as the other approval POSTs, has no CSRF
-form token, and is not on the client API port, so an agent cannot fake presence. The broker keeps
+form token, and is not on the client API port, so an agent cannot fake presence. The approver app's
+`POST /v1/approver/presence` (see "Approver app API") is on the client port but needs the approver's OIDC
+token, so an agent's client key cannot fake presence there either. The broker keeps
 the last beat per user and tab in memory (bounded maps); the user is present when some tab's
 last beat is visible and younger than `ttl_s`. Beats are not audited.
 
@@ -3537,7 +3702,7 @@ enrollment body for a proxy to log. The hash cannot be used as a credential.
 
 ### Enrollment endpoint
 
-`POST /v1/enroll` and `GET /v1/enroll/<id>` on the client API are the only unauthenticated paths.
+`POST /v1/enroll` and `GET /v1/enroll/<id>` on the client API are the only unauthenticated paths (apart from `GET /v1/approver/config`, public settings served only when `approver_api` is set).
 Body `{"name", "hash", "claim"}`: exactly those keys, at most 1024 bytes. It creates one thing: a
 pending enrollment (never a request: no notification button, link, token or Home Assistant hook can
 decide it). The reply is `{id, code, expires_in, interval}`; `id` is a 128-bit random token only the
@@ -3799,7 +3964,8 @@ decision. Hidden on purpose:
 - Approver presence and activity, so the agent cannot time requests for when you are away:
   `approval_viewed`, `request_detail_viewed`, `approval_stale`, `approval_forbidden`,
   `csrf_refused`, `dashboard_viewed`, `history_viewed`, `push_subscribed`, `push_revoked`,
-  `push_refused`, `push_test`, `ha_decide_dropped`.
+  `push_refused`, `push_test`, `ha_decide_dropped`, `approver_auth_refused`, `approver_rate_limited`,
+  `approver_api_discovery_failed`, `notify_failed`.
 - Server-identity policy: `ssh_hosts_changed`, `ssh_hosts_change_refused`, `ssh_hosts_change_failed`,
   `ssh_sign_refused` (a key's `ssh_hosts.allowed_hosts` is approval
   policy; the refusal itself is already returned to the client without the allowed list).
