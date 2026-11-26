@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -196,10 +197,21 @@ class ConfigRulesTests(unittest.TestCase):
     def test_hostile_tokens_are_malformed_not_exceptions(self):
         k = Key("k")
         v = Env(k).verifier()
-        nested = b64(b"[" * 7000)               # under the cap, deep enough to recurse
-        self.assertEqual(v.verify(nested + ".e30.AA"), (None, "malformed"))
-        self.assertEqual(v.verify("a" * 8193), (None, "malformed"))
-        self.assertEqual(v.verify(b64(b"{}") + "." + b64(b"[" * 7000) + ".AA"),
+        deep = b"[" * 5000                      # token stays under the cap
+        hdr = b64(deep) + "." + b64(b"{}") + ".AA"
+        signing = b64(json.dumps({"alg": "RS256", "kid": "k"}).encode()) + "." + b64(deep)
+        pay = signing + "." + b64(k.sign(signing.encode()))   # validly signed, hostile payload
+        hdr_ok = {"alg": "RS256", "kid": "k"}
+        for tok, effects in ((hdr, [RecursionError()]), (pay, [hdr_ok, RecursionError()])):
+            self.assertLessEqual(len(tok), oidc.MAX_TOKEN)
+            self.assertEqual(v.verify(tok), (None, "malformed"))
+            # CPython 3.12's C JSON scanner does not hit RecursionError on <= 6000 levels (it
+            # needs ~20000, far over the cap), so force the exception to exercise the catch.
+            with mock.patch.object(oidc.json, "loads", side_effect=effects):
+                self.assertEqual(v.verify(tok), (None, "malformed"))
+
+    def test_over_cap_token_is_malformed(self):
+        self.assertEqual(Env(Key("k")).verifier().verify("a" * (oidc.MAX_TOKEN + 1)),
                          (None, "malformed"))
 
 
