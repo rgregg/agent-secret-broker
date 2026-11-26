@@ -249,6 +249,43 @@ class Rename(Base):
         self.assertEqual(self.broker.credential_stored_meta("svc")["name"], "svc")
 
 
+class WithASummaryKey(Base):
+    """A summary key provider is configured (the normal production setup): _internal_secrets takes the
+    catalog lock, so rename and delete must not reach it while holding that lock (they once deadlocked
+    there, hanging every later request that needed the catalog)."""
+
+    def setUp(self):
+        super().setUp()
+        self.broker.summarizer = types.SimpleNamespace(key_providers=[types.SimpleNamespace(name="other")])
+        self.assertTrue(self.broker.is_internal_secret("other"))          # premise: real lookup, not a mock
+
+    def run_bounded(self, fn):
+        import threading
+        out = {}
+        th = threading.Thread(target=lambda: out.setdefault("r", fn()), daemon=True)
+        th.start()
+        th.join(10)                                                      # returns at once unless it deadlocks
+        self.assertFalse(th.is_alive(), "the credential action deadlocked on the catalog lock")
+        self.assertFalse(self.broker._cfg_lock.locked())
+        return out["r"]
+
+    def test_rename_with_and_without_alias_finishes(self):
+        for keep, new in ((True, "svc-new"), (False, "svc-newer")):
+            name = "svc" if keep else "svc-new"
+            sha = crededitor.digest(self.broker.credential_stored_meta(name))
+            r = self.run_bounded(lambda: self.broker.rename_credential(name, new, sha, "alice", keep_alias=keep))
+            self.assertEqual(r["status"], "renamed", r)
+
+    def test_rename_of_the_internal_key_is_still_refused(self):
+        sha = crededitor.digest(self.broker.credential_stored_meta("other"))
+        r = self.run_bounded(lambda: self.broker.rename_credential("other", "other2", sha, "alice"))
+        self.assertEqual((r["status"], r["reason"]), ("refused", "internal"))
+
+    def test_delete_finishes(self):
+        r = self.run_bounded(lambda: self.broker.delete_credential("svc", "svc", "alice"))
+        self.assertEqual(r["status"], "deleted", r)
+
+
 class RemoveAlias(Base):
     def test_removal_is_audited_by_name_and_other_aliases_stay(self):
         meta = self.broker.credential_stored_meta("svc")

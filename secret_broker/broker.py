@@ -1832,15 +1832,17 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
         self.log("credential_created", hosts=len(spec["allowed_hosts"]), value_bytes=spec["value_bytes"], **who)
         return {"status": "created", "reason": "", "message": ""}
 
-    def _manage_guard(self, name, who):
-        """Shared preconditions of rename and delete -> a refusal dict, or None to go on."""
+    def _manage_guard(self, name, who, internal):
+        """Shared preconditions of rename and delete -> a refusal dict, or None to go on. Runs under
+        _cfg_lock, so `internal` is the caller's internal_snapshot() taken BEFORE the lock:
+        _internal_secrets takes that lock itself (a plain Lock, so taking it twice deadlocks)."""
         def refused(reason, msg):
             self.log("credential_change_refused", reason=reason, **who)
             return {"status": "refused", "reason": reason, "message": msg}
         if backend_base.CAP_SET_META not in self.backend.capabilities:
             return refused("unsupported", "This vault backend cannot store metadata")
         sc = self.cfg["secrets"][name]
-        if name in self._internal_secrets()[0]:
+        if name in internal:
             return refused("internal", "This is the broker's own key and cannot be changed here")
         if sc.get("auto"):
             return refused("adopted", "This item has no broker metadata yet (it was adopted with defaults): "
@@ -1874,8 +1876,9 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
         if self._plan_denied(name):
             return refused("denied_by_name", "plans.deny_secrets names this credential; "
                                              "change the config first, or the deny rule would stop matching")
+        internal = self.internal_snapshot()          # before the lock: it takes _cfg_lock itself
         with self._cfg_lock:
-            guard = self._manage_guard(name, who)
+            guard = self._manage_guard(name, who, internal)
             if guard:
                 return guard
             sc = self.cfg["secrets"][name]
@@ -1955,8 +1958,9 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
         if typed != name:
             self.log("credential_change_refused", reason="confirm", **who)
             return {"status": "refused", "reason": "confirm", "message": "Type the credential's name to confirm"}
+        internal = self.internal_snapshot()          # before the lock: it takes _cfg_lock itself
         with self._cfg_lock:
-            guard = self._manage_guard(name, who)
+            guard = self._manage_guard(name, who, internal)
             if guard:
                 return guard
             item = self.cfg["secrets"][name]["_item"]
