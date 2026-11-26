@@ -65,6 +65,9 @@ reporting presence until they are allowed again (checked when the app becomes ac
 opens). Focus and Do Not Disturb are not visible to the app: with notifications allowed but
 silenced by a Focus, you still count as present, so the phone push waits for the presence fallback.
 
+The broker URL must be `https://`, except for a broker on this Mac (`http://127.0.0.1`,
+`http://[::1]` or `http://localhost`).
+
 ## Manual verification
 
 Run these on a Mac against a broker with `approver_api` configured (the home-lab broker for the

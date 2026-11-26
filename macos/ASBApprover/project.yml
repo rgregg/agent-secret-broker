@@ -59,7 +59,8 @@ targets:
         # A menu bar app: no Dock icon, no main menu.
         LSUIElement: true
         NSHumanReadableCopyright: MIT License
-        # Plain http is allowed only to local-network hosts (a LAN broker); anything else needs https.
+        # ATS permits plain http to local-network hosts; the app itself accepts http:// only for a
+        # loopback broker (AppModel.parseBrokerURL), so anything else needs https.
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true
         CFBundleURLTypes:

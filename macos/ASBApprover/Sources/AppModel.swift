@@ -127,7 +127,15 @@ final class AppModel {
 
     private func signIn() async {
         signInError = nil
-        guard let url = Self.parseBrokerURL(brokerURLText) else {
+        let url: URL
+        switch Self.parseBrokerURL(brokerURLText) {
+        case .success(let parsed):
+            url = parsed
+        case .failure(.insecureHTTP):
+            signInError = "Use https:// for the broker. Plain http:// is allowed only for this Mac "
+                + "(127.0.0.1, ::1 or localhost), because every call carries your sign-in token."
+            return
+        case .failure(.invalid):
             signInError = "Enter the broker's client URL, for example https://broker.example:8800."
             return
         }
@@ -430,16 +438,35 @@ final class AppModel {
     static let callbackScheme = "asb-approver"
     static let brokerURLKey = "brokerURL"
 
-    /// `https://` is assumed when no scheme is typed. Only http and https are accepted.
-    static func parseBrokerURL(_ text: String) -> URL? {
+    enum BrokerURLProblem: Error, Equatable {
+        /// Empty, unparsable, no host, or a scheme other than http/https.
+        case invalid
+        /// `http://` to a host that is not this Mac: the bearer token would cross the network in clear.
+        case insecureHTTP
+    }
+
+    /// `https://` is assumed when no scheme is typed. `http://` is accepted only for a loopback
+    /// host (`127.0.0.1`, `::1`, `localhost`), since every call carries the approver's token.
+    static func parseBrokerURL(_ text: String) -> Result<URL, BrokerURLProblem> {
         var s = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !s.isEmpty else { return nil }
+        guard !s.isEmpty else { return .failure(.invalid) }
         if !s.contains("://") {
             s = "https://" + s
         }
         guard let url = URL(string: s), let scheme = url.scheme?.lowercased(),
-              scheme == "https" || scheme == "http", let host = url.host, !host.isEmpty else { return nil }
-        return url
+              scheme == "https" || scheme == "http", let host = url.host, !host.isEmpty else {
+            return .failure(.invalid)
+        }
+        if scheme == "http" && !isLoopbackHost(host) {
+            return .failure(.insecureHTTP)
+        }
+        return .success(url)
+    }
+
+    /// `URL.host` gives an IPv6 literal without brackets on current macOS; both forms are accepted.
+    static func isLoopbackHost(_ host: String) -> Bool {
+        let h = host.lowercased()
+        return h == "127.0.0.1" || h == "::1" || h == "[::1]" || h == "localhost"
     }
 
     /// `notify.DEVICE_RE`: 1-64 of `A-Za-z0-9_.:-`. Other characters become `-`.
