@@ -60,7 +60,6 @@ public actor PendingFeed {
         guard loop == nil else { return }
         generation += 1
         let gen = generation
-        reachable = true
         loop = Task { [weak self] in
             await self?.run(gen)
         }
@@ -113,11 +112,13 @@ public actor PendingFeed {
         var attempt = 0
         while !Task.isCancelled {
             do {
-                let page = try await api.pending(since: lastPage?.version, wait: waitSeconds)
+                // After an error, ask for an immediate answer so recovery shows at once.
+                let recovering = !reachable
+                let page = try await api.pending(since: lastPage?.version, wait: recovering ? 0 : waitSeconds)
                 if Task.isCancelled || generation != gen { return }
                 attempt = 0
                 reachable = true
-                accept(page)
+                accept(page, force: recovering)     // "reachable again" even if nothing changed
                 if let pause = page.retryAfter, pause > 0 {
                     try await sleeper(pause)          // waiter cap: the broker asked for a pause
                 }
@@ -145,10 +146,11 @@ public actor PendingFeed {
         }
     }
 
-    private func accept(_ incoming: PendingPage) {
+    /// Emits the page when it changed, or always with `force` (the first success after an outage).
+    private func accept(_ incoming: PendingPage, force: Bool = false) {
         var page = incoming
         page.retryAfter = nil
-        if let last = lastPage, last.version == page.version, last.requests == page.requests {
+        if !force, let last = lastPage, last.version == page.version, last.requests == page.requests {
             return
         }
         lastPage = page

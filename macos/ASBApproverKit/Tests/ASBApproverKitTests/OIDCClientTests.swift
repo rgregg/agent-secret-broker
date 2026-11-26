@@ -217,6 +217,59 @@ final class OIDCClientTests: XCTestCase {
         XCTAssertEqual(s.recorded(path: "/token").count, 1)
     }
 
+    /// A refresh still in flight when the user signs out must not sign them back in.
+    func testSignOutDuringRefreshStaysSignedOut() async throws {
+        let late = try Self.tokenBody(access: "resurrected", refresh: "r2")
+        let s = server { _ in
+            Thread.sleep(forTimeInterval: 0.5)         // the response arrives after the sign-out
+            return .raw(200, late)
+        }
+        let store = MemoryTokenStore(Tokens(accessToken: "old", refreshToken: "r1",
+                                            expiresAt: start.addingTimeInterval(3600)))
+        let client = oidc(s, store: store)
+        let refreshing = Task { try await client.refreshAfter401() }
+        try await Task.sleep(nanoseconds: 100_000_000)  // the refresh is in flight
+        await client.signOut()
+        let outcome = await refreshing.result
+        XCTAssertThrowsError(try outcome.get()) {
+            XCTAssertEqual($0 as? OIDCError, .signInRequired)
+        }
+        try await Task.sleep(nanoseconds: 600_000_000)  // past the delayed response
+        XCTAssertNil(store.load())
+        let signedIn = await client.isSignedIn()
+        XCTAssertFalse(signedIn)
+        do {
+            _ = try await client.accessToken()
+            XCTFail("signed out")
+        } catch {
+            XCTAssertEqual(error as? OIDCError, .signInRequired)
+        }
+    }
+
+    /// A new sign-in during a refresh wins; the waiter gets the new session's token.
+    func testExchangeDuringRefreshKeepsNewSession() async throws {
+        let late = try Self.tokenBody(access: "stale", refresh: "r2")
+        let fresh = try Self.tokenBody(access: "new-session", refresh: "n1")
+        let s = server { rec in
+            if rec.form["grant_type"] == "refresh_token" {
+                Thread.sleep(forTimeInterval: 0.5)
+                return .raw(200, late)
+            }
+            return .raw(200, fresh)
+        }
+        let store = MemoryTokenStore(Tokens(accessToken: "old", refreshToken: "r1",
+                                            expiresAt: start.addingTimeInterval(3600)))
+        let client = oidc(s, store: store)
+        let refreshing = Task { try await client.refreshAfter401() }
+        try await Task.sleep(nanoseconds: 100_000_000)
+        try await client.exchange(code: "c", pkce: PKCE.make())
+        let token = try await refreshing.value
+        XCTAssertEqual(token, "new-session")
+        try await Task.sleep(nanoseconds: 600_000_000)
+        XCTAssertEqual(store.load()?.accessToken, "new-session")
+        XCTAssertEqual(store.load()?.refreshToken, "n1")
+    }
+
     func testDiscoveryChecksIssuer() async throws {
         let s = server { rec in
             guard rec.path == "/application/o/asb-approver/.well-known/openid-configuration" else {

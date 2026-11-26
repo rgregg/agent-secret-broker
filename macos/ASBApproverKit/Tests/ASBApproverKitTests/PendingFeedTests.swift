@@ -153,6 +153,36 @@ final class PendingFeedTests: XCTestCase {
         XCTAssertEqual(events.snapshot.map { $0.kind }, ["unreachable", "page", "unreachable"])
     }
 
+    /// After an outage the app must hear "reachable again" even when the list did not change.
+    func testRecoveryEmitsPageEvenWhenUnchanged() async throws {
+        let same = Self.json(Fixtures.page(1, [Fixtures.row("A", notified: false)]))
+        let calls = Box(0)
+        let s = server { _ in
+            let n = calls.update { (c: inout Int) -> Int in
+                c += 1
+                return c
+            }
+            if n == 2 {
+                throw URLError(.cannotConnectToHost)
+            }
+            if n > 3 {
+                Thread.sleep(forTimeInterval: 0.05)
+            }
+            return .raw(200, same)
+        }
+        let (f, events) = feed(s, sleep: { _ in })
+        await f.start()
+        await fulfillment(of: [events.expectation(count: 3)], timeout: 10)
+        try await Task.sleep(nanoseconds: 300_000_000)  // further identical pages emit nothing
+        XCTAssertEqual(events.snapshot.map { $0.kind }, ["page", "unreachable", "page"])
+        XCTAssertEqual(events.snapshot[2].page?.version, 1)
+        let polls = s.recorded(path: "/v1/approver/pending")
+        XCTAssertGreaterThan(polls.count, 3)
+        XCTAssertEqual(polls[1].query["wait"], "25")
+        XCTAssertEqual(polls[2].query["wait"], "0")     // the first poll after an error answers at once
+        XCTAssertEqual(polls[3].query["wait"], "25")
+    }
+
     func testRetryAfterOnPageAndErrorsIsHonored() async throws {
         let ok = Self.json(Fixtures.page(1, []))
         let calls = Box(0)

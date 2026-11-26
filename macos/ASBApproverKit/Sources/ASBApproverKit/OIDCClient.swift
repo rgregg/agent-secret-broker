@@ -128,12 +128,12 @@ public final class OIDCClient: TokenProvider, Sendable {
             ("client_id", config.clientId),
             ("code_verifier", pkce.verifier),
         ])
-        await state.set(tokens(from: response, previousRefreshToken: nil))
+        await state.signIn(tokens(from: response, previousRefreshToken: nil))
     }
 
     /// Forgets the session (the Keychain item too).
     public func signOut() async {
-        await state.set(nil)
+        await state.signOut()
     }
 
     public func isSignedIn() async -> Bool {
@@ -239,10 +239,15 @@ struct DiscoveryDocument: Decodable, Sendable {
 }
 
 /// The token state, its persistence, and the single in-flight refresh.
+///
+/// `epoch` counts sessions: sign-in and sign-out each start a new one. A refresh records the epoch
+/// it started in and its result is applied only if that is still the current one, so a refresh
+/// that finishes after a sign-out (or a new sign-in) can never bring the old session back.
 actor TokenState {
     private let store: any TokenStore
     private var tokens: Tokens?
-    private var inFlight: Task<Tokens, Error>?
+    private var epoch = 0
+    private var inFlight: (epoch: Int, task: Task<Tokens, Error>)?
 
     init(store: any TokenStore) {
         self.store = store
@@ -253,36 +258,70 @@ actor TokenState {
         tokens
     }
 
-    func set(_ t: Tokens?) {
+    /// A new session (code exchange): replaces the tokens and abandons any refresh in flight.
+    func signIn(_ t: Tokens) {
+        epoch += 1
+        inFlight?.task.cancel()
+        inFlight = nil
         tokens = t
-        if let t {
-            store.save(t)
-        } else {
-            store.clear()
-        }
+        store.save(t)
+    }
+
+    /// Ends the session: forgets the tokens and abandons any refresh in flight.
+    func signOut() {
+        epoch += 1
+        inFlight?.task.cancel()
+        inFlight = nil
+        tokens = nil
+        store.clear()
     }
 
     func refresh(_ perform: @escaping @Sendable (String) async throws -> Tokens) async throws -> Tokens {
+        let started: Int
+        let task: Task<Tokens, Error>
         if let running = inFlight {
-            return try await running.value
+            started = running.epoch
+            task = running.task
+        } else {
+            guard let refreshToken = tokens?.refreshToken else {
+                signOut()
+                throw OIDCError.signInRequired
+            }
+            started = epoch
+            task = Task<Tokens, Error> { try await perform(refreshToken) }
+            inFlight = (started, task)
         }
-        guard let refreshToken = tokens?.refreshToken else {
-            set(nil)
-            throw OIDCError.signInRequired
-        }
-        let task = Task<Tokens, Error> { try await perform(refreshToken) }
-        inFlight = task
         do {
             let fresh = try await task.value
-            inFlight = nil
-            set(fresh)
+            if epoch != started {
+                return try afterSessionChange()
+            }
+            if inFlight?.task == task {         // the first waiter to resume applies it
+                inFlight = nil
+                tokens = fresh
+                store.save(fresh)
+            }
             return fresh
         } catch {
-            inFlight = nil
-            if (error as? OIDCError) == .signInRequired {
-                set(nil)
+            if epoch != started {
+                return try afterSessionChange()
+            }
+            if inFlight?.task == task {
+                inFlight = nil
+                if (error as? OIDCError) == .signInRequired {
+                    signOut()
+                }
             }
             throw error
         }
+    }
+
+    /// The session changed while a refresh ran: its result is discarded. The waiter gets the new
+    /// session's tokens if there is one, else "sign in again".
+    private func afterSessionChange() throws -> Tokens {
+        if let t = tokens {
+            return t
+        }
+        throw OIDCError.signInRequired
     }
 }
