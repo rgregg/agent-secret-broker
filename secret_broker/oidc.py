@@ -11,6 +11,7 @@ A token, or any part of one, never goes into an exception message, a reason or a
 import base64
 import binascii
 import json
+import math
 import re
 import threading
 import time
@@ -252,6 +253,9 @@ class Verifier:
             return None, "expired"
         if nbf is not None and (not _is_num(nbf) or nbf > now + SKEW):
             return None, "expired"
+        iat = claims.get("iat")
+        if iat is not None and not _is_num(iat):     # Python's json accepts NaN / Infinity
+            return None, "expired"
         who = claims.get(cfg["username_claim"])
         if not isinstance(who, str) or not who or who != cfg.get("allowed_user"):
             return None, "user"
@@ -264,4 +268,5 @@ class Verifier:
 
 
 def _is_num(v):
-    return isinstance(v, (int, float)) and not isinstance(v, bool)
+    """A finite JSON number: never a bool, NaN or +/-Infinity."""
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)

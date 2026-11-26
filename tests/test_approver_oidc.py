@@ -286,6 +286,14 @@ class VerifyTests(unittest.TestCase):
         signing = h + "." + b64(json.dumps(claims).encode())
         self.check(signing + "." + b64(self.rsa.sign(signing.encode())), "expired")
 
+    def test_non_finite_time_claims_are_refused(self):
+        # json.dumps writes Infinity / NaN and the broker's json.loads would read them back
+        for claim in ("exp", "nbf", "iat"):
+            for bad in (float("inf"), float("-inf"), float("nan")):
+                self.check(self.rsa.token({claim: bad}), "expired")
+        self.check(self.rsa.token({"iat": NOW}), None)
+        self.check(self.rsa.token({"iat": "yesterday"}), "expired")
+
     def test_user_must_match(self):
         self.check(self.rsa.token({"preferred_username": "mallory"}), "user")
         self.check(self.rsa.token({"email": "ryan"}), None, username_claim="email")
