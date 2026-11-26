@@ -31,7 +31,10 @@ services:
     # `client_peer_observed` lines in the audit log / `docker compose logs broker` (the first 20 requests are
     # logged with the socket peer the broker really sees); list THAT address. Set "client_api_allow_direct": true
     # if some clients (Home Assistant, asb on this host) connect directly.
-    healthcheck:               # /healthz answers only loopback / the container's own address, with "ok"
+    # /healthz answers only loopback / the container's own address: "ok", or 503 "stuck" while a lock every request
+    # needs has been taken for 30 s. Docker does not restart an unhealthy container; the broker's watchdog exits on
+    # its own after `watchdog.stuck_s` (default 120 s) and `restart: unless-stopped` brings it back.
+    healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8800/healthz', timeout=3)"]
       interval: 30s
       timeout: 5s
