@@ -58,8 +58,12 @@ signing secrets is ad-hoc signed only: after downloading it, remove the quaranti
 3. Optional: tick **Launch at login**.
 
 The broker URL and the provider settings are kept in the app's preferences; the tokens only in the
-Keychain. The app counts as "presence" (so the phone push can wait) only while the screen is
-unlocked and you used the keyboard or mouse in the last 2 minutes.
+Keychain. The app counts as "presence" (so the phone push can wait) only while its notifications
+are allowed in System Settings, the screen is unlocked and you used the keyboard or mouse in the
+last 2 minutes. With notifications turned off it tells the broker you are away once and stops
+reporting presence until they are allowed again (checked when the app becomes active or its window
+opens). Focus and Do Not Disturb are not visible to the app: with notifications allowed but
+silenced by a Focus, you still count as present, so the phone push waits for the presence fallback.
 
 ## Manual verification
 

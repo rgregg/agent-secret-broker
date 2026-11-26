@@ -46,6 +46,18 @@ final class Notifications: NSObject, UNUserNotificationCenterDelegate {
         }
     }
 
+    /// Whether banners can be shown right now: authorization `.authorized` or `.provisional`.
+    /// Focus / Do Not Disturb is not visible here and still counts as allowed.
+    nonisolated static func bannersAllowed() async -> Bool {
+        let settings = await UNUserNotificationCenter.current().notificationSettings()
+        switch settings.authorizationStatus {
+        case .authorized, .provisional:
+            return true
+        default:
+            return false
+        }
+    }
+
     // MARK: - Content
 
     static func category(for request: PendingRequest) -> String {

@@ -49,6 +49,7 @@ struct MenuContent: View {
         .frame(width: 400)
         .onAppear {
             model.loginItem.refresh()
+            model.refreshNotificationAuthorization()
         }
     }
 

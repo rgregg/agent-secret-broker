@@ -83,14 +83,15 @@ final class AppModel {
     func launch() {
         guard !launched else { return }
         launched = true
-        Task { [weak self] in
-            let allowed = await Notifications.requestAuthorization()
-            self?.notificationsDenied = !allowed
-        }
         presence.send = { [weak self] active in
             await self?.sendPresence(active)
         }
+        Task { [weak self] in
+            _ = await Notifications.requestAuthorization()
+            self?.refreshNotificationAuthorization()
+        }
         observeSleep()
+        observeActivation()
 
         if let saved = SavedBroker.load() {
             let client = install(saved)
@@ -166,7 +167,7 @@ final class AppModel {
         Task { [weak self] in
             guard let self else { return }
             if self.state != .signedOut {
-                await self.sendPresence(false)
+                await self.presence.stopSendingInactive()
             }
             await self.endSession()
             self.needsSignInAgain = false
@@ -369,6 +370,28 @@ final class AppModel {
     }
 
     // MARK: - Presence
+
+    /// Re-reads the notification authorization (the user can change it in System Settings at any
+    /// time). Presence is reported as active only while banners can be shown: a Mac whose banners
+    /// are off must not hold back the phone push. Called at launch, when the popover opens and when
+    /// the app becomes active.
+    func refreshNotificationAuthorization() {
+        Task { [weak self] in
+            let allowed = await Notifications.bannersAllowed()
+            guard let self else { return }
+            self.notificationsDenied = !allowed
+            self.presence.bannersAllowed = allowed
+        }
+    }
+
+    private func observeActivation() {
+        workspaceObservers.append(NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.refreshNotificationAuthorization()
+            }
+        })
+    }
 
     private func sendPresence(_ active: Bool) async {
         guard let api else { return }

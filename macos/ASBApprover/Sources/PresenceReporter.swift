@@ -4,25 +4,45 @@ import Foundation
 
 /// Tells the broker when the user is really at this Mac, so the phone push can wait.
 ///
-/// Active means: the screen is unlocked (and not asleep, and this login session is the one on the
-/// console) and there was keyboard or mouse input within the last 120 s. While active it sends
+/// Active means: this app's banners can be shown (notification authorization is granted; see
+/// `bannersAllowed`), the screen is unlocked (and not asleep, and this login session is the one on
+/// the console) and there was keyboard or mouse input within the last 120 s. While active it sends
 /// `presence(active: true)` every 10 s (the broker's presence `ttl_s` defaults to 25 s); on the
-/// transition to inactive it sends `active: false` once, at once.
+/// transition to inactive it sends `active: false` once, at once, and then nothing until active again.
+///
+/// Sending: at most one beat is in flight and at most one waits behind it. A newer state replaces
+/// the waiting beat (so an `active: false` always replaces a waiting `true`), and a waiting `true`
+/// older than `staleLimit` is dropped when its turn comes. An outage therefore never piles beats up
+/// to burst out on recovery.
 @MainActor
 final class PresenceReporter {
     static let interval: TimeInterval = 10
     static let idleLimit: TimeInterval = 120
+    /// A waiting `active: true` older than this is not sent (it would claim presence after the fact).
+    static let staleLimit: TimeInterval = 10
 
     /// Sends one presence beat (set by the model).
     var send: ((Bool) async -> Void)?
+
+    /// Whether this app's banners can be seen (notification authorization `.authorized` or
+    /// `.provisional`). Set by the model; while false, presence is never reported as active.
+    var bannersAllowed = false {
+        didSet {
+            if bannersAllowed != oldValue {
+                tick()
+            }
+        }
+    }
 
     private var locked = false
     private var asleep = false
     private var sessionInactive = false
     private var lastActive: Bool?
     private var loop: Task<Void, Never>?
-    /// Beats go out one after another, so an `active: false` never overtakes an earlier `true`.
-    private var sending: Task<Void, Never>?
+    /// The beat being sent, if any.
+    private var inFlight: Task<Void, Never>?
+    /// The one beat waiting behind `inFlight`: the latest state, and when it was queued.
+    private var waiting: (active: Bool, queuedAt: Date)?
     private var observers: [(NotificationCenter, NSObjectProtocol)] = []
 
     init() {
@@ -52,15 +72,28 @@ final class PresenceReporter {
         }
     }
 
-    /// Stops beating. Sends nothing (the caller sends `active: false` first when it still can).
+    /// Stops beating and forgets a waiting beat. Sends nothing (see `stopSendingInactive`).
     func stop() {
         loop?.cancel()
         loop = nil
         lastActive = nil
+        waiting = nil
+    }
+
+    /// Stops beating, waits for a beat in flight, then sends `active: false` (sign-out), so the
+    /// `false` is not overtaken by an earlier `true`.
+    func stopSendingInactive() async {
+        stop()
+        let current = inFlight
+        await current?.value
+        if let send {
+            await send(false)
+        }
     }
 
     var isActive: Bool {
-        !locked && !asleep && !sessionInactive && Self.secondsSinceLastInput() < Self.idleLimit
+        bannersAllowed && !locked && !asleep && !sessionInactive
+            && Self.secondsSinceLastInput() < Self.idleLimit
     }
 
     private func tick() {
@@ -75,11 +108,23 @@ final class PresenceReporter {
     }
 
     private func enqueue(_ active: Bool) {
-        guard let send else { return }
-        let previous = sending
-        sending = Task {
-            await previous?.value
-            await send(active)
+        guard send != nil else { return }
+        waiting = (active: active, queuedAt: Date())     // the latest state replaces a waiting beat
+        pump()
+    }
+
+    /// Starts the waiting beat when nothing is in flight.
+    private func pump() {
+        guard inFlight == nil, let next = waiting, let send else { return }
+        waiting = nil
+        if next.active && Date().timeIntervalSince(next.queuedAt) > Self.staleLimit {
+            return                              // stale presence: the next tick sends a fresh one
+        }
+        inFlight = Task { [weak self] in
+            await send(next.active)
+            guard let self else { return }
+            self.inFlight = nil
+            self.pump()
         }
     }
 
