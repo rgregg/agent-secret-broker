@@ -1261,6 +1261,12 @@ every `/v1/approver/*` path answers 404 and nothing else changes. Config:
 - `issuer` and `client_id` are required; `issuer` must be an `https://` URL. Unknown keys are
   refused at startup, and the error names the field (`approver_api.issuer`, ...). `allowed_user`
   must be set: the token's `username_claim` must equal it.
+- The username claim is the only identity check, so it must be a value users cannot change for
+  themselves at the provider. Turn off self-service username changes there (Authentik: the
+  "Allow users to change username" setting; Keycloak: "Edit username"). Otherwise any other
+  account that can sign in to this client could rename itself to `allowed_user` and approve.
+  Also restrict the provider application to your own account (or set `required_group`), so other
+  accounts cannot get a token for this client at all.
 - `scopes` are what the app asks the provider for (served by `/v1/approver/config`).
   `offline_access` lets the app refresh its token without signing you in again.
 - `actions` has the same shape as the `actions` object of a `notify` entry. For the app's banners
