@@ -1420,6 +1420,10 @@ Create an OAuth2/OpenID provider (placeholders; adapt names to your install):
 1. Client type **Public**, so no secret is stored on the Mac. Copy the generated client ID into
    `client_id`.
 2. Redirect URI (strict): `asb-approver://callback`. The app always uses PKCE (S256).
+   Grant types: `authorization_code` and `refresh_token`. A provider created through the API
+   starts with an empty list, which refuses every sign-in. Authentik then cannot redirect the
+   error to the app's custom scheme and shows only "Bad request". Its event log shows a
+   `suspicious_request` "Unsafe redirect"; that is the symptom, not the cause.
 3. Signing key: an RSA key (RS256). Authentik issues JWT access tokens.
 4. Scopes: `openid`, `profile`, and the `offline_access` scope mapping (so refresh tokens are
    issued); add the `groups` scope mapping if you use `required_group`.
