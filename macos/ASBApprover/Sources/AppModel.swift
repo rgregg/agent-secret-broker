@@ -141,8 +141,14 @@ final class AppModel {
         }
         isSigningIn = true
         defer { isSigningIn = false }
+        let config: ApproverConfig
         do {
-            let config = try await APIClient.fetchConfig(baseURL: url)
+            config = try await APIClient.fetchConfig(baseURL: url)
+        } catch {
+            signInError = Self.describeConfigError(error)
+            return
+        }
+        do {
             let endpoints = try await OIDCClient.discover(issuer: config.issuer)
             let saved = SavedBroker(brokerURL: url, config: config, endpoints: endpoints)
             // A client only to build the authorize URL; its token state is replaced on exchange.
@@ -481,6 +487,25 @@ final class AppModel {
             out = String(out.prefix(64))
         }
         return out.isEmpty ? "mac" : out
+    }
+
+    /// The first sign-in step, `GET /v1/approver/config`, explained in terms of what to fix. A broker
+    /// from before the approver API asks for an agent client key on every path (401); a site behind a
+    /// sign-in proxy (the approval site) redirects to an HTML login page, which does not decode.
+    static func describeConfigError(_ error: Error) -> String {
+        if let e = error as? APIError {
+            switch e {
+            case .http(let status) where status == 401 || status == 403:
+                return "This broker is too old for the app, or this is not its client URL. Update the "
+                    + "broker to a version with the approver API, then add approver_api to its config."
+            case .invalidResponse:
+                return "That address did not answer like the broker's client API. Use the client URL "
+                    + "(the one agents use, port 8800), not the approval site behind your sign-in proxy."
+            default:
+                break
+            }
+        }
+        return describe(error)
     }
 
     /// A fixed, short message for the user. Never includes response bodies.
