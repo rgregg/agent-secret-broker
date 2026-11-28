@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- The ASB logo's padlock alone, one colour with the check cut out: the macOS menu bar template
+     image (macOS tints it). Strokes are heavier than in logo.svg so it reads at 18 pt.
+     See logo.svg for how the files fit together. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="604" height="604" viewBox="210 188 604 604">
+  <defs>
+    <mask id="check">
+      <rect x="0" y="0" width="1024" height="1024" fill="#FFFFFF"/>
+      <path d="M400 612 L483 695 L630 548" fill="none" stroke="#000000" stroke-width="78" stroke-linecap="round" stroke-linejoin="round"/>
+    </mask>
+  </defs>
+  <path d="M362 470 V385 a150 150 0 0 1 300 0 V470" fill="none" stroke="#000000" stroke-width="84" stroke-linecap="round"/>
+  <rect x="270" y="446" width="484" height="346" rx="70" ry="70" fill="#000000" mask="url(#check)"/>
+</svg>

@@ -40,8 +40,9 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: $(ASB_BUNDLE_ID)
         PRODUCT_NAME: ASBApprover
         GENERATE_INFOPLIST_FILE: NO
-        # No app icon set in the catalog yet; the menu bar icon is a template image.
-        ASSETCATALOG_COMPILER_APPICON_NAME: ""
+        # The app icon (also shown on banners) and the menu bar template image are rendered from
+        # assets/logo/ by tools/make_icon.py.
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ENABLE_HARDENED_RUNTIME: YES
         CODE_SIGN_STYLE: Automatic
         CODE_SIGN_IDENTITY: "-"

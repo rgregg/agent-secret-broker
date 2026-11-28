@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- The ASB logo full-bleed (no margin, corners or shadow): iOS applies its own rounded mask.
+     Same art as logo.svg, cropped to the tile. See logo.svg for how the files fit together. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="824" height="824" viewBox="100 100 824 824">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3B6FE0"/>
+      <stop offset="1" stop-color="#1E9E9A"/>
+    </linearGradient>
+  </defs>
+  <rect x="100" y="100" width="824" height="824" fill="url(#bg)"/>
+  <path d="M372 470 V385 a140 140 0 0 1 280 0 V470" fill="none" stroke="#FFFFFF" stroke-width="64" stroke-linecap="round"/>
+  <rect x="300" y="452" width="424" height="330" rx="64" ry="64" fill="#FFFFFF"/>
+  <path d="M410 617 L483 690 L620 553" fill="none" stroke="#2A86BE" stroke-width="58" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

@@ -6229,10 +6229,16 @@ def _agent_label(ua):
     return browser
 
 
-_ICON = ("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E"
-         "%3Crect width='32' height='32' rx='8' fill='%232563eb'/%3E%3Ctext x='16' y='23' "
-         "font-family='system-ui,Arial,sans-serif' font-size='20' font-weight='700' fill='white' "
-         "text-anchor='middle'%3EA%3C/text%3E%3C/svg%3E")
+# The favicon: assets/logo/logo-square.svg (the padlock with a check) with rounded corners, inlined.
+# Keep it in step with assets/logo/ by hand; tools/make_icon.py renders the PNG copies.
+_ICON = ("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='100 100 824 824'%3E"
+         "%3ClinearGradient id='g' x1='0' y1='0' x2='0' y2='1'%3E%3Cstop offset='0' stop-color='%233B6FE0'/%3E"
+         "%3Cstop offset='1' stop-color='%231E9E9A'/%3E%3C/linearGradient%3E"
+         "%3Crect x='100' y='100' width='824' height='824' rx='185' fill='url(%23g)'/%3E"
+         "%3Cpath d='M372 470V385a140 140 0 0 1 280 0V470' fill='none' stroke='white' stroke-width='64' "
+         "stroke-linecap='round'/%3E%3Crect x='300' y='452' width='424' height='330' rx='64' fill='white'/%3E"
+         "%3Cpath d='M410 617L483 690L620 553' fill='none' stroke='%232A86BE' stroke-width='58' "
+         "stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E")
 
 # Manual reload for the home-screen app (it has no browser chrome); shown by the page script in
 # standalone mode only, so a normal tab's header is unchanged.
