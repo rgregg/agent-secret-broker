@@ -49,6 +49,7 @@ from . import errclass
 from . import httpcheck
 from . import masking
 from . import notify as notify_mod
+from . import approver_api as approver_mod
 from . import presence as presence_mod
 from .notify import NotifyError  # noqa: F401 -- re-exported
 from . import grants as grants_mod
@@ -139,6 +140,8 @@ CHANNELS = {
     "push": Channel(token_required=True, may_create_always=False),        # POST /push/decide
     "ha": Channel(token_required=True, may_create_always=False),          # POST /v1/hooks/ha/decide
     "telegram": Channel(token_required=True, may_create_always=False),    # Telegram callback button
+    # the macOS approver app (POST /v1/approver/decide): the OIDC bearer check is its authentication
+    "app": Channel(token_required=False, may_create_always=True, may_create_grant=True),
 }
 
 
@@ -303,8 +306,13 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
         self._ha_rate = {}              # source ip -> {"t", "n", "drop"}; <= RATE_MAP_CAP
         self._ha_unauth = {"t": 0.0, "n": 0, "drop": 0}   # shared bad-key bucket
         self._ha_rate_lock = threading.Lock()
+        self._app_rate = {}             # approver API, valid tokens: source ip -> {"t", "n", "drop"}
+        self._app_unauth = {"t": 0.0, "n": 0, "drop": 0}  # approver API: shared bucket for refused tokens
         self._tg_refusals = {"t": None, "n": 0, "drop": 0}   # coalescing window for telegram_decide_refused
         self._tg_lock = threading.Lock()
+        # the macOS approver app (approver_api.py): None, or {cfg, verifier, feed} plus an `app` notify leaf
+        self.approver = approver_mod.setup(config.get("approver_api"), config.get("allowed_user"), self.log)
+        self.notifier = self._notifier              # adds the app leaf when configured
         if self.ha_hook is not None and not self.ha_hook["allowed_devices"]:
             self.log("ha_hook_any_device", warning="ha_hook.allowed_devices is empty: "
                      "any device id is accepted (it is recorded, not verified)")
@@ -400,7 +408,9 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
 
     @notifier.setter
     def notifier(self, value):
-        self._notifier = notify_mod.adapt(value)    # signature detection happens once, here
+        value = notify_mod.adapt(value)             # signature detection happens once, here
+        ap = getattr(self, "approver", None)
+        self._notifier = value if ap is None else approver_mod.with_app_leaf(value, ap.notifier, ap.on_undelivered)
 
     def _initial_load(self, locked=True):
         try:
@@ -3342,49 +3352,57 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
                 if var not in known:
                     raise ValueError(f"placeholder {httpcheck.clip(var, 60)} not provided by requested secrets")
 
-    def _push(self, req):
-        req.routing = False             # it goes to the human now: its card may show
-        url = f"{self.cfg['approve_base_url'].rstrip('/')}/a/{req.nonce}"
+    def _approve_url(self, req):
+        """The request's page on the approval site (the link every notification carries)."""
+        return f"{self.cfg['approve_base_url'].rstrip('/')}/a/{req.nonce}"
+
+    def _what(self, req):
+        """The one-line (ssh_sign: multi-line) target text of a request, as notifications show it."""
         if req.mode == "http":
-            what = f"{req.spec['method']} {req.spec['url']}"
+            return f"{req.spec['method']} {req.spec['url']}"
         elif req.mode == "store":
             sp = req.spec
             if sp.get("hosts_after") is not None:
-                what = f"change allowed hosts of {req.names[0]}{_host_change_text(sp)}"
+                return f"change allowed hosts of {req.names[0]}{_host_change_text(sp)}"
             else:
-                what = (f"{sp['op']} credential: item {sp['item']!r} field {sp['field']}"
+                return (f"{sp['op']} credential: item {sp['item']!r} field {sp['field']}"
                         f"{' key ' + sp['key'] if sp.get('key') else ''}"
                         f"{', variables ' + ', '.join(sorted(sp['vars'])) if sp.get('vars') else ''} "
                         f"({sp['value_bytes']} bytes, value not shown)")
         elif req.mode == "guidance":
             k = len(req.names)
-            what = f"Guidance change proposed for {k} credential{'' if k == 1 else 's'}"
+            return f"Guidance change proposed for {k} credential{'' if k == 1 else 's'}"
         elif req.mode == "credential":
-            what = (f"Credential replacement requested: {req.names[0]}" if req.spec.get("replace")
+            return (f"Credential replacement requested: {req.names[0]}" if req.spec.get("replace")
                     else f"WebSocket setup change requested: {req.names[0]}" if req.spec.get("ws_change")
                     else f"Credential requested: {req.names[0]}")
         elif req.mode == "plan":
             k = len(req.spec["rules"])
-            what = (f"Plan requested: {req.client['name']}, {k} rule{'' if k == 1 else 's'}: "
+            return (f"Plan requested: {req.client['name']}, {k} rule{'' if k == 1 else 's'}: "
                     f"{', '.join(req.names)}")
         elif req.mode == "session":
             sp = req.spec
             if sp.get("kind") == "ws":
-                what = (f"WebSocket session requested: {req.names[0]} on {', '.join(sp['hosts'])} "
+                return (f"WebSocket session requested: {req.names[0]} on {', '.join(sp['hosts'])} "
                         f"({sp['scheme']}), {sessions_mod._fmt_ttl(sp['ttl_s'])}, up to {sp['max_calls']} frames")
             else:
-                what = (f"HTTP session requested: {req.names[0]} on {', '.join(sp['hosts'])} "
+                return (f"HTTP session requested: {req.names[0]} on {', '.join(sp['hosts'])} "
                         f"({', '.join(sp['methods'])}), {sessions_mod._fmt_ttl(sp['ttl_s'])}, up to {sp['max_calls']} calls")
         elif req.mode == "sudo":
-            what = sudo_mod.push_text(req.spec)
+            return sudo_mod.push_text(req.spec)
         elif req.mode == "exec":
-            what = exec_mod.push_text(req.spec)
+            return exec_mod.push_text(req.spec)
         elif req.mode == "ssh_sign":
-            what = "\n".join([req.spec["ssh"].get("headline") or req.spec["ssh"]["text"],
+            return "\n".join([req.spec["ssh"].get("headline") or req.spec["ssh"]["text"],
                               f"SSH key {req.spec['fingerprint']}: {req.spec['ssh']['text']}"]
                              + sshkey.host_lines(req.spec.get("host")))
         else:
-            what = "run: " + " ".join(req.spec.get("argv") or [])[:200]
+            return "run: " + " ".join(req.spec.get("argv") or [])[:200]
+
+    def _push(self, req):
+        req.routing = False             # it goes to the human now: its card may show
+        url = self._approve_url(req)
+        what = self._what(req)
         head = f"{req.summary} (unverified)\n" if req.summary and req.mode != "ssh_sign" else ""
         if req.mode == "ssh_sign":      # the summary IS the headline (built by code, not a model): lead with it once
             msg_lead, what = what.split("\n", 1)[0] + "\n", what.split("\n", 1)[1]
@@ -3493,7 +3511,7 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
                 if rest is None:
                     self.notifier.send(n)
                 else:
-                    notify_mod.send_to(rest, n)
+                    notify_mod.send_to(rest, n, getattr(self.notifier, "on_undelivered", None))
             except Exception as e:      # noqa: BLE001
                 ok, err = False, e
             if ok:
@@ -3605,9 +3623,13 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
             {notify_mod.transport_type(t) or "?" for t in leaves}))
         try:
             notify_mod.send_to(leaves, h["n"])
-        except Exception:  # noqa: BLE001 -- a request must always settle; the notify error text is never kept
-            if not req._sent_to[:-len(leaves)]:         # nothing was ever delivered
+        except Exception as e:  # noqa: BLE001 -- a request must always settle; the notify error text is never kept
+            before = req._sent_to[:-len(leaves)]
+            if not before:                              # nothing was ever delivered
                 self._finish(req, "failed", error="could not notify")
+            elif self.approver is not None and not any(
+                    getattr(t, "counts_as_delivery", True) for t in before):
+                self.approver.on_undelivered(h["n"], getattr(e, "failures", None) or [])   # only the app has it
         else:
             self.audit("notified", req)
         if req.status not in ("pending", "deciding"):   # settled while sending
@@ -3718,6 +3740,8 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
         if extra.get("via") not in ("policy", "session") and status != "approved":
             self._resolved(req, status)     # approvals were announced at decision time
         req.done.set()
+        if self.approver is not None:
+            self.approver.feed.bump()       # wakes the approver app's long poll
         return True
 
     def _load_proxy_secret(self, config):
@@ -4026,6 +4050,48 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
             first = st["drop"] == 1
         if first:
             self.log("ha_decide_dropped", peer=ip, limit_per_min=self.HA_UNAUTH_LIMIT_PER_MIN,
+                     unauthenticated=True)
+        return False
+
+    APP_LIMIT_PER_MIN = 60          # approver API, per source IP, valid OIDC tokens
+    APP_UNAUTH_LIMIT_PER_MIN = 120  # approver API: ONE shared bucket for missing/refused tokens
+
+    def app_rate_ok(self, ip):
+        """Fixed-window limit on the approver API per source IP, for requests whose OIDC token
+        verified (the HA hook shape). The first drop in a window is audited."""
+        now = time.time()
+        ip = clients_mod.src_key(ip)
+        with self._ha_rate_lock:
+            st = self._app_rate.get(ip)
+            if st is None:
+                self.rate_map_make_room(self._app_rate, now)
+                st = self._app_rate[ip] = {"t": now, "n": 0, "drop": 0}
+            if now - st["t"] >= 60:
+                st.update(t=now, n=0, drop=0)
+            st["n"] += 1
+            if st["n"] <= self.APP_LIMIT_PER_MIN:
+                return True
+            st["drop"] += 1
+            first = st["drop"] == 1
+        if first:
+            self.log("approver_rate_limited", peer=ip, limit_per_min=self.APP_LIMIT_PER_MIN)
+        return False
+
+    def app_unauth_ok(self, ip):
+        """Shared fixed-window limit for approver API requests whose token was missing or refused.
+        No per-source state, so a flood cannot fill the per-IP map or lock out the real app."""
+        now = time.time()
+        with self._ha_rate_lock:
+            st = self._app_unauth
+            if now - st["t"] >= 60:
+                st.update(t=now, n=0, drop=0)
+            st["n"] += 1
+            if st["n"] <= self.APP_UNAUTH_LIMIT_PER_MIN:
+                return True
+            st["drop"] += 1
+            first = st["drop"] == 1
+        if first:
+            self.log("approver_rate_limited", peer=ip, limit_per_min=self.APP_UNAUTH_LIMIT_PER_MIN,
                      unauthenticated=True)
         return False
 
@@ -6218,10 +6284,16 @@ def _agent_label(ua):
     return browser
 
 
-_ICON = ("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E"
-         "%3Crect width='32' height='32' rx='8' fill='%232563eb'/%3E%3Ctext x='16' y='23' "
-         "font-family='system-ui,Arial,sans-serif' font-size='20' font-weight='700' fill='white' "
-         "text-anchor='middle'%3EA%3C/text%3E%3C/svg%3E")
+# The favicon: assets/logo/logo-square.svg (the padlock with a check) with rounded corners, inlined.
+# Keep it in step with assets/logo/ by hand; tools/make_icon.py renders the PNG copies.
+_ICON = ("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='100 100 824 824'%3E"
+         "%3ClinearGradient id='g' x1='0' y1='0' x2='0' y2='1'%3E%3Cstop offset='0' stop-color='%233B6FE0'/%3E"
+         "%3Cstop offset='1' stop-color='%231E9E9A'/%3E%3C/linearGradient%3E"
+         "%3Crect x='100' y='100' width='824' height='824' rx='185' fill='url(%23g)'/%3E"
+         "%3Cpath d='M372 470V385a140 140 0 0 1 280 0V470' fill='none' stroke='white' stroke-width='64' "
+         "stroke-linecap='round'/%3E%3Crect x='300' y='452' width='424' height='330' rx='64' fill='white'/%3E"
+         "%3Cpath d='M410 617L483 690L620 553' fill='none' stroke='%232A86BE' stroke-width='58' "
+         "stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E")
 
 # Manual reload for the home-screen app (it has no browser chrome); shown by the page script in
 # standalone mode only, so a normal tab's header is unchanged.
@@ -7033,6 +7105,8 @@ def client_handler(broker, client_key):
             return _json(self, code, {"ok": False})
 
         def do_POST(self):
+            if approver_mod.handle(self, broker, "POST", self.path):
+                return
             if self.path.split("?")[0] == "/v1/hooks/ha/decide":
                 return self._ha_decide()
             if self.path.split("?")[0] == "/v1/enroll":
@@ -7172,12 +7246,16 @@ def client_handler(broker, client_key):
             _json(self, 200, out)
 
         def _no_write(self):
+            if approver_mod.handle(self, broker, self.command, self.path):
+                return
             if self._authed():
                 _json(self, 405, {"error": "method not allowed"})
 
         do_PUT = do_PATCH = do_DELETE = _no_write
 
         def do_GET(self):
+            if approver_mod.handle(self, broker, "GET", self.path):
+                return
             u = urllib.parse.urlsplit(self.path)
             if u.path == "/healthz" and broker._is_self_peer(self.client_address[0]):
                 ok = broker.healthy()   # a lock every request needs has been stuck: say so to the healthcheck

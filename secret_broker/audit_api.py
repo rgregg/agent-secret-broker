@@ -155,6 +155,10 @@ HIDDEN = frozenset({
     "history_viewed", "request_detail_viewed", "client_event_dropped", "push_subscribed",
     "push_revoked", "push_refused",
     "push_test", "ha_decide_dropped", "telegram_decide_refused", "telegram_poll_error",
+    # the approver app's API: its sign-in failures, limits and identity-provider state
+    "approver_auth_refused", "approver_rate_limited", "approver_api_discovery_failed",
+    # a banner that reached no transport exists only when a human was asked
+    "notify_failed",
     # server-identity policy (a key's allowed_hosts) is approval context
     "ssh_sign_refused",
     # remote commands: the run and its outcome (counts and a fixed label) are approval context, not for the agent's audit view
