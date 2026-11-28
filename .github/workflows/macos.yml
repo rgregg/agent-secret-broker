@@ -23,7 +23,7 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: swift --version
       - run: swift test --package-path macos/ASBApproverKit
 
@@ -43,7 +43,7 @@ jobs:
       HAS_NOTARY: ${{ secrets.MACOS_SIGNING_CERT != '' && secrets.MACOS_SIGNING_CERT_PASSWORD != '' && secrets.MACOS_NOTARY_KEY != '' && secrets.MACOS_NOTARY_KEY_ID != '' && secrets.MACOS_NOTARY_ISSUER != '' }}
       APP: macos/ASBApprover/build/Build/Products/Release/ASBApprover.app
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: xcodebuild -version
       - name: install XcodeGen
         run: brew install xcodegen
@@ -116,7 +116,7 @@ jobs:
           ditto -c -k --keepParent "$APP" dist/ASBApprover-macos.zip
           (cd dist && shasum -a 256 ASBApprover-macos.zip > ASBApprover-macos.zip.sha256)
           echo "signed with Developer ID: $HAS_SIGNING; notarized: $HAS_NOTARY"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ASBApprover-macos
           path: dist/
@@ -140,7 +140,7 @@ jobs:
       GH_REPO: ${{ github.repository }}
       TAG: ${{ github.ref_name }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: ASBApprover-macos
           path: dist
