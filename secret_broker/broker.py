@@ -200,6 +200,10 @@ _CLAIM_RE = re.compile(r"[A-Za-z0-9@._:\[\]%,()+ -]{1,200}")
 
 class Request:
     auto = False        # True once policy approved it and its release runs on its own thread (_release_by_policy)
+    # True while the broker is still deciding whether a human is needed (host check, risk rating, rules,
+    # policy, grants): the request is pending but has no card yet, so one that a rule or policy releases
+    # never flashes up on the requests page. Cleared when it is handed to the human (_push).
+    routing = False
 
     def __init__(self, mode, names, spec, source, ttl, peer=None, client=None):
         self.id = secrets.token_urlsafe(16)
@@ -2178,6 +2182,8 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
             if err is None:
                 req = Request(mode, names, spec, source, ttl, peer, client)
                 req.aliases_used = aliased
+                # these go straight to a human; every other mode is rated (and may be released) first
+                req.routing = mode not in ("sudo", "guidance", "credential", "session")
                 self._by_id[req.id] = req
                 self._by_nonce[req.nonce] = req
         if err:
@@ -2992,6 +2998,7 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
                 return
             sp.update(probe="failed", host_state="probe_failed", probe_label=label)
             req.risk = {"level": "high", "model": None, "reasons": [exec_mod.probe_text(label)]}
+            req.routing = False         # a Deny-only card, with no notification (so no _push)
         self.audit("exec_host_checked", req, host_state="probe_failed", probe_label=label)
 
     def _exec_probe_run(self, req):
@@ -3336,6 +3343,7 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
                     raise ValueError(f"placeholder {httpcheck.clip(var, 60)} not provided by requested secrets")
 
     def _push(self, req):
+        req.routing = False             # it goes to the human now: its card may show
         url = f"{self.cfg['approve_base_url'].rstrip('/')}/a/{req.nonce}"
         if req.mode == "http":
             what = f"{req.spec['method']} {req.spec['url']}"
@@ -4072,7 +4080,8 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
         """Open requests, oldest first."""
         with self._lock:
             self._expire_locked()
-            rows = [r for r in self._by_id.values() if r.status == "pending" and r.session is None]
+            rows = [r for r in self._by_id.values()
+                    if r.status == "pending" and r.session is None and not r.routing]
         return sorted(rows, key=lambda r: r.created)
 
     TG_REFUSALS_PER_WINDOW, TG_WINDOW_S = 10, 60
