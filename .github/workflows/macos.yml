@@ -49,10 +49,13 @@ jobs:
         run: brew install xcodegen
       - name: generate the Xcode project
         run: xcodegen --spec macos/ASBApprover/project.yml
+      # CFBundleVersion is the workflow run number, so every build is a new version: macOS caches an
+      # app's Finder and notification icons by bundle id and version, and keeps the old ones otherwise.
       - name: build
         run: >
           xcodebuild -project macos/ASBApprover/ASBApprover.xcodeproj -scheme ASBApprover
           -configuration Release -derivedDataPath macos/ASBApprover/build
+          CURRENT_PROJECT_VERSION=${{ github.run_number }}
           CODE_SIGNING_ALLOWED=NO build
       - name: ad-hoc sign (no signing secret)
         if: env.HAS_SIGNING != 'true'
