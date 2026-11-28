@@ -294,7 +294,8 @@ Defaults changed for security (see the reference, "Security notes"). Check them 
    `client_api_allow_direct`). At start the broker logs an INFO line saying which routes are proxy-only. It also warns
    for listed ranges broader than /29 (IPv4) or /64 (IPv6). IPv6 clients count as their /64 for every per-source limit.
    `GET /healthz` returns `ok` to loopback and the container's own address only, for a container healthcheck
-   (see `deploy/compose.yaml`). Also restrict the published port at the host firewall to the proxy's address:
+   (see `deploy/compose.yaml`); it returns 503 `stuck` while the watchdog sees the broker hung (see
+   "Watchdog" in `docs/reference.md`). Also restrict the published port at the host firewall to the proxy's address:
    published Docker ports and source NAT can change the peer address the broker sees (a request that looks like
    it comes from the Docker gateway), and the firewall does not depend on that.
 3. **Destinations.** The broker refuses to connect to loopback, link-local (including 169.254.169.254),

@@ -1034,6 +1034,26 @@ Config with an explicit `type` rejects unknown keys at startup, naming the field
 to it). Everything else uses the model's verdict only; no verdict is HIGH. See
 [risk.md](risk.md) for the rubric and the evaluation harness.
 
+## Watchdog (hang detection and self-restart)
+
+A hung broker keeps its port open while every request waits, and Docker's restart policy only acts when the
+process exits; an `unhealthy` container is never restarted by plain Docker or Komodo. So the broker watches itself:
+a daemon thread takes each lock that every request path goes through (`cfg`, the catalog; `state`, requests and
+grants) every 10 s, for at most 1 s, and releases it at once.
+
+* A lock that cannot be taken for 30 s in a row makes `GET /healthz` answer `503 stuck` (it answers `ok` again as
+  soon as the lock is free). `/healthz` reads only the watchdog's state, so it still answers while the broker hangs.
+* A lock stuck for `stuck_s` makes the broker audit `watchdog_restart` (`lock`, `stuck_s`; the audit write gets 5 s,
+  as it may be behind the same hang), print a line on stderr and exit with code 70. `restart: unless-stopped`
+  starts it again. In-flight approvals and sessions are lost, as with any restart.
+
+```json
+"watchdog": {"enabled": true, "stuck_s": 120}
+```
+
+`enabled` (default `true`) and `stuck_s` (default 120, 60 to 3600) are the only options; anything else is refused at
+startup. Raise `stuck_s` if the vault is slow enough that a single read or write can hold the catalog lock for minutes.
+
 ## Notification transports
 
 A transport only delivers the **link** to the approval page; approving always
@@ -2898,9 +2918,24 @@ comma-separated lists. A listed host that the key does not pin still goes to a h
 
 The normal policy chain: the client may use the credential, `approval: allow` plus the risk ceiling (for an SSH key this also
 needs `"auto_modes": ["ssh_sign", "exec"]` in the key's metadata, since a key defaults to `["ssh_sign"]`), auto-approve rules,
-otherwise a human. **There are no timed grants and no Always for `exec`** (a grant on the key would allow any command, the
-agent-signing problem again): standing permission is a rule, which is specific. A form post asking for one is refused (400)
-and claims nothing. The card shows host, account, the command shell-quoted with every non-ASCII character as `<U+XXXX>` (or
+otherwise a human. **There is no Always for `exec`** (it would allow any command on the key for good, the agent-signing
+problem again): lasting permission is a rule, which is specific. A form post asking for one is refused (400) and claims nothing.
+
+**Timed grants for `exec`** are narrower than for other modes. The card of a command on a **pinned** host offers the usual
+duration chips (`timed_grants.durations`, the client-scope choice as for other grants); the grant they make is pinned to the
+key, the host (lower-cased), the port, the login account and the client scope, and it records the risk level the approved
+command was rated as its ceiling (or `timed_grants.max_risk` when that is lower). Until the deadline a later command is
+approved without asking only when it is for that same key, host, port and account, from a client the scope covers, on a host
+whose check shows the pinned key, and is **rated at or below the ceiling**: a command rated higher (no model verdict counts as
+high) asks again (`grant_skipped`, `reason: risk`), and so does any other host, port, account or key. A new or changed host
+key is never covered and its card offers no chips; a grant asked for on one is refused (400) and claims nothing. Token
+channels (push, Home Assistant, Telegram) cannot create grants. Scripts and non-simple commands are covered on their rating
+like any other command, so a grant made from a HIGH command covers anything on that host for its duration: approve one only
+for the commands you would approve anyway. `grant_created` carries `grant_target` and `grant_max_risk`; grants are listed and
+revoked on the key's Policies page and the Clients tab ("remote commands on ryan@nas rated medium or lower"). They are saved
+in `grants.json` under `exec_grants`, which a broker from before this ignores (so a downgrade drops them, never widens them).
+
+The card shows host, account, the command shell-quoted with every non-ASCII character as `<U+XXXX>` (or
 the script in full with its hash) and why it was rated as it was; notification buttons follow the usual action policy, and the
 notification carries host, account, a clipped command and a link, never a script body or output.
 
@@ -4199,7 +4234,7 @@ only to the user, never rotated) out of the page and then POST `/decide` for any
   click from another site shows a freshly minted page; submits from that page work).
 * **Client API gate.** With `trusted_proxies` set, the client API answers 403 `forbidden` to any socket peer outside
   it (before authentication and before enrollment), audits `client_peer_refused` (once a minute per peer, operator
-  only), and serves `GET /healthz` (`ok`) to loopback / own addresses only. `client_api_allow_direct: true` opts out
+  only), and serves `GET /healthz` (`ok`, or 503 `stuck` while the watchdog sees a hang) to loopback / own addresses only. `client_api_allow_direct: true` opts out
   with a startup warning. The check uses the real peer; also restrict the published port at the host firewall.
 * **Defence in depth.** Every outbound call carries `X-Secret-Broker-Egress: 1` (the agent cannot remove or set
   it); both listeners answer 403 to any request that has it. The CSRF token is derived from the user **and** a

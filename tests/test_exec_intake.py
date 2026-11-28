@@ -338,12 +338,19 @@ class Surfaces(ExecBase):
         self.assertIn("U+0430", card)
         self.assertNotIn("а", card.replace("title=\"а\"", ""))   # only the tooltip carries the real character
 
-    def test_card_offers_approve_and_deny_only(self):
+    def test_card_offers_approve_deny_and_timed_grants_but_never_always_or_a_host_rule(self):
         rid = self.pending()
         card = self.card(rid)
         self.assertIn("value=approve>", card)
         self.assertIn("value=deny>", card)
-        for chip in ("approve_always", "approve_grant_", "Automatically approve...", "ssh_rule", "chip always", "class=chip"):
+        self.assertIn("approve_grant_5", card)                          # timed, pinned to this host and risk
+        self.assertIn("ryan@nas.example.com", card)
+        self.assertIn("rated <b>LOW</b> or lower", card)
+        for chip in ("approve_always", "ssh_rule", "chip always"):
+            self.assertNotIn(chip, card, chip)
+        self.broker.grants_cfg = {**self.broker.grants_cfg, "enabled": False}
+        card = self.card(rid)
+        for chip in ("approve_grant_", "Automatically approve...", "class=chip"):
             self.assertNotIn(chip, card, chip)
 
     def test_notification_carries_host_account_command_and_a_link_but_never_a_script(self):
@@ -380,14 +387,14 @@ class Surfaces(ExecBase):
 
 
 class Decisions(ExecBase):
-    def test_always_grant_and_rules_cannot_cover_it_and_claim_nothing(self):
+    def test_always_and_rules_cannot_cover_it_and_claim_nothing(self):
         rid = self.pending()
         req = self.broker._by_id[rid]
-        self.assertFalse(self.broker.grant_eligibility(req)[0])
+        self.assertTrue(self.broker.grant_eligibility(req)[0])         # a timed grant can (tests/test_exec_grants.py)
         self.assertFalse(self.broker.always_allow_eligibility(req)[0])
         self.assertEqual(self.broker.ssh_rule_chip(req), None)
-        for kw in ({"always": True}, {"always": "script"}, {"grant_minutes": 5}, {"ssh_rule": {"days": 1}},
-                   {"rule_scope": "any", "always": True}):
+        for kw in ({"always": True}, {"always": "script"}, {"ssh_rule": {"days": 1}},
+                   {"always": True, "grant_minutes": 5}, {"rule_scope": "any", "always": True}):
             code, got = self.broker.decide_via("dashboard", rid, "approve", "alice", **kw)
             self.assertIn(code, (400, 403, 409), kw)
             self.assertIsNone(got)
@@ -401,7 +408,7 @@ class Decisions(ExecBase):
 
     def test_the_always_form_value_is_refused_on_the_card_post(self):
         rid = self.pending()
-        for decision in ("approve_always", "approve_grant_5"):
+        for decision in ("approve_always", "approve_always_script"):
             self.decide(rid, decision)
             self.assertEqual(self.broker._by_id[rid].status, "pending", decision)
         self.assertEqual(self.events("approved"), [])

@@ -13,7 +13,7 @@ import threading
 
 from .backends import BackendConfigError, registry
 from .broker import Broker, parse_extra_origins, parse_trusted_proxies, serve
-from . import destguard, clients, sessions, credreq, sudomode, execmode, grants, notify, plans, presence, proposals, request_details, risk, riskmodel
+from . import destguard, clients, sessions, credreq, sudomode, execmode, grants, notify, plans, presence, proposals, request_details, risk, riskmodel, watchdog
 
 
 def _read(path):
@@ -62,6 +62,7 @@ def main():
     execmode.parse_config(cfg.get("exec"))                  # fail at startup, naming the field
     plans.parse_config(cfg.get("plans"))                    # fail at startup, naming the field
     sessions.parse_config(cfg.get("sessions"))              # fail at startup, naming the field
+    wd_cfg = watchdog.parse_config(cfg.get("watchdog"))     # fail at startup, naming the field
     clients.parse_config(cfg)           # legacy_client_key, enrollment, clients: fail at startup, naming the field
     try:
         backend = build_backend(cfg)
@@ -91,6 +92,9 @@ def main():
           (bind, int(cfg.get("client_port") or 8800)),
           (bind, int(cfg.get("approval_port") or 8801)),
           _read(cfg["client_key_file"]))
+    if wd_cfg["enabled"]:
+        broker.watchdog = watchdog.Watchdog(broker.watched_locks(), watchdog.exit_on_stuck(broker.log),
+                                            stuck_s=wd_cfg["stuck_s"]).start()
     print("secret-broker listening", flush=True)
     def _stop(*a):
         try:
