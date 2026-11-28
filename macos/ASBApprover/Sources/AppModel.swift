@@ -374,7 +374,7 @@ final class AppModel {
         } else {
             notifications.removeDelivered([id])
         }
-        StatusItemOpener.open()
+        StatusBarController.shared.open()
     }
 
     func openInBrowser(_ request: PendingRequest) {

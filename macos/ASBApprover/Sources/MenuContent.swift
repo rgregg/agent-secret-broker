@@ -2,25 +2,12 @@ import AppKit
 import SwiftUI
 import ASBApproverKit
 
-/// The menu bar icon, plus the pending count when there is any.
-struct MenuBarLabel: View {
-    let model: AppModel
-
-    var body: some View {
-        let count = model.requests.count
-        HStack(spacing: 3) {
-            Image("MenuBarIcon")
-            if count > 0 {
-                Text(verbatim: String(count))
-            }
-        }
-        .accessibilityLabel(Text(verbatim: count > 0 ? "ASB Approver, \(count) pending" : "ASB Approver"))
-    }
-}
-
-/// The menu bar window: sign-in, or the pending list.
+/// The popover's content (StatusBarController): sign-in, or the pending list.
 struct MenuContent: View {
     let model: AppModel
+    /// The measured height of the request rows; the list is this tall up to `listMaxHeight`.
+    @State private var listHeight: CGFloat = 0
+    static let listMaxHeight: CGFloat = 480
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -47,6 +34,10 @@ struct MenuContent: View {
             footer
         }
         .frame(width: 400)
+        // The popover (sizingOptions .preferredContentSize) takes its size from this view's ideal size. Every part below has a
+        // definite height, and fixedSize makes the window follow it (shrinking after sign-in or when
+        // the list empties) instead of keeping an old, taller size with the content centered in it.
+        .fixedSize(horizontal: false, vertical: true)
         .onAppear {
             model.loginItem.refresh()
             model.refreshNotificationAuthorization()
@@ -58,8 +49,8 @@ struct MenuContent: View {
             Text("ASB Approver")
                 .font(.headline)
             Spacer()
-            if model.state != .signedOut {
-                Text(verbatim: model.requests.isEmpty ? "No pending requests" : "\(model.requests.count) pending")
+            if model.state != .signedOut && !model.requests.isEmpty {
+                Text(verbatim: "\(model.requests.count) pending")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
             }
@@ -87,19 +78,28 @@ struct MenuContent: View {
         if model.requests.isEmpty {
             Text("Nothing is waiting for you.")
                 .foregroundStyle(.secondary)
-                .frame(maxWidth: .infinity, minHeight: 80)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 24)
         } else {
             ScrollViewReader { proxy in
                 ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 0) {
+                    // A plain VStack (the list is short) so its full height is known; the ScrollView
+                    // is exactly that tall, up to listMaxHeight, and scrolls beyond it.
+                    VStack(alignment: .leading, spacing: 0) {
                         ForEach(model.requests) { request in
                             RequestRow(request: request, model: model)
                                 .id(request.id)
-                            Divider()
+                            if request.id != model.requests.last?.id {
+                                Divider()
+                            }
                         }
                     }
+                    .background(GeometryReader { geo in
+                        Color.clear.preference(key: ListHeightKey.self, value: geo.size.height)
+                    })
                 }
-                .frame(minHeight: 120, maxHeight: 480)
+                .frame(height: min(max(listHeight, 1), Self.listMaxHeight))
+                .onPreferenceChange(ListHeightKey.self) { listHeight = $0 }
                 .onAppear {
                     scroll(proxy, to: model.focusedRequestID)
                 }
@@ -153,5 +153,13 @@ struct MenuContent: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
+    }
+}
+
+/// Carries the request rows' measured height up to the list's frame.
+private struct ListHeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
     }
 }
