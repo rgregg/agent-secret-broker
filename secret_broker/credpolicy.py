@@ -127,7 +127,8 @@ def body(name, sc, ctx):
     parts = [
         f"<style>{guidance.CSS}</style>",
         f"<h3>Standing approvals ({c['standing']})</h3><p><small class=muted>Requests these cover are approved "
-        "without asking. A time-boxed approval has no risk limit and ends at its deadline; an Always approval "
+        "without asking. A time-boxed approval has no risk limit (a remote-command one covers only its host and "
+        "commands rated no higher than the one approved) and ends at its deadline; an Always approval "
         "never expires and is used only within the auto-approve limit. Revoke to ask every time again.</small></p>"
         + ("" if ctx.grants_enabled else "<p><small class=muted>Time-boxed grants are turned off.</small></p>"),
         standing_card(name, ctx.standing_rows, ctx.csrf, ctx.client_names)]

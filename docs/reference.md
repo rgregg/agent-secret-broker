@@ -2724,9 +2724,24 @@ comma-separated lists. A listed host that the key does not pin still goes to a h
 
 The normal policy chain: the client may use the credential, `approval: allow` plus the risk ceiling (for an SSH key this also
 needs `"auto_modes": ["ssh_sign", "exec"]` in the key's metadata, since a key defaults to `["ssh_sign"]`), auto-approve rules,
-otherwise a human. **There are no timed grants and no Always for `exec`** (a grant on the key would allow any command, the
-agent-signing problem again): standing permission is a rule, which is specific. A form post asking for one is refused (400)
-and claims nothing. The card shows host, account, the command shell-quoted with every non-ASCII character as `<U+XXXX>` (or
+otherwise a human. **There is no Always for `exec`** (it would allow any command on the key for good, the agent-signing
+problem again): lasting permission is a rule, which is specific. A form post asking for one is refused (400) and claims nothing.
+
+**Timed grants for `exec`** are narrower than for other modes. The card of a command on a **pinned** host offers the usual
+duration chips (`timed_grants.durations`, the client-scope choice as for other grants); the grant they make is pinned to the
+key, the host (lower-cased), the port, the login account and the client scope, and it records the risk level the approved
+command was rated as its ceiling (or `timed_grants.max_risk` when that is lower). Until the deadline a later command is
+approved without asking only when it is for that same key, host, port and account, from a client the scope covers, on a host
+whose check shows the pinned key, and is **rated at or below the ceiling**: a command rated higher (no model verdict counts as
+high) asks again (`grant_skipped`, `reason: risk`), and so does any other host, port, account or key. A new or changed host
+key is never covered and its card offers no chips; a grant asked for on one is refused (400) and claims nothing. Token
+channels (push, Home Assistant, Telegram) cannot create grants. Scripts and non-simple commands are covered on their rating
+like any other command, so a grant made from a HIGH command covers anything on that host for its duration: approve one only
+for the commands you would approve anyway. `grant_created` carries `grant_target` and `grant_max_risk`; grants are listed and
+revoked on the key's Policies page and the Clients tab ("remote commands on ryan@nas rated medium or lower"). They are saved
+in `grants.json` under `exec_grants`, which a broker from before this ignores (so a downgrade drops them, never widens them).
+
+The card shows host, account, the command shell-quoted with every non-ASCII character as `<U+XXXX>` (or
 the script in full with its hash) and why it was rated as it was; notification buttons follow the usual action policy, and the
 notification carries host, account, a clipped command and a link, never a script body or output.
 

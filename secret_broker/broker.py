@@ -4238,9 +4238,12 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
                         always or grant_minutes is not None or ssh_rule is not None):
                     req, code = None, 400   # this key asks every time: nothing standing can be created from it
                 if req is not None and req.mode == "exec" and (
-                        always or grant_minutes is not None or ssh_rule is not None or credential is not None
-                        or plan is not None or session_limits is not None):
-                    req, code = None, 400   # a remote command is approved once, as shown; standing permission is a rule
+                        always or ssh_rule is not None or credential is not None
+                        or plan is not None or session_limits is not None
+                        or (grant_minutes is not None and self._exec_grant_problem(req))):
+                    # a remote command is approved once, as shown, or with a timed grant pinned to its host and
+                    # capped at its risk; never an Always (standing permission for a kind of command is a rule)
+                    req, code = None, 400
                 elif req is not None and req.mode == "exec" and approve and req.spec.get("probe") != "ready":
                     req, code = None, 400   # the host check is unfinished or failed: nothing can be approved, nothing is claimed
                 elif req is not None and req.mode == "exec" and req.spec.get("host_state"):
@@ -4357,7 +4360,20 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
             return False, "storing a credential always needs a fresh approval"
         if self._script_not_visible(req.mode, req.spec):
             return False, "the script text is not visible, so env requests like this always prompt"
+        why = self._exec_grant_problem(req) if req.mode == "exec" else None
+        if why:
+            return False, why
         return True, ""
+
+    @staticmethod
+    def _exec_grant_problem(req):
+        """Why a timed grant cannot be made from this remote command (None when it can). Takes no lock, so
+        decide_via may call it while it holds the request lock."""
+        if req.spec.get("probe") != "ready" or req.spec.get("host_state"):
+            return "the host key is not pinned for this host, so every command on it asks"
+        if not (req.risk and req.risk.get("level") in risk_mod.LEVELS):
+            return "the command has no risk rating yet"
+        return None
 
     def active_grants(self):
         """Active timed grants (with seconds left)."""
@@ -4403,7 +4419,8 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
             rows.append({"kind": "timed", "id": g["id"], "secrets": g["secrets"], "names": list(g["secrets"]),
                          "mode": g["mode"],
                          "client": g["client"], "scope": g["scope"],
-                         "covers": standing_mod.covers_label(g["mode"], g["scope"]),
+                         "covers": standing_mod.covers_label(g["mode"], g["scope"], target=g.get("target"),
+                                                             max_risk=g.get("max_risk")),
                          "expires_at": g["expires_at"], "left_s": g["left_s"],
                          "created_by": g["created_by"], "created_at": _utc(g["created_at"]),
                          "minutes": g["minutes"]})
@@ -4537,12 +4554,25 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
         if not ok:
             self.audit("grant_refused", req, kind="timed", reason=why, **who)
             return
+        extra = {}
+        if req.mode == "exec":      # pinned to this host, port and account; covers up to this command's risk
+            extra = {"target": grants_mod.exec_target(req.spec), "max_risk": self._exec_grant_ceiling(req.risk["level"])}
         g = self.grants.add(req.names, minutes, grants_mod.scope_for(req.mode, req.spec), actor,
-                            channel, req.id, mode=req.mode, client=self._rule_client(req, rule_scope))
+                            channel, req.id, mode=req.mode, client=self._rule_client(req, rule_scope), **extra)
+        if req.mode == "exec":
+            extra = {"grant_target": g["target"], "grant_max_risk": g["max_risk"]}
         self.audit("grant_created", req, kind="timed", grant_id=g["id"], scope=g["scope"],
-                   rule_client=g["client"],
+                   rule_client=g["client"], **extra,
                    grant_minutes=minutes, expires_at=g["expires_at"], created_by=actor, channel=channel,
                    approver_peer=who.get("approver_peer"), approver_ip=who.get("approver_ip"))
+
+    def _exec_grant_ceiling(self, level):
+        """The risk ceiling of an exec grant made from a command rated `level`: that level, or
+        timed_grants.max_risk when the operator set that lower."""
+        mx = self.grants_cfg["max_risk"]
+        if mx in risk_mod.LEVELS and risk_mod.rank(mx) < risk_mod.rank(level):
+            return mx
+        return level
 
     def _standing_claim(self, req):
         """Approve `req` from a standing approval, in this order: an Always approval
@@ -4562,6 +4592,8 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
             g = self._standing_find(req, kind)
             if g is None:
                 continue
+            if g.get("mode") == "exec" and ceiling != "none" and risk_mod.rank(g["max_risk"]) < risk_mod.rank(ceiling):
+                ceiling = g["max_risk"]     # an exec grant never covers a command rated above the one approved
             skip = None
             with self._lock:
                 if hidden:
@@ -4597,7 +4629,8 @@ class Broker(sshrules_mod.SshRulesMixin, uirules_mod.UiRulesMixin, clients_mod.C
                 return None
             # this client's grant and the any-client grant may differ in method scope: prefer
             # one that covers this request
-            found = self.grants.find_all(req.names, req.mode, req.client["id"])
+            target = grants_mod.exec_target(req.spec) if req.mode == "exec" else None
+            found = self.grants.find_all(req.names, req.mode, req.client["id"], target)
             return next((g for g in found if grants_mod.covers(g, req.mode, req.spec)),
                         found[0] if found else None)
         if len(req.names) != 1 or req.mode not in standing_mod.ALWAYS_MODES:
@@ -6420,12 +6453,34 @@ def _approve_actions(broker, req):
         return exec_mod.host_actions_html(
             req.spec, broker._exec_remember_why(req),
             restricts=bool(((broker.cfg["secrets"].get(req.names[0]) or {}).get("ssh_hosts") or {}).get("allowed")))
-    if req.mode == "exec":          # Approve or Deny only: standing permission for remote commands is a rule
-        return ("<div class=decide-row><button class='btn approve' name=decision value=approve>"
-                "Approve</button><button class='btn deny' name=decision value=deny>Deny</button></div>"
-                "<p class=scope><small class=muted>Approves this one command, as shown. There is no Always or "
-                "timed approval for remote commands: to allow a kind of command without asking, add an "
-                f"auto-approve rule on {revoke_hint[len('Revoke any time on '):]}</small></p>")
+    if req.mode == "exec":          # Approve, Deny and timed grants pinned to this host and capped at this risk
+        row = ("<div class=decide-row><button class='btn approve' name=decision value=approve>"
+               "Approve</button><button class='btn deny' name=decision value=deny>Deny</button></div>")
+        rule_hint = ("To allow a kind of command without asking for longer, add an auto-approve rule on "
+                     f"{revoke_hint[len('Revoke any time on '):]}")
+        ok_g, _ = broker.grant_eligibility(req)
+        mins = broker.grant_durations() if ok_g else []
+        if not mins:
+            return row + ("<p class=scope><small class=muted>Approves this one command, as shown. There is no "
+                          f"Always for remote commands. {rule_hint}</small></p>")
+        host, port, acct = grants_mod.exec_target(req.spec)
+        where = f"{acct}@{host}" + (f":{port}" if port != 22 else "")
+        level = broker._exec_grant_ceiling(req.risk["level"])
+        chips = "".join(
+            f"<button class=chip name=decision value='approve_grant_{m}' "
+            f"aria-label='Approve this command, and approve further remote commands with {names} on "
+            f"{e(where)} rated {level} or lower for {_fmt_minutes(m)}'>{_fmt_minutes(m)}</button>"
+            for m in mins)
+        cname = req.client["name"]
+        return (row + "<div class=auto><span class=lbl>Automatically approve...</span>"
+                "<label class=rscope>Applies to <select name=rule_scope aria-label='Whom a standing approval applies to'>"
+                f"<option value=client selected>only this client ({e(cname)})</option>"
+                "<option value=any>any client (every machine)</option></select></label>"
+                f"<div class=chips>{chips}</div>"
+                f"<p class=scope><small class=muted>Applies to exactly: remote commands with {names_html} on "
+                f"<b>{e(where)}</b> (its pinned host key) that are rated <b>{e(level.upper())}</b> or lower. "
+                "A command rated higher, another host, port or account, or a host whose key changed asks again. "
+                f"{revoke_hint} {rule_hint}</small></p></div>")
     if req.mode == "sudo":          # Approve or Deny only: no Always, no timed grant
         return ("<div class=decide-row><button class='btn approve' name=decision value=approve>"
                 "Approve</button><button class='btn deny' name=decision value=deny>Deny</button></div>"

@@ -144,8 +144,16 @@ def script_binding(spec):
     return {"sha256": shas, "command": os.path.basename(str(argv[0])) or str(argv[0])}
 
 
-def covers_label(mode, scope, scripts=None):
+def exec_where(target):
+    """'ryan@nas.example.com' (':2222' added for a port other than 22)."""
+    host, port, acct = target
+    return f"{acct}@{host}" + (f":{port}" if int(port) != 22 else "")
+
+
+def covers_label(mode, scope, scripts=None, target=None, max_risk=None):
     """Short phrase for what a standing approval covers."""
+    if mode == "exec":
+        return f"remote commands on {exec_where(target)} rated {max_risk} or lower" if target else "remote commands"
     if mode == "env":
         if scripts:
             return f"run-with-secret, only {scripts['command']} on script {scripts['sha256'][0][:12]}"
@@ -160,6 +168,7 @@ def covers_label(mode, scope, scripts=None):
 def decided_by(kind, minutes, mode, scope):
     """History wording: 'standing approval (always, reads only)'."""
     what = ("run-with-secret" if mode == "env" else "ssh" if mode == "ssh_sign" else
+            "remote commands" if mode == "exec" else
             "reads only" if scope == "read" else "any method")
     how = "always" if kind == "always" else (f"{int(minutes)} min" if minutes else "timed")
     return f"standing approval ({how}, {what})"

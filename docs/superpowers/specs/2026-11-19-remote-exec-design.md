@@ -123,6 +123,9 @@ legacy shared key may not. `GET /v1/status` shows `features.exec`.
   is **not** offered (see below), then auto-approve rules, otherwise a human.
 - **Timed grants and Always do not apply to `exec`.** A grant on the key would allow any command, which is the
   agent-signing problem again. Standing permission for exec is expressed as rules, which are specific.
+  *Amended 2026-11-27:* timed grants now apply, pinned to the key, host, port, account and client, and capped at
+  the risk level of the approved command (a command rated higher asks again). See `docs/reference.md`, "Approval"
+  under Remote commands. Always still does not apply.
 - **Auto-approve rules** gain mode `exec`: `{"name", "mode": "exec", "secret", "host", "account", "clients",
   "argv": [...]}`. For a simple command the rule's `argv` is a prefix of the parsed argv (so `["systemctl",
   "status"]` allows `systemctl status nginx`); for anything not simple, a rule never matches. They live in
