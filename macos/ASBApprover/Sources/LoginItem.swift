@@ -2,7 +2,7 @@ import Foundation
 import Observation
 import ServiceManagement
 
-/// "Launch at login" through `SMAppService.mainApp` (macOS 13+). The system owns the state; this
+/// "Start at login" through `SMAppService.mainApp` (macOS 13+). The system owns the state; this
 /// reads it back after every change and when the popover opens.
 @MainActor
 @Observable

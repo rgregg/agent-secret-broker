@@ -125,7 +125,7 @@ struct MenuContent: View {
     private var footer: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
-                Toggle("Launch at login", isOn: Binding(
+                Toggle("Start at login", isOn: Binding(
                     get: { model.loginItem.isEnabled },
                     set: { model.loginItem.set($0) }))
                     .toggleStyle(.checkbox)

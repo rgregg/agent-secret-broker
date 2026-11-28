@@ -55,7 +55,7 @@ signing secrets is ad-hoc signed only: after downloading it, remove the quaranti
    agents use, e.g. `https://broker.example:8800`) and choose **Sign in**. Sign in at your provider
    in the window that opens.
 2. Allow notifications when macOS asks.
-3. Optional: tick **Launch at login**.
+3. Optional: tick **Start at login** (in the popover, or right-click the menu bar icon; that menu also has **Quit**).
 
 The broker URL and the provider settings are kept in the app's preferences; the tokens only in the
 Keychain. The app counts as "presence" (so the phone push can wait) only while its notifications

@@ -49,7 +49,9 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
             button.image = image
             button.imagePosition = .imageLeading
             button.target = self
-            button.action = #selector(toggle(_:))
+            button.action = #selector(clicked(_:))
+            // Left click opens the popover; right click (or control-click) opens the menu.
+            button.sendAction(on: [.leftMouseUp, .rightMouseUp])
         }
         statusItem = item
         popover.behavior = .transient
@@ -74,12 +76,51 @@ final class StatusBarController: NSObject, NSPopoverDelegate {
         popover.performClose(nil)
     }
 
-    @objc private func toggle(_ sender: Any?) {
-        if popover.isShown {
+    @objc private func clicked(_ sender: Any?) {
+        let event = NSApplication.shared.currentEvent
+        if event?.type == .rightMouseUp || event?.modifierFlags.contains(.control) == true {
+            showMenu()
+        } else if popover.isShown {
             close()
         } else {
             open()
         }
+    }
+
+    /// The right-click menu: Start at login (checked when on) and Quit.
+    private func showMenu() {
+        guard let button = statusItem?.button, let model else { return }
+        close()
+        model.loginItem.refresh()
+        let menu = NSMenu()
+        let login = NSMenuItem(title: "Start at login", action: #selector(toggleLoginItem(_:)), keyEquivalent: "")
+        login.target = self
+        login.state = model.loginItem.isEnabled ? .on : .off
+        menu.addItem(login)
+        if model.loginItem.needsApproval {
+            let allow = NSMenuItem(title: "Allow in System Settings…", action: #selector(openLoginItemSettings(_:)),
+                                   keyEquivalent: "")
+            allow.target = self
+            menu.addItem(allow)
+        }
+        menu.addItem(.separator())
+        let quit = NSMenuItem(title: "Quit ASB Approver", action: #selector(quit(_:)), keyEquivalent: "q")
+        quit.target = self
+        menu.addItem(quit)
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.height + 4), in: button)
+    }
+
+    @objc private func toggleLoginItem(_ sender: Any?) {
+        guard let model else { return }
+        model.loginItem.set(!model.loginItem.isEnabled)
+    }
+
+    @objc private func openLoginItemSettings(_ sender: Any?) {
+        model?.loginItem.openSystemSettings()
+    }
+
+    @objc private func quit(_ sender: Any?) {
+        NSApplication.shared.terminate(nil)
     }
 
     nonisolated func popoverDidClose(_ notification: Notification) {
