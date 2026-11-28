@@ -126,14 +126,17 @@ class Leaf(Base):
         th = threading.Thread(target=self.ask, daemon=True)
         th.start()
         end = time.time() + 5
-        while not self.broker.pending() and time.time() < end:
+        while not self.broker._by_id and time.time() < end:
             time.sleep(0.02)
-        (req,) = self.broker.pending()
+        (req,) = self.broker._by_id.values()
+        # Still routing (its push has not run): not in the app's list, like the dashboard hides its card.
+        self.assertEqual(self.broker.pending(), [])
         v = self.view(req)
         self.assertEqual((v["notified"], v["banner_actions"]), (False, []))
         gate.set()
         th.join(10)
         self.broker.flush_notifications(10)
+        self.assertEqual([r.id for r in self.broker.pending()], [req.id])
         v = self.view(req)
         self.assertEqual((v["notified"], v["banner_actions"]), (True, ["deny", "approve"]))
         # the app never uses the shared action token: its actions do not widen it, and with no
